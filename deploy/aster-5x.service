@@ -1,0 +1,30 @@
+[Unit]
+Description=Aster XAUUSD1 5x capacity monitor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=aster-5x
+Group=aster-5x
+WorkingDirectory=/opt/aster-5x
+Environment=ASTER_CONFIG_FILE=/etc/aster-5x/config.json
+Environment=ASTER_RUNTIME_DIR=/var/lib/aster-5x
+Environment=ASTER_JOURNAL=1
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/rm -f /var/lib/aster-5x/stop
+ExecStart=/usr/bin/python3 /opt/aster-5x/monitor.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aster-5x
+
+[Install]
+WantedBy=multi-user.target

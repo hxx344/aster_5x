@@ -1,4 +1,4 @@
-"""Public Aster leverage-capacity monitor. Python 3.11+, standard library only."""
+"""Public Aster leverage-capacity monitor. Python 3.9+, standard library only."""
 import argparse
 import base64
 from datetime import datetime, timezone
@@ -10,7 +10,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import signal
 import socket
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -110,10 +112,21 @@ def extract_capacity(oi_payload, brackets_payload, symbol, leverage):
 
 
 def load_config():
-    config = json.loads((ROOT / "config.json").read_text(encoding="utf-8-sig"))
-    local = ROOT / "config.local.json"
-    if local.exists():
-        config.update(json.loads(local.read_text(encoding="utf-8-sig")))
+    try:
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8-sig"))
+        local = Path(os.environ.get("ASTER_CONFIG_FILE", ROOT / "config.local.json"))
+        if local.exists():
+            overrides = json.loads(local.read_text(encoding="utf-8-sig"))
+            if not isinstance(overrides, dict):
+                raise MonitorError("Configuration must be a JSON object")
+            config.update(overrides)
+    except (OSError, ValueError):
+        raise MonitorError("Cannot read configuration or invalid JSON") from None
+    return validate_config(config)
+
+
+def validate_config(config):
+    config = config.copy()
     if config.get("symbol") != "XAUUSD1" or config.get("leverage") != 5:
         raise MonitorError("This monitor is configured only for XAUUSD1 at 5x")
     config["threshold"] = number(config["threshold"])
@@ -181,8 +194,13 @@ def sample(config):
     return {"value": str(value), "global_remaining": str(remaining), "bracket_cap": str(cap), "checked_at": now_iso()}
 
 
-def run(config, once=False):
-    runtime = ROOT / "runtime"
+def runtime_dir():
+    return Path(os.environ.get("ASTER_RUNTIME_DIR", ROOT / "runtime"))
+
+
+def run(config, once=False, shutdown=None):
+    shutdown = shutdown or threading.Event()
+    runtime = runtime_dir()
     runtime.mkdir(exist_ok=True)
     # The OS releases this lock even after a crash; no stale PID can block restart.
     lock = socket.socket()
@@ -211,11 +229,13 @@ def run(config, once=False):
     failures = 0
     exit_code = 0
     try:
-        while not stop_file.exists():
+        while not stop_file.exists() and not shutdown.is_set():
             started = time.monotonic()
             delay = config["poll_seconds"]
             try:
                 result = sample(config)
+                if shutdown.is_set():
+                    break
                 value = number(result["value"])
                 status.update(result, status="ok", above_threshold=value > config["threshold"], error=None)
                 def deliver():
@@ -245,8 +265,8 @@ def run(config, once=False):
                 print(json.dumps(status, ensure_ascii=False))
                 break
             deadline = started + delay
-            while not stop_file.exists() and time.monotonic() < deadline:
-                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+            while not stop_file.exists() and not shutdown.is_set() and time.monotonic() < deadline:
+                shutdown.wait(min(0.5, max(0, deadline - time.monotonic())))
     finally:
         status.update(status="completed" if once else "stopped", stopped_at=now_iso())
         atomic_json(runtime / "status.json", status)
@@ -259,15 +279,21 @@ def main():
     parser.add_argument("--once", action="store_true", help="Check once; enabled Feishu delivery still applies")
     parser.add_argument("--stop", action="store_true", help="Request graceful shutdown")
     args = parser.parse_args()
-    runtime = ROOT / "runtime"
+    runtime = runtime_dir()
     runtime.mkdir(exist_ok=True)
     if args.stop:
         (runtime / "stop").touch()
         return 0
     handler = RotatingFileHandler(runtime / "monitor.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[handler])
+    handlers = [handler]
+    if os.environ.get("ASTER_JOURNAL") == "1":
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
+    shutdown = threading.Event()
+    for event in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(event, lambda *_: shutdown.set())
     try:
-        return run(load_config(), args.once)
+        return run(load_config(), args.once, shutdown)
     except MonitorError as exc:
         LOG.error("Startup failed: %s", exc)
         print(str(exc))

@@ -1,6 +1,40 @@
 # Aster XAUUSD1 5x 额度监控
 
-每 5 秒查询网页实际使用的公开风控接口，严格大于 **10,000 USD1** 时触发。飞书目前关闭，触发只记入本地日志。无需第三方 Python 依赖。
+每 5 秒查询网页实际使用的公开风控接口，严格大于 **10,000 USD1** 时触发。默认关闭飞书，触发只记入本地日志。无需第三方 Python 依赖。
+
+## Linux 一键安装
+
+在使用 systemd 的 Linux 服务器上执行（推荐 Ubuntu 22.04+、Debian 12+、RHEL 9+）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install.sh | sudo bash
+```
+
+已经是 root 用户时去掉 `sudo`。服务器需要能访问 GitHub 和 Aster；若没有 `curl`，先运行 `sudo apt-get update && sudo apt-get install -y curl`（Ubuntu/Debian），或 `sudo dnf install -y curl`（RHEL 系列）。其余缺少的依赖由脚本安装，系统 Python 需至少 3.9。
+
+首次安装按提示填写，全部回车即可采用默认值：
+
+1. 阈值：`10000` USD1。
+2. 检查间隔：`5` 秒。
+3. 飞书 Webhook：可留空；填写后自动启用，再输入可选签名密钥。密钥输入不显示。
+
+安装后服务立即启动、开机自动运行、异常退出自动重启。后续无需编辑 JSON：
+
+```bash
+sudo aster-5x status        # 当前额度、查询状态、阈值和飞书开关
+sudo aster-5x configure     # 交互修改配置，保存后自动重启
+sudo aster-5x logs          # 跟踪日志；Ctrl+C 只退出日志查看
+sudo aster-5x test-feishu   # 手动发送一条标明“测试”的消息
+sudo aster-5x stop          # 停止监控
+sudo aster-5x start         # 恢复监控
+sudo aster-5x restart       # 重启监控
+```
+
+配置时回车保留当前值；Webhook 输入 `-` 可关闭飞书并清除保存的地址与密钥。安装不会发送测试消息；启用飞书后，若第一次查询已达标，会发送正常额度提醒。
+
+**升级：重新执行安装命令，配置与提醒历史会保留。** 无交互安装可用 `curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install.sh | sudo bash -s -- --non-interactive`，之后通过 `sudo aster-5x configure` 配置。已克隆仓库时也可执行 `sudo bash install.sh`，直接安装当前目录的代码。
+
+程序位于 `/opt/aster-5x`，配置位于 `/etc/aster-5x/config.json`，状态和轮转日志位于 `/var/lib/aster-5x`。服务以独立 `aster-5x` 用户运行。`status` 同时核对服务和最近一分钟内的查询结果，首次查询失败时安装命令会返回失败并显示原因，但已安装的服务仍会按退避规则重试；用 `logs` 排查。查看 systemd 原始状态：`sudo systemctl status aster-5x`。
 
 ## 数据口径
 
@@ -13,9 +47,9 @@
 - 网页模块 `useTicker-iKEcy8XC.js` 和 `shared~...~e3kb53wr-C_GIamnV.js` 使用上述额度映射和风控档位，再扣个人占用。这些网页接口可能随站点变更；字段缺失或异常时程序报错，不把失败当作 0。
 - [官方 API 文档](https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data)另有账户查询接口，本实现使用已核实的网页公开接口。
 
-## 运行与检查
+## Windows 运行与检查
 
-需要 Python 3.11+，在 PowerShell 执行：
+需要 Python 3.9+，在 PowerShell 执行：
 
 ```powershell
 cd D:\project_aster_5x
@@ -32,9 +66,9 @@ Get-Content .\runtime\monitor.log -Tail 10
 
 5 秒为目标检查周期，网络请求、接口限流和重试会增加延迟，轮询之间的短暂波动可能漏过。失败指数退避，429 至少等 180 秒，418 至少等 24 小时。`Retry-After` 秒数更长时遵从服务端。
 
-## 飞书配置（目前未启用）
+## 手动飞书配置（可选）
 
-日后在已忽略的 `config.local.json` 中填写：
+Linux 推荐使用 `sudo aster-5x configure`；手动配置时编辑 `/etc/aster-5x/config.json`。Windows 在已忽略的 `config.local.json` 中填写：
 
 ```json
 {

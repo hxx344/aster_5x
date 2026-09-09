@@ -135,9 +135,9 @@ def validate_config(config):
     legacy_leverage = config.pop("leverage", None)
     if legacy_symbol not in (None, "XAUUSD1") or legacy_leverage not in (None, 5):
         raise MonitorError("Unsupported legacy symbol or leverage")
-    leverages = config.get("leverages", [4, 5])
-    if not isinstance(leverages, list) or not leverages or any(type(v) is not int or v not in (4, 5) for v in leverages) or len(set(leverages)) != len(leverages):
-        raise MonitorError("leverages must contain unique supported tiers: 4, 5")
+    leverages = config.get("leverages", [4, 5, 10, 20])
+    if not isinstance(leverages, list) or not leverages or any(type(v) is not int or v not in (4, 5, 10, 20) for v in leverages) or len(set(leverages)) != len(leverages):
+        raise MonitorError("leverages must contain unique supported tiers: 4, 5, 10, 20")
     config["leverages"] = leverages.copy()
     symbols = config.get("symbols", list(SUPPORTED_SYMBOLS))
     if not isinstance(symbols, list) or not symbols or any(s not in SUPPORTED_SYMBOLS for s in symbols) or len(set(symbols)) != len(symbols):

@@ -60,7 +60,7 @@ class MultiMarketTests(unittest.TestCase):
 
     @patch("monitor.send_feishu")
     def test_six_combinations_alert_reset_and_retry_independently(self, send):
-        current = {**config(), "feishu_enabled": True, "cooldown_seconds": 0}
+        current = {**config(), "leverages": [4, 5], "feishu_enabled": True, "cooldown_seconds": 0}
         trackers = [m.MarketMonitor({**current, "leverage": v}, s, {}, threading.Event())
                     for s in current["symbols"] for v in current["leverages"]]
         for tracker in trackers:
@@ -82,7 +82,7 @@ class MultiMarketTests(unittest.TestCase):
     @patch("monitor.time.monotonic")
     @patch("monitor.sample")
     def test_failed_tier_backs_off_while_other_tier_keeps_updating(self, sample, monotonic):
-        tracker = m.SymbolMonitor(config(), "XAUUSD1", {}, threading.Event())
+        tracker = m.SymbolMonitor({**config(), "leverages": [4, 5]}, "XAUUSD1", {}, threading.Event())
         sample.return_value = {4: m.MonitorError("test missing tier"), 5: reading(0)}
         monotonic.return_value = 100
         first = tracker.check()[0]
@@ -103,7 +103,7 @@ class MultiMarketTests(unittest.TestCase):
         upgraded = m.validate_config(legacy)
         self.assertEqual(upgraded["symbols"], list(m.SUPPORTED_SYMBOLS))
         self.assertEqual(upgraded["threshold"], 22000)
-        self.assertEqual(upgraded["leverages"], [4, 5])
+        self.assertEqual(upgraded["leverages"], [4, 5, 10, 20])
         self.assertFalse(upgraded["feishu_enabled"])
 
     def test_invalid_and_duplicate_symbols_rejected(self):

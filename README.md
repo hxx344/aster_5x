@@ -1,8 +1,14 @@
-# Aster 多标的 4x / 5x 额度监控
+# Aster 多账户交易管理与额度监控
 
-同时监控 **XAUUSD1、SPCXUSD1、CLUSD1**，每个标的按 **4x 和 5x、每 5 秒检查、严格大于 10,000 USD1** 的规则独立触发。默认关闭飞书，触发只记入本地日志。无需第三方 Python 依赖。
+新增 Linux 网页账户管理：多账户双向分批开仓，监控 **4x / 5x / 10x / 20x + 实际杠杆**，BBO 价差不超过万 5，按 USD1 全仓保证金比率计算每批数量，预测成交后严格低于 50%。升杠杆后按新杠杆额度继续加仓，完成后汇总飞书通知。实盘凭据只放服务器环境变量。完整安装、配置和执行规则见 [Linux 交易部署说明](DEPLOYMENT.md)。
 
-六个“标的 + 杠杆”组合分别保存提醒状态和冷却时间；同一标的两个档位共用一次接口快照，请求量不增加，一个组合的持续达标不会压制其他组合的提醒；普通网络失败只让对应标的退避，其他标的继续检查。遇到 429/418 限流则暂停新的查询请求，遵守服务端退避时间。
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install-trading.sh | sudo bash
+```
+
+以下是保留的**纯额度监控**工具说明，不会登录账户或下单。同时监控 **XAUUSD1、SPCXUSD1、CLUSD1**，每个标的按 **4x / 5x / 10x / 20x、每 5 秒检查、严格大于 10,000 USD1** 的规则独立触发。默认关闭飞书，触发只记入本地日志。纯监控无需第三方 Python 依赖。
+
+十二个“标的 + 杠杆”组合分别保存提醒状态和冷却时间；同一标的各档位共用一次接口快照，请求量不增加，一个组合的持续达标不会压制其他组合的提醒；普通网络失败只让对应标的退避，其他标的继续检查。遇到 429/418 限流则暂停新的查询请求，遵守服务端退避时间。
 
 ## Linux 一键安装
 
@@ -34,13 +40,13 @@ sudo aster-5x restart       # 重启监控
 
 配置时回车保留当前值；Webhook 输入 `-` 可关闭飞书并清除保存的地址与密钥。安装不会发送测试消息；启用飞书后，若第一次查询已达标，会发送正常额度提醒。
 
-**升级：重新执行安装命令，配置与提醒历史会保留，默认监控三个标的的 4x 和 5x。** 原有三个标的的 5x 提醒状态会自动迁移，4x 单独建立提醒记录，阈值、间隔和飞书设置继续沿用。如果手动设置了 `symbols` 列表，则只监控该列表；支持上述三个代码。旧配置中的 `leverage: 5` 会自动升级为两个档位；如需手动限制档位，可设置 `leverages: [4]` 或 `[5]`。服务与管理命令仍叫 `aster-5x`。无交互安装可用 `curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install.sh | sudo bash -s -- --non-interactive`，之后通过 `sudo aster-5x configure` 配置。已克隆仓库时也可执行 `sudo bash install.sh`，直接安装当前目录的代码。
+**升级：重新执行安装命令，配置与提醒历史会保留，默认监控三个标的的 4x / 5x / 10x / 20x。** 原有三个标的的 5x 提醒状态会自动迁移，新增档位单独建立提醒记录，阈值、间隔和飞书设置继续沿用。如果手动设置了 `symbols` 列表，则只监控该列表；支持上述三个代码。旧配置中的 `leverage: 5` 会自动升级为四个档位；如需手动限制档位，可设置 `leverages: [4]` 或 `[5]`。服务与管理命令仍叫 `aster-5x`。无交互安装可用 `curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install.sh | sudo bash -s -- --non-interactive`，之后通过 `sudo aster-5x configure` 配置。已克隆仓库时也可执行 `sudo bash install.sh`，直接安装当前目录的代码。
 
-程序位于 `/opt/aster-5x`，配置位于 `/etc/aster-5x/config.json`，状态和轮转日志位于 `/var/lib/aster-5x`。服务以独立 `aster-5x` 用户运行。`status` 分别显示六个组合的额度、检查时间和错误；只有所有组合数据新鲜且成功时才返回成功。部分成功显示 `partial`，不把单个成功当成全部正常。首次查询失败时安装命令会返回失败并显示原因，但已安装的服务仍会按退避规则重试；用 `logs` 排查。查看 systemd 原始状态：`sudo systemctl status aster-5x`。
+程序位于 `/opt/aster-5x`，配置位于 `/etc/aster-5x/config.json`，状态和轮转日志位于 `/var/lib/aster-5x`。服务以独立 `aster-5x` 用户运行。`status` 分别显示十二个组合的额度、检查时间和错误；只有所有组合数据新鲜且成功时才返回成功。部分成功显示 `partial`，不把单个成功当成全部正常。首次查询失败时安装命令会返回失败并显示原因，但已安装的服务仍会按退避规则重试；用 `logs` 排查。查看 systemd 原始状态：`sudo systemctl status aster-5x`。
 
 ## 数据口径
 
-分别读取 `leverageOiRemainingMap["4"]`、`leverageOiRemainingMap["5"]`，各自取它与对应杠杆风控档位 `bracketNotionalCap` 的较小值。它是**不含个人持仓、挂单占用的公开可开额度**。网页会进一步扣除账户占用，因此公开额度达标不保证你的账户能开出同等仓位。程序不会登录账户、调整杠杆或下单。
+分别读取 `leverageOiRemainingMap` 中配置的 `4`、`5`、`10`、`20` 档位，各自取它与对应杠杆风控档位 `bracketNotionalCap` 的较小值。它是**不含个人持仓、挂单占用的公开可开额度**。网页会进一步扣除账户占用，因此公开额度达标不保证你的账户能开出同等仓位。程序不会登录账户、调整杠杆或下单。
 
 2026-09-09 对照网页公开 JavaScript 核对了以下接口与计算方式，并完成无认证实测：
 

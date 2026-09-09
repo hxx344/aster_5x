@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-status}" in
+  status) systemctl --no-pager status aster-desk; curl -fsS http://127.0.0.1:8765/api/health; printf '\n' ;;
+  logs) journalctl -u aster-desk -f --no-hostname ;;
+  start|stop|restart) systemctl "$1" aster-desk ;;
+  *) printf 'Usage: sudo aster-desk {status|logs|start|stop|restart}\n' >&2; exit 2 ;;
+esac

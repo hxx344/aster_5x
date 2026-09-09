@@ -1,5 +1,10 @@
 __pycache__/
 .env
+.env.*
+!.env.example
+.venv/
+trading.local.json
+dashboard/out/
 config.local.json
 runtime/
 .research/

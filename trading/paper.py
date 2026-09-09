@@ -1,0 +1,113 @@
+"""Deterministic paper broker with persistent balances and order receipts."""
+from dataclasses import asdict
+import time
+
+from .exchange import ExchangeError
+from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TIERS, dec, maintenance_for, wire
+
+
+PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
+
+
+class DemoMarket:
+    """Explicitly simulated quotes; never used by a live account."""
+    demo = True
+
+    def __init__(self):
+        self.assets = dict.fromkeys(SYMBOLS, "USD1")
+        self.rules = {s: Rules(s, dec("0.001"), dec("0.01"), dec("0.001"), dec("10000"), dec("5")) for s in SYMBOLS}
+
+    def load_rules(self):
+        pass
+
+    def book(self, symbol):
+        bid = {"XAUUSD1": dec("4412.01"), "SPCXUSD1": dec("724.18"), "CLUSD1": dec("79.32")}[symbol]
+        return Book(bid, bid + dec("0.01"), dec(50), dec(50), bid + dec("0.005"), time.time())
+
+    def capacities(self, symbol, leverages):
+        return {v: dec({4: "425600", 5: "156800", 10: "85000", 20: "32000"}.get(v, "20000")) for v in leverages}
+
+
+class PaperBroker:
+    mode = "paper"
+
+    def __init__(self, account_id, market, store, seed=False):
+        self.account_id, self.market, self.store = account_id, market, store
+        state = store.get("paper:" + account_id)
+        if state is None:
+            state = {"wallet": "25000", "positions": {}, "leverages": dict.fromkeys(SYMBOLS, 4), "orders": {}}
+            for symbol in SYMBOLS:
+                for side in ("LONG", "SHORT"):
+                    qty = {"XAUUSD1": "5", "SPCXUSD1": "10", "CLUSD1": "30"}[symbol] if seed else "0"
+                    state["positions"][symbol + ":" + side] = {"qty": qty, "entry": wire(market.book(symbol).mark) if seed else "0"}
+            store.put("paper:" + account_id, state)
+        self.state = state
+
+    def snapshot(self, symbols):
+        positions, maintenance, initial, pnl = [], dec(0), dec(0), dec(0)
+        for symbol in SYMBOLS:
+            book = self.market.book(symbol)
+            for side in ("LONG", "SHORT"):
+                row = self.state["positions"][symbol + ":" + side]
+                qty, entry = dec(row["qty"]), dec(row["entry"])
+                profit = qty * (book.mark - entry) * (1 if side == "LONG" else -1)
+                leverage = self.state["leverages"][symbol]
+                mm = maintenance_for(qty * book.mark, PAPER_BRACKETS)
+                maintenance += mm
+                initial += qty * book.mark / leverage
+                pnl += profit
+                positions.append(Position(symbol, side, qty, entry, book.mark, leverage, profit, maintenance=mm))
+        wallet = dec(self.state["wallet"])
+        return AccountSnapshot(wallet + pnl, maintenance, wallet + pnl - initial, wallet, pnl, positions, [], True, False, True,
+            time.time(), dict.fromkeys(symbols, dec("0.0004")), {s: PAPER_BRACKETS for s in symbols})
+
+    def set_leverage(self, symbol, leverage):
+        self.state["leverages"][symbol] = leverage
+        self.save()
+        return {"symbol": symbol, "leverage": leverage}
+
+    def submit(self, orders):
+        responses = []
+        for order in orders:
+            cid, symbol, side = order["newClientOrderId"], order["symbol"], order["positionSide"]
+            if cid in self.state["orders"]:
+                responses.append(self.state["orders"][cid])
+                continue
+            book = self.market.book(symbol)
+            qty, limit = dec(order["quantity"]), dec(order["price"])
+            buy = order["side"] == "BUY"
+            price = book.ask if buy else book.bid
+            fills = (price <= limit if buy else price >= limit) and qty <= (book.ask_qty if buy else book.bid_qty)
+            position = self.state["positions"][symbol + ":" + side]
+            old_qty, old_entry = dec(position["qty"]), dec(position["entry"])
+            opening = (side == "LONG" and buy) or (side == "SHORT" and not buy)
+            if not opening and qty > old_qty:
+                fills = False
+            if fills:
+                fee = qty * price * dec("0.0004")
+                pnl = dec(0) if opening else qty * (price - old_entry) * (1 if side == "LONG" else -1)
+                self.state["wallet"] = wire(dec(self.state["wallet"]) + pnl - fee)
+                next_qty = old_qty + qty if opening else old_qty - qty
+                entry = (old_entry * old_qty + price * qty) / next_qty if opening else old_entry
+                position.update(qty=wire(next_qty), entry=wire(entry if next_qty else 0))
+            receipt = {"symbol": symbol, "clientOrderId": cid, "positionSide": side, "side": order["side"],
+                       "status": "FILLED" if fills else "EXPIRED", "executedQty": wire(qty if fills else 0),
+                       "origQty": wire(qty), "avgPrice": wire(price if fills else 0)}
+            self.state["orders"][cid] = receipt
+            responses.append(receipt)
+            self.save()
+        return responses
+
+    def query(self, symbol, client_id):
+        if client_id not in self.state["orders"]:
+            raise ExchangeError("模拟订单不存在", code=-2013)
+        return self.state["orders"][client_id]
+
+    def cancel(self, symbol, client_id):
+        return self.query(symbol, client_id)
+
+    def save(self):
+        self.store.put("paper:" + self.account_id, self.state)
+
+    def close(self):
+        pass

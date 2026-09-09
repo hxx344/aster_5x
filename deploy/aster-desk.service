@@ -1,0 +1,26 @@
+[Unit]
+Description=Aster multi-account hedge trading dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aster-desk
+Group=aster-desk
+WorkingDirectory=/opt/aster-desk/current
+EnvironmentFile=/etc/aster-desk/environment
+Environment=ASTER_TRADING_RUNTIME=/var/lib/aster-desk
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/aster-desk/current/.venv/bin/python -m trading.server --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aster-desk
+
+[Install]
+WantedBy=multi-user.target

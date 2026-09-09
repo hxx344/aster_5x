@@ -1,6 +1,7 @@
 """Public Aster leverage-capacity monitor. Python 3.9+, standard library only."""
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -23,6 +24,7 @@ BASE = "https://www.asterdex.com"
 OI_PATH = "/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining"
 BRACKETS_PATH = "/bapi/futures/v1/friendly/future/common/brackets"
 LOG = logging.getLogger("aster")
+SUPPORTED_SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
 
 
 class MonitorError(Exception):
@@ -127,8 +129,15 @@ def load_config():
 
 def validate_config(config):
     config = config.copy()
-    if config.get("symbol") != "XAUUSD1" or config.get("leverage") != 5:
-        raise MonitorError("This monitor is configured only for XAUUSD1 at 5x")
+    # Old installations could persist the original single-symbol default.
+    # Keep their notification settings while adopting the expanded default list.
+    legacy_symbol = config.pop("symbol", None)
+    if legacy_symbol not in (None, "XAUUSD1") or config.get("leverage") != 5:
+        raise MonitorError("Unsupported legacy symbol or leverage (5x required)")
+    symbols = config.get("symbols", list(SUPPORTED_SYMBOLS))
+    if not isinstance(symbols, list) or not symbols or any(s not in SUPPORTED_SYMBOLS for s in symbols) or len(set(symbols)) != len(symbols):
+        raise MonitorError("symbols must contain unique supported symbols: XAUUSD1, SPCXUSD1, CLUSD1")
+    config["symbols"] = symbols.copy()
     config["threshold"] = number(config["threshold"])
     for key, minimum in [("poll_seconds", 5), ("timeout_seconds", 1), ("cooldown_seconds", 0)]:
         value = number(config[key])
@@ -198,6 +207,91 @@ def runtime_dir():
     return Path(os.environ.get("ASTER_RUNTIME_DIR", ROOT / "runtime"))
 
 
+def alert_identity(config, symbol):
+    # Preserve the original hash so existing XAUUSD1 alerts survive upgrades.
+    return hashlib.sha256(f"{symbol}|{config['leverage']}|{config['threshold']}|{config['feishu_enabled']}|{config['webhook']}".encode()).hexdigest()
+
+
+def restore_gate(saved, config, symbol):
+    record = saved.get("markets", {}).get(symbol, {})
+    if not record and symbol == "XAUUSD1":
+        record = saved  # Legacy single-market alerts.json.
+    if isinstance(record, dict) and record.get("identity") == alert_identity(config, symbol):
+        gate = record.get("gate")
+        if isinstance(gate, dict) and isinstance(gate.get("notified"), bool):
+            try:
+                number(gate.get("last_alert"))
+                return AlertGate(gate)
+            except MonitorError:
+                pass
+    return AlertGate()
+
+
+class MarketMonitor:
+    """One independently scheduled market, including notification retries."""
+    def __init__(self, config, symbol, saved, shutdown):
+        self.config = {**config, "symbol": symbol}
+        self.symbol = symbol
+        self.shutdown = shutdown
+        self.gate = restore_gate(saved, config, symbol)
+        self.failures = 0
+        self.status = {"symbol": symbol, "status": "starting"}
+
+    def deliver(self, value, result):
+        config = self.config
+        message = (f"Aster 开仓额度提醒\n{self.symbol} · {config['leverage']}x\n"
+                   f"公开剩余可开额度：{value:,.2f} USD1\n"
+                   f"触发条件：> {config['threshold']:,.2f} USD1\n"
+                   "未扣除个人持仓和挂单占用，请以账户页面为准。\n"
+                   f"检查时间：{result['checked_at']}\n"
+                   f"https://www.asterdex.com/zh-CN/trade/pro/futures/{self.symbol}")
+        if config["feishu_enabled"]:
+            send_feishu(config, message)
+        LOG.warning("THRESHOLD_ALERT symbol=%s value=%s USD1 delivery=%s", self.symbol,
+                    value, "feishu" if config["feishu_enabled"] else "local_only")
+
+    def check(self):
+        config = self.config
+        status = self.status.copy()
+        delay = config["poll_seconds"]
+        retry_after = 0
+        try:
+            result = sample(config)
+            if self.shutdown.is_set():
+                return None
+            value = number(result["value"])
+            status.update(result, status="ok", above_threshold=value > config["threshold"], error=None)
+            self.gate.observe(value, config["threshold"], time.time(), config["cooldown_seconds"],
+                              lambda: self.deliver(value, result))
+            status.pop("failed_at", None)
+            status.pop("retry_seconds", None)
+            LOG.info("%s %sx capacity=%s USD1 above_threshold=%s", self.symbol,
+                     config["leverage"], value, status["above_threshold"])
+            self.failures = 0
+        except (MonitorError, KeyError, TypeError, ValueError) as exc:
+            self.failures += 1
+            retry_after = getattr(exc, "retry_after", 0)
+            delay = max(min(300, config["poll_seconds"] * 2 ** min(self.failures, 6)), retry_after)
+            status.update(status="error", error=str(exc) if isinstance(exc, MonitorError) else "Unexpected response format",
+                          failed_at=now_iso(), retry_seconds=delay, above_threshold=None)
+            LOG.error("%s check failed: %s; retry in %ss", self.symbol, status["error"], delay)
+        self.status = status
+        record = {"identity": alert_identity(config, self.symbol), "gate": self.gate.state.copy()}
+        return status.copy(), record, delay, retry_after
+
+
+def summarize(status):
+    markets = list(status["markets"].values())
+    states = [row["status"] for row in markets]
+    status["status"] = ("ok" if all(s == "ok" for s in states) else
+                        "starting" if all(s == "starting" for s in states) else
+                        "error" if all(s == "error" for s in states) else "partial")
+    times = [row.get("checked_at") for row in markets]
+    if all(times):
+        status["checked_at"] = min(times)
+    status["heartbeat_at"] = now_iso()
+
+
 def run(config, once=False, shutdown=None):
     shutdown = shutdown or threading.Event()
     runtime = runtime_dir()
@@ -211,63 +305,75 @@ def run(config, once=False, shutdown=None):
     except OSError:
         raise MonitorError("Another monitor is running, or local lock port 19551 is occupied") from None
     state_path = runtime / "alerts.json"
-    identity = hashlib.sha256(f"{config['symbol']}|{config['leverage']}|{config['threshold']}|{config['feishu_enabled']}|{config['webhook']}".encode()).hexdigest()
-    state = {}
+    saved = {}
     if state_path.exists():
         try:
             saved = json.loads(state_path.read_text(encoding="utf-8"))
-            if saved.get("identity") == identity:
-                state = saved.get("gate", {})
+            if not isinstance(saved, dict) or not isinstance(saved.get("markets", {}), dict):
+                raise ValueError("Invalid alert state")
         except (ValueError, OSError):
             LOG.warning("Alert state unreadable; starting a new alert episode")
-    gate = AlertGate(state)
-    status = {"pid": os.getpid(), "symbol": config["symbol"], "leverage": 5,
+            saved = {}
+    trackers = {symbol: MarketMonitor(config, symbol, saved, shutdown) for symbol in config["symbols"]}
+    records = {symbol: {"identity": alert_identity(config, symbol), "gate": tracker.gate.state.copy()}
+               for symbol, tracker in trackers.items()}
+    status = {"pid": os.getpid(), "symbols": config["symbols"], "leverage": config["leverage"],
               "threshold": str(config["threshold"]), "poll_seconds": config["poll_seconds"],
               "feishu_enabled": config["feishu_enabled"], "scope": "public_capacity_without_account_positions",
-              "started_at": now_iso(), "status": "starting"}
+              "started_at": now_iso(), "status": "starting",
+              "markets": {symbol: tracker.status.copy() for symbol, tracker in trackers.items()}}
     stop_file = runtime / "stop"
-    failures = 0
+    next_due = dict.fromkeys(trackers, 0.0)
+    pending = {}
+    completed = set()
+    rate_limit_until = 0.0
     exit_code = 0
     try:
-        while not stop_file.exists() and not shutdown.is_set():
-            started = time.monotonic()
-            delay = config["poll_seconds"]
+        atomic_json(runtime / "status.json", status)
+        with ThreadPoolExecutor(max_workers=len(trackers)) as pool:
             try:
-                result = sample(config)
-                if shutdown.is_set():
-                    break
-                value = number(result["value"])
-                status.update(result, status="ok", above_threshold=value > config["threshold"], error=None)
-                def deliver():
-                    message = (f"Aster 开仓额度提醒\nXAUUSD1 · 5x\n公开剩余可开额度：{value:,.2f} USD1\n"
-                               f"触发条件：> {config['threshold']:,.2f} USD1\n"
-                               "未扣除个人持仓和挂单占用，请以账户页面为准。\n"
-                               f"检查时间：{result['checked_at']}\n"
-                               "https://www.asterdex.com/zh-CN/trade/pro/futures/XAUUSD1")
-                    if config["feishu_enabled"]:
-                        send_feishu(config, message)
-                    LOG.warning("THRESHOLD_ALERT value=%s USD1 delivery=%s", value,
-                                "feishu" if config["feishu_enabled"] else "local_only")
-                gate.observe(value, config["threshold"], time.time(), config["cooldown_seconds"], deliver)
-                atomic_json(state_path, {"identity": identity, "gate": gate.state})
-                LOG.info("XAUUSD1 5x capacity=%s USD1 above_threshold=%s", value, status["above_threshold"])
-                failures = 0
-                exit_code = 0
-            except (MonitorError, KeyError, TypeError, ValueError) as exc:
-                failures += 1
-                delay = max(min(300, config["poll_seconds"] * 2 ** min(failures, 6)), getattr(exc, "retry_after", 0))
-                status.update(status="error", error=str(exc) if isinstance(exc, MonitorError) else "Unexpected response format", failed_at=now_iso(), retry_seconds=delay)
-                LOG.error("Check failed: %s; retry in %ss", status["error"], delay)
-                exit_code = 1
-            status["heartbeat_at"] = now_iso()
-            atomic_json(runtime / "status.json", status)
-            if once:
-                print(json.dumps(status, ensure_ascii=False))
-                break
-            deadline = started + delay
-            while not stop_file.exists() and not shutdown.is_set() and time.monotonic() < deadline:
-                shutdown.wait(min(0.5, max(0, deadline - time.monotonic())))
+                while not stop_file.exists() and not shutdown.is_set():
+                    changed = False
+                    # Consume results before scheduling, so rate limits apply to all new work.
+                    for symbol, (future, started) in list(pending.items()):
+                        if not future.done():
+                            continue
+                        result = future.result()
+                        del pending[symbol]
+                        if result is None:
+                            continue
+                        market, record, delay, retry_after = result
+                        status["markets"][symbol] = market
+                        records[symbol] = record
+                        next_due[symbol] = max(started + delay, time.monotonic())
+                        if retry_after:
+                            rate_limit_until = max(rate_limit_until, time.monotonic() + retry_after)
+                        completed.add(symbol)
+                        changed = True
+                    if changed:
+                        atomic_json(state_path, {"version": 2, "markets": records})
+                        summarize(status)
+                        atomic_json(runtime / "status.json", status)
+                    if once and len(completed) == len(trackers):
+                        exit_code = 0 if status["status"] == "ok" else 1
+                        print(json.dumps(status, ensure_ascii=False))
+                        break
+                    now = time.monotonic()
+                    for symbol, tracker in trackers.items():
+                        if symbol not in pending and not (once and symbol in completed) and now >= max(next_due[symbol], rate_limit_until):
+                            pending[symbol] = (pool.submit(tracker.check), now)
+                    shutdown.wait(0.1)
+            finally:
+                shutdown.set()
     finally:
+        # Preserve acknowledgements completed during graceful shutdown as well.
+        for symbol, (future, _) in pending.items():
+            if future.done() and not future.cancelled() and future.exception() is None:
+                result = future.result()
+                if result is not None:
+                    status["markets"][symbol], records[symbol] = result[:2]
+        atomic_json(state_path, {"version": 2, "markets": records})
+        summarize(status)
         status.update(status="completed" if once else "stopped", stopped_at=now_iso())
         atomic_json(runtime / "status.json", status)
         lock.close()

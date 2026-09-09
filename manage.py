@@ -54,7 +54,7 @@ def configure(restart=True):
     path = config_path()
     overrides = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     current = m.load_config()
-    print("XAUUSD1 · 5x；按回车保留当前设置。")
+    print(f"监控 {', '.join(current['symbols'])} · 5x；按回车保留当前设置。")
     threshold = input(f"提醒阈值 USD1 [{current['threshold']}]：").strip()
     interval = input(f"检查间隔秒，最少 5 [{current['poll_seconds']:g}]：").strip()
     if threshold:
@@ -95,16 +95,20 @@ def show_status():
     active = systemctl("is-active", check=False).stdout.strip()
     status = read_status()
     print(f"服务：{active or 'unknown'}")
-    print(f"数据：{status.get('status', '尚无记录')}（{'最近一分钟内' if fresh(status) else '尚无新鲜数据'}）")
-    if "value" in status:
-        print(f"最近公开可开额度：{Decimal(status['value']):,.2f} USD1")
     config = m.load_config()
-    print(f"监控：XAUUSD1 · 5x，> {config['threshold']:,.2f} USD1，每 {config['poll_seconds']:g} 秒")
+    print(f"规则：5x，> {config['threshold']:,.2f} USD1，每个标的每 {config['poll_seconds']:g} 秒")
     print(f"飞书：{'已启用' if config['feishu_enabled'] else '关闭，仅本地记录'}")
-    print(f"最近成功检查：{status.get('checked_at', '无')}")
-    if status.get("error"):
-        print(f"最近错误：{status['error']}")
-    return 0 if active == "active" and status.get("status") == "ok" and fresh(status) else 1
+    markets = status.get("markets", {status.get("symbol"): status})
+    healthy = active == "active" and status.get("status") == "ok"
+    for symbol in config["symbols"]:
+        row = markets.get(symbol, {})
+        value = f"{Decimal(row['value']):,.2f} USD1" if "value" in row else "无数据"
+        print(f"{symbol}：{value}；状态 {row.get('status', '尚无记录')}；{'最近一分钟内' if fresh(row) else '尚无新鲜数据'}")
+        print(f"  最近成功检查：{row.get('checked_at', '无')}")
+        if row.get("error"):
+            print(f"  最近错误：{row['error']}")
+        healthy = healthy and row.get("status") == "ok" and fresh(row)
+    return 0 if healthy else 1
 
 
 def wait_ready(timeout=30):
@@ -112,7 +116,8 @@ def wait_ready(timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = read_status()
-        if str(status.get("pid")) == pid and status.get("status") in ("ok", "error"):
+        markets = status.get("markets", {status.get("symbol"): status})
+        if str(status.get("pid")) == pid and markets and all(row.get("status") in ("ok", "error") for row in markets.values()):
             return show_status()
         time.sleep(0.5)
     print("服务已启动，但尚未完成首次查询。请执行 sudo aster-5x logs 排查。")

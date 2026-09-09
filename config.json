@@ -1,5 +1,5 @@
 {
-  "symbol": "XAUUSD1",
+  "symbols": ["XAUUSD1", "SPCXUSD1", "CLUSD1"],
   "leverage": 5,
   "threshold": "10000",
   "poll_seconds": 5,

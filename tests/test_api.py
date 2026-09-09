@@ -94,3 +94,12 @@ class DashboardAPITests(unittest.TestCase):
         with TestClient(create_app(demo, start_engine=False)) as client:
             response = client.post("/api/accounts", headers={"origin": "http://testserver"}, json={"id": "live", "name": "live", "mode": "live", "env_prefix": "ASTER_LIVE"})
         self.assertEqual(response.status_code, 409)
+
+    def test_fixed_modes_are_read_only(self):
+        self.login()
+        for key, value in (("margin_type", "isolated"), ("hedge_mode", False), ("multi_assets", True)):
+            with self.subTest(key=key):
+                response = self.client.patch("/api/accounts/test", json={"threshold": "10000", "order_notional": "1000", key: value})
+                self.assertEqual(response.status_code, 422)
+        checks = self.client.get("/api/state").json()["accounts"][0]["snapshot"]["mode_checks"]
+        self.assertEqual(checks, {"cross": True, "hedge": True, "single_asset": True})

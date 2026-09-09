@@ -79,6 +79,7 @@ type Account = {
     ratio: string | null;
     timestamp: number;
     positions: Position[];
+    mode_checks: { cross: boolean; hedge: boolean; single_asset: boolean };
   };
   strategies: Record<
     string,
@@ -236,6 +237,9 @@ export default function Home() {
     !account.enabled &&
     account.credential_ready &&
     fresh &&
+    snapshot.mode_checks?.cross &&
+    snapshot.mode_checks?.hedge &&
+    snapshot.mode_checks?.single_asset &&
     !['attention', 'error', 'starting'].includes(account.status);
 
   return (
@@ -377,7 +381,7 @@ export default function Home() {
                       v && setNewAccount({ ...newAccount, mode: v })
                     }
                   >
-                    <SelectTrigger aria-label="账户模式">
+                    <SelectTrigger aria-label="执行环境">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -701,16 +705,52 @@ export default function Home() {
                       <dd>{fmt(snapshot?.maintenance)}</dd>
                     </div>
                     <div>
-                      <dt>保证金模式</dt>
-                      <dd>全仓 · 单资产 USD1</dd>
+                      <dt>全仓保证金模式</dt>
+                      <dd
+                        className={
+                          fresh && !snapshot?.mode_checks?.cross ? 'danger' : ''
+                        }
+                      >
+                        {fresh
+                          ? snapshot.mode_checks?.cross
+                            ? '已核实'
+                            : '不符合要求'
+                          : '待核实'}
+                      </dd>
                     </div>
                     <div>
-                      <dt>持仓模式</dt>
-                      <dd>双向持仓</dd>
+                      <dt>双向持仓模式</dt>
+                      <dd
+                        className={
+                          fresh && !snapshot?.mode_checks?.hedge ? 'danger' : ''
+                        }
+                      >
+                        {fresh
+                          ? snapshot.mode_checks?.hedge
+                            ? '已核实'
+                            : '不符合要求'
+                          : '待核实'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>单币保证金模式 · USD1</dt>
+                      <dd
+                        className={
+                          fresh && !snapshot?.mode_checks?.single_asset
+                            ? 'danger'
+                            : ''
+                        }
+                      >
+                        {fresh
+                          ? snapshot.mode_checks?.single_asset
+                            ? '已核实'
+                            : '不符合要求'
+                          : '待核实'}
+                      </dd>
                     </div>
                   </dl>
                   <div className="risk-caption">
-                    每笔下单前检查预计成交后的风险，成交后再次核对。
+                    三项账户模式为固定前提，仅核验，不提供修改。每笔下单前检查预计成交后的风险，成交后再次核对。
                   </div>
                 </section>
                 <section className="panel execution-panel">

@@ -3,7 +3,7 @@ import time
 import uuid
 
 from .exchange import ExchangeError
-from .models import TradingError, dec, floor_step, positive, wire
+from .models import AccountModeError, TradingError, dec, floor_step, positive, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -13,6 +13,7 @@ class Executor:
         self.store, self.broker, self.market = store, broker, market
 
     def open_pair(self, account, snapshot, symbol, plan, book):
+        snapshot.require_modes(account["policy"]["symbols"])
         long, short = snapshot.pair(symbol)
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
@@ -63,7 +64,9 @@ class Executor:
         if qty:
             positive(row.get("avgPrice"))
 
-    def leverage(self, account, symbol, old, target):
+    def leverage(self, account, symbol, old, target, snapshot=None):
+        snapshot = snapshot or self.broker.snapshot(account["policy"]["symbols"])
+        snapshot.require_modes(account["policy"]["symbols"])
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
         intent = {"id": uuid.uuid4().hex, "kind": "leverage", "account_id": account["id"], "symbol": symbol,
@@ -91,6 +94,10 @@ class Executor:
             return "没有未完成批次"
         if intent["kind"] == "leverage":
             snapshot = self.broker.snapshot(account["policy"]["symbols"])
+            try:
+                snapshot.require_modes(account["policy"]["symbols"])
+            except AccountModeError as exc:
+                return self.attention(account, intent, str(exc))
             long, short = snapshot.pair(intent["symbol"])
             if long.leverage == short.leverage == intent["target"]:
                 intent["status"] = "complete"
@@ -133,6 +140,10 @@ class Executor:
 
         # Confirm actual account positions before any repair, including manual changes/ADL.
         snapshot = self.broker.snapshot(account["policy"]["symbols"])
+        try:
+            snapshot.require_modes(account["policy"]["symbols"])
+        except AccountModeError as exc:
+            return self.attention(account, intent, str(exc))
         long, short = snapshot.pair(intent["symbol"])
         filled = {side: dec(0) for side in ("LONG", "SHORT")}
         notionals = {side: dec(0) for side in filled}

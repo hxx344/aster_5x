@@ -201,8 +201,11 @@ class LiveBroker:
             self.cached_at[key] = time.monotonic()
         return self.cached[key]
 
-    def snapshot(self, symbols):
+    def snapshot(self, symbols, fresh_modes=False):
         started = time.time()
+        if fresh_modes:
+            self.cached_at.pop("dual", None)
+            self.cached_at.pop("multi", None)
         dual = self.cached_call("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
         multi = self.cached_call("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
         if type(dual.get("dualSidePosition")) is not bool or type(multi.get("multiAssetsMargin")) is not bool:
@@ -220,6 +223,8 @@ class LiveBroker:
         present = {(r["symbol"], r["positionSide"]) for r in rows}
         for row in account["positions"]:
             if row["symbol"] in symbols and (row["symbol"], row["positionSide"]) not in present:
+                if type(row.get("isolated")) is not bool:
+                    raise TradingError("账户全仓保证金模式响应无效")
                 if dec(row["positionAmt"]):
                     raise TradingError("账户与持仓接口尚未同步")
                 rows.append({"symbol": row["symbol"], "positionSide": row["positionSide"], "positionAmt": "0",
@@ -243,6 +248,8 @@ class LiveBroker:
             other = account_positions.get((p.symbol, p.side))
             if not other or abs(dec(other["positionAmt"])) != p.qty or int(other["leverage"]) != p.leverage:
                 raise TradingError("账户余额与持仓快照正在同步，稍后重试")
+            if type(other.get("isolated")) is not bool or other["isolated"] != p.isolated:
+                raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
         brackets, fees = {}, {}
         for symbol in symbols:
             b = self.cached_call("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)

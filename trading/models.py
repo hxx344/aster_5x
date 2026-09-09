@@ -13,6 +13,10 @@ class TradingError(Exception):
     pass
 
 
+class AccountModeError(TradingError):
+    """A fixed account mode differs from the strategy's required configuration."""
+
+
 def dec(value):
     if isinstance(value, bool) or value is None:
         raise TradingError("缺少有效数值")
@@ -130,16 +134,28 @@ class AccountSnapshot:
         age = (time.time() if now is None else now) - self.timestamp
         if not -1 <= age <= 8:
             raise TradingError("账户快照已过期")
-        if not self.hedge_mode or self.multi_assets:
-            raise TradingError("需要全仓、单资产 USD1、双向持仓模式")
+        self.require_modes([symbol])
         if not self.can_trade:
             raise TradingError("账户没有交易权限")
-        if any(p.isolated and (p.qty or p.symbol == symbol) for p in self.positions):
-            raise TradingError("检测到逐仓设置，自动交易暂停")
         if self.open_orders:
             raise TradingError("账户存在未完成挂单，等待核对")
         self.ratio
         return self.pair(symbol)
+
+    def mode_checks(self, symbols):
+        relevant = [p for p in self.positions if p.qty or p.symbol in symbols]
+        return {
+            "cross": bool(relevant) and set(symbols).issubset({p.symbol for p in relevant})
+                     and all(p.isolated is False for p in relevant),
+            "hedge": self.hedge_mode is True,
+            "single_asset": self.multi_assets is False,
+        }
+
+    def require_modes(self, symbols):
+        labels = {"cross": "全仓保证金模式", "hedge": "双向持仓模式", "single_asset": "单币保证金模式（USD1）"}
+        failed = [labels[key] for key, valid in self.mode_checks(symbols).items() if not valid]
+        if failed:
+            raise AccountModeError("账户固定模式不符合要求：" + "、".join(failed) + "；策略已暂停，程序不会修改账户模式")
 
 
 def maintenance_for(notional, brackets):

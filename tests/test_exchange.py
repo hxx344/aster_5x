@@ -80,6 +80,15 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual(snapshot.maintenance, 13)
         self.assertEqual(snapshot.ratio, dec(".065"))
         self.assertEqual(snapshot.available, 123)
+        account_positions[0]["isolated"] = True
+        with self.assertRaisesRegex(TradingError, "保证金模式尚未同步"):
+            broker.snapshot(["XAUUSD1"])
+        account_positions[0]["isolated"] = False
+        responses["/fapi/v3/positionSide/dual"]["dualSidePosition"] = False
+        responses["/fapi/v3/multiAssetsMargin"]["multiAssetsMargin"] = True
+        changed = broker.snapshot(["XAUUSD1"], fresh_modes=True)
+        self.assertFalse(changed.hedge_mode)
+        self.assertTrue(changed.multi_assets)
         # V3 may omit empty positions; authenticated account rows still supply 4x.
         responses["/fapi/v3/positionRisk"] = []
         self.assertEqual(broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")[0].leverage, 4)

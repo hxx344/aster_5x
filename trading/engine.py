@@ -12,7 +12,7 @@ import monitor
 from .exchange import ExchangeError, LiveBroker, MarketData, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
-from .models import SYMBOLS, TIERS, TradingError, dec, next_leverage, plan_pair, positive, wire
+from .models import AccountModeError, SYMBOLS, TIERS, TradingError, dec, next_leverage, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -41,11 +41,12 @@ def validate_account(account):
     return account
 
 
-def snapshot_json(snapshot):
+def snapshot_json(snapshot, symbols):
     result = asdict(snapshot)
     result.pop("brackets", None)
     result.pop("fees", None)
     result["ratio"] = snapshot.ratio if snapshot.equity > 0 else None
+    result["mode_checks"] = snapshot.mode_checks(symbols)
     return json.loads(dumps(result))
 
 
@@ -144,8 +145,10 @@ class Engine:
             try:
                 broker = self.broker(account)
                 snapshot = broker.snapshot(account["policy"]["symbols"])
-                self.view(account_id, snapshot=snapshot_json(snapshot), credential_ready=True,
-                          status="running" if account["enabled"] else "paused", reason="策略运行中" if account["enabled"] else "策略已暂停")
+                self.view(account_id, snapshot=snapshot_json(snapshot, account["policy"]["symbols"]), credential_ready=True)
+                snapshot.require_modes(account["policy"]["symbols"])
+                self.view(account_id, status="running" if account["enabled"] else "paused",
+                          reason="策略运行中" if account["enabled"] else "策略已暂停")
                 executor = Executor(self.store, broker, self.market)
                 pending = self.store.intent(account_id)
                 if pending:
@@ -190,7 +193,7 @@ class Engine:
                             if candidate in capacities:
                                 target = next_leverage(snapshot, symbol, capacities, book.mark)
                         if target is not None:
-                            reason = executor.leverage(account, symbol, long.leverage, target)
+                            reason = executor.leverage(account, symbol, long.leverage, target, snapshot=snapshot)
                             self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
                             return 5
@@ -207,7 +210,8 @@ class Engine:
                             after = broker.snapshot(markets)
                             unresolved = self.store.intent(account_id)
                             phase = ("attention" if unresolved["status"] == "attention" else "reconciling") if unresolved else "filled"
-                            self.view(account_id, snapshot=snapshot_json(after), reason=reason, status=phase if unresolved else "running")
+                            self.view(account_id, snapshot=snapshot_json(after, markets), reason=reason, status=phase if unresolved else "running")
+                            after.require_modes(markets)
                             self.strategy(account_id, symbol, reason, phase)
                             if after.ratio >= dec(policy["margin_limit"]):
                                 account["enabled"] = False
@@ -220,6 +224,8 @@ class Engine:
                     except (TradingError, KeyError, ValueError, TypeError) as exc:
                         last_reason = str(exc) if isinstance(exc, TradingError) else "交易数据格式异常"
                         self.strategy(account_id, symbol, last_reason, "waiting")
+                        if isinstance(exc, AccountModeError):
+                            raise
                         if self.store.intent(account_id):
                             # No new symbol work until this account's intent is resolved.
                             raise
@@ -236,7 +242,18 @@ class Engine:
                     old_reason = self.views.get(account_id, {}).get("reason")
                 if old_reason != message:
                     self.store.event(account_id, "error", message)
-                self.view(account_id, status="error", reason=message, credential_ready=account_id in self.brokers)
+                status = "error"
+                if isinstance(exc, AccountModeError):
+                    account["enabled"] = False
+                    self.store.save_account(account)
+                    pending = self.store.intent(account_id)
+                    if pending:
+                        pending.update(status="attention", last_error=message)
+                        self.store.save_intent(pending)
+                    for symbol in account["policy"]["symbols"]:
+                        self.strategy(account_id, symbol, message, "attention")
+                    status = "attention"
+                self.view(account_id, status=status, reason=message, credential_ready=account_id in self.brokers)
                 return max(10, getattr(exc, "retry_after", 0))
 
     def add_account(self, data):
@@ -275,7 +292,7 @@ class Engine:
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
                 if self.store.intent(account_id):
                     raise TradingError("请先核对未完成批次")
-                snapshot = self.broker(account).snapshot(account["policy"]["symbols"])
+                snapshot = self.broker(account).snapshot(account["policy"]["symbols"], fresh_modes=True)
                 for symbol in account["policy"]["symbols"]:
                     snapshot.require_ready(symbol)
                 if snapshot.ratio >= dec(account["policy"]["margin_limit"]):

@@ -43,7 +43,7 @@ class PaperBroker:
             store.put("paper:" + account_id, state)
         self.state = state
 
-    def snapshot(self, symbols):
+    def snapshot(self, symbols, fresh_modes=False):
         positions, maintenance, initial, pnl = [], dec(0), dec(0), dec(0)
         for symbol in SYMBOLS:
             book = self.market.book(symbol)

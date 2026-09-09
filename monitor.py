@@ -132,8 +132,13 @@ def validate_config(config):
     # Old installations could persist the original single-symbol default.
     # Keep their notification settings while adopting the expanded default list.
     legacy_symbol = config.pop("symbol", None)
-    if legacy_symbol not in (None, "XAUUSD1") or config.get("leverage") != 5:
-        raise MonitorError("Unsupported legacy symbol or leverage (5x required)")
+    legacy_leverage = config.pop("leverage", None)
+    if legacy_symbol not in (None, "XAUUSD1") or legacy_leverage not in (None, 5):
+        raise MonitorError("Unsupported legacy symbol or leverage")
+    leverages = config.get("leverages", [4, 5])
+    if not isinstance(leverages, list) or not leverages or any(type(v) is not int or v not in (4, 5) for v in leverages) or len(set(leverages)) != len(leverages):
+        raise MonitorError("leverages must contain unique supported tiers: 4, 5")
+    config["leverages"] = leverages.copy()
     symbols = config.get("symbols", list(SUPPORTED_SYMBOLS))
     if not isinstance(symbols, list) or not symbols or any(s not in SUPPORTED_SYMBOLS for s in symbols) or len(set(symbols)) != len(symbols):
         raise MonitorError("symbols must contain unique supported symbols: XAUUSD1, SPCXUSD1, CLUSD1")
@@ -199,8 +204,15 @@ def sample(config):
     query = urlencode({"symbol": config["symbol"]})
     brackets = request_json(BASE + BRACKETS_PATH, {"symbol": config["symbol"]}, config["timeout_seconds"])
     oi = request_json(BASE + OI_PATH + "?" + query, timeout=config["timeout_seconds"])
-    value, remaining, cap = extract_capacity(oi, brackets, config["symbol"], config["leverage"])
-    return {"value": str(value), "global_remaining": str(remaining), "bracket_cap": str(cap), "checked_at": now_iso()}
+    results = {}
+    checked_at = now_iso()
+    for leverage in config["leverages"]:
+        try:
+            value, remaining, cap = extract_capacity(oi, brackets, config["symbol"], leverage)
+            results[leverage] = {"value": str(value), "global_remaining": str(remaining), "bracket_cap": str(cap), "checked_at": checked_at}
+        except (MonitorError, KeyError, TypeError, ValueError) as exc:
+            results[leverage] = exc
+    return results
 
 
 def runtime_dir():
@@ -213,8 +225,10 @@ def alert_identity(config, symbol):
 
 
 def restore_gate(saved, config, symbol):
-    record = saved.get("markets", {}).get(symbol, {})
-    if not record and symbol == "XAUUSD1":
+    record = saved.get("markets", {}).get(market_key(symbol, config["leverage"]), {})
+    if not record and config["leverage"] == 5:
+        record = saved.get("markets", {}).get(symbol, {})
+    if not record and symbol == "XAUUSD1" and config["leverage"] == 5:
         record = saved  # Legacy single-market alerts.json.
     if isinstance(record, dict) and record.get("identity") == alert_identity(config, symbol):
         gate = record.get("gate")
@@ -227,15 +241,19 @@ def restore_gate(saved, config, symbol):
     return AlertGate()
 
 
+def market_key(symbol, leverage):
+    return f"{symbol}:{leverage}"
+
+
 class MarketMonitor:
-    """One independently scheduled market, including notification retries."""
+    """Independent alert state for one symbol and leverage combination."""
     def __init__(self, config, symbol, saved, shutdown):
         self.config = {**config, "symbol": symbol}
         self.symbol = symbol
         self.shutdown = shutdown
         self.gate = restore_gate(saved, config, symbol)
         self.failures = 0
-        self.status = {"symbol": symbol, "status": "starting"}
+        self.status = {"symbol": symbol, "leverage": config["leverage"], "status": "starting"}
 
     def deliver(self, value, result):
         config = self.config
@@ -247,16 +265,17 @@ class MarketMonitor:
                    f"https://www.asterdex.com/zh-CN/trade/pro/futures/{self.symbol}")
         if config["feishu_enabled"]:
             send_feishu(config, message)
-        LOG.warning("THRESHOLD_ALERT symbol=%s value=%s USD1 delivery=%s", self.symbol,
-                    value, "feishu" if config["feishu_enabled"] else "local_only")
+        LOG.warning("THRESHOLD_ALERT symbol=%s leverage=%sx value=%s USD1 delivery=%s", self.symbol,
+                    config["leverage"], value, "feishu" if config["feishu_enabled"] else "local_only")
 
-    def check(self):
+    def check(self, result):
         config = self.config
         status = self.status.copy()
         delay = config["poll_seconds"]
         retry_after = 0
         try:
-            result = sample(config)
+            if isinstance(result, Exception):
+                raise result
             if self.shutdown.is_set():
                 return None
             value = number(result["value"])
@@ -274,10 +293,41 @@ class MarketMonitor:
             delay = max(min(300, config["poll_seconds"] * 2 ** min(self.failures, 6)), retry_after)
             status.update(status="error", error=str(exc) if isinstance(exc, MonitorError) else "Unexpected response format",
                           failed_at=now_iso(), retry_seconds=delay, above_threshold=None)
-            LOG.error("%s check failed: %s; retry in %ss", self.symbol, status["error"], delay)
+            LOG.error("%s %sx check failed: %s; retry in %ss", self.symbol, config["leverage"], status["error"], delay)
         self.status = status
         record = {"identity": alert_identity(config, self.symbol), "gate": self.gate.state.copy()}
         return status.copy(), record, delay, retry_after
+
+
+class SymbolMonitor:
+    """Fetch one shared snapshot per symbol; evaluate each tier independently."""
+    def __init__(self, config, symbol, saved, shutdown):
+        self.config = {**config, "symbol": symbol}
+        self.trackers = {market_key(symbol, leverage): MarketMonitor(
+            {**config, "leverage": leverage}, symbol, saved, shutdown)
+            for leverage in config["leverages"]}
+        self.next_due = dict.fromkeys(self.trackers, 0.0)
+
+    def check(self):
+        try:
+            readings = sample(self.config)
+        except (MonitorError, KeyError, TypeError, ValueError) as exc:
+            readings = dict.fromkeys(self.config["leverages"], exc)
+        markets, records, delays, retries = {}, {}, [], []
+        for key, tracker in self.trackers.items():
+            now = time.monotonic()
+            if now < self.next_due[key]:
+                delays.append(self.next_due[key] - now)
+                continue
+            result = tracker.check(readings.get(tracker.config["leverage"], MonitorError("Requested leverage tier missing")))
+            if result is not None:
+                markets[key], records[key], delay, retry = result
+                self.next_due[key] = now + delay if markets[key]["status"] == "error" else 0
+                delays.append(delay)
+                retries.append(retry)
+        if not markets:
+            return None
+        return markets, records, min(delays), max(retries)
 
 
 def summarize(status):
@@ -314,14 +364,15 @@ def run(config, once=False, shutdown=None):
         except (ValueError, OSError):
             LOG.warning("Alert state unreadable; starting a new alert episode")
             saved = {}
-    trackers = {symbol: MarketMonitor(config, symbol, saved, shutdown) for symbol in config["symbols"]}
-    records = {symbol: {"identity": alert_identity(config, symbol), "gate": tracker.gate.state.copy()}
-               for symbol, tracker in trackers.items()}
-    status = {"pid": os.getpid(), "symbols": config["symbols"], "leverage": config["leverage"],
+    trackers = {symbol: SymbolMonitor(config, symbol, saved, shutdown) for symbol in config["symbols"]}
+    tiers = {key: tier for tracker in trackers.values() for key, tier in tracker.trackers.items()}
+    records = {key: {"identity": alert_identity(tier.config, tier.symbol), "gate": tier.gate.state.copy()}
+               for key, tier in tiers.items()}
+    status = {"pid": os.getpid(), "symbols": config["symbols"], "leverages": config["leverages"],
               "threshold": str(config["threshold"]), "poll_seconds": config["poll_seconds"],
               "feishu_enabled": config["feishu_enabled"], "scope": "public_capacity_without_account_positions",
               "started_at": now_iso(), "status": "starting",
-              "markets": {symbol: tracker.status.copy() for symbol, tracker in trackers.items()}}
+              "markets": {key: tier.status.copy() for key, tier in tiers.items()}}
     stop_file = runtime / "stop"
     next_due = dict.fromkeys(trackers, 0.0)
     pending = {}
@@ -343,15 +394,16 @@ def run(config, once=False, shutdown=None):
                         if result is None:
                             continue
                         market, record, delay, retry_after = result
-                        status["markets"][symbol] = market
-                        records[symbol] = record
-                        next_due[symbol] = max(started + delay, time.monotonic())
+                        status["markets"].update(market)
+                        records.update(record)
+                        # Start retry delays after completion, including slow network calls.
+                        next_due[symbol] = time.monotonic() + delay
                         if retry_after:
                             rate_limit_until = max(rate_limit_until, time.monotonic() + retry_after)
                         completed.add(symbol)
                         changed = True
                     if changed:
-                        atomic_json(state_path, {"version": 2, "markets": records})
+                        atomic_json(state_path, {"version": 3, "markets": records})
                         summarize(status)
                         atomic_json(runtime / "status.json", status)
                     if once and len(completed) == len(trackers):
@@ -371,8 +423,9 @@ def run(config, once=False, shutdown=None):
             if future.done() and not future.cancelled() and future.exception() is None:
                 result = future.result()
                 if result is not None:
-                    status["markets"][symbol], records[symbol] = result[:2]
-        atomic_json(state_path, {"version": 2, "markets": records})
+                    status["markets"].update(result[0])
+                    records.update(result[1])
+        atomic_json(state_path, {"version": 3, "markets": records})
         summarize(status)
         status.update(status="completed" if once else "stopped", stopped_at=now_iso())
         atomic_json(runtime / "status.json", status)

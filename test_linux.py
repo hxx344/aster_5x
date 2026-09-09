@@ -83,7 +83,7 @@ class Lock:
     def bind(self, *args): pass
     def close(self): pass
 m.socket.socket = Lock
-m.sample = lambda config: {"value": "0", "global_remaining": "0", "bracket_cap": "5000000", "checked_at": m.now_iso()}
+m.sample = lambda config: {v: {"value": "0", "global_remaining": "0", "bracket_cap": "5000000", "checked_at": m.now_iso()} for v in config["leverages"]}
 raise SystemExit(m.main())
 '''
         with tempfile.TemporaryDirectory() as directory:

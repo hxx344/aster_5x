@@ -1,5 +1,5 @@
 [Unit]
-Description=Aster XAUUSD1 SPCXUSD1 CLUSD1 5x capacity monitor
+Description=Aster XAUUSD1 SPCXUSD1 CLUSD1 4x and 5x capacity monitor
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=120

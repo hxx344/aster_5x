@@ -54,7 +54,7 @@ def configure(restart=True):
     path = config_path()
     overrides = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     current = m.load_config()
-    print(f"监控 {', '.join(current['symbols'])} · 5x；按回车保留当前设置。")
+    print(f"监控 {', '.join(current['symbols'])} · {', '.join(str(v) + 'x' for v in current['leverages'])}；按回车保留当前设置。")
     threshold = input(f"提醒阈值 USD1 [{current['threshold']}]：").strip()
     interval = input(f"检查间隔秒，最少 5 [{current['poll_seconds']:g}]：").strip()
     if threshold:
@@ -96,14 +96,14 @@ def show_status():
     status = read_status()
     print(f"服务：{active or 'unknown'}")
     config = m.load_config()
-    print(f"规则：5x，> {config['threshold']:,.2f} USD1，每个标的每 {config['poll_seconds']:g} 秒")
+    print(f"规则：{', '.join(str(v) + 'x' for v in config['leverages'])}，> {config['threshold']:,.2f} USD1，每个标的每 {config['poll_seconds']:g} 秒")
     print(f"飞书：{'已启用' if config['feishu_enabled'] else '关闭，仅本地记录'}")
     markets = status.get("markets", {status.get("symbol"): status})
     healthy = active == "active" and status.get("status") == "ok"
-    for symbol in config["symbols"]:
-        row = markets.get(symbol, {})
+    for symbol, leverage in ((s, v) for s in config["symbols"] for v in config["leverages"]):
+        row = markets.get(m.market_key(symbol, leverage), {})
         value = f"{Decimal(row['value']):,.2f} USD1" if "value" in row else "无数据"
-        print(f"{symbol}：{value}；状态 {row.get('status', '尚无记录')}；{'最近一分钟内' if fresh(row) else '尚无新鲜数据'}")
+        print(f"{symbol} {leverage}x：{value}；状态 {row.get('status', '尚无记录')}；{'最近一分钟内' if fresh(row) else '尚无新鲜数据'}")
         print(f"  最近成功检查：{row.get('checked_at', '无')}")
         if row.get("error"):
             print(f"  最近错误：{row['error']}")

@@ -16,6 +16,7 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
+from .market_stream import PublicQuoteStream
 from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
@@ -297,12 +298,19 @@ def credentials_for(prefix):
 
 
 class MarketData:
-    def __init__(self, api=None):
+    def __init__(self, api=None, *, stream=None):
         self.api = api or API()
+        self.stream = stream if stream is not None else PublicQuoteStream()
         self.rules = {}
         self.assets = {}
         self.books, self.book_locks = {}, {}
         self.book_guard = threading.Lock()
+
+    def start_stream(self):
+        self.stream.start()
+
+    def close_stream(self):
+        self.stream.close()
 
     @staticmethod
     def market_quantity_limits(lot, market_lot=None):
@@ -370,10 +378,29 @@ class MarketData:
             if rate.get("rateLimitType") == "REQUEST_WEIGHT" and rate.get("interval") == "MINUTE" and rate.get("intervalNum") == 1:
                 self.api.budget.limit = min(1800, max(1, int(rate["limit"] * .8)))
 
+    def _stream_book(self, symbol):
+        try:
+            streamed = self.stream.book(symbol)
+            if streamed is not None:
+                streamed.require_fresh()
+                # Only the stream owns WS quotes. A disconnected stream must
+                # not leave a second usable copy in the REST fallback cache.
+                return streamed
+        except TradingError:
+            pass
+        return None
+
     def book(self, symbol):
+        # A recovered WS feed must not wait behind an in-flight REST fallback.
+        streamed = self._stream_book(symbol)
+        if streamed is not None:
+            return streamed
         with self.book_guard:
             lock = self.book_locks.setdefault(symbol, threading.Lock())
         with lock:
+            streamed = self._stream_book(symbol)
+            if streamed is not None:
+                return streamed
             cached = self.books.get(symbol)
             if cached is not None and time.monotonic() - cached[0] < 1:
                 try:

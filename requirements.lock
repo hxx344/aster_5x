@@ -25,6 +25,7 @@ py-ecc==8.0.0
 pycryptodome==3.23.0
 pydantic==2.13.5
 pydantic_core==2.46.5
+python-socks==3.1.1
 regex==2026.9.3
 rlp==5.0.0
 socksio==1.0.0
@@ -33,3 +34,4 @@ toolz==1.1.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.52.4
+websockets==16.0

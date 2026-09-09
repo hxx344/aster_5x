@@ -660,6 +660,11 @@ class Engine:
         # Reserve capacity for every account, each public market and the outbox.
         # Slow private APIs must never occupy the market/notification capacity.
         try:
+            if isinstance(self.market, MarketData) and not self.shutdown.is_set():
+                try:
+                    self.market.start_stream()
+                except Exception:
+                    LOG.warning("Public quote stream unavailable; using REST quotes")
             with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 try:
                     while not self.shutdown.is_set():
@@ -743,6 +748,10 @@ class Engine:
                 except Exception:
                     LOG.error("Account client close failed (%s)", account_id)
             if isinstance(self.market, MarketData):
+                try:
+                    self.market.close_stream()
+                except Exception:
+                    LOG.error("Public quote stream close failed")
                 try:
                     self.market.api.close()
                 except Exception:

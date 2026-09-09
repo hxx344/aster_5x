@@ -1,5 +1,6 @@
 """Authenticated local HTTP API and static dashboard, deployed behind HTTPS."""
 import argparse
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
@@ -9,19 +10,88 @@ from pathlib import Path
 import secrets
 import socket
 import threading
-import time
+from time import monotonic
 from typing import Literal
 
+import anyio
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import MutableHeaders
 
 from .engine import Engine
 from .models import TradingError
 from .store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
+MAX_BODY_BYTES = 16384
+BODY_TIMEOUT_SECONDS = 10
+SESSION_SECONDS = 43200
+MAX_SESSIONS = 1024
+LOGIN_WINDOW_SECONDS = 300
+MAX_LOGIN_CLIENTS = 1024
+
+
+class RequestSecurityMiddleware:
+    """Bound actual request bytes before parsing, including chunked requests."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def secure_send(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["X-Frame-Options"] = "DENY"
+                headers["Referrer-Policy"] = "same-origin"
+                if scope["path"].startswith("/api/"):
+                    headers["Cache-Control"] = "no-store"
+            await send(message)
+
+        lengths = [value for key, value in scope["headers"] if key.lower() == b"content-length"]
+        declared = None
+        if lengths:
+            value = lengths[0]
+            # Bound digit conversion too: huge integers and duplicate lengths are invalid.
+            if len(lengths) != 1 or not value.isdigit() or len(value) > 20:
+                return await Response(status_code=413)(scope, receive, secure_send)
+            declared = int(value)
+            if declared > MAX_BODY_BYTES:
+                return await Response(status_code=413)(scope, receive, secure_send)
+
+        body = bytearray()
+        try:
+            with anyio.fail_after(BODY_TIMEOUT_SECONDS):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    chunk = message.get("body", b"")
+                    if len(body) + len(chunk) > MAX_BODY_BYTES:
+                        return await Response(status_code=413)(scope, receive, secure_send)
+                    body.extend(chunk)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            return await Response(status_code=408)(scope, receive, secure_send)
+        if declared is not None and declared != len(body):
+            return await Response(status_code=400)(scope, receive, secure_send)
+
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, secure_send)
 
 
 class Login(BaseModel):
@@ -48,56 +118,54 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         runtime = Path(os.environ.get("ASTER_TRADING_RUNTIME", ROOT / "runtime" / "trading"))
         engine = Engine(Store(runtime / "trading.sqlite3"), demo=demo)
     password = os.environ.get("ASTER_DASHBOARD_PASSWORD", "")
-    secret = secrets.token_bytes(32)
-    failures, fail_lock = {}, threading.Lock()
+    password_digest = hashlib.sha256(password.encode()).digest()
+    failures, fail_lock = OrderedDict(), threading.Lock()
+    sessions, session_lock = OrderedDict(), threading.Lock()
 
     @asynccontextmanager
     async def lifespan(app):
         if start_engine:
             engine.start()
-        yield
-        if start_engine:
-            engine.stop()
+        try:
+            yield
+        finally:
+            if start_engine:
+                engine.stop()
 
     app = FastAPI(title="Aster Account Desk", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.engine = engine
+    app.add_middleware(RequestSecurityMiddleware)
 
-    def session_token():
-        payload = f"{int(time.time()) + 43200}.{secrets.token_hex(16)}"
-        return payload + "." + hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+    def session_token(previous):
+        # Server-side expiry makes logout and login rotation revoke copied cookies too.
+        token = secrets.token_urlsafe(32)
+        with session_lock:
+            now = monotonic()
+            while sessions and next(iter(sessions.values())) <= now:
+                sessions.popitem(last=False)
+            sessions.pop(previous, None)
+            while len(sessions) >= MAX_SESSIONS:
+                sessions.popitem(last=False)
+            sessions[token] = now + SESSION_SECONDS
+        return token
 
-    def authenticated(request: Request):
+    async def authenticated(request: Request):
         if engine.demo:
             return
         token = request.cookies.get("aster_session", "")
-        try:
-            payload, signature = token.rsplit(".", 1)
-            expected = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(signature, expected) or int(payload.split(".")[0]) < time.time():
-                raise ValueError()
-        except (ValueError, IndexError):
-            raise HTTPException(401, "请登录交易管理") from None
+        with session_lock:
+            expires = sessions.get(token)
+            if expires is None or expires <= monotonic():
+                sessions.pop(token, None)
+                raise HTTPException(401, "请登录交易管理")
 
-    def origin_check(request: Request):
+    async def origin_check(request: Request):
         expected = os.environ.get("ASTER_PUBLIC_ORIGIN", str(request.base_url).rstrip("/"))
         allowed = {expected}
         if engine.demo:
             allowed.update({"http://127.0.0.1:3000", "http://localhost:3000"})
         if request.headers.get("origin") not in allowed:
             raise HTTPException(403, "请求来源不匹配")
-
-    @app.middleware("http")
-    async def headers(request, call_next):
-        length = request.headers.get("content-length", "0")
-        if not length.isdigit() or int(length) > 16384:
-            return Response(status_code=413)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "same-origin"
-        if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
-        return response
 
     @app.exception_handler(TradingError)
     async def trading_error(request, exc):
@@ -111,7 +179,11 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         return JSONResponse({"detail": "输入字段或格式无效"}, status_code=422)
 
     @app.get("/api/health")
-    def health():
+    async def health(response: Response):
+        thread = engine.thread if start_engine else None
+        if engine.shutdown.is_set() or (start_engine and (thread is None or not thread.is_alive())):
+            response.status_code = 503
+            return {"status": "unavailable", "demo": engine.demo}
         return {"status": "ok" if engine.ready else "starting", "demo": engine.demo}
 
     @app.post("/api/login", dependencies=[Depends(origin_check)])
@@ -120,24 +192,34 @@ def create_app(engine=None, *, demo=False, start_engine=True):
             raise HTTPException(503, "请先在服务器设置至少 16 字符的 ASTER_DASHBOARD_PASSWORD")
         client = request.client.host if request.client else "unknown"
         with fail_lock:
-            now = time.time()
-            for key in list(failures):
-                failures[key] = [t for t in failures[key] if now - t < 300]
-                if not failures[key]:
-                    del failures[key]
-            if len(failures.get(client, [])) >= 5:
+            now = monotonic()
+            # Ordered by last failure; expired clients are removed once, not scanned
+            # on every attempt. Each remaining client holds at most five timestamps.
+            while failures and next(iter(failures.values()))[-1] <= now - LOGIN_WINDOW_SECONDS:
+                failures.popitem(last=False)
+            attempts = failures.get(client, deque())
+            while attempts and attempts[0] <= now - LOGIN_WINDOW_SECONDS:
+                attempts.popleft()
+            if len(attempts) >= 5:
                 raise HTTPException(429, "登录失败次数过多，请 5 分钟后重试")
-            valid = hmac.compare_digest(hashlib.sha256(password.encode()).digest(), hashlib.sha256(body.password.encode()).digest())
+            valid = hmac.compare_digest(password_digest, hashlib.sha256(body.password.encode()).digest())
             if not valid:
-                failures.setdefault(client, []).append(now)
+                if client not in failures and len(failures) >= MAX_LOGIN_CLIENTS:
+                    raise HTTPException(429, "登录请求过多，请稍后重试")
+                attempts.append(now)
+                failures[client] = attempts
+                failures.move_to_end(client)
                 raise HTTPException(401, "访问密码不正确")
             failures.pop(client, None)
-        response.set_cookie("aster_session", session_token(), httponly=True, secure=request.url.scheme == "https", samesite="strict", max_age=43200, path="/")
+        response.set_cookie("aster_session", session_token(request.cookies.get("aster_session", "")), httponly=True,
+                            secure=request.url.scheme == "https", samesite="strict", max_age=SESSION_SECONDS, path="/")
         return {"ok": True}
 
     @app.post("/api/logout", dependencies=[Depends(origin_check)])
-    def logout(response: Response):
-        response.delete_cookie("aster_session", path="/")
+    def logout(request: Request, response: Response):
+        with session_lock:
+            sessions.pop(request.cookies.get("aster_session", ""), None)
+        response.delete_cookie("aster_session", path="/", secure=request.url.scheme == "https", httponly=True, samesite="strict")
         return {"ok": True}
 
     @app.get("/api/state", dependencies=[Depends(authenticated)])
@@ -199,6 +281,10 @@ def main():
     # Reserve the listening address before any persisted strategy can resume.
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        # Rebind after a Linux service restart even if accepted connections remain
+        # in TIME_WAIT. Windows SO_REUSEADDR can allow taking an occupied address.
+        if os.name != "nt":
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((args.host, args.port))
         config = uvicorn.Config(create_app(demo=args.demo), host=args.host, port=args.port,
                                 proxy_headers=True, forwarded_allow_ips="127.0.0.1", access_log=False)

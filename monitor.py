@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
@@ -41,12 +42,17 @@ class NoRedirect(HTTPRedirectHandler):
 def number(value):
     if isinstance(value, bool) or value is None:
         raise MonitorError("Missing or invalid amount")
+    text = str(value)
+    if len(text) > 128:
+        raise MonitorError("Amount exceeds supported length")
     try:
-        result = Decimal(str(value))
+        result = Decimal(text)
     except InvalidOperation:
         raise MonitorError("Invalid amount") from None
     if not result.is_finite() or result < 0:
         raise MonitorError("Non-finite or negative amount")
+    if abs(result.as_tuple().exponent) > 100:
+        raise MonitorError("Amount precision or exponent exceeds supported range")
     return result
 
 
@@ -64,7 +70,9 @@ def request_json(url, body=None, timeout=10):
         if exc.code in (418, 429):
             retry = 180 if exc.code == 429 else 86400
             try:
-                retry = max(retry, float(exc.headers.get("Retry-After", 0)))
+                requested = float(exc.headers.get("Retry-After", 0))
+                if math.isfinite(requested):
+                    retry = max(retry, requested)
             except (TypeError, ValueError):
                 pass
         # Do not expose webhook URLs or remote error bodies in logs.

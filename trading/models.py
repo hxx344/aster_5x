@@ -1,6 +1,7 @@
 """Exact decimal risk calculations. No network or order side effects."""
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import time
 
 
@@ -21,12 +22,17 @@ class AccountModeError(TradingError):
 def dec(value):
     if isinstance(value, bool) or value is None:
         raise TradingError("缺少有效数值")
+    text = str(value)
+    if len(text) > 128:
+        raise TradingError("数值长度超出范围")
     try:
-        result = Decimal(str(value))
+        result = Decimal(text)
     except (InvalidOperation, ValueError):
         raise TradingError("数值格式无效") from None
     if not result.is_finite():
         raise TradingError("数值不是有限数")
+    if abs(result.as_tuple().exponent) > 100:
+        raise TradingError("数值精度或数量级超出范围")
     return result
 
 
@@ -38,17 +44,42 @@ def positive(value, allow_zero=False):
 
 
 def floor_step(value, step):
-    return (dec(value) / positive(step)).to_integral_value(rounding=ROUND_DOWN) * step
+    amount = value if isinstance(value, Fraction) else Fraction(dec(value))
+    quantum = Fraction(positive(step))
+    return decimal_value(int(amount / quantum) * quantum, exact=True)
 
 
 def wire(value):
+    if isinstance(value, Fraction):
+        value = decimal_value(value, exact=True)
     return format(dec(value), "f")
 
 
 def hedge_balanced(long_qty, short_qty):
     """Allow at most 0.1% of the larger side, including the exact boundary."""
-    long_qty, short_qty = positive(long_qty, True), positive(short_qty, True)
-    return abs(long_qty - short_qty) <= max(long_qty, short_qty) * HEDGE_TOLERANCE
+    long_qty = long_qty if isinstance(long_qty, Fraction) else Fraction(positive(long_qty, True))
+    short_qty = short_qty if isinstance(short_qty, Fraction) else Fraction(positive(short_qty, True))
+    if long_qty < 0 or short_qty < 0:
+        raise TradingError("持仓数量必须非负")
+    return abs(long_qty - short_qty) <= max(long_qty, short_qty) * Fraction(HEDGE_TOLERANCE)
+
+
+def decimal_value(value, exact=False):
+    """Convert a rational for display, or preserve a terminating order quantity."""
+    if not exact:
+        return Decimal(value.numerator) / value.denominator
+    denominator, twos, fives = value.denominator, 0, 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        raise TradingError("数量无法精确表示为有限小数")
+    scale = max(twos, fives)
+    coefficient = value.numerator * 2 ** (scale - twos) * 5 ** (scale - fives)
+    return Decimal((int(coefficient < 0), tuple(int(d) for d in str(abs(coefficient))), -scale))
 
 
 @dataclass
@@ -73,9 +104,14 @@ class Book:
 
     @property
     def spread(self):
+        return decimal_value(self.spread_exact)
+
+    @property
+    def spread_exact(self):
         if self.bid <= 0 or self.ask < self.bid:
             raise TradingError("BBO 价格无效")
-        return (self.ask - self.bid) / ((self.ask + self.bid) / 2)
+        bid, ask = Fraction(self.bid), Fraction(self.ask)
+        return (ask - bid) / ((ask + bid) / 2)
 
     def require_fresh(self, now=None, max_age=3):
         age = (time.time() if now is None else now) - self.timestamp
@@ -101,13 +137,17 @@ class Position:
 
     @property
     def notional(self):
-        return abs(self.qty) * self.mark
+        return decimal_value(Fraction(dec(self.qty).copy_abs()) * Fraction(self.mark), exact=True)
 
     @property
     def occupied_margin(self):
+        return decimal_value(self.occupied_margin_exact)
+
+    @property
+    def occupied_margin_exact(self):
         if type(self.leverage) is not int or not 1 <= self.leverage <= 125:
             raise TradingError("计算占用保证金需要有效的实际杠杆")
-        return positive(self.notional, True) / self.leverage
+        return Fraction(positive(dec(self.qty).copy_abs(), True)) * Fraction(positive(self.mark, True)) / self.leverage
 
 
 @dataclass
@@ -129,13 +169,24 @@ class AccountSnapshot:
     @property
     def occupied_margin(self):
         # Sum every position separately, including opposite sides and other markets.
-        return sum((p.occupied_margin for p in self.positions), ZERO)
+        return decimal_value(self.occupied_margin_exact)
+
+    @property
+    def occupied_margin_exact(self):
+        return sum((p.occupied_margin_exact for p in self.positions), Fraction(0))
 
     @property
     def ratio(self):
         if self.equity <= 0:
             raise TradingError("USD1 账户总权益不足")
-        return self.occupied_margin / self.equity
+        return decimal_value(self.occupied_margin_exact / Fraction(self.equity))
+
+    def margin_exceeds(self, limit, include_equal=False):
+        if self.equity <= 0:
+            raise TradingError("USD1 账户总权益不足")
+        occupied = self.occupied_margin_exact
+        bound = Fraction(self.equity) * Fraction(positive(limit))
+        return occupied >= bound if include_equal else occupied > bound
 
     def pair(self, symbol):
         rows = [p for p in self.positions if p.symbol == symbol]
@@ -148,10 +199,13 @@ class AccountSnapshot:
             raise TradingError("持仓数量或杠杆无效")
         return by_side["LONG"], by_side["SHORT"]
 
-    def require_ready(self, symbol, now=None):
+    def require_fresh(self, now=None, max_age=8):
         age = (time.time() if now is None else now) - self.timestamp
-        if not -1 <= age <= 8:
+        if not -1 <= age <= max_age:
             raise TradingError("账户快照已过期")
+
+    def require_ready(self, symbol, now=None):
+        self.require_fresh(now)
         self.require_modes([symbol])
         if not self.can_trade:
             raise TradingError("账户没有交易权限")
@@ -225,10 +279,10 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     """Size both legs against total occupied margin / equity, cash and capacity."""
     long, short = snapshot.require_ready(rules.symbol, now)
     book.require_fresh(now)
-    limit = dec(policy["margin_limit"])
-    if snapshot.ratio >= limit:
+    limit = Fraction(dec(policy["margin_limit"]))
+    if snapshot.margin_exceeds(policy["margin_limit"], include_equal=True):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
-    if book.spread > dec(policy["spread_limit"]):
+    if book.spread_exact > Fraction(dec(policy["spread_limit"])):
         return Plan(reason="BBO 价差超过万 5")
     if not hedge_balanced(long.qty, short.qty):
         return Plan(reason="已有多空数量差超过 0.1%，等待人工核对")
@@ -240,46 +294,52 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     if not brackets or fee is None:
         raise TradingError("缺少账户风控档位或手续费率")
     # Use gross exposure for capacity checks; never offset LONG against SHORT.
-    gross = (long.qty + short.qty) * book.mark
-    current_remaining = positive(capacities.get(leverage), True)
-    cap_room = max(ZERO, leverage_cap(brackets, leverage) - gross)
+    bid, ask, mark = map(Fraction, (book.bid, book.ask, book.mark))
+    long_qty, short_qty = map(Fraction, (long.qty, short.qty))
+    fee = Fraction(fee)
+    gross = (long_qty + short_qty) * mark
+    current_remaining = Fraction(positive(capacities.get(leverage), True))
+    cap_room = max(Fraction(0), Fraction(leverage_cap(brackets, leverage)) - gross)
     public_room = min(current_remaining, cap_room)
-    high_price = max(book.ask, book.mark)
-    loss_span = max(ZERO, book.ask - book.mark) + max(ZERO, book.mark - book.bid)
-    occupied = snapshot.occupied_margin
-    current_pair_margin = long.occupied_margin + short.occupied_margin
+    high_price = max(ask, mark)
+    loss_span = max(Fraction(0), ask - mark) + max(Fraction(0), mark - bid)
+    occupied = snapshot.occupied_margin_exact
+    current_pair_margin = long.occupied_margin_exact + short.occupied_margin_exact
     # Conservatively revalue the existing pair if the latest quote is higher.
-    price_adjustment = max(ZERO, (long.qty + short.qty) * high_price / leverage - current_pair_margin)
+    price_adjustment = max(Fraction(0), (long_qty + short_qty) * high_price / leverage - current_pair_margin)
     # A tolerated net position can lose equity between the account and book reads.
-    existing_pnl_change = long.qty * (book.mark - long.mark) - short.qty * (book.mark - short.mark)
-    existing_loss = max(ZERO, -existing_pnl_change)
-    max_qty = floor_step(min(
-        dec(policy["order_notional"]) / high_price,
-        rules.max_qty, book.ask_qty, book.bid_qty,
+    existing_pnl_change = long_qty * (mark - Fraction(long.mark)) - short_qty * (mark - Fraction(short.mark))
+    existing_loss = max(Fraction(0), -existing_pnl_change)
+    max_qty = min(
+        Fraction(dec(policy["order_notional"])) / high_price,
+        Fraction(rules.max_qty), Fraction(book.ask_qty), Fraction(book.bid_qty),
         public_room / (2 * high_price),
-        max(ZERO, snapshot.available - existing_loss - price_adjustment)
-        / (2 * high_price / leverage + (book.ask + book.bid) * fee + loss_span),
-    ), rules.step)
-    min_qty = max(rules.min_qty, rules.min_notional / book.bid)
+        max(Fraction(0), Fraction(snapshot.available) - existing_loss - price_adjustment)
+        / (2 * high_price / leverage + (ask + bid) * fee + loss_span),
+    )
+    min_qty = max(Fraction(rules.min_qty), Fraction(rules.min_notional) / bid)
+    step = Fraction(rules.step)
 
     def projected(qty):
         # Charge the complete spread and both taker fees; no unrealized gain credit.
-        cost = qty * loss_span + qty * (book.ask + book.bid) * fee
-        equity = snapshot.equity - existing_loss - cost
+        cost = qty * loss_span + qty * (ask + bid) * fee
+        equity = Fraction(snapshot.equity) - existing_loss - cost
         total_occupied = occupied + price_adjustment + 2 * qty * high_price / leverage
-        return total_occupied / equity if equity > 0 else Decimal("Infinity")
+        return total_occupied, equity
 
-    low, high = 0, int(max_qty / rules.step)
+    low, high = 0, max_qty // step
     while low < high:
         mid = (low + high + 1) // 2
-        if projected(mid * rules.step) <= limit:
+        total_occupied, equity = projected(mid * step)
+        if equity > 0 and total_occupied <= limit * equity:
             low = mid
         else:
             high = mid - 1
-    qty = low * rules.step
+    qty = low * step
     if qty < min_qty or qty == 0:
         return Plan(reason="风险、余额或额度不足以继续最小一笔")
-    return Plan(qty, projected(qty), "可以分批双向开仓")
+    total_occupied, equity = projected(qty)
+    return Plan(decimal_value(qty, exact=True), decimal_value(total_occupied / equity), "可以分批双向开仓")
 
 
 def require_non_decreasing_leverage(current, target):
@@ -293,7 +353,8 @@ def next_leverage(snapshot, symbol, capacities, mark=None, threshold=ZERO):
     long, short = snapshot.pair(symbol)
     if not hedge_balanced(long.qty, short.qty):
         return None
-    gross = (long.qty + short.qty) * positive(mark) if mark is not None else long.notional + short.notional
+    gross = (Fraction(long.qty) + Fraction(short.qty)) * Fraction(positive(mark)) if mark is not None else \
+        Fraction(long.qty) * Fraction(long.mark) + Fraction(short.qty) * Fraction(short.mark)
     # Select the lowest usable higher tier; unavailable intermediate tiers do not block.
     required = max(gross, positive(threshold, True))
     for target in TIERS:

@@ -17,6 +17,8 @@ from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
 LOG = logging.getLogger("aster.trading")
+MAX_ACCOUNTS = 8
+ACCOUNT_LIST_INTERVAL = 1
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5", "spread_limit": "0.0005"}
 
 
@@ -61,6 +63,9 @@ class Engine:
         self.thread = None
         self.process_lock = ProcessLock(store.path.with_suffix(".lock"))
         self.lock = threading.RLock()
+        self.lifecycle_lock = threading.Lock()
+        self.registration_lock = threading.Lock()
+        self.accounts_generation = 0
         self.account_locks = {}
         self.brokers, self.signers, self.users = {}, {}, {}
         self.markets, self.views, self.rotation = {}, {}, {}
@@ -112,6 +117,8 @@ class Engine:
         return account["mode"] == "paper" or (not self.demo and os.environ.get("ASTER_ALLOW_LIVE") == "1")
 
     def poll_market(self, symbol):
+        if self.shutdown.is_set():
+            return 5
         try:
             with self.lock:
                 tiers = set(TIERS)
@@ -140,20 +147,23 @@ class Engine:
 
     def check_post_fill_occupancy(self, account, snapshot):
         snapshot.require_modes(account["policy"]["symbols"])
-        over_limit = snapshot.ratio > dec(account["policy"]["margin_limit"])
+        snapshot.require_fresh()
+        ratio = snapshot.ratio if snapshot.equity > 0 else None
+        over_limit = ratio is None or snapshot.margin_exceeds(account["policy"]["margin_limit"])
         if over_limit:
-            account["enabled"] = False
-            self.store.save_account(account)
-            message = "成交后保证金占用率超过上限，已暂停新加仓"
+            message = "成交后 USD1 账户总权益不足，已暂停新加仓" if ratio is None else "成交后保证金占用率超过上限，已暂停新加仓"
+            self.store.pause_account(account, message)
             self.view(account["id"], status="attention", reason=message)
             self.store.event(account["id"], "error", message)
-            self.store.finish_campaign(account, "保证金占用上限触发，暂停加仓", snapshot.ratio)
+            self.store.finish_campaign(account, message, ratio)
         # Only clear the durable check after any required pause has been saved.
         self.store.put("post_fill_check:" + account["id"], None)
         return over_limit
 
     def tick_account(self, account_id):
         with self.account_lock(account_id):
+            if self.shutdown.is_set():
+                return 5
             account = self.store.account(account_id)
             if not account:
                 return 5
@@ -162,10 +172,13 @@ class Engine:
                 snapshot = broker.snapshot(account["policy"]["symbols"])
                 self.view(account_id, snapshot=snapshot_json(snapshot, account["policy"]["symbols"]), credential_ready=True)
                 snapshot.require_modes(account["policy"]["symbols"])
+                if self.shutdown.is_set():
+                    return 5
                 if self.store.get("post_fill_check:" + account_id) and self.check_post_fill_occupancy(account, snapshot):
                     return 5
-                self.view(account_id, status="running" if account["enabled"] else "paused",
-                          reason="策略运行中" if account["enabled"] else "策略已暂停")
+                pause_reason = account.get("pause_reason") if not account["enabled"] else None
+                self.view(account_id, status="running" if account["enabled"] else "attention" if pause_reason else "paused",
+                          reason="策略运行中" if account["enabled"] else pause_reason or "策略已暂停")
                 executor = Executor(self.store, broker, self.market)
                 pending = self.store.intent(account_id)
                 if pending:
@@ -250,7 +263,7 @@ class Engine:
                             raise
                 self.view(account_id, reason=last_reason)
                 campaign = self.store.get("campaign:" + account_id)
-                if campaign and (snapshot.ratio >= dec(policy["margin_limit"]) or time.time() - campaign["last_fill_at"] >= 60):
+                if campaign and (snapshot.margin_exceeds(policy["margin_limit"], include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):
                     self.store.finish_campaign(account, last_reason, snapshot.ratio)
                 return 5
             except (TradingError, KeyError, ValueError, TypeError) as exc:
@@ -261,8 +274,7 @@ class Engine:
                     self.store.event(account_id, "error", message)
                 status = "error"
                 if isinstance(exc, AccountModeError):
-                    account["enabled"] = False
-                    self.store.save_account(account)
+                    self.store.pause_account(account, message)
                     pending = self.store.intent(account_id)
                     if pending:
                         pending.update(status="attention", last_error=message)
@@ -277,13 +289,15 @@ class Engine:
         account = validate_account({**data, "enabled": False, "policy": {**DEFAULT_POLICY}})
         if self.demo and account["mode"] != "paper":
             raise TradingError("模拟环境只接受模拟账户")
-        with self.lock:
+        with self.registration_lock:
             accounts = self.store.accounts()
-            if len(accounts) >= 8:
+            if len(accounts) >= MAX_ACCOUNTS:
                 raise TradingError("单实例最多管理 8 个账户")
             if any(a["id"] == account["id"] or a["env_prefix"] == account["env_prefix"] for a in accounts):
                 raise TradingError("账户标识或环境变量前缀已使用")
             self.store.save_account(account)
+            with self.lock:
+                self.accounts_generation += 1
         self.store.event(account["id"], "config", "账户已添加，默认暂停")
         return account
 
@@ -315,7 +329,11 @@ class Engine:
                 # High existing occupancy blocks additions in plan_pair, while an
                 # authorized increase in leverage can release margin before adding.
             account["enabled"] = enabled
+            if enabled:
+                account.pop("pause_reason", None)
             self.store.save_account(account)
+            self.view(account_id, status="running" if enabled else "attention" if account.get("pause_reason") else "paused",
+                      reason="策略运行中" if enabled else account.get("pause_reason") or "策略已暂停")
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")
 
     def retry(self, account_id):
@@ -338,13 +356,15 @@ class Engine:
                                        "feishu_sign_secret": os.environ.get("FEISHU_SIGN_SECRET", "")})
 
     def notify(self):
-        if self.demo:
+        if self.demo or self.shutdown.is_set():
             return 5
         try:
             config = self.notification_config()
             if not config:
                 return 5
             for item in self.store.due_notifications():
+                if self.shutdown.is_set():
+                    break
                 try:
                     monitor.send_feishu(config, item["message"])
                     self.store.notification_result(item, True)
@@ -357,58 +377,106 @@ class Engine:
         return 5
 
     def state(self):
+        # Database I/O must not hold the view lock shared by all account workers.
+        saved_accounts = self.store.accounts()
+        events = self.store.events()
+        pending_notifications = self.store.pending_notifications()
         with self.lock:
-            accounts = [{**a, **self.views.get(a["id"], {"status": "starting", "reason": "等待读取账户", "credential_ready": False, "strategies": {}})} for a in self.store.accounts()]
+            accounts = [{**a, **self.views.get(a["id"], {
+                "status": "attention" if a.get("pause_reason") else "starting",
+                "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
-                "accounts": accounts, "markets": self.markets, "events": self.store.events(), "updated_at": time.time(),
-                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": self.store.pending_notifications(), "error": self.notification_error}}))
+                "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(),
+                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications, "error": self.notification_error}}))
 
     def run(self):
         pending, due = {}, {}
-        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="aster") as pool:
-            try:
-                while not self.shutdown.is_set():
-                    if not self.ready:
-                        try:
-                            self.market.load_rules()
-                            if any(s not in self.market.rules for s in SYMBOLS):
-                                raise TradingError("缺少配置市场的交易规则")
-                            self.ready, self.error = True, None
-                        except (TradingError, KeyError, ValueError, TypeError) as exc:
-                            self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
-                            self.shutdown.wait(max(10, getattr(exc, "retry_after", 0)))
-                            continue
-                    for key, future in list(pending.items()):
-                        if future.done():
+        account_ids, account_generation, accounts_due = [], -1, 0
+        # Reserve capacity for every account, each public market and the outbox.
+        # Slow private APIs must never occupy the market/notification capacity.
+        try:
+            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+                try:
+                    while not self.shutdown.is_set():
+                        if not self.ready:
                             try:
-                                delay = future.result()
-                            except Exception:
-                                LOG.error("Worker failed; new work delayed (%s)", key)
-                                delay = 30
-                            due[key] = time.monotonic() + delay
-                            del pending[key]
-                    jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
-                    jobs.update({"account:" + a["id"]: (self.tick_account, a["id"]) for a in self.store.accounts()})
-                    jobs["notify"] = (self.notify,)
-                    for key, (function, *args) in jobs.items():
-                        if key not in pending and time.monotonic() >= due.get(key, 0):
-                            pending[key] = pool.submit(function, *args)
-                    self.shutdown.wait(.1)
-            finally:
-                self.shutdown.set()
-        for broker in self.brokers.values():
-            broker.close()
-        if isinstance(self.market, MarketData):
-            self.market.api.close()
+                                self.market.load_rules()
+                                if any(s not in self.market.rules for s in SYMBOLS):
+                                    raise TradingError("缺少配置市场的交易规则")
+                                self.ready, self.error = True, None
+                            except (TradingError, KeyError, ValueError, TypeError) as exc:
+                                self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
+                                self.shutdown.wait(max(10, getattr(exc, "retry_after", 0)))
+                                continue
+                        for key, future in list(pending.items()):
+                            if future.done():
+                                try:
+                                    delay = future.result()
+                                except Exception:
+                                    LOG.error("Worker failed; new work delayed (%s)", key)
+                                    delay = 30
+                                due[key] = time.monotonic() + delay
+                                del pending[key]
+                        with self.lock:
+                            generation = self.accounts_generation
+                        if generation != account_generation or time.monotonic() >= accounts_due:
+                            account_ids = [a["id"] for a in self.store.accounts()]
+                            account_generation = generation
+                            accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
+                        jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
+                        jobs.update({"account:" + aid: (self.tick_account, aid) for aid in account_ids})
+                        jobs["notify"] = (self.notify,)
+                        for key, (function, *args) in jobs.items():
+                            if key not in pending and time.monotonic() >= due.get(key, 0):
+                                pending[key] = pool.submit(function, *args)
+                        self.shutdown.wait(.1)
+                finally:
+                    # Fail health checks as soon as scheduling ends, before waiting
+                    # for in-flight workers and closing their shared clients.
+                    self.shutdown.set()
+                    with self.lock:
+                        self.ready, self.error = False, "交易调度已停止"
+        except Exception:
+            with self.lock:
+                self.error = "交易调度异常停止，请检查服务后重启"
+            LOG.error("Scheduler stopped unexpectedly")
+        finally:
+            self.shutdown.set()
+            with self.lock:
+                self.ready = False
+                brokers = list(self.brokers.items())
+            # The pool context has joined all workers. One failing close must not
+            # prevent the remaining clients from releasing their resources.
+            for account_id, broker in brokers:
+                try:
+                    broker.close()
+                except Exception:
+                    LOG.error("Account client close failed (%s)", account_id)
+            if isinstance(self.market, MarketData):
+                try:
+                    self.market.api.close()
+                except Exception:
+                    LOG.error("Market client close failed")
 
     def start(self):
-        self.process_lock.acquire()
-        self.thread = threading.Thread(target=self.run, name="aster-engine", daemon=True)
-        self.thread.start()
+        with self.lifecycle_lock:
+            if self.thread is not None:
+                raise TradingError("交易服务已经启动；请勿重复启动同一执行器")
+            if self.shutdown.is_set():
+                raise TradingError("交易服务正在停止或已停止，请重新创建执行器")
+            self.process_lock.acquire()
+            try:
+                self.thread = threading.Thread(target=self.run, name="aster-engine", daemon=True)
+                self.thread.start()
+            except BaseException:
+                self.thread = None
+                self.process_lock.release()
+                raise
 
     def stop(self):
-        self.shutdown.set()
-        if self.thread:
-            self.thread.join(timeout=90)
-        if not self.thread or not self.thread.is_alive():
-            self.process_lock.release()
+        with self.lifecycle_lock:
+            self.shutdown.set()
+            if self.thread:
+                self.thread.join(timeout=90)
+            if not self.thread or not self.thread.is_alive():
+                self.process_lock.release()

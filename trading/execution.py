@@ -1,6 +1,7 @@
 """Crash-recoverable hedge execution. All mutations have durable intent IDs."""
 import time
 import uuid
+from fractions import Fraction
 
 from .exchange import ExchangeError
 from .models import AccountModeError, TradingError, dec, floor_step, hedge_balanced, positive, require_non_decreasing_leverage, wire
@@ -14,7 +15,12 @@ class Executor:
 
     def open_pair(self, account, snapshot, symbol, plan, book):
         snapshot.require_modes(account["policy"]["symbols"])
-        long, short = snapshot.pair(symbol)
+        long, short = snapshot.require_ready(symbol)
+        book.require_fresh()
+        qty = positive(plan.qty)
+        rule = self.market.rules[symbol]
+        if qty != floor_step(qty, rule.step) or not rule.min_qty <= qty <= rule.max_qty:
+            raise TradingError("批次数量不符合交易规则")
         if not hedge_balanced(long.qty, short.qty):
             raise TradingError("已有多空数量差超过 0.1%，等待人工核对")
         if self.store.intent(account["id"]):
@@ -95,8 +101,7 @@ class Executor:
             self.store.event(account["id"], "error", reason)
         intent.update(status="attention", last_error=reason)
         self.store.save_intent(intent)
-        account["enabled"] = False
-        self.store.save_account(account)
+        self.store.pause_account(account, reason)
         return reason
 
     def reconcile(self, account, intent=None):
@@ -107,6 +112,7 @@ class Executor:
             if intent["target"] < intent["previous"]:
                 return self.attention(account, intent, "发现旧降杠杆批次，全局禁止继续执行；请核对实际杠杆")
             snapshot = self.broker.snapshot(account["policy"]["symbols"])
+            snapshot.require_fresh()
             try:
                 snapshot.require_modes(account["policy"]["symbols"])
             except AccountModeError as exc:
@@ -152,42 +158,48 @@ class Executor:
 
         # Confirm actual account positions before any repair, including manual changes/ADL.
         snapshot = self.broker.snapshot(account["policy"]["symbols"])
+        snapshot.require_fresh()
         try:
             snapshot.require_modes(account["policy"]["symbols"])
         except AccountModeError as exc:
             return self.attention(account, intent, str(exc))
         long, short = snapshot.pair(intent["symbol"])
-        filled = {side: dec(0) for side in ("LONG", "SHORT")}
-        notionals = {side: dec(0) for side in filled}
+        filled = {side: Fraction(0) for side in ("LONG", "SHORT")}
+        notionals = {side: Fraction(0) for side in filled}
         for order in intent["orders"]:
             row = intent["receipts"][order["newClientOrderId"]]
-            qty = dec(row["executedQty"])
+            qty = Fraction(dec(row["executedQty"]))
             filled[order["positionSide"]] += qty
-            notionals[order["positionSide"]] += qty * dec(row["avgPrice"])
-        repaired = {side: dec(0) for side in filled}
+            if qty:
+                notionals[order["positionSide"]] += qty * Fraction(dec(row["avgPrice"]))
+        repaired = {side: Fraction(0) for side in filled}
         for order in intent["repairs"]:
-            repaired[order["positionSide"]] += dec(intent["receipts"][order["newClientOrderId"]]["executedQty"])
+            repaired[order["positionSide"]] += Fraction(dec(intent["receipts"][order["newClientOrderId"]]["executedQty"]))
         net = {side: filled[side] - repaired[side] for side in filled}
-        actual = {"LONG": long.qty, "SHORT": short.qty}
-        if any(actual[s] != dec(intent["baseline"][s]) + net[s] or net[s] < 0 for s in actual):
+        actual = {"LONG": Fraction(long.qty), "SHORT": Fraction(short.qty)}
+        if any(actual[s] != Fraction(dec(intent["baseline"][s])) + net[s] or net[s] < 0 for s in actual):
             return self.attention(account, intent, "持仓变化与本批回执不一致，暂停并等待核对（可能有外部成交或 ADL）")
         if not hedge_balanced(long.qty, short.qty):
+            if not snapshot.can_trade or snapshot.open_orders:
+                return self.attention(account, intent, "账户交易权限或未完成挂单不符合补偿条件，等待核对")
             if intent["repair_attempts"] >= 3:
                 return self.attention(account, intent, "单腿补偿尚未完成，已暂停新开仓；请核对并重试补偿")
             side = "LONG" if long.qty > short.qty else "SHORT"
             book = self.market.book(intent["symbol"])
             book.require_fresh()
+            snapshot.require_fresh()
             rule = self.market.rules[intent["symbol"]]
             # Bring total holdings back within tolerance without closing baseline holdings.
             room = floor_step(min(abs(net["LONG"] - net["SHORT"]), net[side], rule.max_qty,
                                   book.bid_qty if side == "LONG" else book.ask_qty), rule.step)
-            qty = floor_step(min(abs(long.qty - short.qty), room), rule.step)
+            qty = Fraction(floor_step(min(abs(actual["LONG"] - actual["SHORT"]), room), rule.step))
             other = "SHORT" if side == "LONG" else "LONG"
             # Old holdings may predate today's step. Crossing equality by one step
             # is allowed only when it restores tolerance and stays within this batch.
-            if not hedge_balanced(actual[side] - qty, actual[other]) and qty + rule.step <= room \
-                    and hedge_balanced(actual[side] - qty - rule.step, actual[other]):
-                qty += rule.step
+            step = Fraction(rule.step)
+            if not hedge_balanced(actual[side] - qty, actual[other]) and qty + step <= room \
+                    and hedge_balanced(actual[side] - qty - step, actual[other]):
+                qty += step
             if qty <= 0:
                 return self.attention(account, intent, "盘口不足以补偿本批单腿，请核对持仓")
             repair = self.order(intent["symbol"], side, "SELL" if side == "LONG" else "BUY", qty,
@@ -206,7 +218,6 @@ class Executor:
             total = sum(notionals[s] * net[s] / filled[s] for s in filled if filled[s])
             self.store.complete_pair(intent, {"long_qty": wire(net["LONG"]), "short_qty": wire(net["SHORT"]), "notional": wire(total)})
         else:
-            intent["status"] = "aborted"
-            self.store.save_intent(intent)
+            self.store.abort_pair(intent)
             self.store.event(account["id"], "order", f"{intent['symbol']} 本批未形成新增双向仓位，订单已核对")
         return "双向批次已核对完成，多空数量差不超过 0.1%" if added else "本批未成交或已完成单腿补偿"

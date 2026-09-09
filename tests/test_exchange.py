@@ -81,7 +81,7 @@ class ExchangeTests(unittest.TestCase):
         self.assertEqual(snapshot.occupied_margin, 0)
         self.assertEqual(snapshot.ratio, 0)
         self.assertEqual(snapshot.available, 123)
-        extra = {**positions[0], "symbol": "SPCXUSD1", "positionAmt": "1", "leverage": "10", "isolated": False}
+        extra = {**positions[0], "symbol": "SPCXUSD1", "positionAmt": "1", "entryPrice": "100", "leverage": "10", "isolated": False}
         account_positions.append(extra)
         with self.assertRaisesRegex(TradingError, "全部持仓尚未同步"):
             broker.snapshot(["XAUUSD1"])

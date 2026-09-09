@@ -13,7 +13,8 @@ def dumps(value):
 
 class Store:
     def __init__(self, path):
-        self.path = Path(path)
+        # All aliases of one database must share its process lock and WAL files.
+        self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         with self.connect() as db:
@@ -66,6 +67,10 @@ class Store:
     def save_account(self, account):
         with self.connect() as db:
             db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(account)))
+
+    def pause_account(self, account, reason):
+        account.update(enabled=False, pause_reason=reason)
+        self.save_account(account)
 
     def get(self, key, default=None):
         with self.connect() as db:
@@ -125,6 +130,18 @@ class Store:
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (
                 intent["account_id"], "fill", f"{intent['symbol']} {intent['leverage']}x 本批成交已核对，多头增加 {quantities['long_qty']}，空头增加 {quantities['short_qty']}", time.time()))
 
+    def abort_pair(self, intent):
+        """Even a fully repaired batch may have reduced equity through fees."""
+        completed = {**intent, "status": "aborted"}
+        with self.connect() as db:
+            row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
+            if row and row[0] in ("complete", "aborted"):
+                return
+            db.execute("UPDATE intents SET status='aborted',data=? WHERE id=?", (dumps(completed), intent["id"]))
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("post_fill_check:" + intent["account_id"], dumps(True)))
+        intent.update(completed)
+
     def finish_campaign(self, account, reason, ratio):
         from .models import dec
         with self.connect() as db:
@@ -144,7 +161,8 @@ class Store:
                 entry["leverage"] = batch["leverage"]
             lines = [f"Aster 双向开仓完成{'（模拟）' if account['mode'] == 'paper' else ''}", f"账户：{account['name']}（{account['id']}）"]
             lines.extend(f"{symbol} · {v['leverage']}x · 本轮多头增加 {v['long_qty']}，空头增加 {v['short_qty']}，新增总名义金额 {v['notional']:,.2f} USD1" for symbol, v in totals.items())
-            lines.extend([f"结束原因：{reason}", f"USD1 保证金占用率（总占用保证金 / 总权益）：{dec(ratio) * 100:.2f}%", f"批次数：{len(campaign['batches'])}"])
+            ratio_text = f"{dec(ratio) * 100:.2f}%" if ratio is not None else "无法计算（账户总权益不足）"
+            lines.extend([f"结束原因：{reason}", f"USD1 保证金占用率（总占用保证金 / 总权益）：{ratio_text}", f"批次数：{len(campaign['batches'])}"])
             message = "\n".join(lines)
             # Simulated trading must never send external completion messages.
             if account["mode"] == "live":

@@ -1,6 +1,7 @@
 """Aster V3 EIP-712 API adapter. No automatic retries of signed mutations."""
-from dataclasses import asdict
 import json
+from fractions import Fraction
+import math
 import os
 import re
 import threading
@@ -12,7 +13,7 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
-from .models import AccountSnapshot, Book, Position, Rules, TradingError, dec, positive, require_non_decreasing_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 
@@ -34,6 +35,8 @@ class RateBudget:
         self.limit = 1800
 
     def reserve(self, weight):
+        if type(weight) is not int or weight <= 0:
+            raise ExchangeError("接口请求权重无效")
         with self.lock:
             now = time.monotonic()
             if now < self.until:
@@ -45,8 +48,15 @@ class RateBudget:
             self.weight += weight
 
     def block(self, seconds):
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError, OverflowError):
+            seconds = 180.0
+        if not math.isfinite(seconds) or seconds < 0:
+            seconds = 180.0
         with self.lock:
             self.until = max(self.until, time.monotonic() + seconds)
+        return seconds
 
 
 BUDGET = RateBudget()
@@ -94,12 +104,14 @@ class API:
         if response.status_code in (429, 418):
             delay = 180 if response.status_code == 429 else 86400
             try:
-                delay = max(delay, float(response.headers.get("Retry-After", "0")))
+                supplied_delay = float(response.headers.get("Retry-After", "0"))
+                if math.isfinite(supplied_delay):
+                    delay = max(delay, supplied_delay)
             except ValueError:
                 pass
             self.budget.block(delay)
             raise ExchangeError("Aster 接口限流", retry_after=delay)
-        if response.status_code >= 500 and is_write:
+        if (response.status_code >= 500 or response.status_code == 408) and is_write:
             raise AmbiguousOrder("Aster 未确认请求结果，需核对订单")
         try:
             data = response.json()
@@ -169,11 +181,17 @@ class MarketData:
         # Fetch mark first so the executable BBO is as recent as possible.
         mark = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
         row = self.api.call("GET", "/fapi/v3/ticker/bookTicker", {"symbol": symbol}, weight=2)
+        if not isinstance(row, dict) or not isinstance(mark, dict):
+            raise TradingError("报价响应无效")
         if row.get("symbol") != symbol or mark.get("symbol") != symbol:
             raise TradingError("报价交易代码不匹配")
+        timestamps = [float(positive(source.get("time"))) / 1000 for source in (row, mark)]
+        now = time.time()
+        if any(not -1 <= now - stamp <= 3 for stamp in timestamps):
+            raise TradingError("BBO 或标记价格时间无效，等待新报价")
         book = Book(positive(row["bidPrice"]), positive(row["askPrice"]), positive(row["bidQty"]),
-                    positive(row["askQty"]), positive(mark["markPrice"]), min(float(row["time"]), float(mark["time"])) / 1000)
-        book.require_fresh()
+                    positive(row["askQty"]), positive(mark["markPrice"]), min(timestamps))
+        book.require_fresh(now)
         return book
 
     def capacities(self, symbol, leverages):
@@ -182,9 +200,8 @@ class MarketData:
             result = monitor.sample({"symbol": symbol, "leverages": sorted(set(leverages)), "timeout_seconds": 8})
             return {v: positive(row["value"], True) for v, row in result.items() if not isinstance(row, Exception)}
         except monitor.MonitorError as exc:
-            if exc.retry_after:
-                self.api.budget.block(exc.retry_after)
-            raise ExchangeError(str(exc), retry_after=exc.retry_after) from None
+            delay = self.api.budget.block(exc.retry_after) if exc.retry_after else 0
+            raise ExchangeError(str(exc), retry_after=delay) from None
 
 
 class LiveBroker:
@@ -196,9 +213,11 @@ class LiveBroker:
         self.cached, self.cached_at = {}, {}
 
     def cached_call(self, key, path, params=None, ttl=300, weight=1):
-        if time.monotonic() - self.cached_at.get(key, -1e9) >= ttl:
+        started = time.monotonic()
+        if started - self.cached_at.get(key, -1e9) >= ttl:
             self.cached[key] = self.api.call("GET", path, params, signed=True, weight=weight)
-            self.cached_at[key] = time.monotonic()
+            # Network time counts towards cache age; slow reads must not renew it.
+            self.cached_at[key] = started
         return self.cached[key]
 
     def snapshot(self, symbols, fresh_modes=False):
@@ -208,27 +227,38 @@ class LiveBroker:
             self.cached_at.pop("multi", None)
         dual = self.cached_call("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
         multi = self.cached_call("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
-        if type(dual.get("dualSidePosition")) is not bool or type(multi.get("multiAssetsMargin")) is not bool:
+        if (not isinstance(dual, dict) or not isinstance(multi, dict)
+                or type(dual.get("dualSidePosition")) is not bool or type(multi.get("multiAssetsMargin")) is not bool):
             raise TradingError("账户持仓或保证金模式响应无效")
         account = self.api.call("GET", "/fapi/v3/accountWithJoinMargin", signed=True, weight=5)
         rows = self.api.call("GET", "/fapi/v3/positionRisk", signed=True, weight=5)
         orders = self.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
-        asset = next((a for a in account["assets"] if a["asset"] == "USD1"), None)
-        if not asset:
+        if (not isinstance(account, dict) or not isinstance(account.get("assets"), list)
+                or any(not isinstance(a, dict) for a in account["assets"])):
+            raise TradingError("账户资产响应无效")
+        assets = [a for a in account["assets"] if a.get("asset") == "USD1"]
+        if not assets:
             raise TradingError("账户缺少 USD1 保证金资产")
-        if not isinstance(rows, list) or not isinstance(orders, list):
+        if len(assets) != 1:
+            raise TradingError("账户 USD1 保证金资产重复")
+        asset = assets[0]
+        account_positions = self._position_rows(account.get("positions"))
+        present = self._position_rows(rows)
+        if not isinstance(orders, list) or any(not isinstance(order, dict) for order in orders):
             raise TradingError("持仓或挂单响应无效")
         # Some V3 responses omit flat symbols; use authenticated account rows for
         # their configured leverage and margin mode, rather than inventing defaults.
-        present = {(r["symbol"], r["positionSide"]) for r in rows}
-        for row in account["positions"]:
+        rows, flat_marks = list(rows), {}
+        for row in account_positions.values():
             if row["symbol"] in symbols and (row["symbol"], row["positionSide"]) not in present:
                 if type(row.get("isolated")) is not bool:
                     raise TradingError("账户全仓保证金模式响应无效")
                 if dec(row["positionAmt"]):
                     raise TradingError("账户与持仓接口尚未同步")
+                if row["symbol"] not in flat_marks:
+                    flat_marks[row["symbol"]] = wire(self.market.book(row["symbol"]).mark)
                 rows.append({"symbol": row["symbol"], "positionSide": row["positionSide"], "positionAmt": "0",
-                             "entryPrice": "0", "markPrice": wire(self.market.book(row["symbol"]).mark),
+                             "entryPrice": "0", "markPrice": flat_marks[row["symbol"]],
                              "leverage": row["leverage"], "unRealizedProfit": "0", "liquidationPrice": "0",
                              "marginType": "isolated" if row["isolated"] else "cross"})
         positions = []
@@ -239,17 +269,18 @@ class LiveBroker:
                 if dec(row["positionAmt"]):
                     raise TradingError("检测到非 USD1 仓位，需要核对风险范围")
                 continue
-            positions.append(Position(row["symbol"], row["positionSide"], abs(dec(row["positionAmt"])), dec(row["entryPrice"]),
-                positive(row["markPrice"]), int(row["leverage"]), dec(row["unRealizedProfit"]), positive(row["liquidationPrice"], True),
+            qty = dec(row["positionAmt"]).copy_abs()
+            entry = positive(row["entryPrice"], allow_zero=not qty)
+            positions.append(Position(row["symbol"], row["positionSide"], qty, entry,
+                positive(row["markPrice"]), self._leverage(row.get("leverage")), dec(row["unRealizedProfit"]), positive(row["liquidationPrice"], True),
                 isolated=row["marginType"].lower() not in ("cross", "crossed")))
         # Never combine balances and positions from different fills.
-        account_positions = {(r["symbol"], r["positionSide"]): r for r in account["positions"]}
         represented = {(p.symbol, p.side) for p in positions}
         if any(dec(row["positionAmt"]) and key not in represented for key, row in account_positions.items()):
             raise TradingError("账户全部持仓尚未同步，无法计算总占用保证金")
         for p in positions:
             other = account_positions.get((p.symbol, p.side))
-            if not other or abs(dec(other["positionAmt"])) != p.qty or int(other["leverage"]) != p.leverage:
+            if not other or dec(other["positionAmt"]).copy_abs() != p.qty or self._leverage(other.get("leverage")) != p.leverage:
                 raise TradingError("账户余额与持仓快照正在同步，稍后重试")
             if type(other.get("isolated")) is not bool or other["isolated"] != p.isolated:
                 raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
@@ -257,17 +288,58 @@ class LiveBroker:
         for symbol in symbols:
             b = self.cached_call("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
             if isinstance(b, list):
-                b = next((item for item in b if item.get("symbol") == symbol), {})
-            if b.get("symbol") != symbol:
+                if any(not isinstance(item, dict) for item in b):
+                    raise TradingError("账户风控档位响应无效")
+                matches = [item for item in b if item.get("symbol") == symbol]
+                if len(matches) != 1:
+                    raise TradingError("账户风控档位缺失或重复")
+                b = matches[0]
+            if not isinstance(b, dict) or b.get("symbol") != symbol:
                 raise TradingError("账户风控档位交易代码不匹配")
             brackets[symbol] = validate_brackets(b["brackets"])
             fee = self.cached_call("fee:" + symbol, "/fapi/v3/commissionRate", {"symbol": symbol}, ttl=60, weight=20)
+            if not isinstance(fee, dict) or fee.get("symbol", symbol) != symbol:
+                raise TradingError("账户手续费率交易代码不匹配")
             fees[symbol] = positive(fee["takerCommissionRate"], True)
         wallet = dec(asset["crossWalletBalance"])
-        unrealized = dec(asset["crossUnPnl"])
-        return AccountSnapshot(wallet + unrealized, positive(asset["maintMargin"], True), dec(asset["availableBalance"]), wallet,
+        account_unrealized = Fraction(dec(asset["crossUnPnl"]))
+        # Account balances and position marks are separate reads. Charge newer
+        # losses immediately, but never fund additions with an unconfirmed gain.
+        position_unrealized = sum((Fraction(p.unrealized) for p in positions), Fraction(0))
+        marked_unrealized = sum((Fraction(p.qty) * (Fraction(p.mark) - Fraction(p.entry)) * (1 if p.side == "LONG" else -1)
+                                 for p in positions), Fraction(0))
+        selected_pnl = min(account_unrealized, position_unrealized, marked_unrealized)
+        unrealized = decimal_value(selected_pnl, exact=True)
+        available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
+        equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
+        return AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
             unrealized, positions, orders, dual.get("dualSidePosition") is True, multi.get("multiAssetsMargin") is True,
             account.get("canTrade") is True, started, fees, brackets)
+
+    @staticmethod
+    def _position_rows(rows):
+        if not isinstance(rows, list):
+            raise TradingError("持仓响应无效")
+        result = {}
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("symbol"), str) or not row["symbol"]
+                    or row.get("positionSide") not in ("LONG", "SHORT", "BOTH")):
+                raise TradingError("持仓交易代码或方向无效")
+            quantity = dec(row.get("positionAmt"))
+            if quantity and row["positionSide"] == "BOTH":
+                raise AccountModeError("双向账户出现单向持仓，需核对账户模式")
+            key = (row["symbol"], row["positionSide"])
+            if key in result:
+                raise TradingError("持仓接口返回重复记录，无法核对总占用保证金")
+            result[key] = row
+        return result
+
+    @staticmethod
+    def _leverage(value):
+        leverage = positive(value)
+        if not 1 <= leverage <= 125 or leverage != leverage.to_integral_value():
+            raise TradingError("账户实际杠杆无效")
+        return int(leverage)
 
     def set_leverage(self, symbol, leverage):
         snapshot = self.snapshot([symbol], fresh_modes=True)

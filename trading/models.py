@@ -8,6 +8,7 @@ import time
 ZERO = Decimal("0")
 HEDGE_TOLERANCE = Decimal("0.001")
 TIERS = (4, 5, 10, 20)
+MIN_OPEN_LEVERAGE = 4
 SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
 
 
@@ -279,6 +280,8 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     """Size both legs against total occupied margin / equity, cash and capacity."""
     long, short = snapshot.require_ready(rules.symbol, now)
     book.require_fresh(now)
+    if long.leverage < MIN_OPEN_LEVERAGE:
+        return Plan(reason=f"当前 {long.leverage}x 低于 {MIN_OPEN_LEVERAGE}x，禁止新增开仓，等待升杠杆")
     limit = Fraction(dec(policy["margin_limit"]))
     if snapshot.margin_exceeds(policy["margin_limit"], include_equal=True):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")

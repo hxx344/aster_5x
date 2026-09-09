@@ -1,5 +1,6 @@
 """Independent account workers and shared market polling for the Linux service."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict
 import json
 import logging
@@ -12,7 +13,7 @@ import monitor
 from .exchange import ExchangeError, LiveBroker, MarketData, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
-from .models import AccountModeError, SYMBOLS, TIERS, TradingError, dec, next_leverage, plan_pair, positive, wire
+from .models import AccountModeError, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, next_leverage, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -69,6 +70,7 @@ class Engine:
         self.account_locks = {}
         self.brokers, self.signers, self.users = {}, {}, {}
         self.markets, self.views, self.rotation = {}, {}, {}
+        self.wake_accounts, self.urgent_accounts = set(), set()
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
@@ -115,6 +117,70 @@ class Engine:
 
     def live_allowed(self, account):
         return account["mode"] == "paper" or (not self.demo and os.environ.get("ASTER_ALLOW_LIVE") == "1")
+
+    def scheduling(self, accounts):
+        """Spread ordinary private reads across the shared IP budget."""
+        live = [a for a in accounts if a["mode"] == "live"]
+        budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else {"ordinary_limit": 1500}
+        # Public monitoring keeps its five-second cadence. Use conservative cold
+        # round costs; no private position or balance cache crosses a mutation.
+        capacity = max(1, budget["ordinary_limit"] - 180)
+        with self.lock:
+            def cost(account):
+                if not account["enabled"]:
+                    return 180
+                positions = self.views.get(account["id"], {}).get("snapshot", {}).get("positions", [])
+                for symbol in account["policy"]["symbols"]:
+                    pair = [p for p in positions if p["symbol"] == symbol]
+                    if len(pair) != 2:
+                        return 500  # Cold start may perform and confirm an upgrade.
+                    leverage = pair[0]["leverage"]
+                    caps = self.markets.get(symbol, {}).get("capacities", {})
+                    threshold = dec(account["policy"]["threshold"])
+                    flat = all(dec(p["qty"]) == 0 for p in pair)
+                    if flat and leverage >= MIN_OPEN_LEVERAGE and dec(caps.get(str(leverage), "0")) > threshold:
+                        continue
+                    if any(target > leverage and dec(caps.get(str(target), "0")) > threshold for target in TIERS):
+                        return 500
+                return 220
+            costs = {a["id"]: cost(a) for a in live}
+        period = 60 * sum(costs.values()) / capacity
+        return {a["id"]: {
+            "interval": max(10 if a["enabled"] else 60, period),
+            "gap": 60 * costs[a["id"]] / capacity,
+        } for a in live}
+
+    @staticmethod
+    def recovery_budget(broker):
+        return getattr(broker, "reconciliation_budget", nullcontext)()
+
+    def completed_snapshot(self, executor, broker, symbols):
+        snapshot = executor.last_snapshot
+        if snapshot is not None:
+            try:
+                snapshot.require_fresh()
+                return snapshot
+            except TradingError:
+                pass
+        with self.recovery_budget(broker):
+            return broker.snapshot(symbols)
+
+    def record_batch_outcome(self, account_id, executor):
+        intent = executor.last_completed_intent
+        if not intent or intent["kind"] != "pair":
+            return
+        key = f"order_cooldown:{account_id}:{intent['symbol']}"
+        if intent["status"] == "complete":
+            self.store.put(key, None)
+            return
+        if intent["status"] != "aborted":
+            return
+        previous = self.store.get(key) or {}
+        count = min(5, previous.get("failures", 0) + 1)
+        rejected = any(r.get("status") == "REJECTED" for r in intent["receipts"].values())
+        delay = min(120, (30 if rejected else 15) * 2 ** (count - 1))
+        self.store.put(key, {"failures": count, "until": time.time() + delay})
+        self.store.event(account_id, "waiting", f"{intent['symbol']} 本批无新增仓位，新开单等待 {delay} 秒；继续核对已有订单")
 
     def poll_market(self, symbol):
         if self.shutdown.is_set():
@@ -169,7 +235,12 @@ class Engine:
                 return 5
             try:
                 broker = self.broker(account)
-                snapshot = broker.snapshot(account["policy"]["symbols"])
+                pending = self.store.intent(account_id)
+                recovery = bool(pending or self.store.get("post_fill_check:" + account_id))
+                with self.recovery_budget(broker) if recovery else nullcontext():
+                    if isinstance(broker, LiveBroker) and not recovery:
+                        broker.api.budget.require_available(200)
+                    snapshot = broker.snapshot(account["policy"]["symbols"])
                 self.view(account_id, snapshot=snapshot_json(snapshot, account["policy"]["symbols"]), credential_ready=True)
                 snapshot.require_modes(account["policy"]["symbols"])
                 if self.shutdown.is_set():
@@ -180,7 +251,6 @@ class Engine:
                 self.view(account_id, status="running" if account["enabled"] else "attention" if pause_reason else "paused",
                           reason="策略运行中" if account["enabled"] else pause_reason or "策略已暂停")
                 executor = Executor(self.store, broker, self.market)
-                pending = self.store.intent(account_id)
                 if pending:
                     if self.live_allowed(account):
                         reason = executor.reconcile(account, pending)
@@ -191,7 +261,8 @@ class Engine:
                     self.view(account_id, status=status, reason=reason)
                     self.strategy(account_id, pending["symbol"], reason, status)
                     if pending["kind"] == "pair" and not self.store.intent(account_id):
-                        after = broker.snapshot(account["policy"]["symbols"])
+                        self.record_batch_outcome(account_id, executor)
+                        after = self.completed_snapshot(executor, broker, account["policy"]["symbols"])
                         self.view(account_id, snapshot=snapshot_json(after, account["policy"]["symbols"]))
                         self.check_post_fill_occupancy(account, after)
                     return 5
@@ -224,12 +295,19 @@ class Engine:
                         if not first_add and (not flat or long.leverage < 4 or not current_available):
                             target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"])
                         if target is not None:
+                            if isinstance(broker, LiveBroker):
+                                broker.api.budget.require_available(250)
                             reason = executor.leverage(account, symbol, long.leverage, target, snapshot=snapshot)
                             self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
                             return 5
-                        if flat and long.leverage < 4:
-                            last_reason = "首次开仓等待可用的更高杠杆档位（最低 4x），禁止降杠杆"
+                        if long.leverage < MIN_OPEN_LEVERAGE:
+                            last_reason = f"当前 {long.leverage}x 低于 4x，禁止新增开仓；等待可用的更高杠杆档位"
+                            self.strategy(account_id, symbol, last_reason)
+                            continue
+                        cooldown = self.store.get(f"order_cooldown:{account_id}:{symbol}") or {}
+                        if cooldown.get("until", 0) > time.time():
+                            last_reason = f"上批无新增仓位，新开单冷却中（剩余 {max(1, int(cooldown['until'] - time.time()))} 秒）"
                             self.strategy(account_id, symbol, last_reason)
                             continue
                         plan = plan_pair(snapshot, book, self.market.rules[symbol], capacities, policy)
@@ -242,7 +320,8 @@ class Engine:
                         if plan.qty:
                             reason = executor.open_pair(account, snapshot, symbol, plan, book)
                             # A completed pair is followed by an actual account risk check.
-                            after = broker.snapshot(markets)
+                            self.record_batch_outcome(account_id, executor)
+                            after = self.completed_snapshot(executor, broker, markets)
                             unresolved = self.store.intent(account_id)
                             phase = ("attention" if unresolved["status"] == "attention" else "reconciling") if unresolved else "filled"
                             self.view(account_id, snapshot=snapshot_json(after, markets), reason=reason, status=phase if unresolved else "running")
@@ -284,6 +363,13 @@ class Engine:
                     status = "attention"
                 self.view(account_id, status=status, reason=message, credential_ready=account_id in self.brokers)
                 return max(10, getattr(exc, "retry_after", 0))
+            finally:
+                urgent = bool(self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id))
+                with self.lock:
+                    if urgent:
+                        self.urgent_accounts.add(account_id)
+                    else:
+                        self.urgent_accounts.discard(account_id)
 
     def add_account(self, data):
         account = validate_account({**data, "enabled": False, "policy": {**DEFAULT_POLICY}})
@@ -332,6 +418,9 @@ class Engine:
             if enabled:
                 account.pop("pause_reason", None)
             self.store.save_account(account)
+            with self.lock:
+                self.wake_accounts.add(account_id)
+                self.accounts_generation += 1
             self.view(account_id, status="running" if enabled else "attention" if account.get("pause_reason") else "paused",
                       reason="策略运行中" if enabled else account.get("pause_reason") or "策略已暂停")
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")
@@ -345,6 +434,9 @@ class Engine:
             if intent["kind"] == "pair":
                 intent["repair_attempts"] = 0
             self.store.save_intent(intent)
+            with self.lock:
+                self.urgent_accounts.add(account_id)
+                self.wake_accounts.add(account_id)
             self.store.event(account_id, "control", "重新核对未完成批次；不重复提交原开仓订单")
 
     def notification_config(self):
@@ -392,6 +484,7 @@ class Engine:
     def run(self):
         pending, due = {}, {}
         account_ids, account_generation, accounts_due = [], -1, 0
+        schedules, known_accounts, next_ordinary_start = {}, set(), 0
         # Reserve capacity for every account, each public market and the outbox.
         # Slow private APIs must never occupy the market/notification capacity.
         try:
@@ -415,20 +508,45 @@ class Engine:
                                 except Exception:
                                     LOG.error("Worker failed; new work delayed (%s)", key)
                                     delay = 30
+                                aid = key.removeprefix("account:")
+                                with self.lock:
+                                    urgent = aid in self.urgent_accounts
+                                if key.startswith("account:") and aid in schedules and not urgent:
+                                    delay = max(delay, schedules[aid]["interval"])
                                 due[key] = time.monotonic() + delay
                                 del pending[key]
                         with self.lock:
                             generation = self.accounts_generation
                         if generation != account_generation or time.monotonic() >= accounts_due:
-                            account_ids = [a["id"] for a in self.store.accounts()]
+                            saved_accounts = self.store.accounts()
+                            account_ids = [a["id"] for a in saved_accounts]
+                            schedules = self.scheduling(saved_accounts)
+                            for aid in set(account_ids) - known_accounts:
+                                if self.store.intent(aid) or self.store.get("post_fill_check:" + aid):
+                                    with self.lock:
+                                        self.urgent_accounts.add(aid)
+                            known_accounts = set(account_ids)
                             account_generation = generation
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
+                        with self.lock:
+                            for aid in list(self.wake_accounts):
+                                key = "account:" + aid
+                                if key not in pending:
+                                    due[key] = 0
+                                    self.wake_accounts.discard(aid)
+                            urgent_accounts = self.urgent_accounts.copy()
                         jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
                         jobs.update({"account:" + aid: (self.tick_account, aid) for aid in account_ids})
                         jobs["notify"] = (self.notify,)
                         for key, (function, *args) in jobs.items():
                             if key not in pending and time.monotonic() >= due.get(key, 0):
+                                aid = key.removeprefix("account:")
+                                ordinary = key.startswith("account:") and aid in schedules and aid not in urgent_accounts
+                                if ordinary and time.monotonic() < next_ordinary_start:
+                                    continue
                                 pending[key] = pool.submit(function, *args)
+                                if ordinary:
+                                    next_ordinary_start = time.monotonic() + schedules[aid]["gap"]
                         self.shutdown.wait(.1)
                 finally:
                     # Fail health checks as soon as scheduling ends, before waiting

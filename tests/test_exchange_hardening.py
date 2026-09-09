@@ -424,8 +424,8 @@ class RateBudgetHardeningTests(unittest.TestCase):
             return accepted
         with ThreadPoolExecutor(max_workers=8) as executor:
             accepted = sum(executor.map(reserve_many, range(8)))
-        self.assertEqual(accepted, 37)
-        self.assertEqual(budget.weight, 37)
+        self.assertEqual(accepted, budget.snapshot()["ordinary_limit"])
+        self.assertEqual(budget.weight, accepted)
 
     def test_window_boundary_and_backoff_do_not_reset_each_other(self):
         with patch("trading.exchange.time.monotonic", return_value=100):

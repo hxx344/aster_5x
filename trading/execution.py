@@ -1,10 +1,11 @@
 """Crash-recoverable hedge execution. All mutations have durable intent IDs."""
 import time
 import uuid
+from contextlib import nullcontext
 from fractions import Fraction
 
-from .exchange import ExchangeError
-from .models import AccountModeError, TradingError, dec, floor_step, hedge_balanced, positive, require_non_decreasing_leverage, wire
+from .exchange import ExchangeError, RequestNotSent
+from .models import AccountModeError, MIN_OPEN_LEVERAGE, TradingError, dec, floor_step, hedge_balanced, positive, require_non_decreasing_leverage, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -12,10 +13,16 @@ TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 class Executor:
     def __init__(self, store, broker, market):
         self.store, self.broker, self.market = store, broker, market
+        self.last_snapshot = None
+        self.last_completed_intent = None
 
     def open_pair(self, account, snapshot, symbol, plan, book):
+        self.last_snapshot = None
+        self.last_completed_intent = None
         snapshot.require_modes(account["policy"]["symbols"])
         long, short = snapshot.require_ready(symbol)
+        if long.leverage < MIN_OPEN_LEVERAGE:
+            raise TradingError(f"当前 {long.leverage}x 低于 {MIN_OPEN_LEVERAGE}x，禁止新增开仓，等待升杠杆")
         book.require_fresh()
         qty = positive(plan.qty)
         rule = self.market.rules[symbol]
@@ -41,7 +48,8 @@ class Executor:
         return {"symbol": symbol, "positionSide": position_side, "side": side, "type": "LIMIT", "timeInForce": "FOK",
                 "quantity": wire(qty), "price": wire(price), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
 
-    def send(self, intent, orders):
+    def send(self, intent, orders, *, repair=False):
+        not_sent = None
         try:
             result = self.broker.submit(orders)
             if not isinstance(result, list) or len(result) != len(orders):
@@ -51,14 +59,31 @@ class Executor:
                 if isinstance(row, dict) and isinstance(row.get("code"), int) and row["code"] < 0:
                     # A batch-level timeout still needs a query, even inside HTTP 200.
                     if row["code"] not in (-1006, -1007):
-                        intent["receipts"][cid] = {**order, "clientOrderId": cid, "status": "REJECTED", "executedQty": "0", "avgPrice": "0"}
+                        intent["receipts"][cid] = {**order, "clientOrderId": cid, "status": "REJECTED", "executedQty": "0",
+                                                   "avgPrice": "0", "reject_code": row["code"]}
                 else:
                     self.validate_receipt(order, row)
                     intent["receipts"][cid] = row
+        except RequestNotSent as exc:
+            not_sent = exc
+            # The local budget rejected the request before any network write.
+            # These orders are known absent and must never enter unknown-order recovery.
+            for order in orders:
+                cid = order["newClientOrderId"]
+                receipt = {**order, "clientOrderId": cid, "status": "REJECTED", "executedQty": "0", "avgPrice": "0",
+                           "local_not_sent": True}
+                if isinstance(exc.code, int):
+                    receipt["reject_code"] = exc.code
+                intent["receipts"][cid] = receipt
+            if repair:
+                # Persist the refund with the known-absent receipt, so a restart
+                # cannot count a local budget denial as an exchange repair attempt.
+                intent["repair_attempts"] -= 1
         except TradingError as exc:
             # Even a transport failure may have reached the exchange. Never resend.
             intent["last_error"] = str(exc)
         self.store.save_intent(intent)
+        return not_sent
 
     @staticmethod
     def validate_receipt(order, row):
@@ -73,6 +98,8 @@ class Executor:
             positive(row.get("avgPrice"))
 
     def leverage(self, account, symbol, old, target, snapshot=None):
+        self.last_snapshot = None
+        self.last_completed_intent = None
         require_non_decreasing_leverage(old, target)
         # Re-read before creating intent; the selection snapshot may now be stale.
         snapshot = self.broker.snapshot(account["policy"]["symbols"], fresh_modes=True)
@@ -91,6 +118,10 @@ class Executor:
         self.store.save_intent(intent)
         try:
             self.broker.set_leverage(symbol, target)
+        except RequestNotSent as exc:
+            intent.update(status="aborted", last_error=str(exc))
+            self.store.save_intent(intent)
+            raise
         except TradingError as exc:
             intent["last_error"] = str(exc)
             self.store.save_intent(intent)
@@ -105,6 +136,12 @@ class Executor:
         return reason
 
     def reconcile(self, account, intent=None):
+        self.last_snapshot = None
+        self.last_completed_intent = None
+        with getattr(self.broker, "reconciliation_budget", nullcontext)():
+            return self._reconcile(account, intent)
+
+    def _reconcile(self, account, intent=None):
         intent = intent or self.store.intent(account["id"])
         if not intent:
             return "没有未完成批次"
@@ -209,7 +246,11 @@ class Executor:
             intent["status"] = "repair"
             self.store.save_intent(intent)
             self.store.event(account["id"], "repair", f"{intent['symbol']} 处理单腿差额：仅平掉本批多出的 {side} {wire(qty)}")
-            self.send(intent, [repair])
+            not_sent = self.send(intent, [repair], repair=True)
+            if not_sent is not None:
+                # Preserve the batch and let the scheduler honor retry_after.
+                # The next pass skips this known-absent order and can retry repair.
+                raise not_sent
             return self.reconcile(account, intent)
 
         added = any(net.values())
@@ -219,5 +260,16 @@ class Executor:
             self.store.complete_pair(intent, {"long_qty": wire(net["LONG"]), "short_qty": wire(net["SHORT"]), "notional": wire(total)})
         else:
             self.store.abort_pair(intent)
-            self.store.event(account["id"], "order", f"{intent['symbol']} 本批未形成新增双向仓位，订单已核对")
+            outcomes = []
+            for order in intent["orders"]:
+                row = intent["receipts"][order["newClientOrderId"]]
+                side = "多头" if order["positionSide"] == "LONG" else "空头"
+                outcome = "本地未发送" if row.get("local_not_sent") else row["status"]
+                code = row.get("reject_code")
+                outcomes.append(f"{side} {outcome}" + (f"（code={code}）" if isinstance(code, int) else ""))
+            self.store.event(account["id"], "order", f"{intent['symbol']} 本批未形成新增双向仓位，订单已核对：{'；'.join(outcomes)}")
+        # Reuse only the account read that verified every terminal receipt and
+        # the final retained holdings, never the snapshot before a repair.
+        self.last_snapshot = snapshot
+        self.last_completed_intent = dict(intent)
         return "双向批次已核对完成，多空数量差不超过 0.1%" if added else "本批未成交或已完成单腿补偿"

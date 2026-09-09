@@ -1,5 +1,6 @@
 """Aster V3 EIP-712 API adapter. No automatic retries of signed mutations."""
 import json
+from contextlib import contextmanager, nullcontext
 from fractions import Fraction
 import math
 import os
@@ -28,24 +29,86 @@ class AmbiguousOrder(ExchangeError):
     """The exchange might have accepted a mutation; query before deciding."""
 
 
+class RequestNotSent(ExchangeError):
+    """A local admission check failed before any HTTP request was sent."""
+
+
 class RateBudget:
-    def __init__(self):
+    def __init__(self, reconciliation_reserve=300):
+        if type(reconciliation_reserve) is not int or reconciliation_reserve < 0:
+            raise ExchangeError("订单核对保留额度无效")
         self.lock = threading.Lock()
         self.until, self.window, self.weight = 0.0, time.monotonic(), 0
         self.limit = 1800
+        self.reconciliation_reserve = reconciliation_reserve
+        self.priority = threading.local()
+
+    @contextmanager
+    def reconciliation(self):
+        """Let an existing intent finish without lending its quota to other threads."""
+        previous = getattr(self.priority, "reconciliation", False)
+        self.priority.reconciliation = True
+        try:
+            yield self
+        finally:
+            self.priority.reconciliation = previous
+
+    def _refresh(self, now):
+        if now - self.window >= 60:
+            self.window, self.weight = now, 0
+
+    def _ordinary_limit(self):
+        return self.limit - min(self.reconciliation_reserve, self.limit // 6)
+
+    def _require_available(self, weight, now):
+        self._refresh(now)
+        if now < self.until:
+            raise RequestNotSent("接口退避中", retry_after=self.until - now)
+        critical = getattr(self.priority, "reconciliation", False)
+        limit = self.limit if critical else self._ordinary_limit()
+        if self.weight + weight > limit:
+            message = "本地请求预算已用完" if critical else "本地普通请求预算不足，已为订单核对和补偿保留额度"
+            raise RequestNotSent(message, retry_after=max(0.0, 60 - (now - self.window)))
+
+    @staticmethod
+    def _validate_weight(weight):
+        if type(weight) is not int or weight <= 0:
+            raise RequestNotSent("接口请求权重无效")
+
+    def require_available(self, weight=200):
+        """Check admission without spending; each actual request still reserves atomically."""
+        self._validate_weight(weight)
+        with self.lock:
+            self._require_available(weight, time.monotonic())
 
     def reserve(self, weight):
-        if type(weight) is not int or weight <= 0:
-            raise ExchangeError("接口请求权重无效")
+        self._validate_weight(weight)
+        with self.lock:
+            self._require_available(weight, time.monotonic())
+            self.weight += weight
+
+    def observe(self, headers):
+        # V3 reports IP-wide use, including other processes/accounts. A lower or
+        # out-of-order response must never refund requests already reserved here.
+        reported = headers.get("X-MBX-USED-WEIGHT-1M")
+        if not isinstance(reported, str) or not re.fullmatch(r"[0-9]{1,12}", reported):
+            return
+        with self.lock:
+            self._refresh(time.monotonic())
+            self.weight = max(self.weight, int(reported))
+
+    def snapshot(self):
         with self.lock:
             now = time.monotonic()
-            if now < self.until:
-                raise ExchangeError("接口退避中", retry_after=self.until - now)
-            if now - self.window >= 60:
-                self.window, self.weight = now, 0
-            if self.weight + weight > self.limit:
-                raise ExchangeError("本地请求预算已用完", retry_after=60 - (now - self.window))
-            self.weight += weight
+            self._refresh(now)
+            ordinary_limit = self._ordinary_limit()
+            reset_after = max(0.0, 60 - (now - self.window))
+            retry_after = max(0.0, self.until - now,
+                              reset_after if self.weight >= ordinary_limit else 0.0)
+            return {"used": self.weight, "limit": self.limit, "ordinary_limit": ordinary_limit,
+                    "remaining": max(0, self.limit - self.weight),
+                    "ordinary_remaining": max(0, ordinary_limit - self.weight),
+                    "reset_after": reset_after, "retry_after": retry_after}
 
     def block(self, seconds):
         try:
@@ -101,6 +164,7 @@ class API:
         except httpx.HTTPError:
             error = AmbiguousOrder if is_write else ExchangeError
             raise error("请求结果未知，需核对订单" if is_write else "Aster 网络连接失败") from None
+        self.budget.observe(response.headers)
         if response.status_code in (429, 418):
             delay = 180 if response.status_code == 429 else 86400
             try:
@@ -118,6 +182,10 @@ class API:
         except ValueError:
             error = AmbiguousOrder if is_write else ExchangeError
             raise error("Aster 返回无法识别的响应") from None
+        if isinstance(data, list) and any(isinstance(row, dict) and row.get("code") in (-1003, -1015) for row in data):
+            # Batch responses may mix fills and rate-limit failures. Retain every
+            # receipt so the executor can reconcile/repair the successful leg.
+            self.budget.block(180)
         code = data.get("code") if isinstance(data, dict) else None
         if isinstance(code, int) and code < 0:
             if code in (-1003, -1015):
@@ -180,7 +248,7 @@ class MarketData:
     def book(self, symbol):
         # Fetch mark first so the executable BBO is as recent as possible.
         mark = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
-        row = self.api.call("GET", "/fapi/v3/ticker/bookTicker", {"symbol": symbol}, weight=2)
+        row = self.api.call("GET", "/fapi/v3/ticker/bookTicker", {"symbol": symbol}, weight=1)
         if not isinstance(row, dict) or not isinstance(mark, dict):
             raise TradingError("报价响应无效")
         if row.get("symbol") != symbol or mark.get("symbol") != symbol:
@@ -211,6 +279,10 @@ class LiveBroker:
         self.api = api or API(credentials)
         self.market = market
         self.cached, self.cached_at = {}, {}
+
+    def reconciliation_budget(self):
+        budget = getattr(self.api, "budget", None)
+        return budget.reconciliation() if budget is not None else nullcontext()
 
     def cached_call(self, key, path, params=None, ttl=300, weight=1):
         started = time.monotonic()
@@ -355,10 +427,12 @@ class LiveBroker:
         return self.api.call("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, signed=True, weight=5)
 
     def query(self, symbol, client_id):
-        return self.api.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
+        with self.reconciliation_budget():
+            return self.api.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
 
     def cancel(self, symbol, client_id):
-        return self.api.call("DELETE", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
+        with self.reconciliation_budget():
+            return self.api.call("DELETE", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
 
     def close(self):
         self.api.close()

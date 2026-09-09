@@ -3,7 +3,7 @@ import time
 import uuid
 
 from .exchange import ExchangeError
-from .models import AccountModeError, TradingError, dec, floor_step, positive, require_non_decreasing_leverage, wire
+from .models import AccountModeError, TradingError, dec, floor_step, hedge_balanced, positive, require_non_decreasing_leverage, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -15,6 +15,8 @@ class Executor:
     def open_pair(self, account, snapshot, symbol, plan, book):
         snapshot.require_modes(account["policy"]["symbols"])
         long, short = snapshot.pair(symbol)
+        if not hedge_balanced(long.qty, short.qty):
+            raise TradingError("已有多空数量差超过 0.1%，等待人工核对")
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
         token = uuid.uuid4().hex
@@ -72,6 +74,8 @@ class Executor:
         long, short = snapshot.require_ready(symbol)
         old = long.leverage
         require_non_decreasing_leverage(old, target)
+        if not hedge_balanced(long.qty, short.qty):
+            raise TradingError("已有多空数量差超过 0.1%，等待人工核对")
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
         if target == old:
@@ -167,14 +171,23 @@ class Executor:
         actual = {"LONG": long.qty, "SHORT": short.qty}
         if any(actual[s] != dec(intent["baseline"][s]) + net[s] or net[s] < 0 for s in actual):
             return self.attention(account, intent, "持仓变化与本批回执不一致，暂停并等待核对（可能有外部成交或 ADL）")
-        if net["LONG"] != net["SHORT"]:
+        if not hedge_balanced(long.qty, short.qty):
             if intent["repair_attempts"] >= 3:
                 return self.attention(account, intent, "单腿补偿尚未完成，已暂停新开仓；请核对并重试补偿")
-            side = "LONG" if net["LONG"] > net["SHORT"] else "SHORT"
+            side = "LONG" if long.qty > short.qty else "SHORT"
             book = self.market.book(intent["symbol"])
             book.require_fresh()
             rule = self.market.rules[intent["symbol"]]
-            qty = floor_step(min(abs(net["LONG"] - net["SHORT"]), book.bid_qty if side == "LONG" else book.ask_qty), rule.step)
+            # Bring total holdings back within tolerance without closing baseline holdings.
+            room = floor_step(min(abs(net["LONG"] - net["SHORT"]), net[side], rule.max_qty,
+                                  book.bid_qty if side == "LONG" else book.ask_qty), rule.step)
+            qty = floor_step(min(abs(long.qty - short.qty), room), rule.step)
+            other = "SHORT" if side == "LONG" else "LONG"
+            # Old holdings may predate today's step. Crossing equality by one step
+            # is allowed only when it restores tolerance and stays within this batch.
+            if not hedge_balanced(actual[side] - qty, actual[other]) and qty + rule.step <= room \
+                    and hedge_balanced(actual[side] - qty - rule.step, actual[other]):
+                qty += rule.step
             if qty <= 0:
                 return self.attention(account, intent, "盘口不足以补偿本批单腿，请核对持仓")
             repair = self.order(intent["symbol"], side, "SELL" if side == "LONG" else "BUY", qty,
@@ -187,13 +200,13 @@ class Executor:
             self.send(intent, [repair])
             return self.reconcile(account, intent)
 
-        qty = net["LONG"]
-        if qty:
-            # Completed notional refers to the matched portion, not repaired exposure.
-            total = sum(notionals[s] * qty / filled[s] for s in filled)
-            self.store.complete_pair(intent, {"qty": wire(qty), "notional": wire(total)})
+        added = any(net.values())
+        if added:
+            # Keep each side's retained fill; exclude quantities closed by repairs.
+            total = sum(notionals[s] * net[s] / filled[s] for s in filled if filled[s])
+            self.store.complete_pair(intent, {"long_qty": wire(net["LONG"]), "short_qty": wire(net["SHORT"]), "notional": wire(total)})
         else:
             intent["status"] = "aborted"
             self.store.save_intent(intent)
             self.store.event(account["id"], "order", f"{intent['symbol']} 本批未形成新增双向仓位，订单已核对")
-        return "双向批次已核对完成" if qty else "本批未成交或已完成单腿补偿"
+        return "双向批次已核对完成，多空数量差不超过 0.1%" if added else "本批未成交或已完成单腿补偿"

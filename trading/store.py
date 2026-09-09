@@ -123,7 +123,7 @@ class Store:
             campaign["last_fill_at"] = time.time()
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(campaign)))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (
-                intent["account_id"], "fill", f"{intent['symbol']} {intent['leverage']}x 本批双向成交完成，每边 {quantities['qty']}", time.time()))
+                intent["account_id"], "fill", f"{intent['symbol']} {intent['leverage']}x 本批成交已核对，多头增加 {quantities['long_qty']}，空头增加 {quantities['short_qty']}", time.time()))
 
     def finish_campaign(self, account, reason, ratio):
         from .models import dec
@@ -135,12 +135,15 @@ class Store:
             campaign = json.loads(row[0])
             totals = {}
             for batch in campaign["batches"]:
-                entry = totals.setdefault(batch["symbol"], {"qty": dec(0), "notional": dec(0), "leverage": batch["leverage"]})
-                entry["qty"] += dec(batch["quantities"]["qty"])
-                entry["notional"] += dec(batch["quantities"]["notional"])
+                entry = totals.setdefault(batch["symbol"], {"long_qty": dec(0), "short_qty": dec(0), "notional": dec(0), "leverage": batch["leverage"]})
+                quantities = batch["quantities"]
+                # Campaigns persisted by older versions have one matched quantity.
+                for side in ("long_qty", "short_qty"):
+                    entry[side] += dec(quantities.get(side, quantities.get("qty")))
+                entry["notional"] += dec(quantities["notional"])
                 entry["leverage"] = batch["leverage"]
             lines = [f"Aster 双向开仓完成{'（模拟）' if account['mode'] == 'paper' else ''}", f"账户：{account['name']}（{account['id']}）"]
-            lines.extend(f"{symbol} · {v['leverage']}x · 本轮每边增加 {v['qty']}，双边名义金额 {v['notional']:,.2f} USD1" for symbol, v in totals.items())
+            lines.extend(f"{symbol} · {v['leverage']}x · 本轮多头增加 {v['long_qty']}，空头增加 {v['short_qty']}，新增总名义金额 {v['notional']:,.2f} USD1" for symbol, v in totals.items())
             lines.extend([f"结束原因：{reason}", f"USD1 保证金占用率（总占用保证金 / 总权益）：{dec(ratio) * 100:.2f}%", f"批次数：{len(campaign['batches'])}"])
             message = "\n".join(lines)
             # Simulated trading must never send external completion messages.

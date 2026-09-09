@@ -5,6 +5,7 @@ import time
 
 
 ZERO = Decimal("0")
+HEDGE_TOLERANCE = Decimal("0.001")
 TIERS = (4, 5, 10, 20)
 SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
 
@@ -42,6 +43,12 @@ def floor_step(value, step):
 
 def wire(value):
     return format(dec(value), "f")
+
+
+def hedge_balanced(long_qty, short_qty):
+    """Allow at most 0.1% of the larger side, including the exact boundary."""
+    long_qty, short_qty = positive(long_qty, True), positive(short_qty, True)
+    return abs(long_qty - short_qty) <= max(long_qty, short_qty) * HEDGE_TOLERANCE
 
 
 @dataclass
@@ -223,8 +230,8 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
     if book.spread > dec(policy["spread_limit"]):
         return Plan(reason="BBO 价差超过万 5")
-    if long.qty != short.qty:
-        return Plan(reason="已有多空仓位不平衡，等待人工核对")
+    if not hedge_balanced(long.qty, short.qty):
+        return Plan(reason="已有多空数量差超过 0.1%，等待人工核对")
     leverage = long.leverage
     if positive(capacities.get(leverage), True) <= dec(policy["threshold"]):
         return Plan(reason=f"{leverage}x 额度未超过阈值")
@@ -239,22 +246,26 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     public_room = min(current_remaining, cap_room)
     high_price = max(book.ask, book.mark)
     loss_span = max(ZERO, book.ask - book.mark) + max(ZERO, book.mark - book.bid)
-    max_qty = floor_step(min(
-        dec(policy["order_notional"]) / high_price,
-        rules.max_qty, book.ask_qty, book.bid_qty,
-        public_room / (2 * high_price),
-        max(ZERO, snapshot.available) / (2 * high_price / leverage + (book.ask + book.bid) * fee + loss_span),
-    ), rules.step)
-    min_qty = max(rules.min_qty, rules.min_notional / book.bid)
     occupied = snapshot.occupied_margin
     current_pair_margin = long.occupied_margin + short.occupied_margin
     # Conservatively revalue the existing pair if the latest quote is higher.
     price_adjustment = max(ZERO, (long.qty + short.qty) * high_price / leverage - current_pair_margin)
+    # A tolerated net position can lose equity between the account and book reads.
+    existing_pnl_change = long.qty * (book.mark - long.mark) - short.qty * (book.mark - short.mark)
+    existing_loss = max(ZERO, -existing_pnl_change)
+    max_qty = floor_step(min(
+        dec(policy["order_notional"]) / high_price,
+        rules.max_qty, book.ask_qty, book.bid_qty,
+        public_room / (2 * high_price),
+        max(ZERO, snapshot.available - existing_loss - price_adjustment)
+        / (2 * high_price / leverage + (book.ask + book.bid) * fee + loss_span),
+    ), rules.step)
+    min_qty = max(rules.min_qty, rules.min_notional / book.bid)
 
     def projected(qty):
         # Charge the complete spread and both taker fees; no unrealized gain credit.
         cost = qty * loss_span + qty * (book.ask + book.bid) * fee
-        equity = snapshot.equity - cost
+        equity = snapshot.equity - existing_loss - cost
         total_occupied = occupied + price_adjustment + 2 * qty * high_price / leverage
         return total_occupied / equity if equity > 0 else Decimal("Infinity")
 
@@ -280,7 +291,7 @@ def require_non_decreasing_leverage(current, target):
 
 def next_leverage(snapshot, symbol, capacities, mark=None, threshold=ZERO):
     long, short = snapshot.pair(symbol)
-    if long.qty != short.qty:
+    if not hedge_balanced(long.qty, short.qty):
         return None
     gross = (long.qty + short.qty) * positive(mark) if mark is not None else long.notional + short.notional
     # Select the lowest usable higher tier; unavailable intermediate tiers do not block.

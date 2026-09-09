@@ -50,6 +50,8 @@ type Position = {
   entry: string;
   mark: string;
   leverage: number;
+  notional: string;
+  occupied_margin: string;
   unrealized: string;
   liquidation: string;
 };
@@ -73,6 +75,7 @@ type Account = {
   snapshot?: {
     equity: string;
     maintenance: string;
+    occupied_margin: string;
     available: string;
     wallet: string;
     unrealized: string;
@@ -441,16 +444,16 @@ export default function Home() {
           <>
             <section className="metrics">
               <Metric
-                label="USD1 全仓保证金余额"
+                label="USD1 账户总权益"
                 value={fmt(snapshot?.equity)}
-                sub="钱包余额 + 全仓未实现盈亏"
+                sub="全仓钱包余额 + 全仓未实现盈亏"
                 icon={<Wallet size={17} />}
               />
               <Metric
-                label="保证金比率"
+                label="保证金占用率"
                 value={snapshot ? pct(snapshot.ratio) : '—'}
-                sub="维持保证金 ÷ 全仓保证金余额"
-                accent={ratio >= 0.5 ? 'danger' : 'mint'}
+                sub="全部仓位占用保证金 ÷ 账户总权益"
+                accent={ratio > 0.5 ? 'danger' : 'mint'}
                 icon={<ShieldCheck size={17} />}
               />
               <Metric
@@ -588,6 +591,10 @@ export default function Home() {
                               <TableHead className="number">开仓均价</TableHead>
                               <TableHead className="number">标记价格</TableHead>
                               <TableHead className="number">杠杆</TableHead>
+                              <TableHead className="number">名义价值</TableHead>
+                              <TableHead className="number">
+                                占用保证金
+                              </TableHead>
                               <TableHead className="number">
                                 预估强平价
                               </TableHead>
@@ -623,6 +630,12 @@ export default function Home() {
                                 </TableCell>
                                 <TableCell className="number">
                                   {p.leverage}x
+                                </TableCell>
+                                <TableCell className="number">
+                                  {fmt(p.notional)}
+                                </TableCell>
+                                <TableCell className="number">
+                                  {fmt(p.occupied_margin)}
                                 </TableCell>
                                 <TableCell className="number">
                                   {Number(p.liquidation) > 0
@@ -682,15 +695,15 @@ export default function Home() {
                     <ShieldCheck className="mint" size={18} />
                   </div>
                   <div className="risk-value">
-                    <span className={ratio >= 0.5 ? 'danger' : ''}>
+                    <span className={ratio > 0.5 ? 'danger' : ''}>
                       {snapshot ? pct(snapshot.ratio) : '—'}
                     </span>
-                    <small>加仓后 &lt; 50%</small>
+                    <small>加仓后 ≤ 50%</small>
                   </div>
                   <div className="risk-track">
                     <Progress
                       value={Math.min(100, ratio * 100)}
-                      aria-label="当前保证金比率"
+                      aria-label="当前保证金占用率"
                     />
                     <i className="limit-marker" />
                   </div>
@@ -699,10 +712,13 @@ export default function Home() {
                     <span>50%</span>
                     <span>100%</span>
                   </div>
+                  <p className="muted">
+                    每仓占用 = |数量| × 标记价格 ÷ 实际杠杆；多空分别累加。
+                  </p>
                   <dl className="details">
                     <div>
-                      <dt>维持保证金</dt>
-                      <dd>{fmt(snapshot?.maintenance)}</dd>
+                      <dt>总占用保证金 · USD1</dt>
+                      <dd>{fmt(snapshot?.occupied_margin)}</dd>
                     </div>
                     <div>
                       <dt>全仓保证金模式</dt>
@@ -783,8 +799,8 @@ export default function Home() {
                     }
                   />
                   <Gate
-                    label="保证金比率 < 50%"
-                    pass={!!fresh && ratio < 0.5}
+                    label="保证金占用率 ≤ 50%"
+                    pass={!!fresh && ratio <= 0.5}
                     value={snapshot ? pct(snapshot.ratio) : '—'}
                   />
                   <div className="strategy-state">

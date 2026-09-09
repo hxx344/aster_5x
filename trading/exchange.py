@@ -244,6 +244,9 @@ class LiveBroker:
                 isolated=row["marginType"].lower() not in ("cross", "crossed")))
         # Never combine balances and positions from different fills.
         account_positions = {(r["symbol"], r["positionSide"]): r for r in account["positions"]}
+        represented = {(p.symbol, p.side) for p in positions}
+        if any(dec(row["positionAmt"]) and key not in represented for key, row in account_positions.items()):
+            raise TradingError("账户全部持仓尚未同步，无法计算总占用保证金")
         for p in positions:
             other = account_positions.get((p.symbol, p.side))
             if not other or abs(dec(other["positionAmt"])) != p.qty or int(other["leverage"]) != p.leverage:

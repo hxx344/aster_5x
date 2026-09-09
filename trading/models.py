@@ -96,6 +96,12 @@ class Position:
     def notional(self):
         return abs(self.qty) * self.mark
 
+    @property
+    def occupied_margin(self):
+        if type(self.leverage) is not int or not 1 <= self.leverage <= 125:
+            raise TradingError("计算占用保证金需要有效的实际杠杆")
+        return positive(self.notional, True) / self.leverage
+
 
 @dataclass
 class AccountSnapshot:
@@ -114,10 +120,15 @@ class AccountSnapshot:
     brackets: dict[str, list[dict]] = field(default_factory=dict)
 
     @property
+    def occupied_margin(self):
+        # Sum every position separately, including opposite sides and other markets.
+        return sum((p.occupied_margin for p in self.positions), ZERO)
+
+    @property
     def ratio(self):
         if self.equity <= 0:
-            raise TradingError("USD1 全仓保证金余额不足")
-        return self.maintenance / self.equity
+            raise TradingError("USD1 账户总权益不足")
+        return self.occupied_margin / self.equity
 
     def pair(self, symbol):
         rows = [p for p in self.positions if p.symbol == symbol]
@@ -204,12 +215,12 @@ class Plan:
 
 
 def plan_pair(snapshot, book, rules, capacities, policy, now=None):
-    """Size both legs against risk, cash, book depth, and both capacity tiers."""
+    """Size both legs against total occupied margin / equity, cash and capacity."""
     long, short = snapshot.require_ready(rules.symbol, now)
     book.require_fresh(now)
     limit = dec(policy["margin_limit"])
     if snapshot.ratio >= limit:
-        return Plan(reason="保证金比率已达到上限")
+        return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
     if book.spread > dec(policy["spread_limit"]):
         return Plan(reason="BBO 价差超过万 5")
     if long.qty != short.qty:
@@ -235,22 +246,22 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
         max(ZERO, snapshot.available) / (2 * high_price / leverage + (book.ask + book.bid) * fee + loss_span),
     ), rules.step)
     min_qty = max(rules.min_qty, rules.min_notional / book.bid)
-    existing_mm = maintenance_for(long.qty * book.mark, brackets) + maintenance_for(short.qty * book.mark, brackets)
+    occupied = snapshot.occupied_margin
+    current_pair_margin = long.occupied_margin + short.occupied_margin
+    # Conservatively revalue the existing pair if the latest quote is higher.
+    price_adjustment = max(ZERO, (long.qty + short.qty) * high_price / leverage - current_pair_margin)
 
     def projected(qty):
         # Charge the complete spread and both taker fees; no unrealized gain credit.
         cost = qty * loss_span + qty * (book.ask + book.bid) * fee
         equity = snapshot.equity - cost
-        mm = (maintenance_for((long.qty + qty) * high_price, brackets)
-              + maintenance_for((short.qty + qty) * high_price, brackets))
-        # Conservatively add gross marginal maintenance to the exchange's current total.
-        total_mm = snapshot.maintenance + max(ZERO, mm - existing_mm)
-        return total_mm / equity if equity > 0 else Decimal("Infinity")
+        total_occupied = occupied + price_adjustment + 2 * qty * high_price / leverage
+        return total_occupied / equity if equity > 0 else Decimal("Infinity")
 
     low, high = 0, int(max_qty / rules.step)
     while low < high:
         mid = (low + high + 1) // 2
-        if projected(mid * rules.step) < limit:
+        if projected(mid * rules.step) <= limit:
             low = mid
         else:
             high = mid - 1

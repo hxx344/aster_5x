@@ -78,8 +78,20 @@ class ExchangeTests(unittest.TestCase):
         snapshot = broker.snapshot(["XAUUSD1"])
         self.assertEqual(snapshot.equity, 200)
         self.assertEqual(snapshot.maintenance, 13)
-        self.assertEqual(snapshot.ratio, dec(".065"))
+        self.assertEqual(snapshot.occupied_margin, 0)
+        self.assertEqual(snapshot.ratio, 0)
         self.assertEqual(snapshot.available, 123)
+        extra = {**positions[0], "symbol": "SPCXUSD1", "positionAmt": "1", "leverage": "10", "isolated": False}
+        account_positions.append(extra)
+        with self.assertRaisesRegex(TradingError, "全部持仓尚未同步"):
+            broker.snapshot(["XAUUSD1"])
+        positions.append({**extra, "positionAmt": "0"})
+        with self.assertRaisesRegex(TradingError, "全部持仓尚未同步"):
+            broker.snapshot(["XAUUSD1"])
+        positions[-1]["positionAmt"] = "1"
+        self.assertEqual(broker.snapshot(["XAUUSD1"]).occupied_margin, 10)
+        positions.pop()
+        account_positions.pop()
         account_positions[0]["isolated"] = True
         with self.assertRaisesRegex(TradingError, "保证金模式尚未同步"):
             broker.snapshot(["XAUUSD1"])

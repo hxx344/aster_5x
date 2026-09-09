@@ -114,6 +114,8 @@ class Store:
             intent["status"] = "complete"
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
             db.execute("DELETE FROM kv WHERE key=?", (f"open_after_leverage:{intent['account_id']}:{intent['symbol']}",))
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("post_fill_check:" + intent["account_id"], dumps(True)))
             key = "campaign:" + intent["account_id"]
             row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
             campaign = json.loads(row[0]) if row else {"id": intent["id"], "batches": [], "started_at": time.time()}
@@ -139,7 +141,7 @@ class Store:
                 entry["leverage"] = batch["leverage"]
             lines = [f"Aster 双向开仓完成{'（模拟）' if account['mode'] == 'paper' else ''}", f"账户：{account['name']}（{account['id']}）"]
             lines.extend(f"{symbol} · {v['leverage']}x · 本轮每边增加 {v['qty']}，双边名义金额 {v['notional']:,.2f} USD1" for symbol, v in totals.items())
-            lines.extend([f"结束原因：{reason}", f"USD1 全仓保证金比率：{dec(ratio) * 100:.2f}%", f"批次数：{len(campaign['batches'])}"])
+            lines.extend([f"结束原因：{reason}", f"USD1 保证金占用率（总占用保证金 / 总权益）：{dec(ratio) * 100:.2f}%", f"批次数：{len(campaign['batches'])}"])
             message = "\n".join(lines)
             # Simulated trading must never send external completion messages.
             if account["mode"] == "live":

@@ -43,14 +43,18 @@ class RiskTests(unittest.TestCase):
         self.assertEqual(self.plan(book=replace(at_limit, ask=dec("100.026"))).qty, 0)
 
     def test_risk_at_fifty_percent_blocks(self):
-        snapshot = replace(self.snapshot, maintenance=self.snapshot.equity / 2)
-        self.assertEqual(self.plan(snapshot=snapshot).qty, 0)
+        for p in self.snapshot.pair("XAUUSD1"):
+            p.qty, p.mark = dec(25), dec(1000)
+        self.assertEqual(self.snapshot.ratio, dec("0.5"))
+        self.assertEqual(self.plan().qty, 0)
 
-    def test_sizing_shrinks_and_stays_strictly_below_limit(self):
-        snapshot = replace(self.snapshot, equity=dec(1000), wallet=dec(1000), available=dec(1000), maintenance=dec("499"))
+    def test_sizing_shrinks_and_stays_within_occupancy_limit(self):
+        snapshot = replace(self.snapshot, equity=dec(1000), wallet=dec(1000), available=dec(1000))
+        other = snapshot.pair("SPCXUSD1")[0]
+        other.qty, other.mark, other.leverage = dec("4.9"), dec(100), 1
         plan = self.plan(snapshot=snapshot)
         self.assertGreater(plan.qty, 0)
-        self.assertLess(plan.projected_ratio, dec("0.5"))
+        self.assertLessEqual(plan.projected_ratio, dec("0.5"))
         self.assertLess(plan.qty * self.book.ask, dec(1000))
         self.assertEqual(plan.qty % self.rules.step, 0)
 
@@ -98,7 +102,7 @@ class RiskTests(unittest.TestCase):
 
     def test_no_credit_for_one_leg_unrealized_gain_during_execution(self):
         far_mark = replace(self.book, mark=self.book.ask + dec(1000))
-        tight = replace(self.snapshot, equity=dec(1000), maintenance=dec(480), available=dec(1000))
+        tight = replace(self.snapshot, equity=dec(1000), available=dec(1000))
         normal = self.plan(snapshot=tight)
         conservative = self.plan(snapshot=tight, book=far_mark)
         self.assertLessEqual(conservative.qty, normal.qty)

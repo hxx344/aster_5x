@@ -110,6 +110,7 @@ class ExecutionTests(unittest.TestCase):
         pending = self.f.store.due_notifications()
         self.assertEqual(len(pending), 1)
         self.assertIn("双向开仓完成", pending[0]["message"])
+        self.assertIn("保证金占用率（总占用保证金 / 总权益）", pending[0]["message"])
         self.f.store.notification_result(pending[0], False)
         self.assertEqual(self.f.store.pending_notifications(), 1)
         self.assertEqual(self.f.store.due_notifications(), [])

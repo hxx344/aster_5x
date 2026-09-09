@@ -46,6 +46,9 @@ def snapshot_json(snapshot, symbols):
     result.pop("brackets", None)
     result.pop("fees", None)
     result["ratio"] = snapshot.ratio if snapshot.equity > 0 else None
+    result["occupied_margin"] = snapshot.occupied_margin
+    result["positions"] = [{**row, "notional": p.notional, "occupied_margin": p.occupied_margin}
+                           for row, p in zip(result["positions"], snapshot.positions)]
     result["mode_checks"] = snapshot.mode_checks(symbols)
     return json.loads(dumps(result))
 
@@ -135,6 +138,20 @@ class Engine:
         capacities = {int(k): dec(v) for k, v in row["capacities"].items()}
         return capacities
 
+    def check_post_fill_occupancy(self, account, snapshot):
+        snapshot.require_modes(account["policy"]["symbols"])
+        over_limit = snapshot.ratio > dec(account["policy"]["margin_limit"])
+        if over_limit:
+            account["enabled"] = False
+            self.store.save_account(account)
+            message = "成交后保证金占用率超过上限，已暂停新加仓"
+            self.view(account["id"], status="attention", reason=message)
+            self.store.event(account["id"], "error", message)
+            self.store.finish_campaign(account, "保证金占用上限触发，暂停加仓", snapshot.ratio)
+        # Only clear the durable check after any required pause has been saved.
+        self.store.put("post_fill_check:" + account["id"], None)
+        return over_limit
+
     def tick_account(self, account_id):
         with self.account_lock(account_id):
             account = self.store.account(account_id)
@@ -145,6 +162,8 @@ class Engine:
                 snapshot = broker.snapshot(account["policy"]["symbols"])
                 self.view(account_id, snapshot=snapshot_json(snapshot, account["policy"]["symbols"]), credential_ready=True)
                 snapshot.require_modes(account["policy"]["symbols"])
+                if self.store.get("post_fill_check:" + account_id) and self.check_post_fill_occupancy(account, snapshot):
+                    return 5
                 self.view(account_id, status="running" if account["enabled"] else "paused",
                           reason="策略运行中" if account["enabled"] else "策略已暂停")
                 executor = Executor(self.store, broker, self.market)
@@ -158,6 +177,10 @@ class Engine:
                         status, reason = "attention", "服务器未启用实盘执行，保留未完成批次等待核对"
                     self.view(account_id, status=status, reason=reason)
                     self.strategy(account_id, pending["symbol"], reason, status)
+                    if pending["kind"] == "pair" and not self.store.intent(account_id):
+                        after = broker.snapshot(account["policy"]["symbols"])
+                        self.view(account_id, snapshot=snapshot_json(after, account["policy"]["symbols"]))
+                        self.check_post_fill_occupancy(account, after)
                     return 5
                 if not account["enabled"] or self.shutdown.is_set():
                     for symbol in account["policy"]["symbols"]:
@@ -212,12 +235,7 @@ class Engine:
                             self.view(account_id, snapshot=snapshot_json(after, markets), reason=reason, status=phase if unresolved else "running")
                             after.require_modes(markets)
                             self.strategy(account_id, symbol, reason, phase)
-                            if after.ratio >= dec(policy["margin_limit"]):
-                                account["enabled"] = False
-                                self.store.save_account(account)
-                                self.view(account_id, status="attention", reason="成交后保证金比率达到上限，已暂停新加仓")
-                                self.store.event(account_id, "error", "成交后保证金比率达到上限，已暂停新加仓")
-                                self.store.finish_campaign(account, "风险上限触发，暂停加仓", after.ratio)
+                            self.check_post_fill_occupancy(account, after)
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
                             return 5
                     except (TradingError, KeyError, ValueError, TypeError) as exc:
@@ -294,8 +312,8 @@ class Engine:
                 snapshot = self.broker(account).snapshot(account["policy"]["symbols"], fresh_modes=True)
                 for symbol in account["policy"]["symbols"]:
                     snapshot.require_ready(symbol)
-                if snapshot.ratio >= dec(account["policy"]["margin_limit"]):
-                    raise TradingError("保证金比率已达到上限")
+                # High existing occupancy blocks additions in plan_pair, while an
+                # authorized increase in leverage can release margin before adding.
             account["enabled"] = enabled
             self.store.save_account(account)
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")

@@ -3,6 +3,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from trading.exchange import ExchangeError
 from trading.execution import Executor
 from trading.models import Plan, TradingError, dec, plan_pair, wire
 from trading.paper import PaperBroker
@@ -120,7 +121,8 @@ class ExecutionHardeningTests(unittest.TestCase):
         intent = self.f.store.intent("test")
         intent["created_at"] = time.time() - 130
         self.f.store.save_intent(intent)
-        with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not resend entry")):
+        with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not resend entry")), \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError("exchange order not yet visible", code=-2013)):
             self.executor.reconcile(self.f.account)
         self.assertEqual(self.f.store.intent("test")["status"], "attention")
         self.assertFalse(self.f.store.account("test")["enabled"])

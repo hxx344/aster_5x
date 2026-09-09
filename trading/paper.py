@@ -3,10 +3,14 @@ from dataclasses import asdict
 import time
 
 from .exchange import ExchangeError
-from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, wire
+from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, TradingError, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, wire
 
 
 PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
+
+
+class PaperOrderAbsent(ExchangeError):
+    """A successful ledger read confirms no simulated fill was committed."""
 
 
 class DemoMarket:
@@ -117,8 +121,18 @@ class PaperBroker:
 
     def query(self, symbol, client_id):
         if client_id not in self.state["orders"]:
-            raise ExchangeError("模拟订单不存在", code=-2013)
+            # A commit may have succeeded before its acknowledgement failed.
+            # Only the durable ledger can prove a simulated order was absent.
+            self.reload()
+        if client_id not in self.state["orders"]:
+            raise PaperOrderAbsent("模拟订单未写入账本", code=-2013)
         return self.state["orders"][client_id]
+
+    def reload(self):
+        state = self.store.get("paper:" + self.account_id)
+        if state is None:
+            raise TradingError("模拟账户账本不存在，无法确认执行结果")
+        self.state = state
 
     def cancel(self, symbol, client_id):
         return self.query(symbol, client_id)

@@ -32,7 +32,8 @@ export function createStatePoller<T>({
     resume() {
       paused = false;
     },
-    async refresh() {
+    async refresh({ resume = false }: { resume?: boolean } = {}) {
+      if (resume) paused = false;
       if (paused || active) return;
       const controller = new AbortController();
       active = controller;

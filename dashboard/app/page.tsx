@@ -314,7 +314,9 @@ export default function Home() {
             size="icon"
             aria-label="刷新数据"
             disabled={busy}
-            onClick={() => void refresh()}
+            onClick={() => {
+              if (!operationPending.current) void poller.refresh({ resume: true });
+            }}
           >
             <RefreshCw size={17} />
           </Button>

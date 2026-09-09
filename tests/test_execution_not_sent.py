@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from trading.exchange import AmbiguousOrder, RequestNotSent
+from trading.exchange import AmbiguousOrder, ExchangeError, RequestNotSent
 from trading.execution import Executor
 from trading.models import Plan, dec
 from trading.paper import PaperBroker
@@ -46,7 +46,8 @@ class ExecutionNotSentTests(unittest.TestCase):
         self.assertNotIn("private", str(completed) + message)
 
     def test_unknown_network_result_still_preserves_intent_and_does_not_mark_local_rejection(self):
-        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("network response lost")) as submit:
+        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("network response lost")) as submit, \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError("exchange order not yet visible", code=-2013)):
             self.open()
             self.executor.reconcile(self.f.account)
         submit.assert_called_once()
@@ -57,7 +58,8 @@ class ExecutionNotSentTests(unittest.TestCase):
         self.assertIsNone(self.executor.last_completed_intent)
 
     def test_exchange_ambiguous_batch_rows_remain_unresolved(self):
-        with patch.object(self.f.broker, "submit", return_value=[{"code": -1006}, {"code": -1007}]):
+        with patch.object(self.f.broker, "submit", return_value=[{"code": -1006}, {"code": -1007}]), \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError("exchange order not yet visible", code=-2013)):
             self.open()
         self.assertEqual(self.f.store.intent("test")["receipts"], {})
         self.assertIsNone(self.executor.last_completed_intent)

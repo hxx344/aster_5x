@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from trading.exchange import AmbiguousOrder
+from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.execution import Executor
 from trading.models import Plan, TradingError, dec
 from .helpers import Fixture
@@ -89,7 +89,8 @@ class ReconciliationSnapshotTests(unittest.TestCase):
     def test_unknown_receipt_or_failed_persistence_never_publishes_snapshot(self):
         prior = self.f.broker.snapshot([self.symbol])
         self.executor.last_snapshot = prior
-        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("response lost")):
+        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("response lost")), \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError("exchange order not yet visible", code=-2013)):
             self.open()
         self.assertIsNone(self.executor.last_snapshot)
         intent = self.f.store.intent("test")

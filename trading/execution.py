@@ -6,6 +6,7 @@ from fractions import Fraction
 
 from .exchange import ExchangeError, LiveBroker, RequestNotSent
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
+from .paper import PaperBroker, PaperOrderAbsent
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -154,6 +155,8 @@ class Executor:
         if intent["kind"] == "leverage":
             if intent["target"] < intent["previous"]:
                 return self.attention(account, intent, "发现旧降杠杆批次，全局禁止继续执行；请核对实际杠杆")
+            if isinstance(self.broker, PaperBroker):
+                self.broker.reload()
             snapshot = self.broker.snapshot(account["policy"]["symbols"])
             snapshot.require_fresh()
             try:
@@ -165,6 +168,13 @@ class Executor:
                 self.store.complete_leverage(intent, long.leverage)
                 self.store.event(account["id"], "leverage", f"{intent['symbol']} 已核实实际杠杆 {long.leverage}x（目标 {intent['target']}x）；按实际档位准备开仓，禁止降档")
                 return "杠杆调整已确认"
+            if isinstance(self.broker, PaperBroker) and long.leverage == short.leverage == intent["previous"]:
+                # Paper mutations commit synchronously under the account lock;
+                # unchanged durable leverage cannot become effective later.
+                reason = "模拟杠杆调整未写入账本，已结束本次调整，等待重新检查"
+                intent.update(status="aborted", last_error=reason)
+                self.store.save_intent(intent)
+                return reason
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "杠杆变更尚未确认，请核对账户后重新检查")
             return "等待账户确认目标杠杆"
@@ -189,8 +199,16 @@ class Executor:
                     if time.time() - intent["created_at"] > 10:
                         self.broker.cancel(intent["symbol"], cid)
             except ExchangeError as exc:
-                unresolved.append(cid)
-                intent["last_error"] = str(exc)
+                if isinstance(self.broker, PaperBroker) and isinstance(exc, PaperOrderAbsent):
+                    intent["receipts"][cid] = {**order, "clientOrderId": cid, "status": "REJECTED",
+                                               "executedQty": "0", "avgPrice": "0", "paper_not_committed": True}
+                    if order in intent["repairs"]:
+                        # Save the refund and terminal receipt together below.
+                        # A retry may already have reset the attempt counter.
+                        intent["repair_attempts"] = max(0, intent["repair_attempts"] - 1)
+                else:
+                    unresolved.append(cid)
+                    intent["last_error"] = str(exc)
             except TradingError as exc:
                 return self.attention(account, intent, str(exc))
         self.store.save_intent(intent)

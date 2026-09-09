@@ -1,4 +1,5 @@
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 import unittest
 from unittest.mock import Mock, patch
@@ -127,8 +128,12 @@ class LeverageRulesTests(unittest.TestCase):
 
     def test_unconfirmed_upgrade_never_opens_or_resubmits(self):
         self.position(1, "1")
-        with patch.object(self.f.broker, "set_leverage", return_value={}) as change, \
-             patch.object(self.f.broker, "submit", side_effect=AssertionError("must wait for confirmation")):
+        broker = LiveBroker({}, self.f.market, api=Mock())
+        broker.api.budget.reconciliation.return_value = nullcontext()
+        self.engine.brokers["test"] = broker
+        with patch.object(broker, "snapshot", side_effect=self.f.broker.snapshot), \
+             patch.object(broker, "set_leverage", return_value={}) as change, \
+             patch.object(broker, "submit", side_effect=AssertionError("must wait for confirmation")):
             self.engine.tick_account("test")
             self.engine.tick_account("test")
             self.engine.tick_account("test")

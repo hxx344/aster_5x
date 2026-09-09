@@ -48,6 +48,8 @@ if [[ -f /etc/systemd/system/aster-desk.service ]]; then
 fi
 cleanup() {
   result=$?
+  # Once rollback starts, repeated termination signals must not leave it half-done.
+  trap '' HUP INT TERM
   if [[ $result -ne 0 ]]; then
     printf '[upgrade] Failed during %s after %ss (total %ss).\n' "$step_name" "$((SECONDS - step_started))" "$((SECONDS - started))" >&2
   fi

@@ -141,12 +141,23 @@ esac''')
         self.executable(self.commands / "systemctl", '''printf '%s\\n' "$*" >> "$HARNESS_BASE/service-calls"
 case "$1" in
 is-active) [[ $(cat "$HARNESS_BASE/service-state") == active ]] ;;
-stop) printf stopped > "$HARNESS_BASE/service-state" ;;
+stop)
+  printf stopped > "$HARNESS_BASE/service-state"
+  if [[ -f "$HARNESS_BASE/rollback-pending" ]]; then
+    rm "$HARNESS_BASE/rollback-pending"
+    for signal in HUP INT TERM; do
+      if [[ -f "$HARNESS_BASE/rollback-signal-$signal" ]]; then kill -"$signal" "$PPID"; fi
+    done
+  fi
+  ;;
 start|enable)
   printf active > "$HARNESS_BASE/service-state"
   if [[ $1 == enable ]]; then
     for signal in HUP INT TERM; do
-      if [[ -f "$HARNESS_BASE/fail-signal-$signal" ]]; then kill -"$signal" "$PPID"; fi
+      if [[ -f "$HARNESS_BASE/fail-signal-$signal" ]]; then
+        touch "$HARNESS_BASE/rollback-pending"
+        kill -"$signal" "$PPID"
+      fi
     done
   fi
   ;;
@@ -317,6 +328,23 @@ class TradingInstallerTests(unittest.TestCase):
                 self.assertEqual(self.h.unit.read_text(), "old unit")
                 self.assertEqual((self.h.base / "service-state").read_text(), "active")
                 self.assertNotIn("disable --now aster-5x", (self.h.base / "service-calls").read_text())
+
+    def test_additional_signal_during_rollback_preserves_service_and_original_exit_status(self):
+        for initial, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):
+            for additional in ("HUP", "INT", "TERM"):
+                with self.subTest(initial=initial, additional=additional):
+                    harness = InstallerHarness(self)
+                    marker = harness.base / ("rollback-signal-" + additional)
+                    marker.touch()
+                    try:
+                        result = harness.run(fail="signal-" + initial)
+                    finally:
+                        marker.unlink()
+                    self.assertEqual(result.returncode, status)
+                    self.assertEqual(harness.current, harness.old)
+                    self.assertEqual(harness.unit.read_text(), "old unit")
+                    self.assertEqual((harness.base / "service-state").read_text(), "active")
+                    self.assertNotIn("disable --now aster-5x", (harness.base / "service-calls").read_text())
 
     def test_failed_health_after_dependency_upgrade_preserves_previous_runtime(self):
         previous = self.h.success()

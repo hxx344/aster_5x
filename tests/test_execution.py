@@ -39,7 +39,8 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(len(self.f.store.get("campaign:test")["batches"]), 1)
 
     def test_unknown_order_keeps_durable_intent_and_never_retries_entry(self):
-        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("test timeout")) as send:
+        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("test timeout")) as send, \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError("exchange order not yet visible", code=-2013)):
             self.open()
             pending = self.f.store.intent("test")
             pending["created_at"] = time.time() - 130

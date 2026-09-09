@@ -85,6 +85,42 @@ test('unauthorized response suspends polling until a new login', async (t) => {
   assert.deepEqual(f.states, [{ accounts: [] }]);
 });
 
+test('explicit refresh checks a session restored in another tab and resumes polling', async (t) => {
+  const f = fixture(t);
+  const expired = f.poller.refresh();
+  f.calls[0].resolve(new Response(null, { status: 401 }));
+  await expired;
+  await f.poller.refresh();
+  assert.equal(f.calls.length, 1);
+
+  // A different tab has renewed the shared cookie; this tab requests a refresh.
+  const manual = f.poller.refresh({ resume: true });
+  assert.equal(f.calls.length, 2);
+  f.calls[1].resolve(Response.json({ session: 'renewed' }));
+  await manual;
+  const next = f.poller.refresh();
+  assert.equal(f.calls.length, 3);
+  f.calls[2].resolve(Response.json({ session: 'renewed', updated: true }));
+  await next;
+  assert.deepEqual(f.states, [
+    { session: 'renewed' },
+    { session: 'renewed', updated: true },
+  ]);
+});
+
+test('an explicit refresh that is still unauthorized pauses again', async (t) => {
+  const f = fixture(t);
+  f.poller.pause();
+  const manual = f.poller.refresh({ resume: true });
+  assert.equal(f.calls.length, 1);
+  f.calls[0].resolve(new Response(null, { status: 401 }));
+  await manual;
+  await f.poller.refresh();
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.states, []);
+  assert.deepEqual(f.unauthorized, [true]);
+});
+
 test('timeout releases polling and ignores even an uncancellable late response', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const f = fixture(t);

@@ -72,6 +72,11 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
+# Bash does not run an EXIT trap when an unhandled signal terminates it.
+# Route interrupted upgrades through the same rollback as a failed command.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 step 'Download source'
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)
 if [[ -f $source_dir/trading/server.py && -f $source_dir/dashboard/package-lock.json ]]; then

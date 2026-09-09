@@ -165,7 +165,10 @@ class RateBudget:
                     self.deadline = now + 61 - stamp % 60
                     self.window = self.deadline - 60
             self.reported_weight = max(self.reported_weight or 0, int(reported))
-            self.weight = max(self.weight, self.reported_weight + sum(self.inflight.values()))
+            # A response may have been generated before an unreported request
+            # reached Aster. Its counter cannot acknowledge that request merely
+            # because our timeout (or headerless response) arrived first.
+            self.weight = max(self.weight, self.reported_weight + self._carry(now))
 
     def snapshot(self):
         with self.lock:

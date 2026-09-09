@@ -142,7 +142,14 @@ esac''')
 case "$1" in
 is-active) [[ $(cat "$HARNESS_BASE/service-state") == active ]] ;;
 stop) printf stopped > "$HARNESS_BASE/service-state" ;;
-start|enable) printf active > "$HARNESS_BASE/service-state" ;;
+start|enable)
+  printf active > "$HARNESS_BASE/service-state"
+  if [[ $1 == enable ]]; then
+    for signal in HUP INT TERM; do
+      if [[ -f "$HARNESS_BASE/fail-signal-$signal" ]]; then kill -"$signal" "$PPID"; fi
+    done
+  fi
+  ;;
 list-unit-files) printf 'aster-5x.service enabled\\n' ;;
 esac''')
 
@@ -300,6 +307,16 @@ class TradingInstallerTests(unittest.TestCase):
         self.assertEqual(self.h.unit.read_text(), "old unit")
         self.assertEqual((self.h.base / "service-state").read_text(), "active")
         self.assertNotIn("disable --now aster-5x", (self.h.base / "service-calls").read_text())
+
+    def test_termination_during_switch_restores_previous_service(self):
+        for signal, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):
+            with self.subTest(signal=signal):
+                result = self.h.run(fail="signal-" + signal)
+                self.assertEqual(self.h.current, self.h.old)
+                self.assertEqual(result.returncode, status)
+                self.assertEqual(self.h.unit.read_text(), "old unit")
+                self.assertEqual((self.h.base / "service-state").read_text(), "active")
+                self.assertNotIn("disable --now aster-5x", (self.h.base / "service-calls").read_text())
 
     def test_failed_health_after_dependency_upgrade_preserves_previous_runtime(self):
         previous = self.h.success()

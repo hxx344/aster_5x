@@ -85,8 +85,8 @@ class RequestBudgetTests(unittest.TestCase):
         budget.observe(httpx.Headers({"x-mbx-used-weight-1m": "1400"}))
         budget.reserve(5)
         budget.observe(httpx.Headers({"X-MBX-USED-WEIGHT-1M": "1399"}))
-        self.assertEqual(budget.weight, 1405)
-        self.assertEqual(budget.snapshot()["ordinary_remaining"], 95)
+        self.assertEqual(budget.weight, 1415)
+        self.assertEqual(budget.snapshot()["ordinary_remaining"], 85)
         with self.assertRaises(RequestNotSent):
             budget.require_available(100)
 

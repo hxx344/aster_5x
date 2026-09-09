@@ -94,6 +94,35 @@ class AlignedBudgetTests(unittest.TestCase):
         self.now = 166
         self.assertEqual(self.budget.snapshot()["used"], 0)
 
+    def test_late_counter_cannot_acknowledge_unreported_requests(self):
+        for completion in ("timeout", "headerless", "public"):
+            with self.subTest(completion=completion):
+                self.budget = RateBudget()
+                # The counter request reaches Aster before the 40-weight request,
+                # but its response is delivered after that request's local end.
+                report = self.budget.reserve(1, track=True)
+                unknown = self.budget.reserve(40, track=completion != "public")
+                if completion == "timeout":
+                    self.budget.finish(unknown)
+                elif completion == "headerless":
+                    self.budget.observe({}, ticket=unknown)
+                self.budget.observe(self.headers(55, 1470), ticket=report)
+                self.assertEqual(self.budget.weight, 1510)
+                self.assertEqual(self.budget.snapshot()["aster_ip_used"], 1470)
+                with self.assertRaises(BudgetWait):
+                    self.budget.reserve(1)
+
+    def test_new_minute_counter_keeps_unreported_weight_on_top_of_shared_ip_use(self):
+        self.first_report(100)
+        self.now = 104.9
+        self.budget.reserve(40)
+        report = self.budget.reserve(1, track=True)
+        self.now = 105
+        self.budget.observe(self.headers(60, 1470), ticket=report)
+        self.assertEqual(self.budget.weight, 1510)
+        with self.assertRaises(BudgetWait):
+            self.budget.reserve(1)
+
     def test_invalid_or_untrusted_date_keeps_the_fallback_window(self):
         for date in (None, "invalid", formatdate(self.epoch - 1000, usegmt=True)):
             with self.subTest(date=date):

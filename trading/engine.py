@@ -224,12 +224,14 @@ class Engine:
             with self.lock:
                 for view in self.views.values():
                     tiers.update(p["leverage"] for p in view.get("snapshot", {}).get("positions", []) if p["symbol"] == symbol)
+            # Network and BBO latency are part of the capacity snapshot's age.
+            checked_at = time.time()
             capacities = self.market.capacities(symbol, tiers)
             capacity_observed = True
-            self.observe_capacity_alerts(symbol, capacities, time.time())
+            self.observe_capacity_alerts(symbol, capacities, checked_at)
             book = self.market.book(symbol)
             row = {"status": "ok", "capacities": {str(k): wire(v) for k, v in capacities.items()},
-                   "checked_at": time.time(), "book": {**asdict(book), "spread": book.spread}}
+                   "checked_at": checked_at, "book": {**asdict(book), "spread": book.spread}}
             with self.lock:
                 self.markets[symbol] = json.loads(dumps(row))
             return 5
@@ -244,7 +246,7 @@ class Engine:
     def capacities(self, symbol):
         with self.lock:
             row = self.markets.get(symbol, {}).copy()
-        if row.get("status") != "ok" or time.time() - row.get("checked_at", 0) > 8:
+        if row.get("status") != "ok" or not -1 <= time.time() - row.get("checked_at", 0) <= 8:
             raise TradingError("市场额度快照过期或查询失败")
         capacities = {int(k): dec(v) for k, v in row["capacities"].items()}
         return capacities

@@ -297,8 +297,11 @@ class MarketMonitor:
             self.failures = 0
         except (MonitorError, KeyError, TypeError, ValueError) as exc:
             self.failures += 1
-            retry_after = getattr(exc, "retry_after", 0)
-            delay = max(min(300, config["poll_seconds"] * 2 ** min(self.failures, 6)), retry_after)
+            failure_retry = getattr(exc, "retry_after", 0)
+            # Only a failed market sample can throttle all Aster queries.
+            # Feishu backoff still delays this tier's delivery retry.
+            retry_after = failure_retry if exc is result else 0
+            delay = max(min(300, config["poll_seconds"] * 2 ** min(self.failures, 6)), failure_retry)
             status.update(status="error", error=str(exc) if isinstance(exc, MonitorError) else "Unexpected response format",
                           failed_at=now_iso(), retry_seconds=delay, above_threshold=None)
             LOG.error("%s %sx check failed: %s; retry in %ss", self.symbol, config["leverage"], status["error"], delay)

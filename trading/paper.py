@@ -44,6 +44,7 @@ class PaperBroker:
         self.state = state
 
     def snapshot(self, symbols, fresh_modes=False):
+        started = time.time()
         positions, maintenance, initial, pnl = [], dec(0), dec(0), dec(0)
         for symbol in SYMBOLS:
             book = self.market.book(symbol)
@@ -59,12 +60,13 @@ class PaperBroker:
                 positions.append(Position(symbol, side, qty, entry, book.mark, leverage, profit, maintenance=mm))
         wallet = dec(self.state["wallet"])
         return AccountSnapshot(wallet + pnl, maintenance, wallet + pnl - initial, wallet, pnl, positions, [], True, False, True,
-            time.time(), dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), {s: PAPER_BRACKETS for s in symbols})
+            started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), {s: PAPER_BRACKETS for s in symbols})
 
     def set_leverage(self, symbol, leverage):
         require_non_decreasing_leverage(self.state["leverages"][symbol], leverage)
-        self.state["leverages"][symbol] = leverage
-        self.save()
+        state = {**self.state, "leverages": {**self.state["leverages"], symbol: leverage}}
+        self.store.put("paper:" + self.account_id, state)
+        self.state = state
         return {"symbol": symbol, "leverage": leverage}
 
     def submit(self, orders):
@@ -87,24 +89,30 @@ class PaperBroker:
                 limit = dec(order["price"])
                 fills = (price <= limit if buy else price >= limit) and qty <= depth
                 executed = qty if fills else dec(0)
-            position = self.state["positions"][symbol + ":" + side]
+            position = self.state["positions"][symbol + ":" + side].copy()
             old_qty, old_entry = dec(position["qty"]), dec(position["entry"])
+            wallet = self.state["wallet"]
             opening = (side == "LONG" and buy) or (side == "SHORT" and not buy)
             if not opening and qty > old_qty:
                 executed = dec(0)
             if executed:
                 fee = executed * price * TAKER_FEE_ESTIMATE
                 pnl = dec(0) if opening else executed * (price - old_entry) * (1 if side == "LONG" else -1)
-                self.state["wallet"] = wire(dec(self.state["wallet"]) + pnl - fee)
+                wallet = wire(dec(wallet) + pnl - fee)
                 next_qty = old_qty + executed if opening else old_qty - executed
                 entry = (old_entry * old_qty + price * executed) / next_qty if opening else old_entry
                 position.update(qty=wire(next_qty), entry=wire(entry if next_qty else 0))
             receipt = {"symbol": symbol, "clientOrderId": cid, "positionSide": side, "side": order["side"],
                        "status": "FILLED" if executed == qty else "EXPIRED", "executedQty": wire(executed),
                        "origQty": wire(qty), "avgPrice": wire(price if executed else 0)}
-            self.state["orders"][cid] = receipt
+            state = {**self.state, "wallet": wallet,
+                     "positions": {**self.state["positions"], symbol + ":" + side: position},
+                     "orders": {**self.state["orders"], cid: receipt}}
+            # A simulated fill exists only once balances and its receipt commit.
+            # Keep earlier successful legs while a failed leg remains absent.
+            self.store.put("paper:" + self.account_id, state)
+            self.state = state
             responses.append(receipt)
-            self.save()
         return responses
 
     def query(self, symbol, client_id):

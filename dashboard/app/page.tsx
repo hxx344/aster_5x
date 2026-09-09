@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   ArrowDownLeft,
@@ -42,6 +42,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
+import { createStatePoller } from '@/lib/state-poller';
 import {
   marginLimitFromPercent,
   parseMinimumLeverage,
@@ -168,30 +169,30 @@ export default function Home() {
   const [drafts, setDrafts] = useState<Record<string, PolicyDraft>>({});
   const [now, setNow] = useState(0);
   const [notice, setNotice] = useState('');
-  const refresh = useCallback(async () => {
-    try {
-      const r = await fetch('/api/state', { cache: 'no-store' });
-      if (r.status === 401) {
-        setNeedsLogin(true);
-        setState(null);
-        return;
-      }
-      if (!r.ok) {
-        const body = (await r.json().catch(() => ({}))) as { detail?: string };
-        throw new Error(body.detail || '交易服务暂时不可用');
-      }
-      const next: State = await r.json();
+  const operationPending = useRef(false);
+  const clearSession = useCallback(() => {
+    setNeedsLogin(true);
+    setState(null);
+    setSelected('');
+    setDrafts({});
+    setAddOpen(false);
+    setConnectionError('');
+  }, []);
+  const [poller] = useState(() => createStatePoller<State>({
+    onState: (next) => {
       setState(next);
       setNeedsLogin(false);
       setConnectionError('');
       setSelected((v) =>
         next.accounts.some((a) => a.id === v) ? v : next.accounts[0]?.id || '',
       );
-    } catch (e) {
-      setConnectionError(e instanceof Error ? e.message : '连接失败');
-    }
-  }, []);
+    },
+    onUnauthorized: clearSession,
+    onError: setConnectionError,
+  }));
+  const refresh = useCallback(() => poller.refresh(), [poller]);
   useEffect(() => {
+    poller.resume();
     const tick = () => {
       setNow(Date.now() / 1000);
       void refresh();
@@ -201,8 +202,9 @@ export default function Home() {
     return () => {
       clearTimeout(initial);
       clearInterval(timer);
+      poller.pause();
     };
-  }, [refresh]);
+  }, [refresh, poller]);
   const account = state?.accounts.find((a) => a.id === selected);
   const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
   const marginPercent = percentFromMarginLimit(
@@ -225,23 +227,51 @@ export default function Home() {
     body?: object,
     method: 'POST' | 'PATCH' = 'POST',
   ) => {
+    if (operationPending.current) return false;
+    operationPending.current = true;
+    poller.pause();
+    let resumePolling = true;
     setBusy(true);
     setError('');
     setNotice('');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
     try {
       const r = await fetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
+        signal: controller.signal,
       });
       const data = (await r.json().catch(() => ({}))) as { detail?: string };
+      if (controller.signal.aborted) throw new Error('操作响应超时');
+      clearTimeout(timeout);
+      if (r.status === 401) {
+        clearSession();
+        resumePolling = false;
+      }
       if (!r.ok) throw new Error(data.detail || '操作未完成');
-      await refresh();
+      if (url === '/api/logout') {
+        clearSession();
+        resumePolling = false;
+      } else {
+        poller.resume();
+        resumePolling = false;
+        await refresh();
+      }
       return true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : '操作失败');
+      setError(controller.signal.aborted
+        ? '操作结果暂未确认，请核对最新状态后再操作'
+        : e instanceof Error ? e.message : '操作失败');
       return false;
     } finally {
+      clearTimeout(timeout);
+      operationPending.current = false;
+      if (resumePolling) {
+        poller.resume();
+        void refresh();
+      }
       setBusy(false);
     }
   };
@@ -293,6 +323,7 @@ export default function Home() {
               variant="ghost"
               size="icon"
               aria-label="退出登录"
+              disabled={busy}
               onClick={() => void action('/api/logout')}
             >
               <LogOut size={17} />

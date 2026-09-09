@@ -4,7 +4,7 @@ import uuid
 from contextlib import nullcontext
 from fractions import Fraction
 
-from .exchange import ExchangeError, RequestNotSent
+from .exchange import ExchangeError, LiveBroker, RequestNotSent
 from .models import AccountModeError, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
@@ -118,7 +118,10 @@ class Executor:
                   "previous": old, "target": target, "created_at": time.time(), "status": "pending"}
         self.store.save_intent(intent)
         try:
-            self.broker.set_leverage(symbol, target)
+            if isinstance(self.broker, LiveBroker):
+                self.broker.set_leverage(symbol, target, checked_snapshot=snapshot)
+            else:
+                self.broker.set_leverage(symbol, target)
         except RequestNotSent as exc:
             intent.update(status="aborted", last_error=str(exc))
             self.store.save_intent(intent)

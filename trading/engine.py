@@ -11,7 +11,7 @@ import threading
 import time
 
 import monitor
-from .exchange import ExchangeError, LiveBroker, MarketData, credentials_for
+from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
 from .models import AccountModeError, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
@@ -80,6 +80,7 @@ class Engine:
         self.registration_lock = threading.Lock()
         self.accounts_generation = 0
         self.account_locks = {}
+        self.budget_wait_events = {}
         self.brokers, self.signers, self.users = {}, {}, {}
         self.markets, self.views, self.rotation = {}, {}, {}
         self.wake_accounts, self.urgent_accounts = set(), set()
@@ -260,7 +261,7 @@ class Engine:
                 recovery = bool(pending or self.store.get("post_fill_check:" + account_id))
                 with self.recovery_budget(broker) if recovery else nullcontext():
                     if isinstance(broker, LiveBroker) and not recovery:
-                        broker.api.budget.require_available(200)
+                        broker.api.budget.require_available(broker.snapshot_weight(account["policy"]["symbols"]))
                     snapshot = broker.snapshot(account["policy"]["symbols"])
                 self.view(account_id, snapshot=snapshot_json(snapshot, account["policy"]["symbols"]), credential_ready=True)
                 snapshot.require_modes(account["policy"]["symbols"])
@@ -318,7 +319,7 @@ class Engine:
                             target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum)
                         if target is not None:
                             if isinstance(broker, LiveBroker):
-                                broker.api.budget.require_available(250)
+                                broker.api.budget.require_available(broker.snapshot_weight(markets, fresh_modes=True) + 1)
                             reason = executor.leverage(account, symbol, long.leverage, target, snapshot=snapshot)
                             self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
@@ -355,7 +356,7 @@ class Engine:
                     except (TradingError, KeyError, ValueError, TypeError) as exc:
                         last_reason = str(exc) if isinstance(exc, TradingError) else "交易数据格式异常"
                         self.strategy(account_id, symbol, last_reason, "waiting")
-                        if isinstance(exc, AccountModeError):
+                        if isinstance(exc, (AccountModeError, RequestNotSent)):
                             raise
                         if self.store.intent(account_id):
                             # No new symbol work until this account's intent is resolved.
@@ -371,9 +372,12 @@ class Engine:
                 message = str(exc) if isinstance(exc, TradingError) else "账户响应格式异常，已停止本轮操作"
                 with self.lock:
                     old_reason = self.views.get(account_id, {}).get("reason")
-                if old_reason != message:
-                    self.store.event(account_id, "error", message)
-                status = "error"
+                    log_wait = not isinstance(exc, BudgetWait) or time.monotonic() - self.budget_wait_events.get(account_id, -1e9) >= 60
+                    if isinstance(exc, BudgetWait) and old_reason != message and log_wait:
+                        self.budget_wait_events[account_id] = time.monotonic()
+                if old_reason != message and log_wait:
+                    self.store.event(account_id, "wait" if isinstance(exc, BudgetWait) else "error", message)
+                status = "waiting" if isinstance(exc, BudgetWait) else "error"
                 if isinstance(exc, AccountModeError):
                     self.store.pause_account(account, message)
                     pending = self.store.intent(account_id)
@@ -580,12 +584,13 @@ class Engine:
         saved_accounts = self.store.accounts()
         events = self.store.events()
         pending_notifications = self.store.pending_notifications()
+        request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, **self.views.get(a["id"], {
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
-                "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(),
+                "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,
                                  "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 

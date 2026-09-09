@@ -1,6 +1,8 @@
 """Aster V3 EIP-712 API adapter. No automatic retries of signed mutations."""
 import json
+from collections import deque
 from contextlib import contextmanager, nullcontext
+from email.utils import parsedate_to_datetime
 from fractions import Fraction
 import math
 import os
@@ -33,12 +35,21 @@ class RequestNotSent(ExchangeError):
     """A local admission check failed before any HTTP request was sent."""
 
 
+class BudgetWait(RequestNotSent):
+    """The local scheduler must wait; this is not an exchange rejection."""
+
+
 class RateBudget:
     def __init__(self, reconciliation_reserve=300):
         if type(reconciliation_reserve) is not int or reconciliation_reserve < 0:
             raise ExchangeError("订单核对保留额度无效")
         self.lock = threading.Lock()
         self.until, self.window, self.weight = 0.0, time.monotonic(), 0
+        self.deadline = self.window + 60
+        self.server_minute = None
+        self.local_weight, self.reported_weight = 0, None
+        self.inflight, self.sequence = {}, 0
+        self.unreported = deque()
         self.limit = 1800
         self.reconciliation_reserve = reconciliation_reserve
         self.priority = threading.local()
@@ -54,8 +65,20 @@ class RateBudget:
             self.priority.reconciliation = previous
 
     def _refresh(self, now):
-        if now - self.window >= 60:
-            self.window, self.weight = now, 0
+        if now >= self.deadline:
+            steps = int((now - self.deadline) // 60) + 1
+            if self.server_minute is not None:
+                self.server_minute += steps
+            self.deadline += steps * 60
+            self.window = self.deadline - 60
+            # Requests sent near the boundary may be counted in the new minute.
+            self.weight = self.local_weight = self._carry(now)
+            self.reported_weight = None
+
+    def _carry(self, now):
+        while self.unreported and self.unreported[0][0] <= now - 60:
+            self.unreported.popleft()
+        return sum(self.inflight.values()) + sum(weight for _, weight in self.unreported)
 
     def _ordinary_limit(self):
         return self.limit - min(self.reconciliation_reserve, self.limit // 6)
@@ -68,7 +91,9 @@ class RateBudget:
         limit = self.limit if critical else self._ordinary_limit()
         if self.weight + weight > limit:
             message = "本地请求预算已用完" if critical else "本地普通请求预算不足，已为订单核对和补偿保留额度"
-            raise RequestNotSent(message, retry_after=max(0.0, 60 - (now - self.window)))
+            reported = "未返回" if self.reported_weight is None else str(self.reported_weight)
+            message += f"（估算已用 {self.weight}/{limit}，本轮需 {weight}；本进程计入 {self.local_weight}，Aster 同 IP 回报 {reported}）"
+            raise BudgetWait(message, retry_after=max(0.0, self.deadline - now))
 
     @staticmethod
     def _validate_weight(weight):
@@ -81,31 +106,77 @@ class RateBudget:
         with self.lock:
             self._require_available(weight, time.monotonic())
 
-    def reserve(self, weight):
+    def reserve(self, weight, *, track=False):
         self._validate_weight(weight)
         with self.lock:
-            self._require_available(weight, time.monotonic())
+            now = time.monotonic()
+            self._require_available(weight, now)
             self.weight += weight
+            self.local_weight += weight
+            if track:
+                self.sequence += 1
+                self.inflight[self.sequence] = weight
+                return self.sequence
+            self.unreported.append((now, weight))
 
-    def observe(self, headers):
-        # V3 reports IP-wide use, including other processes/accounts. A lower or
-        # out-of-order response must never refund requests already reserved here.
-        reported = headers.get("X-MBX-USED-WEIGHT-1M")
-        if not isinstance(reported, str) or not re.fullmatch(r"[0-9]{1,12}", reported):
-            return
+    def finish(self, ticket):
         with self.lock:
-            self._refresh(time.monotonic())
-            self.weight = max(self.weight, int(reported))
+            weight = self.inflight.pop(ticket, 0)
+            if weight:
+                # A timeout is not evidence that the exchange did not count it.
+                self.unreported.append((time.monotonic(), weight))
+
+    @staticmethod
+    def _response_time(headers):
+        try:
+            date = parsedate_to_datetime(headers.get("Date", ""))
+            stamp = date.timestamp()
+            if date.tzinfo is not None and abs(stamp - time.time()) <= 300:
+                return int(stamp)
+        except (ValueError, TypeError, OverflowError, IndexError):
+            pass
+        return None
+
+    def observe(self, headers, *, ticket=None):
+        # Date identifies the exchange minute. Never treat a lower counter alone
+        # as a reset: concurrent responses can arrive out of order.
+        reported = headers.get("X-MBX-USED-WEIGHT-1M")
+        valid_weight = isinstance(reported, str) and re.fullmatch(r"[0-9]{1,12}", reported)
+        stamp = self._response_time(headers) if valid_weight else None
+        with self.lock:
+            now = time.monotonic()
+            self._refresh(now)
+            completed = self.inflight.pop(ticket, 0)
+            if not valid_weight:
+                if completed:
+                    self.unreported.append((now, completed))
+                return
+            if stamp is not None:
+                minute = stamp // 60
+                if self.server_minute is not None and minute < self.server_minute:
+                    return  # A delayed response must not revive last minute's use.
+                if self.server_minute is not None and minute > self.server_minute:
+                    self.weight = self.local_weight = completed + self._carry(now)
+                    self.reported_weight = None
+                if self.server_minute != minute:
+                    self.server_minute = minute
+                    # HTTP Date has one-second precision; allow that rounding and
+                    # count from receipt, so the local reset cannot happen early.
+                    self.deadline = now + 61 - stamp % 60
+                    self.window = self.deadline - 60
+            self.reported_weight = max(self.reported_weight or 0, int(reported))
+            self.weight = max(self.weight, self.reported_weight + sum(self.inflight.values()))
 
     def snapshot(self):
         with self.lock:
             now = time.monotonic()
             self._refresh(now)
             ordinary_limit = self._ordinary_limit()
-            reset_after = max(0.0, 60 - (now - self.window))
+            reset_after = max(0.0, self.deadline - now)
             retry_after = max(0.0, self.until - now,
                               reset_after if self.weight >= ordinary_limit else 0.0)
             return {"used": self.weight, "limit": self.limit, "ordinary_limit": ordinary_limit,
+                    "local_used": self.local_weight, "aster_ip_used": self.reported_weight,
                     "remaining": max(0, self.limit - self.weight),
                     "ordinary_remaining": max(0, ordinary_limit - self.weight),
                     "reset_after": reset_after, "retry_after": retry_after}
@@ -153,18 +224,21 @@ class API:
         return data
 
     def call(self, method, path, params=None, signed=False, weight=1):
-        self.budget.reserve(weight)
-        params = self.signed_parameters(params or {}) if signed else (params or {})
-        is_write = signed and method != "GET"
+        ticket = self.budget.reserve(weight, track=True)
         try:
-            response = self.http.request(method, BASE + path,
-                params=params if method == "GET" else None,
-                content=urlencode(params) if method != "GET" else None,
-                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "AsterAccountDesk/1.0"})
-        except httpx.HTTPError:
-            error = AmbiguousOrder if is_write else ExchangeError
-            raise error("请求结果未知，需核对订单" if is_write else "Aster 网络连接失败") from None
-        self.budget.observe(response.headers)
+            params = self.signed_parameters(params or {}) if signed else (params or {})
+            is_write = signed and method != "GET"
+            try:
+                response = self.http.request(method, BASE + path,
+                    params=params if method == "GET" else None,
+                    content=urlencode(params) if method != "GET" else None,
+                    headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "AsterAccountDesk/1.0"})
+            except httpx.HTTPError:
+                error = AmbiguousOrder if is_write else ExchangeError
+                raise error("请求结果未知，需核对订单" if is_write else "Aster 网络连接失败") from None
+            self.budget.observe(response.headers, ticket=ticket)
+        finally:
+            self.budget.finish(ticket)
         if response.status_code in (429, 418):
             delay = 180 if response.status_code == 429 else 86400
             try:
@@ -224,6 +298,8 @@ class MarketData:
         self.api = api or API()
         self.rules = {}
         self.assets = {}
+        self.books, self.book_locks = {}, {}
+        self.book_guard = threading.Lock()
 
     @staticmethod
     def market_quantity_limits(lot, market_lot=None):
@@ -292,6 +368,24 @@ class MarketData:
                 self.api.budget.limit = min(1800, max(1, int(rate["limit"] * .8)))
 
     def book(self, symbol):
+        with self.book_guard:
+            lock = self.book_locks.setdefault(symbol, threading.Lock())
+        with lock:
+            cached = self.books.get(symbol)
+            if cached is not None and time.monotonic() - cached[0] < 1:
+                try:
+                    cached[1].require_fresh()
+                    return cached[1]
+                except TradingError:
+                    pass
+            self.books.pop(symbol, None)
+            started = time.monotonic()
+            book = self._read_book(symbol)
+            # Network time is part of cache age; a slow read cannot renew it.
+            self.books[symbol] = (started, book)
+            return book
+
+    def _read_book(self, symbol):
         # Fetch mark first so the executable BBO is as recent as possible.
         mark = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
         row = self.api.call("GET", "/fapi/v3/ticker/bookTicker", {"symbol": symbol}, weight=1)
@@ -325,6 +419,7 @@ class LiveBroker:
         self.api = api or API(credentials)
         self.market = market
         self.cached, self.cached_at = {}, {}
+        self.leverage_snapshot = None
 
     def reconciliation_budget(self):
         budget = getattr(self.api, "budget", None)
@@ -338,7 +433,20 @@ class LiveBroker:
             self.cached_at[key] = started
         return self.cached[key]
 
+    def snapshot_weight(self, symbols, *, fresh_modes=False):
+        """Conservative admission estimate using cache expiries, without a request."""
+        now = time.monotonic()
+        def due(key, ttl):
+            # Leave time for this read to complete before reusing an expiring item.
+            return now - self.cached_at.get(key, -1e9) + 8 >= ttl
+        weight = 50 + 2 * len(symbols)  # Balances, all positions/orders, flat marks.
+        weight += sum(30 for key in ("dual", "multi") if fresh_modes or due(key, 15))
+        weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
+        weight += sum(20 for symbol in symbols if due("fee:" + symbol, 60))
+        return weight
+
     def snapshot(self, symbols, fresh_modes=False):
+        self.leverage_snapshot = None
         started = time.time()
         if fresh_modes:
             self.cached_at.pop("dual", None)
@@ -430,9 +538,12 @@ class LiveBroker:
         unrealized = decimal_value(selected_pnl, exact=True)
         available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
         equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
-        return AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
+        snapshot = AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
             unrealized, positions, orders, dual.get("dualSidePosition") is True, multi.get("multiAssetsMargin") is True,
             account.get("canTrade") is True, started, fees, brackets)
+        if fresh_modes:
+            self.leverage_snapshot = (snapshot, time.monotonic())
+        return snapshot
 
     @staticmethod
     def _position_rows(rows):
@@ -459,8 +570,19 @@ class LiveBroker:
             raise TradingError("账户实际杠杆无效")
         return int(leverage)
 
-    def set_leverage(self, symbol, leverage):
-        snapshot = self.snapshot([symbol], fresh_modes=True)
+    def set_leverage(self, symbol, leverage, *, checked_snapshot=None):
+        verified, self.leverage_snapshot = self.leverage_snapshot, None
+        snapshot = (checked_snapshot if verified is not None and checked_snapshot is verified[0]
+                    and 0 <= time.monotonic() - verified[1] <= 1 else None)
+        if snapshot is not None:
+            try:
+                snapshot.require_fresh()
+            except TradingError:
+                snapshot = None
+        if snapshot is None:
+            snapshot = self.snapshot([symbol], fresh_modes=True)
+            self.leverage_snapshot = None
+        snapshot.require_modes([symbol])
         long, short = snapshot.require_ready(symbol)
         require_non_decreasing_leverage(long.leverage, leverage)
         if leverage == long.leverage:
@@ -468,6 +590,7 @@ class LiveBroker:
         return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
 
     def submit(self, orders):
+        self.leverage_snapshot = None
         if len(orders) == 1:
             return [self.api.call("POST", "/fapi/v3/order", orders[0], signed=True)]
         return self.api.call("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, signed=True, weight=5)

@@ -702,7 +702,7 @@ export default function Home() {
                             <div className="event" key={e.id}>
                               <time>{clock(e.created_at)}</time>
                               <i
-                                className={`event-dot ${e.kind === 'error' ? 'danger-bg' : 'mint-bg'}`}
+                                className={`event-dot ${e.kind === 'error' ? 'danger-bg' : e.kind === 'wait' ? 'amber-bg' : 'mint-bg'}`}
                               />
                               <p>{e.message}</p>
                             </div>

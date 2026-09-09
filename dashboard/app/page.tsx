@@ -42,6 +42,11 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
+import {
+  marginLimitFromPercent,
+  parseMinimumLeverage,
+  percentFromMarginLimit,
+} from '@/lib/policy';
 
 type Position = {
   symbol: string;
@@ -59,8 +64,15 @@ type Policy = {
   threshold: string;
   order_notional: string;
   margin_limit: string;
+  min_open_leverage?: number;
   spread_limit: string;
   symbols: string[];
+};
+type PolicyDraft = {
+  threshold: string;
+  order_notional: string;
+  margin_percent: string;
+  min_open_leverage: string;
 };
 type Account = {
   id: string;
@@ -151,9 +163,7 @@ export default function Home() {
     env_prefix: '',
     mode: 'live',
   });
-  const [drafts, setDrafts] = useState<
-    Record<string, { threshold: string; order_notional: string }>
-  >({});
+  const [drafts, setDrafts] = useState<Record<string, PolicyDraft>>({});
   const [now, setNow] = useState(0);
   const [notice, setNotice] = useState('');
   const refresh = useCallback(async () => {
@@ -192,9 +202,19 @@ export default function Home() {
     };
   }, [refresh]);
   const account = state?.accounts.find((a) => a.id === selected);
+  const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
+  const marginPercent = percentFromMarginLimit(
+    account?.policy.margin_limit ?? '0.5',
+  );
+  const minimumLeverage = account?.policy.min_open_leverage ?? 4;
+  const displayedTiers = [...new Set([4, 5, 10, 20, minimumLeverage])].sort(
+    (a, b) => a - b,
+  );
   const form = drafts[selected] || {
     threshold: account?.policy.threshold || '10000',
     order_notional: account?.policy.order_notional || '1000',
+    margin_percent: marginPercent,
+    min_open_leverage: String(minimumLeverage),
   };
   const setForm = (value: typeof form) =>
     setDrafts((previous) => ({ ...previous, [selected]: value }));
@@ -229,7 +249,8 @@ export default function Home() {
   const market = state?.markets[focus];
   const strategy = account?.strategies[focus];
   const currentLeverage =
-    snapshot?.positions.find((p) => p.symbol === focus)?.leverage || 4;
+    snapshot?.positions.find((p) => p.symbol === focus)?.leverage ||
+    minimumLeverage;
   const positions =
     snapshot?.positions.filter((p) => Number(p.qty) !== 0) || [];
   const events =
@@ -449,7 +470,7 @@ export default function Home() {
                 label="保证金占用率"
                 value={snapshot ? pct(snapshot.ratio) : '—'}
                 sub="全部仓位占用保证金 ÷ 账户总权益"
-                accent={ratio > 0.5 ? 'danger' : 'mint'}
+                accent={ratio > marginLimit ? 'danger' : 'mint'}
                 icon={<ShieldCheck size={17} />}
               />
               <Metric
@@ -484,7 +505,7 @@ export default function Home() {
                       <TableHeader>
                         <TableRow>
                           <TableHead>市场</TableHead>
-                          {[4, 5, 10, 20].map((v) => (
+                          {displayedTiers.map((v) => (
                             <TableHead key={v} className="number">
                               {v}x
                             </TableHead>
@@ -517,7 +538,7 @@ export default function Home() {
                                   </span>
                                 </button>
                               </TableCell>
-                              {[4, 5, 10, 20].map((v) => (
+                              {displayedTiers.map((v) => (
                                 <TableCell
                                   key={v}
                                   className={`number ${live && Number(m.capacities[v]) > Number(account?.policy.threshold || 10000) ? 'mint' : ''}`}
@@ -531,7 +552,7 @@ export default function Home() {
                                 ) : (
                                   '—'
                                 )}
-                                {lev && ![4, 5, 10, 20].includes(lev) && (
+                                {lev && !displayedTiers.includes(lev) && (
                                   <small className="current-capacity">
                                     额度{' '}
                                     {live ? fmt(m?.capacities[lev], 0) : '—'}
@@ -691,17 +712,21 @@ export default function Home() {
                     <ShieldCheck className="mint" size={18} />
                   </div>
                   <div className="risk-value">
-                    <span className={ratio > 0.5 ? 'danger' : ''}>
+                    <span className={ratio > marginLimit ? 'danger' : ''}>
                       {snapshot ? pct(snapshot.ratio) : '—'}
                     </span>
-                    <small>加仓后 ≤ 50%</small>
+                    <small>加仓后 ≤ {marginPercent}%</small>
                   </div>
                   <div className="risk-track">
                     <Progress
                       value={Math.min(100, ratio * 100)}
                       aria-label="当前保证金占用率"
                     />
-                    <i className="limit-marker" />
+                    <i
+                      className="limit-marker"
+                      style={{ left: `${marginPercent}%` }}
+                      title={`风险上限 ${marginPercent}%`}
+                    />
                   </div>
                   <div className="scale">
                     <span>0%</span>
@@ -772,12 +797,12 @@ export default function Home() {
                   </div>
                   <Gate
                     label={
-                      currentLeverage < 4
-                        ? `当前 ${currentLeverage}x，需先升至至少 4x`
+                      currentLeverage < minimumLeverage
+                        ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
                         : `${currentLeverage}x 额度超过阈值`
                     }
                     pass={
-                      currentLeverage >= 4 &&
+                      currentLeverage >= minimumLeverage &&
                       market?.status === 'ok' &&
                       Number(market.capacities[currentLeverage]) >
                         Number(account?.policy.threshold || 10000)
@@ -800,8 +825,8 @@ export default function Home() {
                     }
                   />
                   <Gate
-                    label="保证金占用率 ≤ 50%"
-                    pass={!!fresh && ratio <= 0.5}
+                    label={`保证金占用率 ≤ ${marginPercent}%`}
+                    pass={!!fresh && ratio <= marginLimit}
                     value={snapshot ? pct(snapshot.ratio) : '—'}
                   />
                   <div className="strategy-state">
@@ -851,21 +876,42 @@ export default function Home() {
                 </section>
                 <section className="panel settings-panel">
                   <div className="section-head">
-                    <h2>分批设置</h2>
+                    <h2>策略设置</h2>
                     <SlidersHorizontal size={17} />
                   </div>
                   <form
                     onSubmit={async (e) => {
                       e.preventDefault();
-                      if (
-                        account &&
-                        (await action(
-                          `/api/accounts/${account.id}`,
-                          form,
-                          'PATCH',
-                        ))
-                      )
-                        setNotice('分批设置已保存');
+                      if (!account) return;
+                      try {
+                        const policy = {
+                          threshold: form.threshold,
+                          order_notional: form.order_notional,
+                          margin_limit: marginLimitFromPercent(
+                            form.margin_percent,
+                          ),
+                          min_open_leverage: parseMinimumLeverage(
+                            form.min_open_leverage,
+                          ),
+                        };
+                        if (
+                          await action(
+                            `/api/accounts/${account.id}`,
+                            policy,
+                            'PATCH',
+                          )
+                        ) {
+                          setDrafts((previous) => {
+                            const next = { ...previous };
+                            delete next[account.id];
+                            return next;
+                          });
+                          setNotice('策略设置已保存');
+                        }
+                      } catch (e) {
+                        setNotice('');
+                        setError(e instanceof Error ? e.message : '设置无效');
+                      }
                     }}
                   >
                     <label htmlFor="threshold">
@@ -876,7 +922,7 @@ export default function Home() {
                         min="0"
                         step="any"
                         required
-                        disabled={!account || account.enabled}
+                        disabled={busy || !account || account.enabled}
                         value={form.threshold}
                         onChange={(e) =>
                           setForm({ ...form, threshold: e.target.value })
@@ -891,15 +937,53 @@ export default function Home() {
                         min="1"
                         step="any"
                         required
-                        disabled={!account || account.enabled}
+                        disabled={busy || !account || account.enabled}
                         value={form.order_notional}
                         onChange={(e) =>
                           setForm({ ...form, order_notional: e.target.value })
                         }
                       />
                     </label>
+                    <label htmlFor="margin-percent">
+                      风险约束上限 <span>%</span>
+                      <Input
+                        id="margin-percent"
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="any"
+                        required
+                        disabled={busy || !account || account.enabled}
+                        value={form.margin_percent}
+                        onChange={(e) =>
+                          setForm({ ...form, margin_percent: e.target.value })
+                        }
+                      />
+                    </label>
+                    <label htmlFor="min-open-leverage">
+                      最低开仓杠杆 <span>x</span>
+                      <Input
+                        id="min-open-leverage"
+                        type="number"
+                        min="1"
+                        max="125"
+                        step="1"
+                        required
+                        disabled={busy || !account || account.enabled}
+                        value={form.min_open_leverage}
+                        onChange={(e) =>
+                          setForm({
+                            ...form,
+                            min_open_leverage: e.target.value,
+                          })
+                        }
+                      />
+                    </label>
                     <p className="muted">
-                      按风险余量、余额与盘口深度缩小实际数量。修改前请暂停策略。
+                      修改前请暂停策略。风险约束为保证金占用率上限，大于
+                      0%、不超过
+                      100%；实际下单量还受余额与盘口限制。最低杠杆可设
+                      1–125，调低该值不会降低已有杠杆。
                     </p>
                     <Button
                       variant="outline"

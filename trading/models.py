@@ -44,6 +44,19 @@ def positive(value, allow_zero=False):
     return result
 
 
+def minimum_open_leverage(policy):
+    """Read the account floor, retaining the historical default for old policies."""
+    value = policy.get("min_open_leverage", MIN_OPEN_LEVERAGE)
+    if type(value) is not int or not 1 <= value <= 125:
+        raise TradingError("最低开仓杠杆必须为 1 至 125 的整数")
+    return value
+
+
+def leverage_candidates(min_open_leverage=MIN_OPEN_LEVERAGE):
+    minimum = minimum_open_leverage({"min_open_leverage": min_open_leverage})
+    return tuple(tier for tier in sorted({*TIERS, minimum}) if tier >= minimum)
+
+
 def floor_step(value, step):
     amount = value if isinstance(value, Fraction) else Fraction(dec(value))
     quantum = Fraction(positive(step))
@@ -280,8 +293,9 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     """Size both legs against total occupied margin / equity, cash and capacity."""
     long, short = snapshot.require_ready(rules.symbol, now)
     book.require_fresh(now)
-    if long.leverage < MIN_OPEN_LEVERAGE:
-        return Plan(reason=f"当前 {long.leverage}x 低于 {MIN_OPEN_LEVERAGE}x，禁止新增开仓，等待升杠杆")
+    minimum = minimum_open_leverage(policy)
+    if long.leverage < minimum:
+        return Plan(reason=f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
     limit = Fraction(dec(policy["margin_limit"]))
     if snapshot.margin_exceeds(policy["margin_limit"], include_equal=True):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
@@ -353,7 +367,7 @@ def require_non_decreasing_leverage(current, target):
         raise TradingError(f"全局禁止降杠杆：当前 {current}x，目标 {target}x")
 
 
-def next_leverage(snapshot, symbol, capacities, mark=None, threshold=ZERO):
+def next_leverage(snapshot, symbol, capacities, mark=None, threshold=ZERO, min_open_leverage=MIN_OPEN_LEVERAGE):
     long, short = snapshot.pair(symbol)
     if not hedge_balanced(long.qty, short.qty):
         return None
@@ -361,7 +375,7 @@ def next_leverage(snapshot, symbol, capacities, mark=None, threshold=ZERO):
         Fraction(long.qty) * Fraction(long.mark) + Fraction(short.qty) * Fraction(short.mark)
     # Select the lowest usable higher tier; unavailable intermediate tiers do not block.
     required = max(gross, positive(threshold, True))
-    for target in TIERS:
+    for target in leverage_candidates(min_open_leverage):
         if target <= long.leverage or target not in capacities:
             continue
         if positive(capacities[target], True) > required and leverage_cap(snapshot.brackets[symbol], target) >= gross:

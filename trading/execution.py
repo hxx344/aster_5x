@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from fractions import Fraction
 
 from .exchange import ExchangeError, RequestNotSent
-from .models import AccountModeError, MIN_OPEN_LEVERAGE, TradingError, dec, floor_step, hedge_balanced, positive, require_non_decreasing_leverage, wire
+from .models import AccountModeError, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -21,8 +21,9 @@ class Executor:
         self.last_completed_intent = None
         snapshot.require_modes(account["policy"]["symbols"])
         long, short = snapshot.require_ready(symbol)
-        if long.leverage < MIN_OPEN_LEVERAGE:
-            raise TradingError(f"当前 {long.leverage}x 低于 {MIN_OPEN_LEVERAGE}x，禁止新增开仓，等待升杠杆")
+        minimum = minimum_open_leverage(account["policy"])
+        if long.leverage < minimum:
+            raise TradingError(f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
         book.require_fresh()
         qty = positive(plan.qty)
         rule = self.market.rules[symbol]

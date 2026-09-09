@@ -393,7 +393,6 @@ td:last-child {
 }
 .limit-marker {
   position: absolute;
-  left: 50%;
   width: 2px;
   height: 13px;
   background: #e6c17f;

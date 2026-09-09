@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 
-from .models import SYMBOLS, TIERS, TradingError, positive
+from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, positive
 
 
 CAPACITY_ALERT_MAX_AGE = 8
@@ -57,6 +57,11 @@ class Store:
             for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {kind}")
+            for row in db.execute("SELECT id,data FROM accounts").fetchall():
+                account = json.loads(row["data"])
+                normalized = self.account_defaults(account)
+                if normalized != account:
+                    db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(normalized), row["id"]))
 
     @contextmanager
     def connect(self):
@@ -70,16 +75,24 @@ class Store:
             finally:
                 db.close()
 
+    @staticmethod
+    def account_defaults(account):
+        policy = account.get("policy")
+        if isinstance(policy, dict) and "min_open_leverage" not in policy:
+            return {**account, "policy": {**policy, "min_open_leverage": MIN_OPEN_LEVERAGE}}
+        return account
+
     def accounts(self):
         with self.connect() as db:
-            return [json.loads(r[0]) for r in db.execute("SELECT data FROM accounts ORDER BY id")]
+            return [self.account_defaults(json.loads(r[0])) for r in db.execute("SELECT data FROM accounts ORDER BY id")]
 
     def account(self, account_id):
         with self.connect() as db:
             row = db.execute("SELECT data FROM accounts WHERE id=?", (account_id,)).fetchone()
-            return json.loads(row[0]) if row else None
+            return self.account_defaults(json.loads(row[0])) if row else None
 
     def save_account(self, account):
+        account = self.account_defaults(account)
         with self.connect() as db:
             db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(account)))
 

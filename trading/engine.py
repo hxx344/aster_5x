@@ -14,14 +14,16 @@ import monitor
 from .exchange import ExchangeError, LiveBroker, MarketData, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
-from .models import AccountModeError, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, next_leverage, plan_pair, positive, wire
+from .models import AccountModeError, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
 ACCOUNT_LIST_INTERVAL = 1
-DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5", "spread_limit": "0.0005"}
+DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
+                  "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE}
+EDITABLE_POLICY_FIELDS = {"threshold", "order_notional", "margin_limit", "min_open_leverage"}
 
 
 def validate_account(account):
@@ -34,14 +36,21 @@ def validate_account(account):
     if account.get("mode") not in ("paper", "live") or not isinstance(account.get("enabled"), bool):
         raise TradingError("账户运行模式无效")
     policy = account.get("policy", {})
+    if not isinstance(policy, dict):
+        raise TradingError("策略配置字段不完整")
+    policy = {"min_open_leverage": MIN_OPEN_LEVERAGE, **policy}
     if set(policy) != set(DEFAULT_POLICY):
         raise TradingError("策略配置字段不完整")
     if not isinstance(policy["symbols"], list) or not policy["symbols"] or any(s not in SYMBOLS for s in policy["symbols"]) or len(set(policy["symbols"])) != len(policy["symbols"]):
         raise TradingError("交易市场配置无效")
     if positive(policy["threshold"], True) > 1000000000 or not 1 <= positive(policy["order_notional"]) <= 1000000:
         raise TradingError("阈值或单笔金额超出配置范围")
-    if not 0 < positive(policy["margin_limit"]) <= dec("0.5") or not 0 < positive(policy["spread_limit"]) <= dec("0.0005"):
-        raise TradingError("风险上限不得超过 50%，价差上限不得超过万 5")
+    if not 0 < positive(policy["margin_limit"]) <= 1:
+        raise TradingError("风险上限必须大于 0 且不超过 100%")
+    if not 0 < positive(policy["spread_limit"]) <= dec("0.0005"):
+        raise TradingError("价差上限不得超过万 5")
+    minimum_open_leverage(policy)
+    account["policy"] = policy
     return account
 
 
@@ -132,6 +141,7 @@ class Engine:
                 if not account["enabled"]:
                     return 180
                 positions = self.views.get(account["id"], {}).get("snapshot", {}).get("positions", [])
+                minimum = minimum_open_leverage(account["policy"])
                 for symbol in account["policy"]["symbols"]:
                     pair = [p for p in positions if p["symbol"] == symbol]
                     if len(pair) != 2:
@@ -140,9 +150,9 @@ class Engine:
                     caps = self.markets.get(symbol, {}).get("capacities", {})
                     threshold = dec(account["policy"]["threshold"])
                     flat = all(dec(p["qty"]) == 0 for p in pair)
-                    if flat and leverage >= MIN_OPEN_LEVERAGE and dec(caps.get(str(leverage), "0")) > threshold:
+                    if flat and leverage >= minimum and dec(caps.get(str(leverage), "0")) > threshold:
                         continue
-                    if any(target > leverage and dec(caps.get(str(target), "0")) > threshold for target in TIERS):
+                    if any(target > leverage and dec(caps.get(str(target), "0")) > threshold for target in leverage_candidates(minimum)):
                         return 500
                 return 220
             costs = {a["id"]: cost(a) for a in live}
@@ -189,8 +199,10 @@ class Engine:
             return 5
         capacity_observed = False
         try:
+            accounts = self.store.accounts()
+            tiers = set(TIERS)
+            tiers.update(minimum_open_leverage(account["policy"]) for account in accounts if symbol in account["policy"]["symbols"])
             with self.lock:
-                tiers = set(TIERS)
                 for view in self.views.values():
                     tiers.update(p["leverage"] for p in view.get("snapshot", {}).get("positions", []) if p["symbol"] == symbol)
             capacities = self.market.capacities(symbol, tiers)
@@ -282,6 +294,7 @@ class Engine:
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
                 policy = account["policy"]
+                minimum = minimum_open_leverage(policy)
                 markets = policy["symbols"]
                 start = self.rotation.get(account_id, 0) % len(markets)
                 ordered = markets[start:] + markets[:start]
@@ -298,9 +311,9 @@ class Engine:
                         flat = long.qty + short.qty == 0
                         target = None
                         current_available = capacities.get(long.leverage, dec(0)) > dec(policy["threshold"])
-                        first_add = self.store.get(f"open_after_leverage:{account_id}:{symbol}") == long.leverage and current_available
-                        if not first_add and (not flat or long.leverage < 4 or not current_available):
-                            target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"])
+                        first_add = long.leverage >= minimum and self.store.get(f"open_after_leverage:{account_id}:{symbol}") == long.leverage and current_available
+                        if not first_add and (not flat or long.leverage < minimum or not current_available):
+                            target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum)
                         if target is not None:
                             if isinstance(broker, LiveBroker):
                                 broker.api.budget.require_available(250)
@@ -308,8 +321,8 @@ class Engine:
                             self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
                             return 5
-                        if long.leverage < MIN_OPEN_LEVERAGE:
-                            last_reason = f"当前 {long.leverage}x 低于 4x，禁止新增开仓；等待可用的更高杠杆档位"
+                        if long.leverage < minimum:
+                            last_reason = f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓；等待可用的更高杠杆档位"
                             self.strategy(account_id, symbol, last_reason)
                             continue
                         cooldown = self.store.get(f"order_cooldown:{account_id}:{symbol}") or {}
@@ -401,10 +414,16 @@ class Engine:
                 raise TradingError("账户不存在")
             if account["enabled"] or self.store.intent(account_id):
                 raise TradingError("请先暂停策略并等待当前批次完成")
+            if not isinstance(changes, dict) or not changes or set(changes) - EDITABLE_POLICY_FIELDS:
+                raise TradingError("请选择有效的策略配置字段")
+            if any(value is None or (key != "min_open_leverage" and not isinstance(value, str)) for key, value in changes.items()):
+                raise TradingError("策略配置字段类型无效")
             account["policy"] = {**account["policy"], **changes}
             validate_account(account)
             self.store.save_account(account)
-            self.store.event(account_id, "config", "分批设置已更新")
+            with self.lock:
+                self.accounts_generation += 1
+            self.store.event(account_id, "config", "策略设置已更新")
 
     def enable(self, account_id, enabled):
         with self.account_lock(account_id):

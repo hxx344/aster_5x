@@ -17,7 +17,7 @@ import anyio
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from starlette.datastructures import MutableHeaders
 
 from .engine import Engine
@@ -108,9 +108,18 @@ class NewAccount(BaseModel):
 
 
 class PolicyEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    threshold: str = Field(min_length=1, max_length=40)
-    order_notional: str = Field(min_length=1, max_length=40)
+    model_config = ConfigDict(extra="forbid", strict=True)
+    threshold: str | None = Field(default=None, min_length=1, max_length=40)
+    order_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    margin_limit: str | None = Field(default=None, min_length=1, max_length=128)
+    min_open_leverage: StrictInt | None = Field(default=None, ge=1, le=125)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_present_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的策略配置字段")
+        return values
 
 
 def create_app(engine=None, *, demo=False, start_engine=True):
@@ -235,7 +244,7 @@ def create_app(engine=None, *, demo=False, start_engine=True):
 
     @app.patch("/api/accounts/{account_id}", dependencies=write_dependencies)
     def configure(account_id: str, body: PolicyEdit):
-        engine.configure(account_id, body.model_dump())
+        engine.configure(account_id, body.model_dump(exclude_unset=True))
         return {"ok": True}
 
     @app.post("/api/accounts/{account_id}/enable", dependencies=write_dependencies)

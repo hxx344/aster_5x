@@ -1,7 +1,7 @@
 """Independent account workers and shared market polling for the Linux service."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import logging
@@ -14,7 +14,7 @@ import monitor
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
-from .models import AccountModeError, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
+from .models import AccountModeError, Book, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -24,6 +24,18 @@ ACCOUNT_LIST_INTERVAL = 1
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
                   "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE}
 EDITABLE_POLICY_FIELDS = {"threshold", "order_notional", "margin_limit", "min_open_leverage"}
+
+
+@dataclass
+class MarketCandidate:
+    symbol: str
+    leverage: int
+    book: Book
+    target: int | None = None
+
+    @property
+    def opening_leverage(self):
+        return self.leverage if self.target is None else self.target
 
 
 def validate_account(account):
@@ -248,6 +260,26 @@ class Engine:
         self.store.put("post_fill_check:" + account["id"], None)
         return over_limit
 
+    @staticmethod
+    def rank_candidates(candidates):
+        # Only reorder slots belonging to the same opening tier. Stable sorting
+        # retains account rotation for equal spreads and across different tiers.
+        tiers = {}
+        for candidate in candidates:
+            tiers.setdefault(candidate.opening_leverage, []).append(candidate)
+        ranked = {tier: iter(sorted(group, key=lambda c: c.book.spread_exact)) for tier, group in tiers.items()}
+        return [next(ranked[c.opening_leverage]) for c in candidates]
+
+    def market_error(self, account_id, symbol, exc):
+        reason = str(exc) if isinstance(exc, TradingError) else "交易数据格式异常"
+        self.strategy(account_id, symbol, reason, "waiting")
+        if isinstance(exc, (AccountModeError, RequestNotSent)) or self.store.intent(account_id):
+            # No new symbol work until an existing intent is resolved.
+            raise exc
+        if isinstance(exc, ExchangeError) and exc.retry_after:
+            raise exc
+        return reason
+
     def tick_account(self, account_id):
         with self.account_lock(account_id):
             if self.shutdown.is_set():
@@ -302,6 +334,7 @@ class Engine:
                 start = self.rotation.get(account_id, 0) % len(markets)
                 ordered = markets[start:] + markets[:start]
                 last_reason = "等待交易条件"
+                candidates = []
                 for symbol in ordered:
                     try:
                         long, short = snapshot.require_ready(symbol)
@@ -309,6 +342,7 @@ class Engine:
                             raise TradingError("仅允许 USD1 保证金市场")
                         capacities = self.capacities(symbol)
                         book = self.market.book(symbol)
+                        book.require_fresh()
                         if self.shutdown.is_set():
                             return 5
                         flat = long.qty + short.qty == 0
@@ -318,12 +352,8 @@ class Engine:
                         if not first_add and (not flat or long.leverage < minimum or not current_available):
                             target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum)
                         if target is not None:
-                            if isinstance(broker, LiveBroker):
-                                broker.api.budget.require_available(broker.snapshot_weight(markets, fresh_modes=True) + 1)
-                            reason = executor.leverage(account, symbol, long.leverage, target, snapshot=snapshot)
-                            self.strategy(account_id, symbol, reason, "leverage")
-                            self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
-                            return 5
+                            candidates.append(MarketCandidate(symbol, long.leverage, book, target))
+                            continue
                         if long.leverage < minimum:
                             last_reason = f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓；等待可用的更高杠杆档位"
                             self.strategy(account_id, symbol, last_reason)
@@ -341,28 +371,49 @@ class Engine:
                         self.strategy(account_id, symbol, plan.reason, projected_ratio=wire(plan.projected_ratio) if plan.projected_ratio is not None else None)
                         last_reason = plan.reason
                         if plan.qty:
-                            reason = executor.open_pair(account, snapshot, symbol, plan, book)
-                            # A completed pair is followed by an actual account risk check.
-                            self.record_batch_outcome(account_id, executor)
-                            after = self.completed_snapshot(executor, broker, markets)
-                            unresolved = self.store.intent(account_id)
-                            phase = ("attention" if unresolved["status"] == "attention" else "reconciling") if unresolved else "filled"
-                            self.view(account_id, snapshot=snapshot_json(after, markets), reason=reason, status=phase if unresolved else "running")
-                            after.require_modes(markets)
-                            self.strategy(account_id, symbol, reason, phase)
-                            self.check_post_fill_occupancy(account, after)
+                            candidates.append(MarketCandidate(symbol, long.leverage, book))
+                    except (TradingError, KeyError, ValueError, TypeError) as exc:
+                        last_reason = self.market_error(account_id, symbol, exc)
+                for candidate in self.rank_candidates(candidates):
+                    if self.shutdown.is_set():
+                        return 5
+                    symbol, book, target = candidate.symbol, candidate.book, candidate.target
+                    try:
+                        # Comparing markets can take time. Reuse the sampled BBO
+                        # only while fresh, and recheck the shared capacity cache.
+                        snapshot.require_ready(symbol)
+                        book.require_fresh()
+                        capacities = self.capacities(symbol)
+                        if target is not None:
+                            if next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum) != target:
+                                last_reason = "可用杠杆档位已变化，等待下一轮比较"
+                                self.strategy(account_id, symbol, last_reason)
+                                continue
+                            if isinstance(broker, LiveBroker):
+                                broker.api.budget.require_available(broker.snapshot_weight(markets, fresh_modes=True) + 1)
+                            reason = executor.leverage(account, symbol, candidate.leverage, target, snapshot=snapshot)
+                            self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
                             return 5
+                        plan = plan_pair(snapshot, book, self.market.rules[symbol], capacities, policy)
+                        if not plan.qty:
+                            last_reason = plan.reason
+                            self.strategy(account_id, symbol, last_reason)
+                            continue
+                        reason = executor.open_pair(account, snapshot, symbol, plan, book)
+                        # A completed pair is followed by an actual account risk check.
+                        self.record_batch_outcome(account_id, executor)
+                        after = self.completed_snapshot(executor, broker, markets)
+                        unresolved = self.store.intent(account_id)
+                        phase = ("attention" if unresolved["status"] == "attention" else "reconciling") if unresolved else "filled"
+                        self.view(account_id, snapshot=snapshot_json(after, markets), reason=reason, status=phase if unresolved else "running")
+                        after.require_modes(markets)
+                        self.strategy(account_id, symbol, reason, phase)
+                        self.check_post_fill_occupancy(account, after)
+                        self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
+                        return 5
                     except (TradingError, KeyError, ValueError, TypeError) as exc:
-                        last_reason = str(exc) if isinstance(exc, TradingError) else "交易数据格式异常"
-                        self.strategy(account_id, symbol, last_reason, "waiting")
-                        if isinstance(exc, (AccountModeError, RequestNotSent)):
-                            raise
-                        if self.store.intent(account_id):
-                            # No new symbol work until this account's intent is resolved.
-                            raise
-                        if isinstance(exc, ExchangeError) and exc.retry_after:
-                            raise
+                        last_reason = self.market_error(account_id, symbol, exc)
                 self.view(account_id, reason=last_reason)
                 campaign = self.store.get("campaign:" + account_id)
                 if campaign and (snapshot.margin_exceeds(policy["margin_limit"], include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):

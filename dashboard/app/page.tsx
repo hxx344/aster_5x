@@ -92,6 +92,8 @@ type Account = {
     wallet: string;
     unrealized: string;
     ratio: string | null;
+    margin_ratio?: string | null;
+    total_notional?: string;
     timestamp: number;
     positions: Position[];
     mode_checks: { cross: boolean; hedge: boolean; single_asset: boolean };
@@ -465,6 +467,18 @@ export default function Home() {
                 value={fmt(snapshot?.equity)}
                 sub="全仓钱包余额 + 全仓未实现盈亏"
                 icon={<Wallet size={17} />}
+              />
+              <Metric
+                label="总名义持仓金额"
+                value={fmt(snapshot?.total_notional)}
+                sub="USD1 · 全部仓位按标记价格计，多空累加"
+                icon={<Layers3 size={17} />}
+              />
+              <Metric
+                label="账户保证金比率"
+                value={pct(snapshot?.margin_ratio)}
+                sub="维持保证金 ÷ 账户总权益"
+                icon={<ShieldCheck size={17} />}
               />
               <Metric
                 label="保证金占用率"

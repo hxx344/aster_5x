@@ -181,6 +181,17 @@ class AccountSnapshot:
     brackets: dict[str, list[dict]] = field(default_factory=dict)
 
     @property
+    def total_notional(self):
+        # Gross exposure: both directions and every account position count.
+        return decimal_value(sum((Fraction(p.notional) for p in self.positions), Fraction(0)), exact=True)
+
+    @property
+    def margin_ratio(self):
+        if self.equity <= 0:
+            raise TradingError("USD1 账户总权益不足")
+        return decimal_value(Fraction(self.maintenance) / Fraction(self.equity))
+
+    @property
     def occupied_margin(self):
         # Sum every position separately, including opposite sides and other markets.
         return decimal_value(self.occupied_margin_exact)

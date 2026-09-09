@@ -59,6 +59,8 @@ def snapshot_json(snapshot, symbols):
     result.pop("brackets", None)
     result.pop("fees", None)
     result["ratio"] = snapshot.ratio if snapshot.equity > 0 else None
+    result["margin_ratio"] = snapshot.margin_ratio if snapshot.equity > 0 else None
+    result["total_notional"] = snapshot.total_notional
     result["occupied_margin"] = snapshot.occupied_margin
     result["positions"] = [{**row, "notional": p.notional, "occupied_margin": p.occupied_margin}
                            for row, p in zip(result["positions"], snapshot.positions)]

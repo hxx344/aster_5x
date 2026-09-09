@@ -411,6 +411,7 @@ class Engine:
             account = self.store.account(account_id)
             if not account:
                 raise TradingError("账户不存在")
+            view_updates = {}
             if enabled:
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
@@ -419,6 +420,9 @@ class Engine:
                 snapshot = self.broker(account).snapshot(account["policy"]["symbols"], fresh_modes=True)
                 for symbol in account["policy"]["symbols"]:
                     snapshot.require_ready(symbol)
+                view_updates = {"snapshot": snapshot_json(snapshot, account["policy"]["symbols"]), "credential_ready": True,
+                                "strategies": {symbol: {"phase": "waiting", "reason": "策略已启动，等待下一轮检查"}
+                                               for symbol in account["policy"]["symbols"]}}
                 # High existing occupancy blocks additions in plan_pair, while an
                 # authorized increase in leverage can release margin before adding.
             account["enabled"] = enabled
@@ -429,7 +433,7 @@ class Engine:
                 self.wake_accounts.add(account_id)
                 self.accounts_generation += 1
             self.view(account_id, status="running" if enabled else "attention" if account.get("pause_reason") else "paused",
-                      reason="策略运行中" if enabled else account.get("pause_reason") or "策略已暂停")
+                      reason="策略运行中" if enabled else account.get("pause_reason") or "策略已暂停", **view_updates)
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")
 
     def retry(self, account_id):

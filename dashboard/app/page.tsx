@@ -110,6 +110,7 @@ type Event = {
 };
 type State = {
   demo: boolean;
+  ready: boolean;
   accounts: Account[];
   markets: Record<string, Market>;
   events: Event[];
@@ -235,15 +236,10 @@ export default function Home() {
     state?.events.filter(
       (e) => !selected || e.account_id === selected || !e.account_id,
     ) || [];
+  // Paused accounts poll slowly. The enable endpoint re-reads and validates the
+  // account, so an old display snapshot must not prevent requesting a restart.
   const canStart =
-    account &&
-    !account.enabled &&
-    account.credential_ready &&
-    fresh &&
-    snapshot.mode_checks?.cross &&
-    snapshot.mode_checks?.hedge &&
-    snapshot.mode_checks?.single_asset &&
-    !['attention', 'error', 'starting'].includes(account.status);
+    account && !account.enabled && state?.ready && !connectionError;
 
   return (
     <main className="desk">
@@ -775,8 +771,13 @@ export default function Home() {
                     <span className="symbol-tag">{focus}</span>
                   </div>
                   <Gate
-                    label={`${currentLeverage}x 额度超过阈值`}
+                    label={
+                      currentLeverage < 4
+                        ? `当前 ${currentLeverage}x，需先升至至少 4x`
+                        : `${currentLeverage}x 额度超过阈值`
+                    }
                     pass={
+                      currentLeverage >= 4 &&
                       market?.status === 'ok' &&
                       Number(market.capacities[currentLeverage]) >
                         Number(account?.policy.threshold || 10000)
@@ -814,6 +815,7 @@ export default function Home() {
                   <div className="execution-buttons">
                     <Button
                       disabled={busy || !canStart}
+                      title="启动前会重新核对账户，满足条件后恢复策略"
                       onClick={() =>
                         account &&
                         void action(`/api/accounts/${account.id}/enable`)

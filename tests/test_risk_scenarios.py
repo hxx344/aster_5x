@@ -117,7 +117,7 @@ class RiskScenarioTests(unittest.TestCase):
                     opened += 1
                     self.assertEqual(plan.qty % market.rules["XAUUSD1"].step, 0)
                     orders = [Executor.order("XAUUSD1", side, "BUY" if side == "LONG" else "SELL", plan.qty,
-                                             book.ask if side == "LONG" else book.bid, f"{seed}-{case}-{side}")
+                                             f"{seed}-{case}-{side}")
                               for side in ("LONG", "SHORT")]
                     receipts = broker.submit(orders)
                     self.assertTrue(all(row["status"] == "FILLED" for row in receipts))

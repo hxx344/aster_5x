@@ -14,7 +14,7 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
-from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 
@@ -225,6 +225,34 @@ class MarketData:
         self.rules = {}
         self.assets = {}
 
+    @staticmethod
+    def market_quantity_limits(lot, market_lot=None):
+        """Use quantities satisfying both general and market-specific lot filters."""
+        minimums, maximums, steps = [], [], []
+        for constraint in (lot,) if market_lot is None else (lot, market_lot):
+            if not isinstance(constraint, dict) or any(key not in constraint for key in ("minQty", "maxQty", "stepSize")):
+                raise TradingError("市价数量过滤器响应无效")
+            minimum, maximum, step = (positive(constraint[key], True) for key in ("minQty", "maxQty", "stepSize"))
+            minimums.append(minimum)
+            if maximum:
+                maximums.append(maximum)
+            if step:
+                # Rules/plan_pair use a zero-origin grid. Do not silently turn an
+                # exchange-supplied offset grid into quantities it would reject.
+                if Fraction(minimum) % Fraction(step):
+                    raise TradingError("市价数量下限与步长不对齐，无法安全生成委托数量")
+                steps.append(Fraction(step))
+        if not steps or not maximums:
+            # quantityPrecision is expressly not a substitute for stepSize.
+            raise TradingError("市价数量规则缺少有效步长或数量上限")
+        common_step = Fraction(math.lcm(*(s.numerator for s in steps)), math.gcd(*(s.denominator for s in steps)))
+        step = decimal_value(common_step, exact=True)
+        minimum, maximum = max(*minimums, step), min(maximums)
+        first_lot = -(-Fraction(minimum) // common_step)
+        if first_lot * common_step > Fraction(maximum):
+            raise TradingError("市价数量上下限没有有效步进，暂停该规则加载")
+        return step, minimum, maximum
+
     def load_rules(self):
         data = self.api.call("GET", "/fapi/v3/exchangeInfo")
         if not isinstance(data, dict) or not isinstance(data.get("symbols"), list):
@@ -232,14 +260,32 @@ class MarketData:
         rules, assets = {}, {}
         for row in data["symbols"]:
             assets[row["symbol"]] = row["marginAsset"]
-            if row.get("status") != "TRADING":
+            # All assets are needed to account for outside holdings, but only the
+            # configured strategy universe needs executable MARKET quantity rules.
+            if row.get("status") != "TRADING" or row["symbol"] not in SYMBOLS:
                 continue
-            filters = {f["filterType"]: f for f in row["filters"]}
+            order_types = row.get("orderTypes", row.get("OrderType"))
+            if order_types is not None:
+                if not isinstance(order_types, list) or any(not isinstance(kind, str) for kind in order_types):
+                    raise TradingError("交易订单类型响应无效")
+                if "MARKET" not in order_types:
+                    continue
+            if not isinstance(row.get("filters"), list):
+                raise TradingError("交易过滤器响应无效")
+            filters = {}
+            for constraint in row["filters"]:
+                if not isinstance(constraint, dict) or not isinstance(constraint.get("filterType"), str):
+                    raise TradingError("交易过滤器响应无效")
+                kind = constraint["filterType"]
+                if kind in filters:
+                    raise TradingError("交易过滤器重复，无法确认市价数量规则")
+                filters[kind] = constraint
             lot, price = filters.get("LOT_SIZE"), filters.get("PRICE_FILTER")
             notional = filters.get("MIN_NOTIONAL", filters.get("NOTIONAL", {}))
             if lot and price and ("notional" in notional or "minNotional" in notional):
-                rules[row["symbol"]] = Rules(row["symbol"], positive(lot["stepSize"]), positive(price["tickSize"]),
-                    positive(lot["minQty"]), positive(lot["maxQty"]), positive(notional.get("notional", notional.get("minNotional"))), row["marginAsset"])
+                step, minimum, maximum = self.market_quantity_limits(lot, filters.get("MARKET_LOT_SIZE"))
+                rules[row["symbol"]] = Rules(row["symbol"], step, positive(price["tickSize"]), minimum, maximum,
+                    positive(notional.get("notional", notional.get("minNotional")), True), row["marginAsset"])
         self.rules, self.assets = rules, assets
         for rate in data.get("rateLimits", []):
             if rate.get("rateLimitType") == "REQUEST_WEIGHT" and rate.get("interval") == "MINUTE" and rate.get("intervalNum") == 1:

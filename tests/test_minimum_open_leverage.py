@@ -76,9 +76,10 @@ class MinimumOpenLeverageTests(unittest.TestCase):
     def legacy_batch(self, leverage, one_leg):
         self.position(leverage)
         book = self.f.market.book(self.symbol)
-        orders = [self.executor.order(self.symbol, side, "BUY" if side == "LONG" else "SELL", dec("0.005"),
-                                      book.ask if side == "LONG" else book.bid, f"legacy-{leverage}-{side}")
-                  for side in ("LONG", "SHORT")]
+        orders = [{"symbol": self.symbol, "positionSide": side, "side": "BUY" if side == "LONG" else "SELL",
+                   "type": "LIMIT", "timeInForce": "FOK", "quantity": "0.005",
+                   "price": str(book.ask if side == "LONG" else book.bid), "newClientOrderId": f"legacy-{leverage}-{side}",
+                   "newOrderRespType": "RESULT"} for side in ("LONG", "SHORT")]
         # Model orders accepted by the paper exchange before the new gate existed.
         receipts = self.f.broker.submit(orders[:1] if one_leg else orders)
         if one_leg:

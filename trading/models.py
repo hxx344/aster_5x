@@ -320,7 +320,8 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
         max(Fraction(0), Fraction(snapshot.available) - existing_loss - price_adjustment)
         / (2 * high_price / leverage + (ask + bid) * fee + loss_span),
     )
-    min_qty = max(Fraction(rules.min_qty), Fraction(rules.min_notional) / bid)
+    # MARKET orders use the mark price for the exchange's minimum notional.
+    min_qty = max(Fraction(rules.min_qty), Fraction(rules.min_notional) / mark)
     step = Fraction(rules.step)
 
     def projected(qty):

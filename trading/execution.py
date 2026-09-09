@@ -34,19 +34,19 @@ class Executor:
             raise TradingError("已有批次正在执行")
         token = uuid.uuid4().hex
         orders = [self.order(symbol, side, "BUY" if side == "LONG" else "SELL", plan.qty,
-                            book.ask if side == "LONG" else book.bid, side[0] + token[:28]) for side in ("LONG", "SHORT")]
+                            side[0] + token[:28]) for side in ("LONG", "SHORT")]
         intent = {"id": token, "kind": "pair", "account_id": account["id"], "symbol": symbol, "leverage": long.leverage,
                   "status": "pending", "created_at": time.time(), "baseline": {"LONG": wire(long.qty), "SHORT": wire(short.qty)},
                   "orders": orders, "receipts": {}, "repairs": [], "repair_attempts": 0}
         self.store.save_intent(intent)  # FULL synchronous commit before any write request.
-        self.store.event(account["id"], "order", f"{symbol} {long.leverage}x 提交双向批次，每边 {wire(plan.qty)}")
+        self.store.event(account["id"], "order", f"{symbol} {long.leverage}x 提交双向市价批次，每边 {wire(plan.qty)}")
         self.send(intent, orders)
         return self.reconcile(account, intent)
 
     @staticmethod
-    def order(symbol, position_side, side, qty, price, client_id):
-        return {"symbol": symbol, "positionSide": position_side, "side": side, "type": "LIMIT", "timeInForce": "FOK",
-                "quantity": wire(qty), "price": wire(price), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
+    def order(symbol, position_side, side, qty, client_id):
+        return {"symbol": symbol, "positionSide": position_side, "side": side, "type": "MARKET",
+                "quantity": wire(qty), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
 
     def send(self, intent, orders, *, repair=False):
         not_sent = None
@@ -239,13 +239,15 @@ class Executor:
                 qty += step
             if qty <= 0:
                 return self.attention(account, intent, "盘口不足以补偿本批单腿，请核对持仓")
+            if qty < Fraction(rule.min_qty):
+                return self.attention(account, intent, "可补偿数量低于市价最小数量，暂停并等待核对")
             repair = self.order(intent["symbol"], side, "SELL" if side == "LONG" else "BUY", qty,
-                                book.bid if side == "LONG" else book.ask, "R" + uuid.uuid4().hex[:28])
+                                "R" + uuid.uuid4().hex[:28])
             intent["repairs"].append(repair)
             intent["repair_attempts"] += 1
             intent["status"] = "repair"
             self.store.save_intent(intent)
-            self.store.event(account["id"], "repair", f"{intent['symbol']} 处理单腿差额：仅平掉本批多出的 {side} {wire(qty)}")
+            self.store.event(account["id"], "repair", f"{intent['symbol']} 处理单腿差额：仅市价平掉本批多出的 {side} {wire(qty)}")
             not_sent = self.send(intent, [repair], repair=True)
             if not_sent is not None:
                 # Preserve the batch and let the scheduler honor retry_after.

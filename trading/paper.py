@@ -3,7 +3,7 @@ from dataclasses import asdict
 import time
 
 from .exchange import ExchangeError
-from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TIERS, dec, maintenance_for, require_non_decreasing_leverage, wire
+from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TIERS, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, wire
 
 
 PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
@@ -75,25 +75,33 @@ class PaperBroker:
                 responses.append(self.state["orders"][cid])
                 continue
             book = self.market.book(symbol)
-            qty, limit = dec(order["quantity"]), dec(order["price"])
+            qty = positive(order["quantity"])
             buy = order["side"] == "BUY"
             price = book.ask if buy else book.bid
-            fills = (price <= limit if buy else price >= limit) and qty <= (book.ask_qty if buy else book.bid_qty)
+            depth = max(dec(0), book.ask_qty if buy else book.bid_qty)
+            if order.get("type") == "MARKET":
+                # Only the current BBO depth is known. Model a partial market fill
+                # and terminate the remainder instead of inventing deeper liquidity.
+                executed = floor_step(min(qty, depth), self.market.rules[symbol].step)
+            else:
+                limit = dec(order["price"])
+                fills = (price <= limit if buy else price >= limit) and qty <= depth
+                executed = qty if fills else dec(0)
             position = self.state["positions"][symbol + ":" + side]
             old_qty, old_entry = dec(position["qty"]), dec(position["entry"])
             opening = (side == "LONG" and buy) or (side == "SHORT" and not buy)
             if not opening and qty > old_qty:
-                fills = False
-            if fills:
-                fee = qty * price * dec("0.0004")
-                pnl = dec(0) if opening else qty * (price - old_entry) * (1 if side == "LONG" else -1)
+                executed = dec(0)
+            if executed:
+                fee = executed * price * dec("0.0004")
+                pnl = dec(0) if opening else executed * (price - old_entry) * (1 if side == "LONG" else -1)
                 self.state["wallet"] = wire(dec(self.state["wallet"]) + pnl - fee)
-                next_qty = old_qty + qty if opening else old_qty - qty
-                entry = (old_entry * old_qty + price * qty) / next_qty if opening else old_entry
+                next_qty = old_qty + executed if opening else old_qty - executed
+                entry = (old_entry * old_qty + price * executed) / next_qty if opening else old_entry
                 position.update(qty=wire(next_qty), entry=wire(entry if next_qty else 0))
             receipt = {"symbol": symbol, "clientOrderId": cid, "positionSide": side, "side": order["side"],
-                       "status": "FILLED" if fills else "EXPIRED", "executedQty": wire(qty if fills else 0),
-                       "origQty": wire(qty), "avgPrice": wire(price if fills else 0)}
+                       "status": "FILLED" if executed == qty else "EXPIRED", "executedQty": wire(executed),
+                       "origQty": wire(qty), "avgPrice": wire(price if executed else 0)}
             self.state["orders"][cid] = receipt
             responses.append(receipt)
             self.save()

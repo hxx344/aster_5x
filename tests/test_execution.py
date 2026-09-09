@@ -123,7 +123,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(self.f.store.pending_notifications(), 0)
 
     def test_receipt_identity_and_quantities_are_validated(self):
-        order = self.executor.order("XAUUSD1", "LONG", "BUY", dec(1), dec(100), "test")
+        order = self.executor.order("XAUUSD1", "LONG", "BUY", dec(1), "test")
         row = {**order, "clientOrderId": "different", "executedQty": "1", "avgPrice": "100", "status": "FILLED"}
         from trading.models import TradingError
         with self.assertRaises(TradingError):

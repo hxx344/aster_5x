@@ -98,31 +98,31 @@ class SnapshotHardeningTests(unittest.TestCase):
 
     def test_newer_position_loss_prevents_stale_equity_crossing_half_margin(self):
         account = self.responses["/fapi/v3/accountWithJoinMargin"]
-        account["assets"][0].update(crossWalletBalance="100.043064", crossUnPnl="0", availableBalance="55")
+        account["assets"][0].update(crossWalletBalance="10004.3064", crossUnPnl="0", availableBalance="5500")
         account["positions"][1]["positionAmt"] = "0.999"
         rows = self.responses["/fapi/v3/positionRisk"]
-        rows[0].update(markPrice="90", unRealizedProfit="-10")
-        rows[1].update(markPrice="90", positionAmt="0.999", unRealizedProfit="9.99")
+        rows[0].update(entryPrice="10000", markPrice="9000", unRealizedProfit="-1000")
+        rows[1].update(entryPrice="10000", markPrice="9000", positionAmt="0.999", unRealizedProfit="999")
         snapshot = self.snapshot()
-        self.assertEqual(snapshot.wallet, dec("100.043064"))
-        self.assertEqual(snapshot.unrealized, dec("-.01"))
+        self.assertEqual(snapshot.wallet, dec("10004.3064"))
+        self.assertEqual(snapshot.unrealized, dec("-1"))
         self.assertEqual(snapshot.equity, snapshot.wallet + snapshot.unrealized)
-        self.assertEqual(snapshot.available, dec("54.99"))
-        book = replace(self.market.book("XAUUSD1"), bid=dec(90), ask=dec(90), mark=dec(90))
-        plan = plan_pair(snapshot, book, self.market.rules["XAUUSD1"], {4: dec(500000)}, DEFAULT_POLICY)
+        self.assertEqual(snapshot.available, dec("5499"))
+        book = replace(self.market.book("XAUUSD1"), bid=dec(9000), ask=dec(9000), mark=dec(9000))
+        plan = plan_pair(snapshot, book, self.market.rules["XAUUSD1"], {4: dec(500000)}, {**DEFAULT_POLICY, "order_notional": "100000"})
         self.assertEqual(plan.qty, dec(".111"))
 
         def realized_ratio(qty):
-            equity = snapshot.wallet + sum(p.unrealized for p in snapshot.positions) - qty * dec("180") * dec(".0004")
-            occupied = snapshot.occupied_margin + 2 * qty * dec(90) / 4
+            equity = snapshot.wallet + sum(p.unrealized for p in snapshot.positions) - qty * dec("18000") * dec(".0004")
+            occupied = snapshot.occupied_margin + 2 * qty * dec(9000) / 4
             return occupied / equity
 
         self.assertEqual(plan.projected_ratio, realized_ratio(plan.qty))
         self.assertLessEqual(realized_ratio(plan.qty), dec(".5"))
         self.assertGreater(realized_ratio(plan.qty + dec(".001")), dec(".5"))
         # Without the loss adjustment this next lot appeared to fit exactly at 50%.
-        old_equity = snapshot.wallet - dec(".112") * dec(180) * dec(".0004")
-        self.assertEqual((snapshot.occupied_margin + dec(".112") * dec(45)) / old_equity, dec(".5"))
+        old_equity = snapshot.wallet - dec(".112") * dec(18000) * dec(".0004")
+        self.assertEqual((snapshot.occupied_margin + dec(".112") * dec(4500)) / old_equity, dec(".5"))
 
     def test_newer_position_gain_does_not_increase_equity_or_available_cash(self):
         account = self.responses["/fapi/v3/accountWithJoinMargin"]
@@ -222,9 +222,9 @@ class SnapshotHardeningTests(unittest.TestCase):
                         LiveBroker({}, self.market, api=FixtureAPI(responses)).snapshot(["XAUUSD1"])
                     self.assertNotIn("secret-payload", str(caught.exception))
 
-    def test_malformed_account_mode_and_orders_fail_closed(self):
+    def test_malformed_account_and_modes_fail_closed(self):
         cases = (("/fapi/v3/positionSide/dual", []), ("/fapi/v3/multiAssetsMargin", None),
-                 ("/fapi/v3/accountWithJoinMargin", []), ("/fapi/v3/openOrders", [None]))
+                 ("/fapi/v3/accountWithJoinMargin", []))
         for path, value in cases:
             with self.subTest(path=path):
                 responses = account_responses()
@@ -243,10 +243,11 @@ class SnapshotHardeningTests(unittest.TestCase):
         self.market.book.assert_called_once_with("XAUUSD1")
         self.assertEqual(self.responses["/fapi/v3/positionRisk"], [])
 
-    def test_commission_for_different_symbol_is_rejected(self):
-        self.responses["/fapi/v3/commissionRate"]["symbol"] = "CLUSD1"
-        with self.assertRaisesRegex(TradingError, "手续费率交易代码"):
-            self.snapshot()
+    def test_snapshot_uses_a_fixed_fee_estimate_without_a_commission_response(self):
+        self.responses.pop("/fapi/v3/commissionRate")
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.fees, {"XAUUSD1": dec("0.0004")})
+        self.assertIsNone(snapshot.open_orders)
 
     def test_brackets_must_identify_one_unambiguous_requested_symbol(self):
         valid = self.responses["/fapi/v3/leverageBracket"]

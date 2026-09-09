@@ -948,7 +948,8 @@ export default function Home() {
                       <Input
                         id="order-notional"
                         type="number"
-                        min="1"
+                        min="500"
+                        max="1000000"
                         step="any"
                         required
                         disabled={busy || !account || account.enabled}
@@ -957,6 +958,7 @@ export default function Home() {
                           setForm({ ...form, order_notional: e.target.value })
                         }
                       />
+                      <span>新开仓固定每边至少 500 USD1</span>
                     </label>
                     <label htmlFor="margin-percent">
                       风险约束上限 <span>%</span>

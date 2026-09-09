@@ -115,7 +115,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         with patch.object(self.f.store, "event", side_effect=RuntimeError("simulated loss before submit")), \
              patch.object(self.f.broker, "submit") as submit:
             with self.assertRaises(RuntimeError):
-                self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(".005")), book)
+                self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(".12")), book)
             submit.assert_not_called()
         intent = self.f.store.intent("test")
         intent["created_at"] = time.time() - 130
@@ -148,7 +148,7 @@ class ExecutionHardeningTests(unittest.TestCase):
                     return rows
 
                 with patch.object(self.f.broker, "submit", side_effect=expired) as submit:
-                    self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(".005")), book)
+                    self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(".12")), book)
                     self.assertEqual(submit.call_count, 1)
                 self.assertIsNone(self.f.store.intent("test"))
                 self.assertIsNone(self.f.store.get("campaign:test"))

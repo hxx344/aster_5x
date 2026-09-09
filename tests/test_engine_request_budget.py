@@ -109,7 +109,7 @@ class EngineRequestBudgetTests(unittest.TestCase):
             planned = 180
             for row in accounts:
                 timing = schedule[row["id"]]
-                cost = 500 if row["enabled"] else 180
+                cost = 300 if row["enabled"] else 90
                 self.assertGreaterEqual(timing["interval"], 10 if row["enabled"] else 60)
                 planned += cost * 60 / timing["interval"]
             self.assertLessEqual(planned, 1500.000001)

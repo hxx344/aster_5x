@@ -60,14 +60,14 @@ class RiskScenarioTests(unittest.TestCase):
 
     def test_sizing_uses_exact_constraint_at_last_quantity_step(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
-        snapshot.equity = dec(".999999999999999999999999999999999999")
-        snapshot.available = dec(2)
+        snapshot.equity = dec("999.999999999999999999999999999999999")
+        snapshot.available = dec(2000)
         snapshot.fees["XAUUSD1"] = dec(0)
-        book = replace(self.f.market.book("XAUUSD1"), bid=dec(1), ask=dec(1), mark=dec(1))
+        book = replace(self.f.market.book("XAUUSD1"), bid=dec(1000), ask=dec(1000), mark=dec(1000))
         rule = replace(self.f.market.rules["XAUUSD1"], step=dec(".1"), min_qty=dec(".1"), min_notional=dec(".1"))
         plan = plan_pair(snapshot, book, rule, {4: dec(500000)}, self.f.account["policy"])
         self.assertEqual(plan.qty, dec(".9"))
-        self.assertGreater(Fraction(1, 2) / Fraction(snapshot.equity), Fraction(1, 2))
+        self.assertGreater(Fraction(500) / Fraction(snapshot.equity), Fraction(1, 2))
 
     def test_terminating_order_quantities_survive_rational_conversion_exactly(self):
         for value in (Fraction(1, 2 ** 100), Fraction(1, 5 ** 100), Fraction(-7, 10 ** 80), Fraction(0)):
@@ -89,7 +89,7 @@ class RiskScenarioTests(unittest.TestCase):
                     market.width = dec(0)
                     market.depth = dec(50)
                     for symbol in market.rules:
-                        market.prices[symbol] = dec(randomizer.choice((1, 10, 100, 1000)))
+                        market.prices[symbol] = dec(randomizer.choice((100, 1000, 5000, 10000)))
                         broker.state["leverages"][symbol] = randomizer.choice((4, 5, 10, 20))
                         quantity = dec(randomizer.randint(10, 100)) / 10
                         difference = dec(randomizer.randint(0, int(quantity))) / 1000
@@ -100,21 +100,22 @@ class RiskScenarioTests(unittest.TestCase):
                                 "entry": str(market.prices[symbol]),
                             }
                     occupied = broker.snapshot(["XAUUSD1"]).occupied_margin
-                    broker.state["wallet"] = str(occupied * dec(randomizer.choice(("1.7", "1.95", "2", "2.02", "2.5", "4"))))
+                    broker.state["wallet"] = str(occupied * dec(randomizer.choice(("1.7", "1.95", "2", "2.02", "2.5", "4", "6", "8"))))
                     snapshot = broker.snapshot(["XAUUSD1"])
                     baseline = tuple(p.qty for p in snapshot.pair("XAUUSD1"))
                     market.prices["XAUUSD1"] *= dec(randomizer.choice((".98", "1", "1.02")))
                     market.width = dec(randomizer.choice(("0", ".0001")))
-                    market.depth = dec(randomizer.choice((".01", ".1", "1", "10", "50")))
+                    market.depth = dec(randomizer.choice((".1", "1", "10", "50", "100")))
                     book = market.book("XAUUSD1")
                     leverage = snapshot.pair("XAUUSD1")[0].leverage
-                    policy = {**self.f.account["policy"], "order_notional": str(randomizer.choice((25, 100, 1000)))}
+                    policy = {**self.f.account["policy"], "order_notional": str(randomizer.choice((1000, 2000, 5000)))}
                     capacities = {leverage: dec(randomizer.choice((10001, 12000, 500000)))}
                     plan = plan_pair(snapshot, book, market.rules["XAUUSD1"], capacities, policy)
                     if not plan.qty:
                         blocked += 1
                         continue
                     opened += 1
+                    self.assertGreaterEqual(Fraction(plan.qty) * Fraction(book.mark), 500)
                     self.assertEqual(plan.qty % market.rules["XAUUSD1"].step, 0)
                     orders = [Executor.order("XAUUSD1", side, "BUY" if side == "LONG" else "SELL", plan.qty,
                                              f"{seed}-{case}-{side}")

@@ -16,14 +16,15 @@ class HedgeToleranceTests(unittest.TestCase):
         self.addCleanup(self.f.close)
         self.executor = Executor(self.f.store, self.f.broker, self.f.market)
 
-    def seed(self, long="5", short="5", leverage=4):
+    def seed(self, long="120", short="120", leverage=4):
         self.f.broker.state["leverages"]["XAUUSD1"] = leverage
+        self.f.broker.state["wallet"] = str(max(dec(25000), max(dec(long), dec(short)) * 5000))
         for side, qty in (("LONG", long), ("SHORT", short)):
             self.f.broker.state["positions"]["XAUUSD1:" + side] = {"qty": qty, "entry": "4412.015"}
         self.f.broker.save()
         return self.f.broker.snapshot(["XAUUSD1"])
 
-    def open(self, qty="0.005"):
+    def open(self, qty="0.12"):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         return self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(qty)), self.f.market.book("XAUUSD1"))
 
@@ -80,7 +81,7 @@ class HedgeToleranceTests(unittest.TestCase):
         current = self.seed("1", ".998")
         with patch.object(self.f.broker, "submit") as submit, patch.object(self.f.broker, "set_leverage") as change:
             with self.assertRaisesRegex(TradingError, "0.1%"):
-                self.executor.open_pair(self.f.account, current, "XAUUSD1", Plan(dec(".005")), self.f.market.book("XAUUSD1"))
+                self.executor.open_pair(self.f.account, current, "XAUUSD1", Plan(dec(".12")), self.f.market.book("XAUUSD1"))
             with self.assertRaisesRegex(TradingError, "0.1%"):
                 self.executor.leverage(self.f.account, "XAUUSD1", 4, 5, snapshot=stale)
             submit.assert_not_called()
@@ -90,7 +91,7 @@ class HedgeToleranceTests(unittest.TestCase):
     def test_one_side_fill_at_boundary_is_retained_and_recorded_per_side(self):
         for side in ("LONG", "SHORT"):
             with self.subTest(side=side):
-                self.seed("4.995", "4.995")
+                self.seed("119.88", "119.88")
                 self.f.store.put("campaign:test", {"id": side, "batches": []})
                 with patch.object(self.f.broker, "submit", side_effect=self.only_side(side)) as submit:
                     self.open()
@@ -99,37 +100,37 @@ class HedgeToleranceTests(unittest.TestCase):
                 self.assertEqual(abs(long.qty - short.qty) / max(long.qty, short.qty), dec(".001"))
                 self.assertIsNone(self.f.store.intent("test"))
                 quantities = self.f.store.get("campaign:test")["batches"][0]["quantities"]
-                self.assertEqual(dec(quantities["long_qty"]), dec(".005") if side == "LONG" else 0)
-                self.assertEqual(dec(quantities["short_qty"]), dec(".005") if side == "SHORT" else 0)
+                self.assertEqual(dec(quantities["long_qty"]), dec(".12") if side == "LONG" else 0)
+                self.assertEqual(dec(quantities["short_qty"]), dec(".12") if side == "SHORT" else 0)
                 price = self.f.market.book("XAUUSD1").ask if side == "LONG" else self.f.market.book("XAUUSD1").bid
-                self.assertEqual(dec(quantities["notional"]), dec(".005") * price)
+                self.assertEqual(dec(quantities["notional"]), dec(".12") * price)
                 self.assertTrue(self.f.store.get("post_fill_check:test"))
 
     def test_repair_stops_once_total_position_returns_within_tolerance(self):
         self.seed()
-        shallow = replace(self.f.market.book("XAUUSD1"), bid_qty=dec(".015"))
+        shallow = replace(self.f.market.book("XAUUSD1"), bid_qty=dec(".36"))
         with patch.object(self.f.market, "book", return_value=shallow), \
              patch.object(self.f.broker, "submit", side_effect=self.only_side("LONG")) as submit:
-            self.open(".02")
+            self.open(".48")
             self.assertEqual(submit.call_count, 2)
-            self.assertEqual(dec(submit.call_args.args[0][0]["quantity"]), dec(".015"))
+            self.assertEqual(dec(submit.call_args.args[0][0]["quantity"]), dec(".36"))
         long, short = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")
-        self.assertEqual((long.qty, short.qty), (dec("5.005"), dec(5)))
+        self.assertEqual((long.qty, short.qty), (dec("120.12"), dec(120)))
         self.assertTrue(hedge_balanced(long.qty, short.qty))
         quantities = self.f.store.get("campaign:test")["batches"][0]["quantities"]
-        self.assertEqual(dec(quantities["long_qty"]), dec(".005"))
-        self.assertEqual(dec(quantities["notional"]), dec(".005") * shallow.ask)
+        self.assertEqual(dec(quantities["long_qty"]), dec(".12"))
+        self.assertEqual(dec(quantities["notional"]), dec(".12") * shallow.ask)
 
     def test_repair_uses_actual_total_difference_and_keeps_baseline(self):
         for smaller_side in ("LONG", "SHORT"):
             with self.subTest(smaller_side=smaller_side):
-                self.seed("4.995" if smaller_side == "LONG" else "5", "4.995" if smaller_side == "SHORT" else "5")
+                self.seed("119.88" if smaller_side == "LONG" else "120", "119.88" if smaller_side == "SHORT" else "120")
                 with patch.object(self.f.broker, "submit", side_effect=self.only_side(smaller_side)) as submit:
-                    self.open(".02")
+                    self.open(".48")
                     self.assertEqual(submit.call_count, 2)
-                    self.assertEqual(dec(submit.call_args.args[0][0]["quantity"]), dec(".015"))
+                    self.assertEqual(dec(submit.call_args.args[0][0]["quantity"]), dec(".36"))
                 long, short = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")
-                self.assertEqual((long.qty, short.qty), (5, 5))
+                self.assertEqual((long.qty, short.qty), (120, 120))
 
     def test_tiny_external_position_change_still_requires_exact_reconciliation(self):
         self.seed()
@@ -153,9 +154,9 @@ class HedgeToleranceTests(unittest.TestCase):
         self.seed("1", ".9995")
         self.f.market.rules["XAUUSD1"].step = dec(".002")
         with patch.object(self.f.broker, "submit", side_effect=self.only_side("SHORT")) as submit:
-            self.open(".002")
+            self.open()
             self.assertEqual(submit.call_count, 2)
-            self.assertEqual(dec(submit.call_args.args[0][0]["quantity"]), dec(".002"))
+            self.assertEqual(dec(submit.call_args.args[0][0]["quantity"]), dec(".12"))
         long, short = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")
         self.assertEqual((long.qty, short.qty), (dec(1), dec(".9995")))
         self.assertIsNone(self.f.store.intent("test"))
@@ -174,7 +175,7 @@ class HedgeToleranceTests(unittest.TestCase):
             executor.reconcile(self.f.account)
         batches = store.get("campaign:test")["batches"]
         self.assertEqual(len(batches), 1)
-        self.assertEqual(dec(batches[0]["quantities"]["short_qty"]), dec(".005"))
+        self.assertEqual(dec(batches[0]["quantities"]["short_qty"]), dec(".12"))
 
     def test_campaign_aggregates_old_matched_and_new_asymmetric_quantities(self):
         self.seed()
@@ -185,21 +186,22 @@ class HedgeToleranceTests(unittest.TestCase):
             self.open()
         self.f.store.finish_campaign({**self.f.account, "mode": "live"}, "done", dec(".45"))
         message = self.f.store.due_notifications()[0]["message"]
-        self.assertIn("多头增加 1，空头增加 1.005", message)
-        self.assertIn("新增总名义金额 8,846.09 USD1", message)
+        self.assertIn("多头增加 1，空头增加 1.12", message)
+        self.assertIn("新增总名义金额 9,353.47 USD1", message)
         self.assertNotIn("每边增加", message)
 
     def test_adverse_net_position_move_reduces_equity_and_available_cash(self):
-        for long_qty, short_qty, old_mark, new_mark in (("1", ".999", "110", "100"), (".999", "1", "90", "100")):
-            for available in ("1000", "8"):
+        for long_qty, short_qty, old_mark, new_mark in (("1", ".999", "11000", "10000"), (".999", "1", "9000", "10000")):
+            for available in ("100000", "800"):
                 with self.subTest(long=long_qty, available=available):
                     snapshot = self.f.broker.snapshot(["XAUUSD1"])
-                    snapshot.equity, snapshot.available = dec(120), dec(available)
+                    snapshot.equity, snapshot.available = dec(12000), dec(available)
                     long, short = snapshot.pair("XAUUSD1")
                     long.qty, short.qty = dec(long_qty), dec(short_qty)
                     long.mark = short.mark = dec(old_mark)
                     book = replace(self.f.market.book("XAUUSD1"), bid=dec(new_mark), ask=dec(new_mark), mark=dec(new_mark))
-                    plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+                    plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)},
+                                     {**self.f.account["policy"], "order_notional": "100000"})
                     self.assertGreater(plan.qty, 0)
                     pnl = long.qty * (book.mark - long.mark) - short.qty * (book.mark - short.mark)
                     loss = max(dec(0), -pnl)
@@ -212,4 +214,4 @@ class HedgeToleranceTests(unittest.TestCase):
                     self.assertLessEqual(ratio(plan.qty), dec(".5"))
                     self.assertLessEqual(plan.qty * (2 * book.mark / 4 + 2 * book.mark * dec(".0004")) + loss + adjustment, snapshot.available)
                     next_qty = plan.qty + self.f.market.rules["XAUUSD1"].step
-                    self.assertTrue(ratio(next_qty) > dec(".5") or next_qty * dec("50.08") + loss + adjustment > snapshot.available)
+                    self.assertTrue(ratio(next_qty) > dec(".5") or next_qty * dec("5008") + loss + adjustment > snapshot.available)

@@ -3,7 +3,7 @@ from dataclasses import asdict
 import time
 
 from .exchange import ExchangeError
-from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TIERS, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, wire
+from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, wire
 
 
 PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
@@ -59,7 +59,7 @@ class PaperBroker:
                 positions.append(Position(symbol, side, qty, entry, book.mark, leverage, profit, maintenance=mm))
         wallet = dec(self.state["wallet"])
         return AccountSnapshot(wallet + pnl, maintenance, wallet + pnl - initial, wallet, pnl, positions, [], True, False, True,
-            time.time(), dict.fromkeys(symbols, dec("0.0004")), {s: PAPER_BRACKETS for s in symbols})
+            time.time(), dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), {s: PAPER_BRACKETS for s in symbols})
 
     def set_leverage(self, symbol, leverage):
         require_non_decreasing_leverage(self.state["leverages"][symbol], leverage)
@@ -93,7 +93,7 @@ class PaperBroker:
             if not opening and qty > old_qty:
                 executed = dec(0)
             if executed:
-                fee = executed * price * dec("0.0004")
+                fee = executed * price * TAKER_FEE_ESTIMATE
                 pnl = dec(0) if opening else executed * (price - old_entry) * (1 if side == "LONG" else -1)
                 self.state["wallet"] = wire(dec(self.state["wallet"]) + pnl - fee)
                 next_qty = old_qty + executed if opening else old_qty - executed

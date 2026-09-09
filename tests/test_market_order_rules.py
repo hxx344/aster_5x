@@ -164,13 +164,13 @@ class MarketOrderRuleTests(unittest.TestCase):
     def test_market_plan_honors_effective_step_and_maximum_quantity(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
-        rule = self.load(exchange_info({"minQty": ".003", "maxQty": ".020", "stepSize": ".003"},
+        rule = self.load(exchange_info({"minQty": ".003", "maxQty": ".200", "stepSize": ".003"},
                                        lot={"minQty": ".002", "stepSize": ".002"})).rules["XAUUSD1"]
         snapshot = fixture.broker.snapshot(["XAUUSD1"])
         book = fixture.market.book("XAUUSD1")
         plan = plan_pair(snapshot, book, rule, {4: dec("500000")}, fixture.account["policy"])
-        self.assertEqual(plan.qty, dec(".018"))
-        self.assertLessEqual(plan.qty, dec(".020"))
+        self.assertEqual(plan.qty, dec(".198"))
+        self.assertLessEqual(plan.qty, dec(".200"))
         self.assertEqual(plan.qty % dec(".002"), 0)
         self.assertEqual(plan.qty % dec(".003"), 0)
 

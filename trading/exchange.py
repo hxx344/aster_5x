@@ -16,7 +16,7 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
-from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 
@@ -439,10 +439,9 @@ class LiveBroker:
         def due(key, ttl):
             # Leave time for this read to complete before reusing an expiring item.
             return now - self.cached_at.get(key, -1e9) + 8 >= ttl
-        weight = 50 + 2 * len(symbols)  # Balances, all positions/orders, flat marks.
+        weight = 10 + 2 * len(symbols)  # Balances, all positions, flat marks.
         weight += sum(30 for key in ("dual", "multi") if fresh_modes or due(key, 15))
         weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
-        weight += sum(20 for symbol in symbols if due("fee:" + symbol, 60))
         return weight
 
     def snapshot(self, symbols, fresh_modes=False):
@@ -458,7 +457,6 @@ class LiveBroker:
             raise TradingError("账户持仓或保证金模式响应无效")
         account = self.api.call("GET", "/fapi/v3/accountWithJoinMargin", signed=True, weight=5)
         rows = self.api.call("GET", "/fapi/v3/positionRisk", signed=True, weight=5)
-        orders = self.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
         if (not isinstance(account, dict) or not isinstance(account.get("assets"), list)
                 or any(not isinstance(a, dict) for a in account["assets"])):
             raise TradingError("账户资产响应无效")
@@ -470,8 +468,6 @@ class LiveBroker:
         asset = assets[0]
         account_positions = self._position_rows(account.get("positions"))
         present = self._position_rows(rows)
-        if not isinstance(orders, list) or any(not isinstance(order, dict) for order in orders):
-            raise TradingError("持仓或挂单响应无效")
         # Some V3 responses omit flat symbols; use authenticated account rows for
         # their configured leverage and margin mode, rather than inventing defaults.
         rows, flat_marks = list(rows), {}
@@ -510,7 +506,7 @@ class LiveBroker:
                 raise TradingError("账户余额与持仓快照正在同步，稍后重试")
             if type(other.get("isolated")) is not bool or other["isolated"] != p.isolated:
                 raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
-        brackets, fees = {}, {}
+        brackets = {}
         for symbol in symbols:
             b = self.cached_call("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
             if isinstance(b, list):
@@ -523,10 +519,6 @@ class LiveBroker:
             if not isinstance(b, dict) or b.get("symbol") != symbol:
                 raise TradingError("账户风控档位交易代码不匹配")
             brackets[symbol] = validate_brackets(b["brackets"])
-            fee = self.cached_call("fee:" + symbol, "/fapi/v3/commissionRate", {"symbol": symbol}, ttl=60, weight=20)
-            if not isinstance(fee, dict) or fee.get("symbol", symbol) != symbol:
-                raise TradingError("账户手续费率交易代码不匹配")
-            fees[symbol] = positive(fee["takerCommissionRate"], True)
         wallet = dec(asset["crossWalletBalance"])
         account_unrealized = Fraction(dec(asset["crossUnPnl"]))
         # Account balances and position marks are separate reads. Charge newer
@@ -538,9 +530,11 @@ class LiveBroker:
         unrealized = decimal_value(selected_pnl, exact=True)
         available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
         equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
+        # External orders are not queried; None must not imply a verified empty
+        # order book. Fees are a fixed planning estimate, not a fetched fee rate.
         snapshot = AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
-            unrealized, positions, orders, dual.get("dualSidePosition") is True, multi.get("multiAssetsMargin") is True,
-            account.get("canTrade") is True, started, fees, brackets)
+            unrealized, positions, None, dual.get("dualSidePosition") is True, multi.get("multiAssetsMargin") is True,
+            account.get("canTrade") is True, started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets)
         if fresh_modes:
             self.leverage_snapshot = (snapshot, time.monotonic())
         return snapshot

@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from fractions import Fraction
 
 from .exchange import ExchangeError, LiveBroker, RequestNotSent
-from .models import AccountModeError, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
+from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -29,6 +29,8 @@ class Executor:
         rule = self.market.rules[symbol]
         if qty != floor_step(qty, rule.step) or not rule.min_qty <= qty <= rule.max_qty:
             raise TradingError("批次数量不符合交易规则")
+        if Fraction(qty) * Fraction(book.mark) < max(rule.min_notional, MIN_BATCH_NOTIONAL):
+            raise TradingError("新开仓每边名义金额至少为 500 USD1，并须满足交易所最低金额")
         if not hedge_balanced(long.qty, short.qty):
             raise TradingError("已有多空数量差超过 0.1%，等待人工核对")
         if self.store.intent(account["id"]):

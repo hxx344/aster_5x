@@ -17,7 +17,7 @@ class ExecutionNotSentTests(unittest.TestCase):
 
     def open(self):
         return self.executor.open_pair(self.f.account, self.f.broker.snapshot(["XAUUSD1"]), "XAUUSD1",
-                                       Plan(dec("0.005")), self.f.market.book("XAUUSD1"))
+                                       Plan(dec("0.12")), self.f.market.book("XAUUSD1"))
 
     def test_local_budget_rejection_completes_without_unknown_order_queries_or_resubmission(self):
         with patch.object(self.f.broker, "submit", side_effect=RequestNotSent("local request budget exhausted", retry_after=60)) as submit, \
@@ -116,7 +116,7 @@ class ExecutionNotSentTests(unittest.TestCase):
         self.assertTrue(self.f.store.account("test")["enabled"])
         self.assertIsNone(self.executor.last_completed_intent)
         self.assertIsNone(self.executor.last_snapshot)
-        self.assertEqual(tuple(p.qty for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")), (dec("0.005"), 0))
+        self.assertEqual(tuple(p.qty for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")), (dec("0.12"), 0))
 
         # A new process can finish after the budget recovers, without querying
         # or resending either original leg or the known-absent repair.
@@ -128,7 +128,7 @@ class ExecutionNotSentTests(unittest.TestCase):
             restarted.reconcile(self.f.account)
         recovered_send.assert_called_once()
         repair, = recovered_send.call_args.args[0]
-        self.assertEqual((repair["positionSide"], repair["side"], repair["quantity"]), ("LONG", "SELL", "0.005"))
+        self.assertEqual((repair["positionSide"], repair["side"], repair["quantity"]), ("LONG", "SELL", "0.12"))
         prior_ids = {order["newClientOrderId"] for order in pending["orders"] + pending["repairs"]}
         self.assertNotIn(repair["newClientOrderId"], prior_ids)
         self.assertIsNone(store.intent("test"))

@@ -48,7 +48,7 @@ class MarketExecutionTests(unittest.TestCase):
         self.addCleanup(self.reader.stop)
         self.executor = Executor(self.f.store, self.live, self.f.market)
 
-    def open(self, qty=".01"):
+    def open(self, qty=".12"):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         return self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(qty)), self.f.market.book("XAUUSD1"))
 
@@ -67,11 +67,11 @@ class MarketExecutionTests(unittest.TestCase):
         self.assertTrue(kwargs["signed"])
         orders = json.loads(params["batchOrders"])
         self.assertEqual([(o["positionSide"], o["side"], o["quantity"]) for o in orders],
-                         [("LONG", "BUY", "0.01"), ("SHORT", "SELL", "0.01")])
+                         [("LONG", "BUY", "0.12"), ("SHORT", "SELL", "0.12")])
         for order in orders:
             self.assert_market(order)
         self.assertIsNone(self.f.store.intent("test"))
-        self.assertEqual(tuple(p.qty for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")), (dec(".01"), dec(".01")))
+        self.assertEqual(tuple(p.qty for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")), (dec(".12"), dec(".12")))
 
     def test_single_leg_repair_is_a_market_close_and_preserves_old_positions(self):
         for side in ("LONG", "SHORT"):
@@ -84,7 +84,7 @@ class MarketExecutionTests(unittest.TestCase):
         self.assertEqual((method, path), ("POST", "/fapi/v3/order"))
         self.assertTrue(kwargs["signed"])
         self.assert_market(repair)
-        self.assertEqual((repair["positionSide"], repair["side"], dec(repair["quantity"])), ("LONG", "SELL", dec(".01")))
+        self.assertEqual((repair["positionSide"], repair["side"], dec(repair["quantity"])), ("LONG", "SELL", dec(".12")))
         self.assertEqual(tuple(p.qty for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")), (dec(1), dec(1)))
 
     def test_price_move_after_planning_fills_and_is_recorded_at_actual_market_prices(self):
@@ -92,7 +92,7 @@ class MarketExecutionTests(unittest.TestCase):
         self.entry_book = replace(book, bid=book.bid + 10, ask=book.ask + 10, mark=book.mark + 10)
         self.open()
         quantities = self.f.store.get("campaign:test")["batches"][0]["quantities"]
-        self.assertEqual(dec(quantities["notional"]), dec(".01") * (self.entry_book.bid + self.entry_book.ask))
+        self.assertEqual(dec(quantities["notional"]), dec(".12") * (self.entry_book.bid + self.entry_book.ask))
         self.assertIsNone(self.f.store.intent("test"))
 
     def test_partial_market_fills_reconcile_and_close_only_actual_excess(self):
@@ -132,7 +132,7 @@ class MarketExecutionTests(unittest.TestCase):
     def test_partial_fill_excess_below_market_minimum_pauses_without_invalid_repairs(self):
         self.f.market.rules["XAUUSD1"].min_qty = dec(".01")
         self.entry_book = replace(self.f.market.book("XAUUSD1"), bid_qty=dec(".019"), ask_qty=dec(".02"))
-        self.open(".02")
+        self.open()
         self.assertEqual(len(self.calls), 1)
         pending = self.f.store.intent("test")
         self.assertEqual((pending["status"], pending["repair_attempts"], pending["repairs"]), ("attention", 0, []))
@@ -141,11 +141,12 @@ class MarketExecutionTests(unittest.TestCase):
 
     def test_market_minimum_notional_uses_mark_price_when_it_differs_from_bbo(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
-        book = replace(self.f.market.book("XAUUSD1"), bid=dec(200), ask=dec("200.01"), mark=dec(100))
+        book = replace(self.f.market.book("XAUUSD1"), bid=dec(20000), ask=dec(20001), mark=dec(10000))
         for depth, expected in ((".03", 0), (".05", ".05")):
             with self.subTest(depth=depth):
                 current = replace(book, bid_qty=dec(depth), ask_qty=dec(depth))
-                plan = plan_pair(snapshot, current, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+                plan = plan_pair(snapshot, current, self.f.market.rules["XAUUSD1"], {4: dec(500000)},
+                                 {**self.f.account["policy"], "order_notional": "2000"})
                 self.assertEqual(plan.qty, dec(expected))
 
     def test_restart_queries_legacy_limit_orders_without_converting_or_resubmitting(self):

@@ -1,4 +1,6 @@
 """Independent account workers and shared market polling for the Linux service."""
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -14,7 +16,7 @@ import monitor
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
-from .models import AccountModeError, Book, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
+from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -55,8 +57,10 @@ def validate_account(account):
         raise TradingError("策略配置字段不完整")
     if not isinstance(policy["symbols"], list) or not policy["symbols"] or any(s not in SYMBOLS for s in policy["symbols"]) or len(set(policy["symbols"])) != len(policy["symbols"]):
         raise TradingError("交易市场配置无效")
-    if positive(policy["threshold"], True) > 1000000000 or not 1 <= positive(policy["order_notional"]) <= 1000000:
-        raise TradingError("阈值或单笔金额超出配置范围")
+    if positive(policy["threshold"], True) > 1000000000:
+        raise TradingError("额度阈值超出配置范围")
+    if not MIN_BATCH_NOTIONAL <= positive(policy["order_notional"]) <= 1000000:
+        raise TradingError("单批每边上限必须为 500 至 1000000 USD1")
     if not 0 < positive(policy["margin_limit"]) <= 1:
         raise TradingError("风险上限必须大于 0 且不超过 100%")
     if not 0 < positive(policy["spread_limit"]) <= dec("0.0005"):
@@ -154,13 +158,13 @@ class Engine:
         with self.lock:
             def cost(account):
                 if not account["enabled"]:
-                    return 180
+                    return 90
                 positions = self.views.get(account["id"], {}).get("snapshot", {}).get("positions", [])
                 minimum = minimum_open_leverage(account["policy"])
                 for symbol in account["policy"]["symbols"]:
                     pair = [p for p in positions if p["symbol"] == symbol]
                     if len(pair) != 2:
-                        return 500  # Cold start may perform and confirm an upgrade.
+                        return 300  # Cold start may perform and confirm an upgrade.
                     leverage = pair[0]["leverage"]
                     caps = self.markets.get(symbol, {}).get("capacities", {})
                     threshold = dec(account["policy"]["threshold"])
@@ -168,8 +172,8 @@ class Engine:
                     if flat and leverage >= minimum and dec(caps.get(str(leverage), "0")) > threshold:
                         continue
                     if any(target > leverage and dec(caps.get(str(target), "0")) > threshold for target in leverage_candidates(minimum)):
-                        return 500
-                return 220
+                        return 300
+                return 120
             costs = {a["id"]: cost(a) for a in live}
         period = 60 * sum(costs.values()) / capacity
         return {a["id"]: {
@@ -491,6 +495,8 @@ class Engine:
             if enabled:
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
+                if dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
+                    raise TradingError("单批每边上限低于固定最低批次金额 500 USD1，请先修改策略设置")
                 if self.store.intent(account_id):
                     raise TradingError("请先核对未完成批次")
                 snapshot = self.broker(account).snapshot(account["policy"]["symbols"], fresh_modes=True)

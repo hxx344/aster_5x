@@ -19,7 +19,7 @@ class ReconciliationSnapshotTests(unittest.TestCase):
 
     def open(self):
         return self.executor.open_pair(self.f.account, self.f.broker.snapshot([self.symbol]),
-                                       self.symbol, Plan(dec("0.005")), self.f.market.book(self.symbol))
+                                       self.symbol, Plan(dec("0.12")), self.f.market.book(self.symbol))
 
     def pending_pair(self):
         with patch.object(self.executor, "reconcile", return_value="simulated interruption"):
@@ -45,7 +45,7 @@ class ReconciliationSnapshotTests(unittest.TestCase):
             self.open()
         self.assertEqual(len(account_reads), 2)
         self.assertIs(self.executor.last_snapshot, account_reads[-1])
-        self.assertEqual(tuple(p.qty for p in self.executor.last_snapshot.pair(self.symbol)), (dec("0.005"), dec("0.005")))
+        self.assertEqual(tuple(p.qty for p in self.executor.last_snapshot.pair(self.symbol)), (dec("0.12"), dec("0.12")))
         self.assertIsNone(self.f.store.intent("test"))
 
     def test_repaired_batch_publishes_only_the_snapshot_after_compensation(self):
@@ -67,7 +67,7 @@ class ReconciliationSnapshotTests(unittest.TestCase):
              patch.object(self.f.broker, "submit", side_effect=one_leg):
             self.open()
         self.assertEqual(len(snapshots), 3)
-        self.assertEqual(tuple(p.qty for p in snapshots[1].pair(self.symbol)), (dec("0.005"), 0))
+        self.assertEqual(tuple(p.qty for p in snapshots[1].pair(self.symbol)), (dec("0.12"), 0))
         self.assertIs(self.executor.last_snapshot, snapshots[-1])
         self.assertEqual(tuple(p.qty for p in self.executor.last_snapshot.pair(self.symbol)), (0, 0))
         self.assertIsNone(self.f.store.intent("test"))

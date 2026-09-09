@@ -60,7 +60,7 @@ class DashboardAPITests(unittest.TestCase):
         result = self.client.post("/api/accounts", json={"id": "second", "name": "第二账户", "mode": "paper", "env_prefix": "ASTER_SECOND"})
         self.assertEqual(result.status_code, 200, result.text)
         self.assertFalse(self.f.store.account("second")["enabled"])
-        result = self.client.patch("/api/accounts/second", json={"threshold": "20000", "order_notional": "100"})
+        result = self.client.patch("/api/accounts/second", json={"threshold": "20000", "order_notional": "700"})
         self.assertEqual(result.status_code, 200)
         self.assertEqual(self.client.post("/api/accounts/second/enable").status_code, 200)
         self.assertEqual(self.client.patch("/api/accounts/second", json={"threshold": "0", "order_notional": "500"}).status_code, 409)

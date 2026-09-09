@@ -51,7 +51,7 @@ class RiskTests(unittest.TestCase):
     def test_sizing_shrinks_and_stays_within_occupancy_limit(self):
         snapshot = replace(self.snapshot, equity=dec(1000), wallet=dec(1000), available=dec(1000))
         other = snapshot.pair("SPCXUSD1")[0]
-        other.qty, other.mark, other.leverage = dec("4.9"), dec(100), 1
+        other.qty, other.mark, other.leverage = dec(2), dec(100), 1
         plan = self.plan(snapshot=snapshot)
         self.assertGreater(plan.qty, 0)
         self.assertLessEqual(plan.projected_ratio, dec("0.5"))
@@ -59,14 +59,15 @@ class RiskTests(unittest.TestCase):
         self.assertEqual(plan.qty % self.rules.step, 0)
 
     def test_cash_includes_both_legs_and_costs(self):
-        snapshot = replace(self.snapshot, available=dec("20"))
+        snapshot = replace(self.snapshot, available=dec("300"))
         plan = self.plan(snapshot=snapshot)
+        self.assertGreater(plan.qty, 0)
         cost = plan.qty * (2 * max(self.book.ask, self.book.mark) / 4 + (self.book.ask + self.book.bid) * dec("0.0004") + self.book.ask - self.book.bid)
         self.assertLessEqual(cost, snapshot.available)
 
     def test_book_depth_and_minimum_order_are_respected(self):
-        shallow = replace(self.book, ask_qty=dec("0.005"))
-        self.assertLessEqual(self.plan(book=shallow).qty, dec("0.005"))
+        shallow = replace(self.book, ask_qty=dec("0.12"))
+        self.assertEqual(self.plan(book=shallow).qty, dec("0.12"))
         dust = replace(self.book, ask_qty=dec("0.00001"))
         self.assertEqual(self.plan(book=dust).qty, 0)
 

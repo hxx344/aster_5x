@@ -1,4 +1,6 @@
 """Exact decimal risk calculations. No network or order side effects."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -9,6 +11,8 @@ ZERO = Decimal("0")
 HEDGE_TOLERANCE = Decimal("0.001")
 TIERS = (4, 5, 10, 20)
 MIN_OPEN_LEVERAGE = 4
+MIN_BATCH_NOTIONAL = Decimal("500")
+TAKER_FEE_ESTIMATE = Decimal("0.0004")
 SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
 
 
@@ -172,7 +176,7 @@ class AccountSnapshot:
     wallet: Decimal
     unrealized: Decimal
     positions: list[Position]
-    open_orders: list[dict]
+    open_orders: list[dict] | None  # None means the broker did not query external orders.
     hedge_mode: bool
     multi_assets: bool
     can_trade: bool
@@ -307,6 +311,8 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     minimum = minimum_open_leverage(policy)
     if long.leverage < minimum:
         return Plan(reason=f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
+    if dec(policy["order_notional"]) < MIN_BATCH_NOTIONAL:
+        return Plan(reason="单批每边上限低于固定最低批次金额 500 USD1，请修改策略设置")
     limit = Fraction(dec(policy["margin_limit"]))
     if snapshot.margin_exceeds(policy["margin_limit"], include_equal=True):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
@@ -346,7 +352,7 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
         / (2 * high_price / leverage + (ask + bid) * fee + loss_span),
     )
     # MARKET orders use the mark price for the exchange's minimum notional.
-    min_qty = max(Fraction(rules.min_qty), Fraction(rules.min_notional) / mark)
+    min_qty = max(Fraction(rules.min_qty), Fraction(max(rules.min_notional, MIN_BATCH_NOTIONAL)) / mark)
     step = Fraction(rules.step)
 
     def projected(qty):
@@ -366,7 +372,7 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
             high = mid - 1
     qty = low * step
     if qty < min_qty or qty == 0:
-        return Plan(reason="风险、余额或额度不足以继续最小一笔")
+        return Plan(reason="风险、余额或额度不足以继续最小一笔（每边至少 500 USD1）")
     total_occupied, equity = projected(qty)
     return Plan(decimal_value(qty, exact=True), decimal_value(total_occupied / equity), "可以分批双向开仓")
 

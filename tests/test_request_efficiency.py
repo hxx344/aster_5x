@@ -43,20 +43,22 @@ class LeverageReadEfficiencyTests(unittest.TestCase):
             for row in rows:
                 row["leverage"] = str(leverage)
 
-    def test_upgrade_uses_two_full_snapshots_and_242_weight_instead_of_352(self):
+    def test_upgrade_uses_two_snapshots_and_142_weight_without_removed_queries(self):
         self.engine.tick_account("test")
-        for path in ("/fapi/v3/accountWithJoinMargin", "/fapi/v3/positionRisk", "/fapi/v3/openOrders"):
+        for path in ("/fapi/v3/accountWithJoinMargin", "/fapi/v3/positionRisk"):
             self.assertEqual(self.calls.count(path), 2)
+        self.assertNotIn("/fapi/v3/openOrders", self.calls)
+        self.assertNotIn("/fapi/v3/commissionRate", self.calls)
         self.assertEqual(self.calls.count("/fapi/v3/leverage"), 1)
-        self.assertEqual(self.api.budget.weight, 242)
+        self.assertEqual(self.api.budget.weight, 142)
         self.assertEqual(self.f.store.intent("test")["target"], 5)
         # The previous third snapshot is still required for direct broker calls.
         self.broker.set_leverage(SYMBOL, 5)
         self.assertEqual(self.calls.count("/fapi/v3/accountWithJoinMargin"), 3)
-        self.assertEqual(self.api.budget.weight, 353)  # Three reads and two POSTs; old path had one POST.
+        self.assertEqual(self.api.budget.weight, 213)  # Three reads and two POSTs.
 
-    def test_cached_cost_admission_allows_a_complete_upgrade_with_260_weight_remaining(self):
-        self.api.budget.reserve(1240)
+    def test_cached_cost_admission_allows_a_complete_upgrade_with_160_weight_remaining(self):
+        self.api.budget.reserve(1340)
         self.engine.tick_account("test")
         self.assertEqual(self.calls.count("/fapi/v3/leverage"), 1)
         self.assertEqual(self.api.budget.weight, 1482)
@@ -100,14 +102,11 @@ class LeverageReadEfficiencyTests(unittest.TestCase):
             self.broker.set_leverage(SYMBOL, 5, checked_snapshot=snapshot)
         self.assertNotIn("/fapi/v3/leverage", self.calls)
 
-    def test_invalid_modes_and_foreign_open_orders_still_prevent_the_upgrade(self):
-        for change in ("mode", "orders"):
-            with self.subTest(change=change):
-                self.responses["/fapi/v3/multiAssetsMargin"]["multiAssetsMargin"] = change == "mode"
-                self.responses["/fapi/v3/openOrders"] = [{"symbol": "BTCUSD1"}] if change == "orders" else []
-                snapshot = self.broker.snapshot([SYMBOL], fresh_modes=True)
-                with self.assertRaises(TradingError):
-                    self.broker.set_leverage(SYMBOL, 5, checked_snapshot=snapshot)
+    def test_invalid_modes_still_prevent_the_upgrade(self):
+        self.responses["/fapi/v3/multiAssetsMargin"]["multiAssetsMargin"] = True
+        snapshot = self.broker.snapshot([SYMBOL], fresh_modes=True)
+        with self.assertRaises(TradingError):
+            self.broker.set_leverage(SYMBOL, 5, checked_snapshot=snapshot)
         self.assertNotIn("/fapi/v3/leverage", self.calls)
 
     def test_checked_snapshot_is_consumed_once(self):
@@ -119,11 +118,12 @@ class LeverageReadEfficiencyTests(unittest.TestCase):
         self.assertEqual(self.calls.count("/fapi/v3/leverage"), 1)
 
     def test_snapshot_cost_estimate_uses_caches_but_keeps_all_account_reads(self):
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 133)
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 73)
         self.broker.snapshot([SYMBOL])
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 53)
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL], fresh_modes=True), 113)
-        self.broker.cached_at["fee:" + SYMBOL] = time.monotonic() - 53
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 13)
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL], fresh_modes=True), 73)
+        self.broker.cached_at["dual"] = time.monotonic() - 8
+        self.broker.cached_at["multi"] = time.monotonic() - 8
         self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 73)
 
 

@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict
+import hashlib
 import json
 import logging
 import os
@@ -74,6 +75,7 @@ class Engine:
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
+        self.capacity_notification_errors = {}
         if demo and not store.accounts():
             account = {"id": "demo", "name": "示例子账户", "mode": "paper", "env_prefix": "ASTER_DEMO", "enabled": False, "policy": {**DEFAULT_POLICY}}
             store.save_account(account)
@@ -185,12 +187,15 @@ class Engine:
     def poll_market(self, symbol):
         if self.shutdown.is_set():
             return 5
+        capacity_observed = False
         try:
             with self.lock:
                 tiers = set(TIERS)
                 for view in self.views.values():
                     tiers.update(p["leverage"] for p in view.get("snapshot", {}).get("positions", []) if p["symbol"] == symbol)
             capacities = self.market.capacities(symbol, tiers)
+            capacity_observed = True
+            self.observe_capacity_alerts(symbol, capacities, time.time())
             book = self.market.book(symbol)
             row = {"status": "ok", "capacities": {str(k): wire(v) for k, v in capacities.items()},
                    "checked_at": time.time(), "book": {**asdict(book), "spread": book.spread}}
@@ -198,6 +203,8 @@ class Engine:
                 self.markets[symbol] = json.loads(dumps(row))
             return 5
         except (TradingError, KeyError, ValueError, TypeError) as exc:
+            if not capacity_observed:
+                self.invalidate_capacity_alerts(symbol)
             with self.lock:
                 previous = self.markets.get(symbol, {})
                 self.markets[symbol] = {**previous, "status": "error", "error": str(exc) if isinstance(exc, TradingError) else "行情数据格式异常"}
@@ -447,6 +454,63 @@ class Engine:
         return monitor.validate_config({**base, "feishu_enabled": True, "feishu_webhook": webhook,
                                        "feishu_sign_secret": os.environ.get("FEISHU_SIGN_SECRET", "")})
 
+    def capacity_alert_config(self, notification=None):
+        if self.demo:
+            return None
+        enabled = os.environ.get("ASTER_CAPACITY_ALERT_ENABLED", "1").strip()
+        if enabled not in ("0", "1"):
+            raise TradingError("额度提醒开关必须为 0 或 1")
+        if enabled == "0":
+            return None
+        config = notification if notification is not None else self.notification_config()
+        if config is None:
+            return None
+        threshold = positive(os.environ.get("ASTER_CAPACITY_ALERT_THRESHOLD", str(config["threshold"])), True)
+        cooldown = positive(os.environ.get("ASTER_CAPACITY_ALERT_COOLDOWN_SECONDS", str(config["cooldown_seconds"])), True)
+        if threshold > 1000000000 or cooldown > 86400:
+            raise TradingError("额度提醒阈值或冷却时间超出范围")
+        # Keep credentials out of the database, while a new webhook or threshold
+        # gets its own gate. Equivalent numeric spellings have the same identity.
+        identity = hashlib.sha256(f"{config['webhook']}|{threshold.as_integer_ratio()}".encode()).hexdigest()
+        return {"threshold": threshold, "cooldown": float(cooldown), "identity": identity}
+
+    def invalidate_capacity_alerts(self, symbol, leverage=None):
+        try:
+            self.store.invalidate_capacity_alert(symbol, leverage)
+            return True
+        except Exception:
+            # A notification failure must not take down price polling or trading.
+            with self.lock:
+                self.capacity_notification_errors[symbol] = "额度提醒状态保存失败，等待重试"
+            return False
+
+    def observe_capacity_alerts(self, symbol, capacities, checked_at):
+        if self.demo or self.shutdown.is_set():
+            return
+        try:
+            policy = self.capacity_alert_config()
+            if policy is None:
+                if self.invalidate_capacity_alerts(symbol):
+                    with self.lock:
+                        self.capacity_notification_errors.pop(symbol, None)
+                return
+            for leverage in TIERS:
+                if leverage not in capacities:
+                    if not self.invalidate_capacity_alerts(symbol, leverage):
+                        return
+                    continue
+                self.store.observe_capacity_alert(symbol, leverage, capacities[leverage],
+                    threshold=policy["threshold"], cooldown=policy["cooldown"], identity=policy["identity"], checked_at=checked_at)
+            with self.lock:
+                self.capacity_notification_errors.pop(symbol, None)
+        except (TradingError, monitor.MonitorError, ValueError, TypeError, OSError):
+            self.invalidate_capacity_alerts(symbol)
+            with self.lock:
+                self.capacity_notification_errors[symbol] = "额度提醒配置或数据无效，等待修正"
+        except Exception:
+            with self.lock:
+                self.capacity_notification_errors[symbol] = "额度提醒状态保存失败，等待重试"
+
     def notify(self):
         if self.demo or self.shutdown.is_set():
             return 5
@@ -454,9 +518,27 @@ class Engine:
             config = self.notification_config()
             if not config:
                 return 5
+            try:
+                capacity_policy = self.capacity_alert_config(config)
+                with self.lock:
+                    self.capacity_notification_errors.pop("config", None)
+            except (TradingError, ValueError, TypeError):
+                capacity_policy = None
+                with self.lock:
+                    self.capacity_notification_errors["config"] = "额度提醒配置无效；成交汇总继续发送"
+            capacity_sent = 0
             for item in self.store.due_notifications():
                 if self.shutdown.is_set():
                     break
+                # Re-read after earlier sends: a capacity value may have changed
+                # or expired while another webhook request was in flight.
+                item = self.store.notification_for_delivery(item["id"])
+                if item is None:
+                    continue
+                if item.get("capacity_key"):
+                    if capacity_policy is None or item.get("capacity_identity") != capacity_policy["identity"] or capacity_sent >= 2:
+                        continue
+                    capacity_sent += 1
                 try:
                     monitor.send_feishu(config, item["message"])
                     self.store.notification_result(item, True)
@@ -479,7 +561,8 @@ class Engine:
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
                 "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(),
-                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications, "error": self.notification_error}}))
+                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,
+                                 "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
     def run(self):
         pending, due = {}, {}

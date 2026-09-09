@@ -1,10 +1,19 @@
 """Durable execution intents and notification outbox, isolated per account."""
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
+import uuid
+
+from .models import SYMBOLS, TIERS, TradingError, positive
+
+
+CAPACITY_ALERT_MAX_AGE = 8
 
 
 def dumps(value):
@@ -37,11 +46,17 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id,id);
                 CREATE TABLE IF NOT EXISTS outbox (
                     id TEXT PRIMARY KEY, message TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-                    due_at REAL NOT NULL, delivered_at REAL
+                    due_at REAL NOT NULL, delivered_at REAL, expires_at REAL, capacity_key TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(due_at) WHERE delivered_at IS NULL;
                 PRAGMA optimize;
             """)
+            # Existing trade notifications keep NULL expiry and remain deliverable.
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(outbox)")}
+            for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {kind}")
 
     @contextmanager
     def connect(self):
@@ -170,18 +185,132 @@ class Store:
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (account["id"], "complete", message, time.time()))
             db.execute("DELETE FROM kv WHERE key=?", (key,))
 
+    @staticmethod
+    def capacity_alert_key(symbol, leverage):
+        if symbol not in SYMBOLS or type(leverage) is not int or leverage not in TIERS:
+            raise TradingError("额度提醒市场或杠杆档位无效")
+        return f"capacity_alert:{symbol}:{leverage}"
+
+    def observe_capacity_alert(self, symbol, leverage, value, *, threshold, cooldown, identity, checked_at, now=None):
+        """Atomically persist an independent threshold gate and its one pending message."""
+        key = self.capacity_alert_key(symbol, leverage)
+        value, threshold = positive(value, True), positive(threshold, True)
+        cooldown = float(positive(cooldown, True))
+        now = time.time() if now is None else float(positive(now, True))
+        checked_at = float(positive(checked_at, True))
+        if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity):
+            raise TradingError("额度提醒配置标识无效")
+        if not all(math.isfinite(v) for v in (now, checked_at, cooldown)):
+            raise TradingError("额度提醒时间无效")
+        if not -1 <= now - checked_at < CAPACITY_ALERT_MAX_AGE:
+            return False
+        try:
+            checked_text = datetime.fromtimestamp(checked_at, timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            raise TradingError("额度提醒检查时间无效") from None
+        above = value > threshold
+        message = (f"Aster 开仓额度提醒\n{symbol} · {leverage}x\n"
+                   f"公开剩余可开额度（估算）：{value:,.2f} USD1\n"
+                   f"触发条件：> {threshold:,.2f} USD1\n"
+                   "未扣除个人持仓和挂单占用，请以账户页面为准。\n"
+                   f"检查时间：{checked_text}\n"
+                   f"https://www.asterdex.com/zh-CN/trade/pro/futures/{symbol}")
+        queued = False
+        with self.connect() as db:
+            # Serialize read-modify-write across separate Store instances/processes.
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+            gate = json.loads(row[0]) if row else None
+            if not gate or gate.get("identity") != identity:
+                if gate and gate.get("pending_id"):
+                    db.execute("UPDATE outbox SET expires_at=0 WHERE id=? AND delivered_at IS NULL", (gate["pending_id"],))
+                gate = {"identity": identity, "notified": False, "last_alert": None, "pending_id": None,
+                        "above": False, "fall_generation": 0}
+            elif checked_at < gate.get("checked_at", 0):
+                return False
+            gate.setdefault("fall_generation", 0)
+            if gate.get("above") and not above:
+                gate["fall_generation"] += 1
+            gate.update(above=above, checked_at=checked_at)
+            pending_id = gate.get("pending_id")
+            pending = db.execute("SELECT delivered_at FROM outbox WHERE id=?", (pending_id,)).fetchone() if pending_id else None
+            if not pending or pending["delivered_at"] is not None:
+                pending_id = gate["pending_id"] = None
+            if not above:
+                gate["notified"] = False
+                if pending_id:
+                    # Keep an in-flight id attached to the gate until its result is known.
+                    db.execute("UPDATE outbox SET expires_at=0 WHERE id=?", (pending_id,))
+            elif pending_id:
+                # Refresh the estimate without resetting a failed send's retry backoff.
+                db.execute("UPDATE outbox SET message=?,expires_at=? WHERE id=?",
+                           (message, checked_at + CAPACITY_ALERT_MAX_AGE, pending_id))
+            elif not gate.get("notified") and (gate.get("last_alert") is None or now - gate["last_alert"] >= cooldown):
+                pending_id = "capacity-" + uuid.uuid4().hex
+                db.execute("INSERT INTO outbox(id,message,due_at,expires_at,capacity_key) VALUES (?,?,?,?,?)",
+                           (pending_id, message, now, checked_at + CAPACITY_ALERT_MAX_AGE, key))
+                gate["pending_id"], queued = pending_id, True
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(gate)))
+        return queued
+
+    def invalidate_capacity_alert(self, symbol, leverage=None):
+        """Pause stale/disabled sources without treating a failed read as a threshold fall."""
+        keys = [self.capacity_alert_key(symbol, tier) for tier in (TIERS if leverage is None else (leverage,))]
+        with self.connect() as db:
+            db.executemany("UPDATE outbox SET expires_at=0 WHERE capacity_key=? AND delivered_at IS NULL", ((key,) for key in keys))
+
+    @staticmethod
+    def _notification_item(db, row):
+        item = dict(row)
+        if item["capacity_key"]:
+            saved = db.execute("SELECT data FROM kv WHERE key=?", (item["capacity_key"],)).fetchone()
+            gate = json.loads(saved[0]) if saved else None
+            if not gate or gate.get("pending_id") != item["id"] or not gate.get("above"):
+                return None
+            item["capacity_identity"] = gate["identity"]
+            item["capacity_generation"] = gate.get("fall_generation", 0)
+        return item
+
     def due_notifications(self):
         with self.connect() as db:
-            return [dict(r) for r in db.execute("SELECT * FROM outbox WHERE delivered_at IS NULL AND due_at<=? ORDER BY due_at LIMIT 5", (time.time(),))]
+            now = time.time()
+            rows = db.execute("""SELECT * FROM outbox WHERE delivered_at IS NULL AND due_at<=?
+                AND (expires_at IS NULL OR expires_at>?)
+                ORDER BY (capacity_key IS NOT NULL),due_at,id LIMIT 5""", (now, now)).fetchall()
+            return [item for row in rows if (item := self._notification_item(db, row)) is not None]
+
+    def notification_for_delivery(self, notification_id):
+        """Re-read just before sending: a queued estimate may have fallen or expired."""
+        with self.connect() as db:
+            now = time.time()
+            row = db.execute("""SELECT * FROM outbox WHERE id=? AND delivered_at IS NULL AND due_at<=?
+                AND (expires_at IS NULL OR expires_at>?)""", (notification_id, now, now)).fetchone()
+            return self._notification_item(db, row) if row else None
 
     def notification_result(self, item, success):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM outbox WHERE id=?", (item["id"],)).fetchone()
+            if not row or row["delivered_at"] is not None:
+                return
+            now = time.time()
             if success:
-                db.execute("UPDATE outbox SET delivered_at=? WHERE id=?", (time.time(), item["id"]))
+                db.execute("UPDATE outbox SET delivered_at=? WHERE id=?", (now, item["id"]))
+                if row["capacity_key"]:
+                    saved = db.execute("SELECT data FROM kv WHERE key=?", (row["capacity_key"],)).fetchone()
+                    gate = json.loads(saved[0]) if saved else None
+                    if gate and gate.get("pending_id") == item["id"] and gate.get("identity") == item.get("capacity_identity"):
+                        # An in-flight success does not consume a newer threshold crossing.
+                        current_generation = item.get("capacity_generation", 0) == gate.get("fall_generation", 0)
+                        gate.update(last_alert=now, notified=bool(gate.get("above")) and current_generation, pending_id=None)
+                        db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(gate), row["capacity_key"]))
+                        _, symbol, leverage = row["capacity_key"].split(":")
+                        db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
+                                   ("", "capacity", f"{symbol} {leverage}x 额度达标提醒已发送飞书", now))
             else:
-                attempts = item["attempts"] + 1
-                db.execute("UPDATE outbox SET attempts=?,due_at=? WHERE id=?", (attempts, time.time() + min(3600, 5 * 2 ** min(attempts, 10)), item["id"]))
+                attempts = row["attempts"] + 1
+                db.execute("UPDATE outbox SET attempts=?,due_at=? WHERE id=?", (attempts, now + min(3600, 5 * 2 ** min(attempts, 10)), item["id"]))
 
     def pending_notifications(self):
         with self.connect() as db:
-            return db.execute("SELECT count(*) FROM outbox WHERE delivered_at IS NULL").fetchone()[0]
+            return db.execute("SELECT count(*) FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>0)").fetchone()[0]

@@ -6,11 +6,17 @@
 curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install-trading.sh | sudo bash
 ```
 
-以下是保留的**纯额度监控**工具说明，不会登录账户或下单。同时监控 **XAUUSD1、SPCXUSD1、CLUSD1**，每个标的按 **4x / 5x / 10x / 20x、每 5 秒检查、严格大于 10,000 USD1** 的规则独立触发。默认关闭飞书，触发只记入本地日志。纯监控无需第三方 Python 依赖。
+新版 `aster-desk` 同时支持**公共额度提醒**和**实盘交易完成汇总**，共用 `FEISHU_WEBHOOK_URL` 与可选的 `FEISHU_SIGN_SECRET`。已有机器人配置升级后直接沿用。公共提醒复用现有行情轮询，监控三个标的的 4x / 5x / 10x / 20x，默认严格大于 10,000 USD1 时提醒，与账户数量、账户开仓阈值和交易启停互相独立，不增加 Aster 查询。
+
+公共提醒默认启用，可在 `/etc/aster-desk/environment` 设置 `ASTER_CAPACITY_ALERT_ENABLED=0` 单独关闭；自定义阈值与冷却时间分别使用 `ASTER_CAPACITY_ALERT_THRESHOLD=10000`、`ASTER_CAPACITY_ALERT_COOLDOWN_SECONDS=300`，修改后执行 `sudo aster-desk restart`。每个组合首次达标提醒一次，持续高位不刷屏，回落后重新达标且冷却结束才再提醒。成功状态持久化，失败只在新额度仍有效且达标时重试；未配置 Webhook 时不积累公共提醒历史，演示模式不发送。交易汇总优先发送，HTTP 投递结果不确定时仍可能重复。提醒使用未扣个人占用的公开估算，完整说明见 [飞书、升级与运维](DEPLOYMENT.md#飞书升级与运维)。
+
+升级保留新版环境文件和数据库，安装脚本会停用旧 `aster-5x` 服务以免重复轮询。新版不启动旧 `monitor.py`，也不自动导入旧 `alerts.json` 的提醒状态；首次启用时可能对当前达标额度提醒，之后重启沿用新的成功状态。
+
+以下是保留的**旧版独立额度监控工具**说明，其安装命令、配置和历史迁移规则只适用于 `aster-5x`，与新版 `aster-desk` 分开管理。旧工具不会登录账户或下单，同时监控 **XAUUSD1、SPCXUSD1、CLUSD1**，每个标的按 **4x / 5x / 10x / 20x、每 5 秒检查、严格大于 10,000 USD1** 的规则独立触发。默认关闭飞书，触发只记入本地日志。纯监控无需第三方 Python 依赖。
 
 十二个“标的 + 杠杆”组合分别保存提醒状态和冷却时间；同一标的各档位共用一次接口快照，请求量不增加，一个组合的持续达标不会压制其他组合的提醒；普通网络失败只让对应标的退避，其他标的继续检查。遇到 429/418 限流则暂停新的查询请求，遵守服务端退避时间。
 
-## Linux 一键安装
+## 旧版独立监控：Linux 一键安装
 
 在使用 systemd 的 Linux 服务器上执行（推荐 Ubuntu 22.04+、Debian 12+、RHEL 9+）：
 

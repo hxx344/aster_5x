@@ -260,16 +260,23 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     return Plan(qty, projected(qty), "可以分批双向开仓")
 
 
-def next_leverage(snapshot, symbol, capacities, mark=None):
+def require_non_decreasing_leverage(current, target):
+    if any(type(v) is not int or not 1 <= v <= 125 for v in (current, target)):
+        raise TradingError("杠杆档位无效")
+    if target < current:
+        raise TradingError(f"全局禁止降杠杆：当前 {current}x，目标 {target}x")
+
+
+def next_leverage(snapshot, symbol, capacities, mark=None, threshold=ZERO):
     long, short = snapshot.pair(symbol)
-    if long.qty + short.qty == 0:
+    if long.qty != short.qty:
         return None
     gross = (long.qty + short.qty) * positive(mark) if mark is not None else long.notional + short.notional
-    # Move one configured tier at a time; exchange acknowledgement is verified separately.
-    targets = [v for v in TIERS if v > long.leverage]
-    if not targets:
-        return None
-    target = targets[0]
-    if positive(capacities.get(target), True) > gross and leverage_cap(snapshot.brackets[symbol], target) >= gross:
-        return target
+    # Select the lowest usable higher tier; unavailable intermediate tiers do not block.
+    required = max(gross, positive(threshold, True))
+    for target in TIERS:
+        if target <= long.leverage or target not in capacities:
+            continue
+        if positive(capacities[target], True) > required and leverage_cap(snapshot.brackets[symbol], target) >= gross:
+            return target
     return None

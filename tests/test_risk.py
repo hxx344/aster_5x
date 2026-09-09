@@ -79,10 +79,10 @@ class RiskTests(unittest.TestCase):
         self.snapshot.pair("XAUUSD1")[0].qty = dec(1)
         self.assertEqual(self.plan().qty, 0)
 
-    def test_upgrade_requires_more_than_gross_notional_and_one_rung(self):
+    def test_upgrade_requires_more_than_gross_notional(self):
         for p in self.snapshot.pair("XAUUSD1"):
             p.qty, p.mark = dec(1), dec(100)
-        self.capacities[5] = dec(200)
+        self.capacities = {5: dec(200)}
         self.assertIsNone(next_leverage(self.snapshot, "XAUUSD1", self.capacities))
         self.capacities[5] = dec("200.01")
         self.assertEqual(next_leverage(self.snapshot, "XAUUSD1", self.capacities), 5)

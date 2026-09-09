@@ -127,14 +127,12 @@ class Engine:
                 self.markets[symbol] = {**previous, "status": "error", "error": str(exc) if isinstance(exc, TradingError) else "行情数据格式异常"}
             return max(10, getattr(exc, "retry_after", 0))
 
-    def capacities(self, symbol, leverage):
+    def capacities(self, symbol):
         with self.lock:
             row = self.markets.get(symbol, {}).copy()
         if row.get("status") != "ok" or time.time() - row.get("checked_at", 0) > 8:
             raise TradingError("市场额度快照过期或查询失败")
         capacities = {int(k): dec(v) for k, v in row["capacities"].items()}
-        if leverage not in capacities:
-            raise TradingError(f"等待 {leverage}x 额度数据")
         return capacities
 
     def tick_account(self, account_id):
@@ -179,29 +177,30 @@ class Engine:
                         long, short = snapshot.require_ready(symbol)
                         if self.market.rules[symbol].margin_asset != "USD1":
                             raise TradingError("仅允许 USD1 保证金市场")
-                        capacities = self.capacities(symbol, long.leverage)
+                        capacities = self.capacities(symbol)
                         book = self.market.book(symbol)
                         if self.shutdown.is_set():
                             return 5
                         flat = long.qty + short.qty == 0
                         target = None
-                        if flat and long.leverage != 4:
-                            if capacities.get(4, dec(0)) > dec(policy["threshold"]) and book.spread <= dec(policy["spread_limit"]) and snapshot.ratio < dec(policy["margin_limit"]):
-                                target = 4
-                        elif not flat and long.qty == short.qty:
-                            candidate = next((v for v in TIERS if v > long.leverage), None)
-                            if candidate in capacities:
-                                target = next_leverage(snapshot, symbol, capacities, book.mark)
+                        current_available = capacities.get(long.leverage, dec(0)) > dec(policy["threshold"])
+                        first_add = self.store.get(f"open_after_leverage:{account_id}:{symbol}") == long.leverage and current_available
+                        if not first_add and (not flat or long.leverage < 4 or not current_available):
+                            target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"])
                         if target is not None:
                             reason = executor.leverage(account, symbol, long.leverage, target, snapshot=snapshot)
                             self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
                             return 5
-                        if flat and long.leverage != 4:
-                            last_reason = "首次开仓等待 4x 额度条件"
+                        if flat and long.leverage < 4:
+                            last_reason = "首次开仓等待可用的更高杠杆档位（最低 4x），禁止降杠杆"
                             self.strategy(account_id, symbol, last_reason)
                             continue
                         plan = plan_pair(snapshot, book, self.market.rules[symbol], capacities, policy)
+                        if first_add and not plan.qty:
+                            # A full current initial margin must not permanently block
+                            # a further upgrade that could free balance for the first add.
+                            self.store.put(f"open_after_leverage:{account_id}:{symbol}", None)
                         self.strategy(account_id, symbol, plan.reason, projected_ratio=wire(plan.projected_ratio) if plan.projected_ratio is not None else None)
                         last_reason = plan.reason
                         if plan.qty:

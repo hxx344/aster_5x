@@ -3,7 +3,7 @@ from dataclasses import asdict
 import time
 
 from .exchange import ExchangeError
-from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TIERS, dec, maintenance_for, wire
+from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TIERS, dec, maintenance_for, require_non_decreasing_leverage, wire
 
 
 PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
@@ -62,6 +62,7 @@ class PaperBroker:
             time.time(), dict.fromkeys(symbols, dec("0.0004")), {s: PAPER_BRACKETS for s in symbols})
 
     def set_leverage(self, symbol, leverage):
+        require_non_decreasing_leverage(self.state["leverages"][symbol], leverage)
         self.state["leverages"][symbol] = leverage
         self.save()
         return {"symbol": symbol, "leverage": leverage}

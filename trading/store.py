@@ -94,6 +94,17 @@ class Store:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))]
 
+    def complete_leverage(self, intent, actual):
+        """Persist confirmation and the first-add priority in the same transaction."""
+        intent.update(status="complete", confirmed_leverage=actual)
+        with self.connect() as db:
+            row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
+            if row and row[0] == "complete":
+                return
+            db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
+            key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
+
     def complete_pair(self, intent, quantities):
         """Commit the acknowledgement and aggregate progress in one transaction."""
         with self.connect() as db:
@@ -102,6 +113,7 @@ class Store:
                 return
             intent["status"] = "complete"
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
+            db.execute("DELETE FROM kv WHERE key=?", (f"open_after_leverage:{intent['account_id']}:{intent['symbol']}",))
             key = "campaign:" + intent["account_id"]
             row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
             campaign = json.loads(row[0]) if row else {"id": intent["id"], "batches": [], "started_at": time.time()}

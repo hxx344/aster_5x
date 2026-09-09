@@ -3,7 +3,7 @@ import time
 import uuid
 
 from .exchange import ExchangeError
-from .models import AccountModeError, TradingError, dec, floor_step, positive, wire
+from .models import AccountModeError, TradingError, dec, floor_step, positive, require_non_decreasing_leverage, wire
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -65,10 +65,17 @@ class Executor:
             positive(row.get("avgPrice"))
 
     def leverage(self, account, symbol, old, target, snapshot=None):
-        snapshot = snapshot or self.broker.snapshot(account["policy"]["symbols"])
+        require_non_decreasing_leverage(old, target)
+        # Re-read before creating intent; the selection snapshot may now be stale.
+        snapshot = self.broker.snapshot(account["policy"]["symbols"], fresh_modes=True)
         snapshot.require_modes(account["policy"]["symbols"])
+        long, short = snapshot.require_ready(symbol)
+        old = long.leverage
+        require_non_decreasing_leverage(old, target)
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
+        if target == old:
+            return f"当前已为 {old}x，保持杠杆不变"
         intent = {"id": uuid.uuid4().hex, "kind": "leverage", "account_id": account["id"], "symbol": symbol,
                   "previous": old, "target": target, "created_at": time.time(), "status": "pending"}
         self.store.save_intent(intent)
@@ -93,16 +100,17 @@ class Executor:
         if not intent:
             return "没有未完成批次"
         if intent["kind"] == "leverage":
+            if intent["target"] < intent["previous"]:
+                return self.attention(account, intent, "发现旧降杠杆批次，全局禁止继续执行；请核对实际杠杆")
             snapshot = self.broker.snapshot(account["policy"]["symbols"])
             try:
                 snapshot.require_modes(account["policy"]["symbols"])
             except AccountModeError as exc:
                 return self.attention(account, intent, str(exc))
             long, short = snapshot.pair(intent["symbol"])
-            if long.leverage == short.leverage == intent["target"]:
-                intent["status"] = "complete"
-                self.store.save_intent(intent)
-                self.store.event(account["id"], "leverage", f"{intent['symbol']} 杠杆已从 {intent['previous']}x 调整为 {intent['target']}x，并核实到账户")
+            if long.leverage == short.leverage and long.leverage >= intent["target"]:
+                self.store.complete_leverage(intent, long.leverage)
+                self.store.event(account["id"], "leverage", f"{intent['symbol']} 已核实实际杠杆 {long.leverage}x（目标 {intent['target']}x）；按实际档位准备开仓，禁止降档")
                 return "杠杆调整已确认"
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "杠杆变更尚未确认，请核对账户后重新检查")

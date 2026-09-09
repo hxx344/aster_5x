@@ -12,7 +12,7 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
-from .models import AccountSnapshot, Book, Position, Rules, TradingError, dec, positive, validate_brackets, wire
+from .models import AccountSnapshot, Book, Position, Rules, TradingError, dec, positive, require_non_decreasing_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 
@@ -267,6 +267,11 @@ class LiveBroker:
             account.get("canTrade") is True, started, fees, brackets)
 
     def set_leverage(self, symbol, leverage):
+        snapshot = self.snapshot([symbol], fresh_modes=True)
+        long, short = snapshot.require_ready(symbol)
+        require_non_decreasing_leverage(long.leverage, leverage)
+        if leverage == long.leverage:
+            return {"symbol": symbol, "leverage": leverage}
         return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
 
     def submit(self, orders):

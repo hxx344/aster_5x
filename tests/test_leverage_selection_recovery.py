@@ -9,7 +9,7 @@ import httpx
 from trading.engine import Engine
 from trading.exchange import API, ExchangeError, LiveBroker, RateBudget
 from trading.execution import Executor
-from trading.models import SYMBOLS
+from trading.models import Book, SYMBOLS, dec
 from trading.store import Store
 from .helpers import Fixture
 from .test_exchange_hardening import account_responses
@@ -31,6 +31,68 @@ class HigherLeverageSelectionTests(unittest.TestCase):
         for symbol in SYMBOLS:
             self.engine.poll_market(symbol)
             self.engine.markets[symbol]["capacities"] = {"2": "500000"}
+
+    def seed_held_markets(self):
+        quotes = {XAU: ("4999.995", "5000.005", "5000"),
+                  SPCX: ("999.966", "1000.034", "1000"),
+                  CL: ("99.98945", "100.01055", "100")}
+
+        def quote(symbol):
+            bid, ask, mark = map(dec, quotes[symbol])
+            return Book(bid, ask, dec(50), dec(50), mark, time.time())
+
+        patcher = patch.object(self.f.market, "book", side_effect=quote)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.f.broker.state["wallet"] = "100000"
+        for symbol in SYMBOLS:
+            for side in ("LONG", "SHORT"):
+                self.f.broker.state["positions"][symbol + ":" + side] = {"qty": "5", "entry": quotes[symbol][2]}
+        self.f.broker.save()
+        snapshot = self.f.broker.snapshot(SYMBOLS)
+        gross = {symbol: sum(p.qty * p.mark for p in snapshot.pair(symbol)) for symbol in SYMBOLS}
+        self.assertEqual(gross, {XAU: dec(50000), SPCX: dec(10000), CL: dec(1000)})
+        self.engine.rotation["test"] = 1
+
+    def test_largest_held_xau_upgrades_confirms_adds_then_checks_next_tier(self):
+        self.seed_held_markets()
+        self.engine.markets[XAU]["capacities"].update({"4": "1984153", "5": "1984153"})
+        with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
+             patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
+            self.engine.tick_account("test")
+            change.assert_called_once_with(XAU, 4)
+            submit.assert_not_called()
+            self.engine.tick_account("test")
+            self.assertIsNone(self.f.store.intent("test"))
+            submit.assert_not_called()
+            self.engine.tick_account("test")
+            submit.assert_called_once()
+            self.assertEqual({o["symbol"] for o in submit.call_args.args[0]}, {XAU})
+            self.assertEqual(change.call_count, 1)
+            self.engine.tick_account("test")
+            self.assertEqual(change.call_args.args, (XAU, 5))
+            self.assertEqual(change.call_count, 2)
+        self.assertTrue(self.f.store.account("test")["enabled"])
+
+    def test_largest_held_xau_skips_unavailable_four_and_upgrades_before_spcx(self):
+        self.seed_held_markets()
+        self.engine.markets[XAU]["capacities"].update({"4": "0", "5": "1984153"})
+        with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
+             patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
+            self.engine.tick_account("test")
+            change.assert_called_once_with(XAU, 5)
+            submit.assert_not_called()
+
+    def test_largest_held_xau_at_five_receives_next_add_before_spcx(self):
+        self.seed_held_markets()
+        self.f.broker.state["leverages"][XAU] = 5
+        self.f.broker.save()
+        self.engine.markets[XAU]["capacities"]["5"] = "1984153"
+        with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
+            self.engine.tick_account("test")
+        submit.assert_called_once()
+        self.assertEqual({o["symbol"] for o in submit.call_args.args[0]}, {XAU})
+        self.assertTrue(self.f.store.account("test")["enabled"])
 
     def test_flat_current_capacity_does_not_hide_available_higher_tier(self):
         self.engine.markets[XAU]["capacities"].update({"4": "500000", "5": "500000"})
@@ -147,6 +209,28 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
                 self.assertEqual(self.executor.reconcile(self.f.account), "杠杆调整已确认")
                 self.assertIsNone(self.f.store.intent("test"))
                 self.assertEqual(self.f.store.get("open_after_leverage:test:XAUUSD1"), 5)
+                self.assertFalse(self.f.store.account("test")["enabled"])
+        self.assertEqual(self.writes, [])
+
+    def test_legacy_pending_with_fifty_thousand_held_confirms_actual_five(self):
+        self.f.account.update(enabled=False, pause_reason="旧版本未确认")
+        self.f.store.save_account(self.f.account)
+        for rows in (self.responses["/fapi/v3/positionRisk"],
+                     self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
+            for row in rows:
+                row.update(leverage="5", positionAmt="250" if row["positionSide"] == "LONG" else "-250",
+                           entryPrice="100", markPrice="100")
+        self.responses["/fapi/v3/accountWithJoinMargin"]["assets"][0].update(
+            crossWalletBalance="100000", availableBalance="90000", maintMargin="1250")
+        snapshot = self.broker.snapshot([XAU])
+        self.assertEqual(sum(p.qty * p.mark for p in snapshot.pair(XAU)), dec(50000))
+        for target in (4, 5):
+            with self.subTest(target=target):
+                self.f.store.save_intent({"id": f"held-legacy-{target}", "kind": "leverage", "account_id": "test",
+                    "symbol": XAU, "previous": 2, "target": target, "created_at": time.time() - 3600,
+                    "status": "attention", "last_error": "杠杆变更尚未确认，请核对账户后重新检查"})
+                self.assertEqual(self.executor.reconcile(self.f.account), "杠杆调整已确认")
+                self.assertIsNone(self.f.store.intent("test"))
                 self.assertFalse(self.f.store.account("test")["enabled"])
         self.assertEqual(self.writes, [])
 

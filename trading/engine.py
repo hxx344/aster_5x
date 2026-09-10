@@ -168,9 +168,6 @@ class Engine:
                     leverage = pair[0]["leverage"]
                     caps = self.markets.get(symbol, {}).get("capacities", {})
                     threshold = dec(account["policy"]["threshold"])
-                    flat = all(dec(p["qty"]) == 0 for p in pair)
-                    if flat and leverage >= minimum and dec(caps.get(str(leverage), "0")) > threshold:
-                        continue
                     if any(target > leverage and dec(caps.get(str(target), "0")) > threshold for target in leverage_candidates(minimum)):
                         return 300
                 return 120
@@ -268,13 +265,9 @@ class Engine:
 
     @staticmethod
     def rank_candidates(candidates):
-        # Only reorder slots belonging to the same opening tier. Stable sorting
-        # retains account rotation for equal spreads and across different tiers.
-        tiers = {}
-        for candidate in candidates:
-            tiers.setdefault(candidate.opening_leverage, []).append(candidate)
-        ranked = {tier: iter(sorted(group, key=lambda c: c.book.spread_exact)) for tier, group in tiers.items()}
-        return [next(ranked[c.opening_leverage]) for c in candidates]
+        # Rank the usable opening tier first, including a pending upgrade target.
+        # Stable sorting retains rotation only when both tier and spread tie.
+        return sorted(candidates, key=lambda c: (-c.opening_leverage, c.book.spread_exact))
 
     def market_error(self, account_id, symbol, exc):
         reason = str(exc) if isinstance(exc, TradingError) else "交易数据格式异常"
@@ -351,11 +344,10 @@ class Engine:
                         book.require_fresh()
                         if self.shutdown.is_set():
                             return 5
-                        flat = long.qty + short.qty == 0
                         target = None
                         current_available = capacities.get(long.leverage, dec(0)) > dec(policy["threshold"])
                         first_add = long.leverage >= minimum and self.store.get(f"open_after_leverage:{account_id}:{symbol}") == long.leverage and current_available
-                        if not first_add and (not flat or long.leverage < minimum or not current_available):
+                        if not first_add:
                             target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum)
                         if target is not None:
                             candidates.append(MarketCandidate(symbol, long.leverage, book, target))

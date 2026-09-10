@@ -93,6 +93,7 @@ class OccupancyTests(unittest.TestCase):
         engine = Engine(self.f.store, market=self.f.market)
         engine.brokers["test"] = self.f.broker
         engine.poll_market("XAUUSD1")
+        engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
         original = self.f.broker.submit
         def fill_then_equity_changes(orders):
             receipts = original(orders)

@@ -1,4 +1,4 @@
-"""Select the lowest relative BBO spread among usable markets at one tier."""
+"""Prefer higher usable opening tiers, then the lowest relative BBO spread."""
 from dataclasses import replace
 import time
 import unittest
@@ -114,15 +114,17 @@ class MarketPriorityTests(unittest.TestCase):
         with patch.object(self.f.broker, "snapshot", side_effect=limited):
             self.open_tick(CL)
 
-    def test_spread_does_not_override_rotation_across_different_tiers(self):
+    def test_higher_tier_precedes_a_lower_tier_with_a_better_spread(self):
         self.f.broker.state["leverages"][XAU] = 5
         self.capacities(XAU, {5: 500000})
+        self.engine.rotation["test"] = 1
         self.open_tick(XAU)
 
-    def test_same_tier_candidates_are_compared_across_another_tier(self):
+    def test_higher_tier_precedes_lower_tier_slots_in_rotation(self):
         self.f.broker.state["leverages"][SPCX] = 5
         self.capacities(SPCX, {5: 500000})
-        self.open_tick(CL)
+        self.engine.rotation["test"] = 2
+        self.open_tick(SPCX)
 
     def test_same_target_tier_is_ranked_before_upgrade_and_first_open(self):
         self.f.broker.state["leverages"] = dict.fromkeys(SYMBOLS, 1)

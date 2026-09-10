@@ -149,9 +149,11 @@ class EngineTests(unittest.TestCase):
         self.engine.poll_market("XAUUSD1")
 
     def test_open_then_upgrade_and_continue_using_new_tier(self):
+        self.engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
         self.engine.tick_account("test")
         initial_qty = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")[0].qty
         self.assertGreater(initial_qty, 0)
+        self.engine.markets["XAUUSD1"]["capacities"]["5"] = "500000"
         self.engine.tick_account("test")
         self.assertEqual(self.f.store.intent("test")["target"], 5)
         self.engine.tick_account("test")

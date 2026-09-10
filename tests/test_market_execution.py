@@ -112,6 +112,7 @@ class MarketExecutionTests(unittest.TestCase):
         engine = Engine(self.f.store, market=self.f.market)
         engine.brokers["test"] = self.f.broker
         engine.poll_market("XAUUSD1")
+        engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
         submit = self.f.broker.submit
         moved = replace(self.f.market.book("XAUUSD1"), ask=dec(4500), bid=dec(4300))
 

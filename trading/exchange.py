@@ -36,6 +36,18 @@ class RequestNotSent(ExchangeError):
     """A local admission check failed before any HTTP request was sent."""
 
 
+class LeverageRejected(ExchangeError):
+    """The leverage mutation received a documented, definitive rejection."""
+
+
+# Restrict this classification to documented rejection codes, not network or
+# unknown processing failures. It is used only for the leverage POST below.
+LEVERAGE_REJECTION_CODES = frozenset({
+    -1002, -1011, -1020, -1022, -1100, -1101, -1102, -1103, -1104, -1105,
+    -1106, -1111, -1121, -1130, -2014, -2015, -2019, -2027, -2028, -4028,
+})
+
+
 class BudgetWait(RequestNotSent):
     """The local scheduler must wait; this is not an exchange rejection."""
 
@@ -611,7 +623,12 @@ class LiveBroker:
         require_non_decreasing_leverage(long.leverage, leverage)
         if leverage == long.leverage:
             return {"symbol": symbol, "leverage": leverage}
-        return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
+        try:
+            return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
+        except ExchangeError as exc:
+            if not isinstance(exc, (AmbiguousOrder, RequestNotSent)) and exc.code in LEVERAGE_REJECTION_CODES:
+                raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after)) from None
+            raise
 
     def submit(self, orders):
         self.leverage_snapshot = None

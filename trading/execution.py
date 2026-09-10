@@ -4,7 +4,7 @@ import uuid
 from contextlib import nullcontext
 from fractions import Fraction
 
-from .exchange import ExchangeError, LiveBroker, RequestNotSent
+from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
@@ -122,17 +122,30 @@ class Executor:
         self.store.save_intent(intent)
         try:
             if isinstance(self.broker, LiveBroker):
-                self.broker.set_leverage(symbol, target, checked_snapshot=snapshot)
+                response = self.broker.set_leverage(symbol, target, checked_snapshot=snapshot)
             else:
-                self.broker.set_leverage(symbol, target)
+                response = self.broker.set_leverage(symbol, target)
+            if not isinstance(response, dict) or response.get("symbol") != symbol:
+                raise TradingError("杠杆调整回执无效，等待实际账户确认")
+            acknowledged = LiveBroker._leverage(response.get("leverage"))
+            if acknowledged < target:
+                raise TradingError("杠杆调整回执未达到目标，等待实际账户确认")
+            # A write acknowledgement is useful diagnostics, not a replacement
+            # for the fresh account confirmation needed before opening a pair.
+            intent["change_response"] = {"symbol": symbol, "leverage": acknowledged}
         except RequestNotSent as exc:
             intent.update(status="aborted", last_error=str(exc))
             self.store.save_intent(intent)
             raise
-        except TradingError as exc:
-            intent["last_error"] = str(exc)
+        except LeverageRejected as exc:
+            reason = f"{symbol} {old}x→{target}x 杠杆调整被拒绝（代码 {exc.code}），等待重新评估"
+            intent.update(status="aborted", last_error=reason, submission_error=str(exc), submission_code=exc.code)
             self.store.save_intent(intent)
-        return "正在核对杠杆调整结果"
+            raise LeverageRejected(reason, code=exc.code, retry_after=exc.retry_after) from None
+        except TradingError as exc:
+            intent.update(last_error=str(exc), submission_error=str(exc), submission_code=getattr(exc, "code", None))
+        self.store.save_intent(intent)
+        return f"正在核对 {symbol} {old}x→{target}x 杠杆调整结果"
 
     def attention(self, account, intent, reason):
         if intent.get("status") != "attention" or intent.get("last_error") != reason:
@@ -176,8 +189,14 @@ class Executor:
                 self.store.save_intent(intent)
                 return reason
             if time.time() - intent["created_at"] > 120:
-                return self.attention(account, intent, "杠杆变更尚未确认，请核对账户后重新检查")
-            return "等待账户确认目标杠杆"
+                reason = (f"{intent['symbol']} 杠杆变更尚未确认：{intent['previous']}x→{intent['target']}x，"
+                          f"实际仍为 {long.leverage}x；请核对账户后重新检查")
+                if intent.get("submission_error"):
+                    reason += "；提交时：" + intent["submission_error"]
+                if intent.get("submission_code") is not None:
+                    reason += f"（代码 {intent['submission_code']}）"
+                return self.attention(account, intent, reason)
+            return f"等待账户确认 {intent['symbol']} 目标 {intent['target']}x，实际 {long.leverage}x"
 
         orders = intent["orders"] + intent["repairs"]
         unresolved = []

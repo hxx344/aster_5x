@@ -417,6 +417,26 @@ td:last-child {
   border-top: 1px solid var(--border);
   font-size: 13px;
 }
+.risk-explanation {
+  display: grid;
+  gap: 8px;
+  margin: 0 22px 16px;
+}
+.risk-explanation p {
+  margin: 0;
+}
+.risk-bonus {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.risk-bonus strong {
+  color: #a1beb6;
+  font-weight: 500;
+  white-space: nowrap;
+}
 .details > div {
   display: flex;
   justify-content: space-between;

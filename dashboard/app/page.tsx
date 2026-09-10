@@ -797,12 +797,16 @@ export default function Home() {
                     <span>50%</span>
                     <span>100%</span>
                   </div>
-                  <p className="muted">
-                    10x / 20x 加仓后 ≤ {highMarginPercent}%，共同使用额外 5 个百分点，最高 100%。
-                  </p>
-                  <p className="muted">
-                    每仓占用 = |数量| × 标记价格 ÷ 实际杠杆；多空分别累加。
-                  </p>
+                  <div className="risk-explanation muted">
+                    <p className="risk-bonus">
+                      <span>10x / 20x 加仓上限</span>
+                      <strong>{highMarginPercent}%</strong>
+                    </p>
+                    <p>共用额外 5 个百分点，最高 100%。</p>
+                    <p>
+                      每仓占用 = |数量| × 标记价格 ÷ 实际杠杆；多空分别累加。
+                    </p>
+                  </div>
                   <dl className="details">
                     <div>
                       <dt>总占用保证金 · USD1</dt>
@@ -854,7 +858,7 @@ export default function Home() {
                     </div>
                   </dl>
                   <div className="risk-caption">
-                    三项账户模式为固定前提，仅核验，不提供修改。每笔下单前检查预计成交后的风险，成交后再次核对。
+                    三项账户模式必须满足，仅核验，不自动修改。下单前与成交后均检查风险。
                   </div>
                 </section>
                 <section className="panel execution-panel">

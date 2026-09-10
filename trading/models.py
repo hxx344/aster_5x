@@ -304,6 +304,13 @@ class Plan:
     reason: str = "等待"
 
 
+def opening_margin_limit(policy, leverage):
+    """10x and 20x share five percentage points above the account base limit."""
+    base = Fraction(dec(policy["margin_limit"]))
+    bonus = Fraction(1, 20) if leverage in (10, 20) else Fraction(0)
+    return decimal_value(min(Fraction(1), base + bonus), exact=True)
+
+
 def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     """Size both legs against total occupied margin / equity, cash and capacity."""
     long, short = snapshot.require_ready(rules.symbol, now)
@@ -313,8 +320,8 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
         return Plan(reason=f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
     if dec(policy["order_notional"]) < MIN_BATCH_NOTIONAL:
         return Plan(reason="单批每边上限低于固定最低批次金额 500 USD1，请修改策略设置")
-    limit = Fraction(dec(policy["margin_limit"]))
-    if snapshot.margin_exceeds(policy["margin_limit"], include_equal=True):
+    limit = Fraction(opening_margin_limit(policy, long.leverage))
+    if snapshot.margin_exceeds(decimal_value(limit, exact=True), include_equal=True):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
     if book.spread_exact > Fraction(dec(policy["spread_limit"])):
         return Plan(reason="BBO 价差超过万 5")

@@ -148,7 +148,7 @@ class Store:
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
             db.execute("DELETE FROM kv WHERE key=?", (f"open_after_leverage:{intent['account_id']}:{intent['symbol']}",))
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                       ("post_fill_check:" + intent["account_id"], dumps(True)))
+                       ("post_fill_check:" + intent["account_id"], dumps({"symbol": intent["symbol"], "leverage": intent.get("leverage")})))
             key = "campaign:" + intent["account_id"]
             row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
             campaign = json.loads(row[0]) if row else {"id": intent["id"], "batches": [], "started_at": time.time()}
@@ -167,7 +167,7 @@ class Store:
                 return
             db.execute("UPDATE intents SET status='aborted',data=? WHERE id=?", (dumps(completed), intent["id"]))
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                       ("post_fill_check:" + intent["account_id"], dumps(True)))
+                       ("post_fill_check:" + intent["account_id"], dumps({"symbol": intent["symbol"], "leverage": intent.get("leverage")})))
         intent.update(completed)
 
     def finish_campaign(self, account, reason, ratio):

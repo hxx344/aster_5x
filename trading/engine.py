@@ -16,7 +16,7 @@ import monitor
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
-from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, plan_pair, positive, wire
+from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -251,8 +251,19 @@ class Engine:
     def check_post_fill_occupancy(self, account, snapshot):
         snapshot.require_modes(account["policy"]["symbols"])
         snapshot.require_fresh()
+        limit = dec(account["policy"]["margin_limit"])
+        batch = self.store.get("post_fill_check:" + account["id"])
+        if not batch:
+            # A partially filled pair has not written the completion marker yet.
+            pending = self.store.intent(account["id"])
+            batch = pending if pending and pending["kind"] == "pair" else None
+        # Old boolean markers retain the base limit. An unrelated high-leverage
+        # position must never grant a low-leverage batch extra opening room.
+        if isinstance(batch, dict) and batch.get("leverage") in (10, 20):
+            actual, _ = snapshot.pair(batch["symbol"])
+            limit = opening_margin_limit(account["policy"], actual.leverage)
         ratio = snapshot.ratio if snapshot.equity > 0 else None
-        over_limit = ratio is None or snapshot.margin_exceeds(account["policy"]["margin_limit"])
+        over_limit = ratio is None or snapshot.margin_exceeds(limit)
         if over_limit:
             message = "成交后 USD1 账户总权益不足，已暂停新加仓" if ratio is None else "成交后保证金占用率超过上限，已暂停新加仓"
             self.store.pause_account(account, message)
@@ -334,9 +345,11 @@ class Engine:
                 ordered = markets[start:] + markets[:start]
                 last_reason = "等待交易条件"
                 candidates = []
+                campaign_limit = dec(policy["margin_limit"])
                 for symbol in ordered:
                     try:
                         long, short = snapshot.require_ready(symbol)
+                        campaign_limit = max(campaign_limit, opening_margin_limit(policy, long.leverage))
                         if self.market.rules[symbol].margin_asset != "USD1":
                             raise TradingError("仅允许 USD1 保证金市场")
                         capacities = self.capacities(symbol)
@@ -414,7 +427,7 @@ class Engine:
                         last_reason = self.market_error(account_id, symbol, exc)
                 self.view(account_id, reason=last_reason)
                 campaign = self.store.get("campaign:" + account_id)
-                if campaign and (snapshot.margin_exceeds(policy["margin_limit"], include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):
+                if campaign and (snapshot.margin_exceeds(campaign_limit, include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):
                     self.store.finish_campaign(account, last_reason, snapshot.ratio)
                 return 5
             except (TradingError, KeyError, ValueError, TypeError) as exc:
@@ -637,7 +650,9 @@ class Engine:
         pending_notifications = self.store.pending_notifications()
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
-            accounts = [{**a, **self.views.get(a["id"], {
+            accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
+                                            "high_leverage": wire(opening_margin_limit(a["policy"], 10))},
+                         **self.views.get(a["id"], {
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,

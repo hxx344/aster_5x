@@ -93,6 +93,12 @@ a {
 .amber-bg {
   background: #e9bf72;
 }
+.amber {
+  color: #e6c17f;
+}
+.limit-marker.high-limit-marker {
+  background: #8ae8c8;
+}
 .muted-bg {
   background: #58656e;
 }

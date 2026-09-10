@@ -85,6 +85,7 @@ type Account = {
   reason: string;
   credential_ready: boolean;
   policy: Policy;
+  risk_limits?: { base: string; high_leverage: string };
   snapshot?: {
     equity: string;
     maintenance: string;
@@ -210,6 +211,10 @@ export default function Home() {
   const marginPercent = percentFromMarginLimit(
     account?.policy.margin_limit ?? '0.5',
   );
+  const highMarginLimitValue =
+    account?.risk_limits?.high_leverage ?? account?.policy.margin_limit ?? '0.5';
+  const highMarginLimit = Number(highMarginLimitValue);
+  const highMarginPercent = percentFromMarginLimit(highMarginLimitValue);
   const minimumLeverage = account?.policy.min_open_leverage ?? 4;
   const displayedTiers = [...new Set([4, 5, 10, 20, minimumLeverage])].sort(
     (a, b) => a - b,
@@ -283,6 +288,11 @@ export default function Home() {
   const currentLeverage =
     snapshot?.positions.find((p) => p.symbol === focus)?.leverage ||
     minimumLeverage;
+  const highLeverage = currentLeverage === 10 || currentLeverage === 20;
+  const openingLimit = highLeverage ? highMarginLimit : marginLimit;
+  const openingPercent = highLeverage ? highMarginPercent : marginPercent;
+  const riskAccent =
+    ratio > highMarginLimit ? 'danger' : ratio > marginLimit ? 'amber' : 'mint';
   const positions =
     snapshot?.positions.filter((p) => Number(p.qty) !== 0) || [];
   const events =
@@ -517,7 +527,7 @@ export default function Home() {
                 label="保证金占用率"
                 value={snapshot ? pct(snapshot.ratio) : '—'}
                 sub="全部仓位占用保证金 ÷ 账户总权益"
-                accent={ratio > marginLimit ? 'danger' : 'mint'}
+                accent={riskAccent}
                 icon={<ShieldCheck size={17} />}
               />
               <Metric
@@ -759,10 +769,10 @@ export default function Home() {
                     <ShieldCheck className="mint" size={18} />
                   </div>
                   <div className="risk-value">
-                    <span className={ratio > marginLimit ? 'danger' : ''}>
+                    <span className={riskAccent}>
                       {snapshot ? pct(snapshot.ratio) : '—'}
                     </span>
-                    <small>加仓后 ≤ {marginPercent}%</small>
+                    <small>基础 ≤ {marginPercent}%</small>
                   </div>
                   <div className="risk-track">
                     <Progress
@@ -772,14 +782,24 @@ export default function Home() {
                     <i
                       className="limit-marker"
                       style={{ left: `${marginPercent}%` }}
-                      title={`风险上限 ${marginPercent}%`}
+                      title={`基础上限 ${marginPercent}%`}
                     />
+                    {highMarginLimit > marginLimit && (
+                      <i
+                        className="limit-marker high-limit-marker"
+                        style={{ left: `${highMarginPercent}%` }}
+                        title={`10x / 20x 上限 ${highMarginPercent}%`}
+                      />
+                    )}
                   </div>
                   <div className="scale">
                     <span>0%</span>
                     <span>50%</span>
                     <span>100%</span>
                   </div>
+                  <p className="muted">
+                    10x / 20x 加仓后 ≤ {highMarginPercent}%，共同使用额外 5 个百分点，最高 100%。
+                  </p>
                   <p className="muted">
                     每仓占用 = |数量| × 标记价格 ÷ 实际杠杆；多空分别累加。
                   </p>
@@ -872,8 +892,8 @@ export default function Home() {
                     }
                   />
                   <Gate
-                    label={`保证金占用率 ≤ ${marginPercent}%`}
-                    pass={!!fresh && ratio <= marginLimit}
+                    label={`${currentLeverage}x 加仓占用率 < ${openingPercent}%`}
+                    pass={!!fresh && ratio < openingLimit}
                     value={snapshot ? pct(snapshot.ratio) : '—'}
                   />
                   <div className="strategy-state">
@@ -994,7 +1014,7 @@ export default function Home() {
                       <span>新开仓固定每边至少 500 USD1</span>
                     </label>
                     <label htmlFor="margin-percent">
-                      风险约束上限 <span>%</span>
+                      基础风险上限 <span>%</span>
                       <Input
                         id="margin-percent"
                         type="number"
@@ -1029,9 +1049,9 @@ export default function Home() {
                       />
                     </label>
                     <p className="muted">
-                      修改前请暂停策略。风险约束为保证金占用率上限，大于
+                      修改前请暂停策略。基础风险约束大于
                       0%、不超过
-                      100%；实际下单量还受余额与盘口限制。最低杠杆可设
+                      100%；10x / 20x 共同额外增加 5 个百分点，最高 100%。实际下单量还受余额与盘口限制。最低杠杆可设
                       1–125，调低该值不会降低已有杠杆。
                     </p>
                     <Button

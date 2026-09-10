@@ -123,10 +123,10 @@ class RiskScenarioTests(unittest.TestCase):
                     receipts = broker.submit(orders)
                     self.assertTrue(all(row["status"] == "FILLED" for row in receipts))
                     after = broker.snapshot(["XAUUSD1"])
-                    self.assertFalse(after.margin_exceeds(".5"))
+                    self.assertFalse(after.margin_exceeds(".55" if leverage in (10, 20) else ".5"))
                     self.assertGreaterEqual(after.available, 0)
                     # PaperBroker persists rounded weighted entry prices. Allow
-                    # display rounding here; the 50% check above remains exact.
+                    # display rounding here; the applicable risk check stays exact.
                     self.assertLessEqual(after.ratio - plan.projected_ratio, dec("1e-26"))
                     long, short = after.pair("XAUUSD1")
                     self.assertTrue(hedge_balanced(long.qty, short.qty))

@@ -138,12 +138,19 @@ class Executor:
             self.store.save_intent(intent)
             raise
         except LeverageRejected as exc:
-            reason = f"{symbol} {old}x→{target}x 杠杆调整被拒绝（代码 {exc.code}），等待重新评估"
-            intent.update(status="aborted", last_error=reason, submission_error=str(exc), submission_code=exc.code)
+            details = []
+            if exc.http_status is not None and exc.http_status >= 400:
+                details.append(f"HTTP {exc.http_status}")
+            if exc.code is not None:
+                details.append(f"代码 {exc.code}")
+            reason = f"{symbol} {old}x→{target}x 杠杆调整被拒绝（{'，'.join(details)}），等待重新评估"
+            intent.update(status="aborted", last_error=reason, submission_error=str(exc), submission_code=exc.code,
+                          submission_http_status=exc.http_status)
             self.store.save_intent(intent)
-            raise LeverageRejected(reason, code=exc.code, retry_after=exc.retry_after) from None
+            raise LeverageRejected(reason, code=exc.code, retry_after=exc.retry_after, http_status=exc.http_status) from None
         except TradingError as exc:
-            intent.update(last_error=str(exc), submission_error=str(exc), submission_code=getattr(exc, "code", None))
+            intent.update(last_error=str(exc), submission_error=str(exc), submission_code=getattr(exc, "code", None),
+                          submission_http_status=getattr(exc, "http_status", None))
         self.store.save_intent(intent)
         return f"正在核对 {symbol} {old}x→{target}x 杠杆调整结果"
 
@@ -195,6 +202,8 @@ class Executor:
                     reason += "；提交时：" + intent["submission_error"]
                 if intent.get("submission_code") is not None:
                     reason += f"（代码 {intent['submission_code']}）"
+                if intent.get("submission_http_status") is not None and intent["submission_http_status"] >= 400:
+                    reason += f"（HTTP {intent['submission_http_status']}）"
                 return self.attention(account, intent, reason)
             return f"等待账户确认 {intent['symbol']} 目标 {intent['target']}x，实际 {long.leverage}x"
 

@@ -23,9 +23,10 @@ BASE = "https://fapi.asterdex.com"
 
 
 class ExchangeError(TradingError):
-    def __init__(self, message, code=None, retry_after=0):
+    def __init__(self, message, code=None, retry_after=0, *, http_status=None):
         super().__init__(message)
         self.code, self.retry_after = code, retry_after
+        self.http_status = http_status
 
 
 class AmbiguousOrder(ExchangeError):
@@ -43,9 +44,12 @@ class LeverageRejected(ExchangeError):
 # Restrict this classification to documented rejection codes, not network or
 # unknown processing failures. It is used only for the leverage POST below.
 LEVERAGE_REJECTION_CODES = frozenset({
-    -1002, -1011, -1020, -1022, -1100, -1101, -1102, -1103, -1104, -1105,
+    -1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101, -1102, -1103, -1104, -1105,
     -1106, -1111, -1121, -1130, -2014, -2015, -2019, -2027, -2028, -4028,
 })
+# Aster documents these as WAF/rate-limit/IP-ban rejections. Gateways may
+# return HTML or no body, so the status itself must survive JSON parsing.
+LEVERAGE_REJECTION_HTTP_STATUSES = frozenset({403, 418, 429})
 
 
 class BudgetWait(RequestNotSent):
@@ -255,8 +259,9 @@ class API:
             self.budget.observe(response.headers, ticket=ticket)
         finally:
             self.budget.finish(ticket)
-        if response.status_code in (429, 418):
-            delay = 180 if response.status_code == 429 else 86400
+        gateway_delay = 0
+        if response.status_code in (403, 429, 418):
+            delay = {403: 30, 429: 180, 418: 86400}[response.status_code]
             try:
                 supplied_delay = float(response.headers.get("Retry-After", "0"))
                 if math.isfinite(supplied_delay):
@@ -264,14 +269,18 @@ class API:
             except ValueError:
                 pass
             self.budget.block(delay)
-            raise ExchangeError("Aster 接口限流", retry_after=delay)
+            if response.status_code != 403:
+                raise ExchangeError("Aster 接口限流", retry_after=delay, http_status=response.status_code)
+            # Preserve a WAF Retry-After even for non-JSON gateway pages, while
+            # still honoring an explicit unknown-execution code in a JSON body.
+            gateway_delay = delay
         if (response.status_code >= 500 or response.status_code == 408) and is_write:
-            raise AmbiguousOrder("Aster 未确认请求结果，需核对订单")
+            raise AmbiguousOrder("Aster 未确认请求结果，需核对订单", http_status=response.status_code)
         try:
             data = response.json()
         except ValueError:
             error = AmbiguousOrder if is_write else ExchangeError
-            raise error("Aster 返回无法识别的响应") from None
+            raise error("Aster 返回无法识别的响应", retry_after=gateway_delay, http_status=response.status_code) from None
         if isinstance(data, list) and any(isinstance(row, dict) and row.get("code") in (-1003, -1015) for row in data):
             # Batch responses may mix fills and rate-limit failures. Retain every
             # receipt so the executor can reconcile/repair the successful leg.
@@ -280,12 +289,12 @@ class API:
         if isinstance(code, int) and code < 0:
             if code in (-1003, -1015):
                 self.budget.block(180)
-                raise ExchangeError("Aster 请求或订单限流", code, retry_after=180)
+                raise ExchangeError("Aster 请求或订单限流", code, retry_after=max(180, gateway_delay), http_status=response.status_code)
             if code in (-1006, -1007) and is_write:
-                raise AmbiguousOrder("Aster 请求超时，需核对订单", code)
-            raise ExchangeError(f"Aster 拒绝请求（代码 {code}）", code)
+                raise AmbiguousOrder("Aster 请求超时，需核对订单", code, retry_after=gateway_delay, http_status=response.status_code)
+            raise ExchangeError(f"Aster 拒绝请求（代码 {code}）", code, retry_after=gateway_delay, http_status=response.status_code)
         if not response.is_success:
-            raise ExchangeError(f"Aster HTTP {response.status_code}", code)
+            raise ExchangeError(f"Aster HTTP {response.status_code}", code, retry_after=gateway_delay, http_status=response.status_code)
         return data
 
     def close(self):
@@ -626,8 +635,11 @@ class LiveBroker:
         try:
             return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
         except ExchangeError as exc:
-            if not isinstance(exc, (AmbiguousOrder, RequestNotSent)) and exc.code in LEVERAGE_REJECTION_CODES:
-                raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after)) from None
+            status_rejected = exc.http_status in LEVERAGE_REJECTION_HTTP_STATUSES and exc.code not in (-1006, -1007)
+            code_rejected = not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES
+            if not isinstance(exc, RequestNotSent) and (status_rejected or code_rejected):
+                raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after),
+                                       http_status=exc.http_status) from None
             raise
 
     def submit(self, orders):

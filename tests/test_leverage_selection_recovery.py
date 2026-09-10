@@ -1,5 +1,7 @@
 """Higher-tier selection and live leverage rejection regressions; no live I/O."""
 import copy
+import json
+import os
 import time
 import unittest
 from unittest.mock import patch
@@ -7,7 +9,7 @@ from unittest.mock import patch
 import httpx
 
 from trading.engine import Engine
-from trading.exchange import API, ExchangeError, LiveBroker, RateBudget
+from trading.exchange import API, ExchangeError, LeverageRejected, LiveBroker, RateBudget
 from trading.execution import Executor
 from trading.models import Book, SYMBOLS, dec
 from trading.store import Store
@@ -149,6 +151,8 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
                 self.writes.append(request.url.path)
                 if isinstance(self.result, Exception):
                     raise self.result
+                if isinstance(self.result, httpx.Response):
+                    return self.result
                 return httpx.Response(self.http_status, json=self.result)
             return httpx.Response(200, json=copy.deepcopy(self.responses[request.url.path]))
 
@@ -163,6 +167,116 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
             return self.executor.leverage(self.f.account, XAU, 2, 4)
         except ExchangeError as exc:
             return str(exc)
+
+    def engine_at_risk_limit(self):
+        self.f.account["mode"] = "live"
+        self.f.account["policy"]["min_open_leverage"] = 2
+        self.f.store.save_account(self.f.account)
+        for rows in (self.responses["/fapi/v3/positionRisk"],
+                     self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
+            for row in rows:
+                row.update(positionAmt="250" if row["positionSide"] == "LONG" else "-250",
+                           entryPrice="100", markPrice="100", leverage="2")
+        self.responses["/fapi/v3/accountWithJoinMargin"]["assets"][0].update(
+            crossWalletBalance="50000", crossUnPnl="0", availableBalance="25000", maintMargin="1250")
+        patcher = patch.object(self.f.market, "book", side_effect=lambda symbol: Book(
+            dec("99.9999"), dec("100.0001"), dec(50), dec(50), dec(100), time.time()))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        engine = Engine(self.f.store, market=self.f.market)
+        engine.brokers["test"] = self.broker
+        engine.poll_market(XAU)
+        engine.markets[XAU]["capacities"] = {"2": "11178592", "4": "1984153", "5": "1984153"}
+        self.assertEqual(self.broker.snapshot([XAU]).ratio, dec(".5"))
+        return engine
+
+    def test_documented_http_rejections_and_rate_codes_end_leverage_intent(self):
+        cases = ((429, None, 240), (418, None, 86400), (403, None, 240),
+                 (200, -1003, 180), (200, -1015, 180))
+        for status, code, delay in cases:
+            with self.subTest(status=status, code=code):
+                previous = self.f.store.intent("test")
+                if previous:
+                    previous["status"] = "aborted"
+                    self.f.store.save_intent(previous)
+                self.api.budget = RateBudget()
+                self.result = (httpx.Response(status, json={"code": code, "msg": "private server details"}) if code else
+                               httpx.Response(status, text="private gateway page", headers={"Retry-After": "240"}))
+                with self.assertRaises(LeverageRejected) as raised:
+                    self.executor.leverage(self.f.account, XAU, 2, 4)
+                self.assertIsNone(self.f.store.intent("test"))
+                self.assertTrue(self.f.store.account("test")["enabled"])
+                self.assertEqual(raised.exception.http_status, status)
+                self.assertGreaterEqual(raised.exception.retry_after, delay)
+                self.assertNotIn("private", str(raised.exception))
+                self.assertIn(str(code if code else status), str(raised.exception))
+                with self.f.store.connect() as db:
+                    saved = json.loads(db.execute("SELECT data FROM intents ORDER BY rowid DESC LIMIT 1").fetchone()[0])
+                self.assertEqual(saved["status"], "aborted")
+                self.assertEqual(saved["submission_http_status"], status)
+
+    def test_unknown_http_outcomes_keep_pending_with_status_for_diagnostics(self):
+        for status, code in ((400, -1007), (403, -1007), (408, -2027), (500, -2027), (503, -2027)):
+            with self.subTest(status=status, code=code):
+                self.api.budget = RateBudget()
+                previous = self.f.store.intent("test")
+                if previous:
+                    previous["status"] = "aborted"
+                    self.f.store.save_intent(previous)
+                self.result = httpx.Response(status, json={"code": code})
+                self.begin()
+                pending = self.f.store.intent("test")
+                self.assertIsNotNone(pending)
+                self.assertEqual(pending.get("submission_http_status"), status)
+
+    def test_rate_limit_at_risk_limit_replans_after_backoff_and_confirms(self):
+        engine = self.engine_at_risk_limit()
+        self.result = httpx.Response(429, headers={"Retry-After": "240"})
+        with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "1"}):
+            self.assertGreaterEqual(engine.tick_account("test"), 240)
+            self.assertIsNone(self.f.store.intent("test"))
+            self.assertTrue(self.f.store.account("test")["enabled"])
+            engine.tick_account("test")
+            self.assertEqual(self.writes, ["/fapi/v3/leverage"])
+            self.result = {"symbol": XAU, "leverage": 4}
+            with patch("trading.exchange.time.monotonic", return_value=self.api.budget.until + 1):
+                engine.tick_account("test")
+                self.assertEqual(self.f.store.intent("test")["target"], 4)
+                engine.tick_account("test")
+                self.assertIsNotNone(self.f.store.intent("test"))
+                for rows in (self.responses["/fapi/v3/positionRisk"],
+                             self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
+                    for row in rows:
+                        row["leverage"] = "4"
+                self.responses["/fapi/v3/accountWithJoinMargin"]["assets"][0]["availableBalance"] = "37500"
+                engine.tick_account("test")
+                self.assertEqual(self.broker.snapshot([XAU]).ratio, dec(".25"))
+            self.assertIsNone(self.f.store.intent("test"))
+            self.assertTrue(self.f.store.account("test")["enabled"])
+            self.assertEqual(self.writes, ["/fapi/v3/leverage"] * 2)
+
+    def test_unknown_at_risk_limit_recheck_does_not_resend_or_resume(self):
+        engine = self.engine_at_risk_limit()
+        self.result = httpx.Response(503)
+        with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "1"}):
+            engine.tick_account("test")
+            pending = self.f.store.intent("test")
+            pending["created_at"] = time.time() - 121
+            self.f.store.save_intent(pending)
+            engine.tick_account("test")
+            engine.retry("test")
+            engine.tick_account("test")
+            self.assertEqual(self.f.store.intent("test")["status"], "attention")
+            self.assertIn("503", self.f.store.intent("test")["last_error"])
+            self.assertFalse(self.f.store.account("test")["enabled"])
+            for rows in (self.responses["/fapi/v3/positionRisk"],
+                         self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
+                for row in rows:
+                    row["leverage"] = "4"
+            engine.tick_account("test")
+            self.assertIsNone(self.f.store.intent("test"))
+            self.assertFalse(self.f.store.account("test")["enabled"])
+            self.assertEqual(self.writes, ["/fapi/v3/leverage"])
 
     def test_definite_rejection_does_not_wait_forever_for_an_unapplied_change(self):
         for code in (-2027, -2028, -4028, -1022):

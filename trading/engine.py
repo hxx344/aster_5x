@@ -23,8 +23,8 @@ from .store import dumps
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
 ACCOUNT_LIST_INTERVAL = 1
-CAPACITY_POLL_INTERVAL = 1
-CAPACITY_MONITOR_RESERVE = 360  # Three markets, two requests per second.
+CAPACITY_POLL_INTERVAL = 2
+CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * 2 * 60 // CAPACITY_POLL_INTERVAL
 PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120  # Includes REST quote fallback.
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
@@ -161,7 +161,7 @@ class Engine:
         """Spread ordinary private reads across the shared IP budget."""
         live = [a for a in accounts if a["mode"] == "live"]
         budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else {"ordinary_limit": 1500}
-        # Reserve the one-second capacity feed and ordinary quote fallback. Use cold
+        # Reserve the capacity feed and ordinary quote fallback. Use cold
         # round costs; no private position or balance cache crosses a mutation.
         capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE)
         with self.lock:
@@ -270,7 +270,7 @@ class Engine:
             return max(10, getattr(exc, "retry_after", 0))
 
     def wake_capacity_accounts(self, symbol, capacities, checked_at, accounts):
-        """Merge availability edges; sustained capacity never polls private accounts at 1 Hz."""
+        """Merge availability edges without polling private accounts at the feed cadence."""
         fresh = -1 <= time.time() - checked_at <= 8
         by_id = {a["id"]: a for a in accounts}
         with self.lock:

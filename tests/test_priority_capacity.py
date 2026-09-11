@@ -41,7 +41,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
     def test_only_capacity_strictly_above_the_account_threshold_wakes(self):
         self.f.account["policy"]["threshold"] = "20000"
         self.f.store.save_account(self.f.account)
-        self.assertEqual(self.publish({4: 500000, 5: 500000, 10: 20000, 20: 19999}), 1)
+        self.assertEqual(self.publish({4: 500000, 5: 500000, 10: 20000, 20: 19999}), 2)
         self.assertNotIn("test", self.engine.priority_accounts)
 
         self.publish({10: "20000.0001", 20: 20000})
@@ -122,7 +122,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
 
     def test_capacity_poll_does_not_read_or_wait_for_a_book(self):
         with patch.object(self.f.market, "book", side_effect=AssertionError("book has its own worker")):
-            self.assertEqual(self.publish({10: 500000}), 1)
+            self.assertEqual(self.publish({10: 500000}), 2)
             self.assertEqual(self.engine.capacities(SYMBOL)[10], dec(500000))
         self.assertIn("test", self.engine.priority_accounts)
 
@@ -141,7 +141,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
             worker.start()
             try:
                 self.assertTrue(entered.wait(1))
-                self.assertEqual(self.publish({10: 500000}), 1)
+                self.assertEqual(self.publish({10: 500000}), 2)
                 self.assertIn("test", self.engine.priority_accounts)
                 self.assertEqual(self.engine.capacities(SYMBOL)[10], dec(500000))
                 self.assertTrue(worker.is_alive())

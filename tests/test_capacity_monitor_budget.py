@@ -6,27 +6,28 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from trading.engine import CAPACITY_MONITOR_RESERVE
 from trading.exchange import BudgetWait, ExchangeError, MarketData, RateBudget, RequestNotSent
 from trading.models import dec
 
 
 class CapacityMonitorBudgetTests(unittest.TestCase):
     def test_execution_leaves_monitor_headroom_and_reports_its_actual_limit(self):
-        budget = RateBudget(capacity_reserve=360)
-        budget.require_available(1140)
+        budget = RateBudget(capacity_reserve=CAPACITY_MONITOR_RESERVE)
+        budget.require_available(1320)
         self.assertEqual(budget.weight, 0)
-        budget.reserve(1140)
+        budget.reserve(1320)
         for check in (budget.require_available, budget.reserve):
-            with self.assertRaisesRegex(BudgetWait, "1140/1140"):
+            with self.assertRaisesRegex(BudgetWait, "1320/1320"):
                 check(1)
         state = budget.snapshot()
         self.assertEqual((state["ordinary_limit"], state["execution_limit"], state["capacity_reserve"]),
-                         (1500, 1140, 360))
-        self.assertEqual((state["remaining"], state["ordinary_remaining"]), (660, 0))
+                         (1500, 1320, 180))
+        self.assertEqual((state["remaining"], state["ordinary_remaining"]), (480, 0))
         self.assertGreater(state["retry_after"], 0)
         with budget.capacity_monitoring():
-            budget.require_available(360)
-            budget.reserve(360)
+            budget.require_available(180)
+            budget.reserve(180)
         self.assertEqual(budget.weight, 1500)
 
     def test_monitoring_cannot_spend_reconciliation_quota(self):

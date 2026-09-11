@@ -42,7 +42,7 @@ class CapacityAlertEngineTests(unittest.TestCase):
              patch.object(self.f.market, "book", wraps=self.f.market.book) as book:
             self.engine.poll_market("XAUUSD1")
         capacities.assert_called_once()
-        book.assert_called_once_with("XAUUSD1")
+        book.assert_not_called()
         self.assertEqual(self.f.store.pending_notifications(), 4)
         self.engine.notify()
         self.engine.notify()
@@ -98,7 +98,9 @@ class CapacityAlertEngineTests(unittest.TestCase):
         with patch.object(self.f.market, "capacities", return_value={4: dec(20000)}), \
              patch.object(self.f.market, "book", side_effect=TradingError("BBO unavailable")):
             self.engine.poll_market("XAUUSD1")
-        self.assertEqual(self.engine.markets["XAUUSD1"]["status"], "error")
+            self.engine.poll_book("XAUUSD1")
+        self.assertEqual(self.engine.markets["XAUUSD1"]["status"], "ok")
+        self.assertIn("book_error", self.engine.markets["XAUUSD1"])
         self.engine.notify()
         self.sender.assert_called_once()
 

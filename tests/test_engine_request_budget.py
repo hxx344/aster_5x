@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from trading.engine import Engine
+from trading.engine import Engine, PUBLIC_POLL_ALLOWANCE
 from trading.exchange import API, MarketData, RateBudget
 from trading.models import dec
 from trading.store import Store
@@ -106,7 +106,7 @@ class EngineRequestBudgetTests(unittest.TestCase):
         for active in range(9):
             accounts = [{**account("a" + str(i), mode="live"), "enabled": i < active} for i in range(8)]
             schedule = self.engine.scheduling(accounts)
-            planned = 180
+            planned = PUBLIC_POLL_ALLOWANCE
             for row in accounts:
                 timing = schedule[row["id"]]
                 cost = 300 if row["enabled"] else 90

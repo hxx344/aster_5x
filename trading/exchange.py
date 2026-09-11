@@ -57,9 +57,11 @@ class BudgetWait(RequestNotSent):
 
 
 class RateBudget:
-    def __init__(self, reconciliation_reserve=300):
+    def __init__(self, reconciliation_reserve=300, capacity_reserve=0):
         if type(reconciliation_reserve) is not int or reconciliation_reserve < 0:
             raise ExchangeError("订单核对保留额度无效")
+        if type(capacity_reserve) is not int or capacity_reserve < 0:
+            raise ExchangeError("额度监控保留预算无效")
         self.lock = threading.Lock()
         self.until, self.window, self.weight = 0.0, time.monotonic(), 0
         self.deadline = self.window + 60
@@ -69,7 +71,24 @@ class RateBudget:
         self.unreported = deque()
         self.limit = 1800
         self.reconciliation_reserve = reconciliation_reserve
+        self.capacity_reserve = capacity_reserve
         self.priority = threading.local()
+
+    def configure_capacity_reserve(self, weight):
+        if type(weight) is not int or weight < 0:
+            raise ExchangeError("额度监控保留预算无效")
+        with self.lock:
+            self.capacity_reserve = weight
+
+    @contextmanager
+    def capacity_monitoring(self):
+        """Keep shared quota discovery moving when account execution is busy."""
+        previous = getattr(self.priority, "capacity_monitoring", False)
+        self.priority.capacity_monitoring = True
+        try:
+            yield self
+        finally:
+            self.priority.capacity_monitoring = previous
 
     @contextmanager
     def reconciliation(self):
@@ -100,14 +119,24 @@ class RateBudget:
     def _ordinary_limit(self):
         return self.limit - min(self.reconciliation_reserve, self.limit // 6)
 
+    def _execution_limit(self):
+        ordinary_limit = self._ordinary_limit()
+        return ordinary_limit - min(self.capacity_reserve, ordinary_limit // 3)
+
     def _require_available(self, weight, now):
         self._refresh(now)
         if now < self.until:
             raise RequestNotSent("接口退避中", retry_after=self.until - now)
-        critical = getattr(self.priority, "reconciliation", False)
-        limit = self.limit if critical else self._ordinary_limit()
+        monitoring = getattr(self.priority, "capacity_monitoring", False)
+        critical = getattr(self.priority, "reconciliation", False) and not monitoring
+        if monitoring:
+            limit = self._ordinary_limit()
+        else:
+            limit = self.limit if critical else self._execution_limit()
         if self.weight + weight > limit:
             message = "本地请求预算已用完" if critical else "本地普通请求预算不足，已为订单核对和补偿保留额度"
+            if not critical and not monitoring and self.capacity_reserve:
+                message = "本地执行请求预算不足，已为额度监控、订单核对和补偿保留额度"
             reported = "未返回" if self.reported_weight is None else str(self.reported_weight)
             message += f"（估算已用 {self.weight}/{limit}，本轮需 {weight}；本进程计入 {self.local_weight}，Aster 同 IP 回报 {reported}）"
             raise BudgetWait(message, retry_after=max(0.0, self.deadline - now))
@@ -192,13 +221,15 @@ class RateBudget:
             now = time.monotonic()
             self._refresh(now)
             ordinary_limit = self._ordinary_limit()
+            execution_limit = self._execution_limit()
             reset_after = max(0.0, self.deadline - now)
             retry_after = max(0.0, self.until - now,
-                              reset_after if self.weight >= ordinary_limit else 0.0)
+                              reset_after if self.weight >= execution_limit else 0.0)
             return {"used": self.weight, "limit": self.limit, "ordinary_limit": ordinary_limit,
+                    "execution_limit": execution_limit, "capacity_reserve": ordinary_limit - execution_limit,
                     "local_used": self.local_weight, "aster_ip_used": self.reported_weight,
                     "remaining": max(0, self.limit - self.weight),
-                    "ordinary_remaining": max(0, ordinary_limit - self.weight),
+                    "ordinary_remaining": max(0, execution_limit - self.weight),
                     "reset_after": reset_after, "retry_after": retry_after}
 
     def block(self, seconds):
@@ -454,7 +485,8 @@ class MarketData:
         return book
 
     def capacities(self, symbol, leverages):
-        self.api.budget.reserve(2)
+        with self.api.budget.capacity_monitoring():
+            self.api.budget.reserve(2)
         try:
             result = monitor.sample({"symbol": symbol, "leverages": sorted(set(leverages)), "timeout_seconds": 8})
             return {v: positive(row["value"], True) for v, row in result.items() if not isinstance(row, Exception)}
@@ -615,7 +647,7 @@ class LiveBroker:
             raise TradingError("账户实际杠杆无效")
         return int(leverage)
 
-    def set_leverage(self, symbol, leverage, *, checked_snapshot=None):
+    def set_leverage(self, symbol, leverage, *, checked_snapshot=None, before_submit=None):
         verified, self.leverage_snapshot = self.leverage_snapshot, None
         snapshot = (checked_snapshot if verified is not None and checked_snapshot is verified[0]
                     and 0 <= time.monotonic() - verified[1] <= 1 else None)
@@ -632,6 +664,15 @@ class LiveBroker:
         require_non_decreasing_leverage(long.leverage, leverage)
         if leverage == long.leverage:
             return {"symbol": symbol, "leverage": leverage}
+        if before_submit is not None:
+            try:
+                # This is the last account read, including the stale-token fallback.
+                before_submit(snapshot)
+                snapshot.require_ready(symbol)
+            except RequestNotSent:
+                raise
+            except TradingError as exc:
+                raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
         try:
             return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
         except ExchangeError as exc:

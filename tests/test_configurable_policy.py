@@ -355,7 +355,7 @@ class ConfigurablePolicyMarketTests(unittest.TestCase):
              patch.object(f.market, "book", wraps=f.market.book) as book:
             engine.poll_market(SYMBOL)
             capacities.assert_called_once()
-            book.assert_called_once_with(SYMBOL)
+            book.assert_not_called()
             queried_symbol, queried_tiers = capacities.call_args.args
             self.assertEqual(queried_symbol, SYMBOL)
             self.assertEqual(set(queried_tiers), {2, 4, 5, 7, 10, 13, 20})

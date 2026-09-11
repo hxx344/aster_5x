@@ -40,6 +40,7 @@ class CapacityFreshnessTests(unittest.TestCase):
              patch.object(self.f.market, "capacities", return_value={4: dec(20000)}), \
              patch.object(self.f.market, "book", side_effect=slow_book):
             self.engine.poll_market("XAUUSD1")
+            self.engine.poll_book("XAUUSD1")
             self.assertEqual(self.engine.capacities("XAUUSD1"), {4: dec(20000)})
             self.now += 2
             with self.assertRaisesRegex(TradingError, "额度快照"):

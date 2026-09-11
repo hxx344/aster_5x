@@ -101,7 +101,7 @@ class Executor:
         if qty:
             positive(row.get("avgPrice"))
 
-    def leverage(self, account, symbol, old, target, snapshot=None):
+    def leverage(self, account, symbol, old, target, snapshot=None, before_submit=None):
         self.last_snapshot = None
         self.last_completed_intent = None
         require_non_decreasing_leverage(old, target)
@@ -117,12 +117,15 @@ class Executor:
             raise TradingError("已有批次正在执行")
         if target == old:
             return f"当前已为 {old}x，保持杠杆不变"
+        if before_submit is not None and not isinstance(self.broker, LiveBroker):
+            before_submit(snapshot)
         intent = {"id": uuid.uuid4().hex, "kind": "leverage", "account_id": account["id"], "symbol": symbol,
                   "previous": old, "target": target, "created_at": time.time(), "status": "pending"}
         self.store.save_intent(intent)
         try:
             if isinstance(self.broker, LiveBroker):
-                response = self.broker.set_leverage(symbol, target, checked_snapshot=snapshot)
+                options = {"before_submit": before_submit} if before_submit is not None else {}
+                response = self.broker.set_leverage(symbol, target, checked_snapshot=snapshot, **options)
             else:
                 response = self.broker.set_leverage(symbol, target)
             if not isinstance(response, dict) or response.get("symbol") != symbol:

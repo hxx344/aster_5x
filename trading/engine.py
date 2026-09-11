@@ -23,6 +23,10 @@ from .store import dumps
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
 ACCOUNT_LIST_INTERVAL = 1
+CAPACITY_POLL_INTERVAL = 1
+CAPACITY_MONITOR_RESERVE = 360  # Three markets, two requests per second.
+PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120  # Includes REST quote fallback.
+PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
                   "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE}
 EDITABLE_POLICY_FIELDS = {"threshold", "order_notional", "margin_limit", "min_open_leverage"}
@@ -89,6 +93,7 @@ class Engine:
         self.store, self.demo = store, demo
         self.market = market or (DemoMarket() if demo else MarketData())
         self.shutdown = threading.Event()
+        self.scheduler_event = threading.Event()
         self.thread = None
         self.process_lock = ProcessLock(store.path.with_suffix(".lock"))
         self.lock = threading.RLock()
@@ -100,6 +105,10 @@ class Engine:
         self.brokers, self.signers, self.users = {}, {}, {}
         self.markets, self.views, self.rotation = {}, {}, {}
         self.wake_accounts, self.urgent_accounts = set(), set()
+        self.priority_accounts, self.priority_levels = {}, {}
+        self.priority_followups, self.active_priority_accounts = set(), set()
+        self.active_priority_signals = {}
+        self.account_backoff = {}
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
@@ -152,9 +161,9 @@ class Engine:
         """Spread ordinary private reads across the shared IP budget."""
         live = [a for a in accounts if a["mode"] == "live"]
         budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else {"ordinary_limit": 1500}
-        # Public monitoring keeps its five-second cadence. Use conservative cold
+        # Reserve the one-second capacity feed and ordinary quote fallback. Use cold
         # round costs; no private position or balance cache crosses a mutation.
-        capacity = max(1, budget["ordinary_limit"] - 180)
+        capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE)
         with self.lock:
             def cost(account):
                 if not account["enabled"]:
@@ -212,8 +221,7 @@ class Engine:
 
     def poll_market(self, symbol):
         if self.shutdown.is_set():
-            return 5
-        capacity_observed = False
+            return CAPACITY_POLL_INTERVAL
         try:
             accounts = self.store.accounts()
             tiers = set(TIERS)
@@ -221,24 +229,95 @@ class Engine:
             with self.lock:
                 for view in self.views.values():
                     tiers.update(p["leverage"] for p in view.get("snapshot", {}).get("positions", []) if p["symbol"] == symbol)
-            # Network and BBO latency are part of the capacity snapshot's age.
+            # Network latency is part of the capacity snapshot's age.
             checked_at = time.time()
             capacities = self.market.capacities(symbol, tiers)
-            capacity_observed = True
-            self.observe_capacity_alerts(symbol, capacities, checked_at)
-            book = self.market.book(symbol)
             row = {"status": "ok", "capacities": {str(k): wire(v) for k, v in capacities.items()},
-                   "checked_at": checked_at, "book": {**asdict(book), "spread": book.spread}}
+                   "checked_at": checked_at}
             with self.lock:
-                self.markets[symbol] = json.loads(dumps(row))
-            return 5
+                previous = self.markets.get(symbol, {})
+                self.markets[symbol] = {**previous, **json.loads(dumps(row))}
+                self.markets[symbol].pop("error", None)
+            # Wake execution before notification storage or quote I/O can delay it.
+            self.wake_capacity_accounts(symbol, capacities, checked_at, accounts)
+            self.observe_capacity_alerts(symbol, capacities, checked_at)
+            return CAPACITY_POLL_INTERVAL
         except (TradingError, KeyError, ValueError, TypeError) as exc:
-            if not capacity_observed:
-                self.invalidate_capacity_alerts(symbol)
+            self.invalidate_capacity_alerts(symbol)
             with self.lock:
                 previous = self.markets.get(symbol, {})
                 self.markets[symbol] = {**previous, "status": "error", "error": str(exc) if isinstance(exc, TradingError) else "行情数据格式异常"}
+            self.wake_capacity_accounts(symbol, {}, time.time(), [])
             return max(10, getattr(exc, "retry_after", 0))
+
+    def poll_book(self, symbol):
+        """Display quotes cannot hold up the shared capacity feed."""
+        if self.shutdown.is_set():
+            return 5
+        try:
+            book = self.market.book(symbol)
+            book.require_fresh()
+            with self.lock:
+                row = self.markets.setdefault(symbol, {})
+                row["book"] = json.loads(dumps({**asdict(book), "spread": book.spread}))
+                row.pop("book_error", None)
+            return 5
+        except (TradingError, KeyError, ValueError, TypeError) as exc:
+            with self.lock:
+                row = self.markets.setdefault(symbol, {})
+                row.pop("book", None)
+                row["book_error"] = str(exc) if isinstance(exc, TradingError) else "盘口数据格式异常"
+            return max(10, getattr(exc, "retry_after", 0))
+
+    def wake_capacity_accounts(self, symbol, capacities, checked_at, accounts):
+        """Merge availability edges; sustained capacity never polls private accounts at 1 Hz."""
+        fresh = -1 <= time.time() - checked_at <= 8
+        by_id = {a["id"]: a for a in accounts}
+        with self.lock:
+            ids = set(by_id) | {aid for aid, market in self.priority_levels if market == symbol}
+            for aid in ids:
+                account = by_id.get(aid)
+                levels = ()
+                if fresh and account and account["enabled"] and self.live_allowed(account) and symbol in account["policy"]["symbols"]:
+                    positions = [p for p in self.views.get(aid, {}).get("snapshot", {}).get("positions", []) if p["symbol"] == symbol]
+                    current = max((p["leverage"] for p in positions), default=0)
+                    threshold = dec(account["policy"]["threshold"])
+                    required = max(threshold,
+                                   sum((dec(p.get("qty", 0)).copy_abs() * dec(p.get("mark", 0)) for p in positions), dec(0)))
+                    minimum = minimum_open_leverage(account["policy"])
+                    levels = tuple(tier for tier in PRIORITY_TIERS
+                                   if (tier > current and capacities.get(tier, dec(0)) > required)
+                                   or (tier == current >= minimum and capacities.get(tier, dec(0)) > threshold))
+                key = (aid, symbol)
+                previous = self.priority_levels.get(key, ())
+                if levels:
+                    self.priority_levels[key] = levels
+                    if set(levels) - set(previous):
+                        self.priority_accounts.setdefault(aid, {})[symbol] = checked_at
+                    elif symbol in self.priority_accounts.get(aid, {}):
+                        # Refresh a queued opportunity while this account is busy/backing off.
+                        self.priority_accounts[aid][symbol] = checked_at
+                else:
+                    self.priority_levels.pop(key, None)
+                    self.priority_accounts.get(aid, {}).pop(symbol, None)
+                if not self.priority_accounts.get(aid):
+                    self.priority_accounts.pop(aid, None)
+            if self.priority_accounts:
+                self.scheduler_event.set()
+
+    def priority_continuation(self, account_id):
+        with self.lock:
+            self.priority_followups.add(account_id)
+        self.scheduler_event.set()
+
+    @staticmethod
+    def select_leverage(snapshot, symbol, capacities, book, policy, priority=False):
+        options = {"threshold": policy["threshold"], "min_open_leverage": minimum_open_leverage(policy)}
+        if priority:
+            target = next_leverage(snapshot, symbol, {tier: value for tier, value in capacities.items() if tier in PRIORITY_TIERS}, book.mark, **options)
+            if target is not None:
+                return target
+        return next_leverage(snapshot, symbol, capacities, book.mark, **options)
 
     def capacities(self, symbol):
         with self.lock:
@@ -292,6 +371,10 @@ class Engine:
 
     def tick_account(self, account_id):
         with self.account_lock(account_id):
+            with self.lock:
+                priority = account_id in self.active_priority_accounts
+                priority_signals = self.active_priority_signals.pop(account_id, {})
+            progressed, consumed_symbol, retry_priority = False, None, False
             if self.shutdown.is_set():
                 return 5
             account = self.store.account(account_id)
@@ -324,11 +407,17 @@ class Engine:
                         status, reason = "attention", "服务器未启用实盘执行，保留未完成批次等待核对"
                     self.view(account_id, status=status, reason=reason)
                     self.strategy(account_id, pending["symbol"], reason, status)
+                    progressed = True
                     if pending["kind"] == "pair" and not self.store.intent(account_id):
+                        consumed_symbol = pending["symbol"]
                         self.record_batch_outcome(account_id, executor)
                         after = self.completed_snapshot(executor, broker, account["policy"]["symbols"])
                         self.view(account_id, snapshot=snapshot_json(after, account["policy"]["symbols"]))
                         self.check_post_fill_occupancy(account, after)
+                    elif (pending["kind"] == "leverage" and pending["target"] in PRIORITY_TIERS
+                          and not self.store.intent(account_id) and account["enabled"] and self.live_allowed(account)
+                          and self.store.get(f"open_after_leverage:{account_id}:{pending['symbol']}") is not None):
+                        self.priority_continuation(account_id)
                     return 5
                 if not account["enabled"] or self.shutdown.is_set():
                     for symbol in account["policy"]["symbols"]:
@@ -345,6 +434,7 @@ class Engine:
                 ordered = markets[start:] + markets[:start]
                 last_reason = "等待交易条件"
                 candidates = []
+                first_add_symbols = set()
                 campaign_limit = dec(policy["margin_limit"])
                 for symbol in ordered:
                     try:
@@ -360,8 +450,12 @@ class Engine:
                         target = None
                         current_available = capacities.get(long.leverage, dec(0)) > dec(policy["threshold"])
                         first_add = long.leverage >= minimum and self.store.get(f"open_after_leverage:{account_id}:{symbol}") == long.leverage and current_available
+                        if first_add and priority and long.leverage not in PRIORITY_TIERS:
+                            high_target = self.select_leverage(snapshot, symbol, capacities, book, policy, True)
+                            if high_target in PRIORITY_TIERS:
+                                first_add = False
                         if not first_add:
-                            target = next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum)
+                            target = self.select_leverage(snapshot, symbol, capacities, book, policy, priority)
                         if target is not None:
                             candidates.append(MarketCandidate(symbol, long.leverage, book, target))
                             continue
@@ -383,8 +477,18 @@ class Engine:
                         last_reason = plan.reason
                         if plan.qty:
                             candidates.append(MarketCandidate(symbol, long.leverage, book))
+                            if first_add and long.leverage in PRIORITY_TIERS:
+                                first_add_symbols.add(symbol)
                     except (TradingError, KeyError, ValueError, TypeError) as exc:
                         last_reason = self.market_error(account_id, symbol, exc)
+                if priority_signals:
+                    # Unrelated filled markets must not repeatedly consume another
+                    # market's queued opportunity. Keep confirmed first adds eligible.
+                    preferred = [c for c in candidates if c.symbol in priority_signals or c.symbol in first_add_symbols]
+                    if preferred:
+                        candidates = preferred
+                    else:
+                        priority_signals = {}
                 for candidate in self.rank_candidates(candidates):
                     if self.shutdown.is_set():
                         return 5
@@ -396,15 +500,26 @@ class Engine:
                         book.require_fresh()
                         capacities = self.capacities(symbol)
                         if target is not None:
-                            if next_leverage(snapshot, symbol, capacities, book.mark, threshold=policy["threshold"], min_open_leverage=minimum) != target:
+                            if self.select_leverage(snapshot, symbol, capacities, book, policy, priority) != target:
                                 last_reason = "可用杠杆档位已变化，等待下一轮比较"
                                 self.strategy(account_id, symbol, last_reason)
                                 continue
                             if isinstance(broker, LiveBroker):
                                 broker.api.budget.require_available(broker.snapshot_weight(markets, fresh_modes=True) + 1)
-                            reason = executor.leverage(account, symbol, candidate.leverage, target, snapshot=snapshot)
+                            def validate_upgrade(current):
+                                latest_book = self.market.book(symbol)
+                                latest_book.require_fresh()
+                                latest = self.capacities(symbol)
+                                if next_leverage(current, symbol, {target: latest.get(target, dec(0))}, latest_book.mark,
+                                                 threshold=policy["threshold"], min_open_leverage=minimum) != target:
+                                    raise TradingError("目标杠杆额度或账户条件已变化，等待新机会")
+                            reason = executor.leverage(account, symbol, candidate.leverage, target, snapshot=snapshot,
+                                                       before_submit=validate_upgrade)
+                            progressed = True
                             self.strategy(account_id, symbol, reason, "leverage")
                             self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
+                            if target in PRIORITY_TIERS:
+                                self.priority_continuation(account_id)
                             return 5
                         plan = plan_pair(snapshot, book, self.market.rules[symbol], capacities, policy)
                         if not plan.qty:
@@ -412,6 +527,7 @@ class Engine:
                             self.strategy(account_id, symbol, last_reason)
                             continue
                         reason = executor.open_pair(account, snapshot, symbol, plan, book)
+                        progressed, consumed_symbol = True, symbol
                         # A completed pair is followed by an actual account risk check.
                         self.record_batch_outcome(account_id, executor)
                         after = self.completed_snapshot(executor, broker, markets)
@@ -450,10 +566,25 @@ class Engine:
                         self.strategy(account_id, symbol, message, "attention")
                     status = "attention"
                 self.view(account_id, status=status, reason=message, credential_ready=account_id in self.brokers)
-                return max(10, getattr(exc, "retry_after", 0))
+                delay = max(10, getattr(exc, "retry_after", 0))
+                with self.lock:
+                    self.account_backoff[account_id] = time.monotonic() + delay
+                if priority and isinstance(exc, ExchangeError):
+                    retry_priority = True
+                    self.priority_continuation(account_id)
+                return delay
             finally:
                 urgent = bool(self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id))
                 with self.lock:
+                    self.active_priority_accounts.discard(account_id)
+                    if progressed or retry_priority:
+                        # Keep each opportunity through upgrade and confirmation;
+                        # consume it after its first batch, retaining the other markets.
+                        for symbol in priority_signals:
+                            row = self.markets.get(symbol, {})
+                            if (symbol != consumed_symbol and self.priority_levels.get((account_id, symbol))
+                                and row.get("status") == "ok" and -1 <= time.time() - row.get("checked_at", 0) <= 8):
+                                self.priority_accounts.setdefault(account_id, {}).setdefault(symbol, row["checked_at"])
                     if urgent:
                         self.urgent_accounts.add(account_id)
                     else:
@@ -693,17 +824,18 @@ class Engine:
         pending, due = {}, {}
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
-        # Reserve capacity for every account, each public market and the outbox.
-        # Slow private APIs must never occupy the market/notification capacity.
+        # Capacity, quotes, accounts and the outbox each have worker capacity.
         try:
             if isinstance(self.market, MarketData) and not self.shutdown.is_set():
+                self.market.api.budget.configure_capacity_reserve(CAPACITY_MONITOR_RESERVE)
                 try:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + 2 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 try:
                     while not self.shutdown.is_set():
+                        self.scheduler_event.clear()
                         if not self.ready:
                             try:
                                 self.market.load_rules()
@@ -724,6 +856,8 @@ class Engine:
                                 aid = key.removeprefix("account:")
                                 with self.lock:
                                     urgent = aid in self.urgent_accounts
+                                    self.active_priority_accounts.discard(aid)
+                                    self.active_priority_signals.pop(aid, None)
                                 if key.startswith("account:") and aid in schedules and not urgent:
                                     delay = max(delay, schedules[aid]["interval"])
                                 due[key] = time.monotonic() + delay
@@ -748,19 +882,38 @@ class Engine:
                                     due[key] = 0
                                     self.wake_accounts.discard(aid)
                             urgent_accounts = self.urgent_accounts.copy()
+                            priority_accounts = self.priority_followups.copy()
+                            for aid, signals in self.priority_accounts.items():
+                                if aid not in urgent_accounts and any(-1 <= time.time() - stamp <= 8
+                                       and self.markets.get(symbol, {}).get("status") == "ok"
+                                       for symbol, stamp in signals.items()):
+                                    priority_accounts.add(aid)
                         jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
-                        jobs.update({"account:" + aid: (self.tick_account, aid) for aid in account_ids})
+                        jobs.update({"book:" + s: (self.poll_book, s) for s in SYMBOLS})
                         jobs["notify"] = (self.notify,)
+                        ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts, aid not in priority_accounts))
+                        jobs.update({"account:" + aid: (self.tick_account, aid) for aid in ordered_accounts})
                         for key, (function, *args) in jobs.items():
-                            if key not in pending and time.monotonic() >= due.get(key, 0):
-                                aid = key.removeprefix("account:")
-                                ordinary = key.startswith("account:") and aid in schedules and aid not in urgent_accounts
+                            is_account = key.startswith("account:")
+                            aid = key.removeprefix("account:")
+                            priority = is_account and aid in priority_accounts
+                            if key not in pending and (priority or time.monotonic() >= due.get(key, 0)):
+                                if is_account:
+                                    with self.lock:
+                                        if time.monotonic() < self.account_backoff.get(aid, 0):
+                                            continue
+                                ordinary = is_account and aid in schedules and aid not in urgent_accounts and not priority
                                 if ordinary and time.monotonic() < next_ordinary_start:
                                     continue
+                                if priority:
+                                    with self.lock:
+                                        self.active_priority_signals[aid] = self.priority_accounts.pop(aid, {})
+                                        self.priority_followups.discard(aid)
+                                        self.active_priority_accounts.add(aid)
                                 pending[key] = pool.submit(function, *args)
-                                if ordinary:
-                                    next_ordinary_start = time.monotonic() + schedules[aid]["gap"]
-                        self.shutdown.wait(.1)
+                                if ordinary or priority and aid in schedules and aid not in urgent_accounts:
+                                    next_ordinary_start = max(next_ordinary_start, time.monotonic() + schedules[aid]["gap"])
+                        self.scheduler_event.wait(.1)
                 finally:
                     # Fail health checks as soon as scheduling ends, before waiting
                     # for in-flight workers and closing their shared clients.
@@ -773,6 +926,7 @@ class Engine:
             LOG.error("Scheduler stopped unexpectedly")
         finally:
             self.shutdown.set()
+            self.scheduler_event.set()
             with self.lock:
                 self.ready = False
                 brokers = list(self.brokers.items())
@@ -811,6 +965,7 @@ class Engine:
     def stop(self):
         with self.lifecycle_lock:
             self.shutdown.set()
+            self.scheduler_event.set()
             if self.thread:
                 self.thread.join(timeout=90)
             if not self.thread or not self.thread.is_alive():

@@ -6,9 +6,11 @@
 curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install-trading.sh | sudo bash
 ```
 
-新版 `aster-desk` 同时支持**公共额度提醒**和**实盘交易完成汇总**，共用 `FEISHU_WEBHOOK_URL` 与可选的 `FEISHU_SIGN_SECRET`。已有机器人配置升级后直接沿用。公共提醒复用现有行情轮询，监控三个标的的 4x / 5x / 10x / 20x，默认严格大于 10,000 USD1 时提醒，与账户数量、账户开仓阈值和交易启停互相独立，不增加 Aster 查询。
+新版 `aster-desk` 的额度监控独立于盘口刷新，各标的所有档位共用一次采样，完成后等待 **1 秒**再查。10x / 20x 额度满足已启用账户的网页阈值并通过持仓容量初筛，可用状态发生变化时，立即优先唤醒升杠杆及开仓路径，跳过普通账户轮次间隔；优先从 10x、20x 中选择可用的更高档，确认升档后立即尝试首批开仓。账户状态、额度、盘口和风控仍会重新检查，接口退避、预算及开仓冷却仍生效；请求耗时会增加延迟，不保证即时成交。
 
-公共提醒默认启用，可在 `/etc/aster-desk/environment` 设置 `ASTER_CAPACITY_ALERT_ENABLED=0` 单独关闭；自定义阈值与冷却时间分别使用 `ASTER_CAPACITY_ALERT_THRESHOLD=10000`、`ASTER_CAPACITY_ALERT_COOLDOWN_SECONDS=300`，修改后执行 `sudo aster-desk restart`。每个组合首次达标提醒一次，持续高位不刷屏，回落后重新达标且冷却结束才再提醒。成功状态持久化，失败只在新额度仍有效且达标时重试；未配置 Webhook 时不积累公共提醒历史，演示模式不发送。交易汇总优先发送，HTTP 投递结果不确定时仍可能重复。提醒使用未扣个人占用的公开估算，完整说明见 [飞书、升级与运维](DEPLOYMENT.md#飞书升级与运维)。
+新版同时支持**公共额度提醒**和**实盘交易完成汇总**，共用 `FEISHU_WEBHOOK_URL` 与可选的 `FEISHU_SIGN_SECRET`。已有机器人配置升级后直接沿用。公共提醒复用上述采样，不增加 Aster 查询，也不阻塞账户唤醒；阈值使用网页“策略设置”，多账户按关注该市场的最低阈值触发，暂停账户仍参与提醒，暂停策略不会因额度出现而自动启动。
+
+公共提醒默认启用，可在 `/etc/aster-desk/environment` 设置 `ASTER_CAPACITY_ALERT_ENABLED=0` 单独关闭；冷却时间使用 `ASTER_CAPACITY_ALERT_COOLDOWN_SECONDS=300`，修改环境文件后执行 `sudo aster-desk restart`。旧 `ASTER_CAPACITY_ALERT_THRESHOLD` 不再覆盖网页阈值。每个组合首次达标提醒一次，持续高位不刷屏，回落后重新达标且冷却结束才再提醒。成功状态持久化，失败只在新额度仍有效且达标时重试；未配置 Webhook 时不积累公共提醒历史，演示模式不发送。交易汇总优先发送，HTTP 投递结果不确定时仍可能重复。提醒使用未扣个人占用的公开估算，完整说明见 [飞书、升级与运维](DEPLOYMENT.md#飞书升级与运维)。
 
 升级保留新版环境文件和数据库，安装脚本会停用旧 `aster-5x` 服务以免重复轮询。新版不启动旧 `monitor.py`，也不自动导入旧 `alerts.json` 的提醒状态；首次启用时可能对当前达标额度提醒，之后重启沿用新的成功状态。
 

@@ -204,7 +204,8 @@ class Store:
             raise TradingError("额度提醒市场或杠杆档位无效")
         return f"capacity_alert:{symbol}:{leverage}"
 
-    def observe_capacity_alert(self, symbol, leverage, value, *, threshold, cooldown, identity, checked_at, now=None):
+    def observe_capacity_alert(self, symbol, leverage, value, *, threshold, cooldown, identity, checked_at, now=None,
+                               account_labels=()):
         """Atomically persist an independent threshold gate and its one pending message."""
         key = self.capacity_alert_key(symbol, leverage)
         value, threshold = positive(value, True), positive(threshold, True)
@@ -222,9 +223,11 @@ class Store:
         except (OverflowError, OSError, ValueError):
             raise TradingError("额度提醒检查时间无效") from None
         above = value > threshold
+        account_text = "满足网页额度阈值的账户：" + "、".join(account_labels) + "\n" if account_labels else ""
         message = (f"Aster 开仓额度提醒\n{symbol} · {leverage}x\n"
                    f"公开剩余可开额度（估算）：{value:,.2f} USD1\n"
                    f"触发条件：> {threshold:,.2f} USD1\n"
+                   f"{account_text}"
                    "未扣除个人持仓和挂单占用，请以账户页面为准。\n"
                    f"检查时间：{checked_text}\n"
                    f"https://www.asterdex.com/zh-CN/trade/pro/futures/{symbol}")

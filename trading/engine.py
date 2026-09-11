@@ -558,14 +558,29 @@ class Engine:
         config = notification if notification is not None else self.notification_config()
         if config is None:
             return None
-        threshold = positive(os.environ.get("ASTER_CAPACITY_ALERT_THRESHOLD", str(config["threshold"])), True)
         cooldown = positive(os.environ.get("ASTER_CAPACITY_ALERT_COOLDOWN_SECONDS", str(config["cooldown_seconds"])), True)
-        if threshold > 1000000000 or cooldown > 86400:
-            raise TradingError("额度提醒阈值或冷却时间超出范围")
-        # Keep credentials out of the database, while a new webhook or threshold
-        # gets its own gate. Equivalent numeric spellings have the same identity.
-        identity = hashlib.sha256(f"{config['webhook']}|{threshold.as_integer_ratio()}".encode()).hexdigest()
-        return {"threshold": threshold, "cooldown": float(cooldown), "identity": identity}
+        if cooldown > 86400:
+            raise TradingError("额度提醒冷却时间超出范围")
+        accounts = sorted(self.store.accounts(), key=lambda account: account["id"])
+        markets = {}
+        for symbol in SYMBOLS:
+            sources = []
+            for account in accounts:
+                if symbol not in account["policy"]["symbols"]:
+                    continue
+                threshold = positive(account["policy"]["threshold"], True)
+                if threshold > 1000000000:
+                    raise TradingError("网页额度阈值超出范围")
+                sources.append((account["id"], account["name"], threshold))
+            if not sources:
+                continue
+            # Bind queued messages to the saved web settings. Changing a setting
+            # invalidates an old candidate, including during delivery retries.
+            identity_sources = [(aid, name, threshold.as_integer_ratio()) for aid, name, threshold in sources]
+            identity = hashlib.sha256(f"{config['webhook']}|{symbol}|{identity_sources!r}".encode()).hexdigest()
+            markets[symbol] = {"threshold": min(source[2] for source in sources),
+                               "identity": identity, "accounts": sources}
+        return {"markets": markets, "cooldown": float(cooldown)}
 
     def invalidate_capacity_alerts(self, symbol, leverage=None):
         try:
@@ -582,7 +597,8 @@ class Engine:
             return
         try:
             policy = self.capacity_alert_config()
-            if policy is None:
+            market_policy = policy["markets"].get(symbol) if policy else None
+            if market_policy is None:
                 if self.invalidate_capacity_alerts(symbol):
                     with self.lock:
                         self.capacity_notification_errors.pop(symbol, None)
@@ -593,7 +609,11 @@ class Engine:
                         return
                     continue
                 self.store.observe_capacity_alert(symbol, leverage, capacities[leverage],
-                    threshold=policy["threshold"], cooldown=policy["cooldown"], identity=policy["identity"], checked_at=checked_at)
+                    threshold=market_policy["threshold"], cooldown=policy["cooldown"],
+                    identity=market_policy["identity"], checked_at=checked_at,
+                    account_labels=[f"{name}（{aid}，> {threshold:,.2f} USD1）"
+                                    for aid, name, threshold in market_policy["accounts"]
+                                    if dec(capacities[leverage]) > threshold])
             with self.lock:
                 self.capacity_notification_errors.pop(symbol, None)
         except (TradingError, monitor.MonitorError, ValueError, TypeError, OSError):
@@ -629,7 +649,16 @@ class Engine:
                 if item is None:
                     continue
                 if item.get("capacity_key"):
-                    if capacity_policy is None or item.get("capacity_identity") != capacity_policy["identity"] or capacity_sent >= 2:
+                    # Settings may change while an earlier Feishu request is in flight.
+                    try:
+                        capacity_policy = self.capacity_alert_config(config)
+                    except (TradingError, ValueError, TypeError):
+                        capacity_policy = None
+                        with self.lock:
+                            self.capacity_notification_errors["config"] = "额度提醒配置无效；成交汇总继续发送"
+                    symbol = item["capacity_key"].split(":")[1]
+                    market_policy = capacity_policy["markets"].get(symbol) if capacity_policy else None
+                    if market_policy is None or item.get("capacity_identity") != market_policy["identity"] or capacity_sent >= 2:
                         continue
                     capacity_sent += 1
                 try:

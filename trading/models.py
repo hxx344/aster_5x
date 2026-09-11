@@ -57,8 +57,9 @@ def minimum_open_leverage(policy):
 
 
 def leverage_candidates(min_open_leverage=MIN_OPEN_LEVERAGE):
+    """Keep every base upgrade tier; the opening floor only adds a custom tier."""
     minimum = minimum_open_leverage({"min_open_leverage": min_open_leverage})
-    return tuple(tier for tier in sorted({*TIERS, minimum}) if tier >= minimum)
+    return tuple(sorted({*TIERS, minimum}))
 
 
 def floor_step(value, step):

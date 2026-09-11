@@ -200,13 +200,16 @@ class ConfigurablePolicyExecutionTests(unittest.TestCase):
         self.publish(capacities)
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
-            self.engine.tick_account("test")
-            change.assert_called_once_with(SYMBOL, 7)
-            submit.assert_not_called()
-            self.assertEqual(self.f.store.intent("test")["target"], 7)
-            self.publish(capacities)
-            self.engine.tick_account("test")
-            self.assertIsNone(self.f.store.intent("test"))
+            for index, target in enumerate((4, 5, 7), start=1):
+                self.publish(capacities)
+                self.engine.tick_account("test")
+                self.assertEqual(change.call_count, index)
+                self.assertEqual(change.call_args.args, (SYMBOL, target))
+                submit.assert_not_called()
+                self.assertEqual(self.f.store.intent("test")["target"], target)
+                self.publish(capacities)
+                self.engine.tick_account("test")
+                self.assertIsNone(self.f.store.intent("test"))
             self.publish(capacities)
             self.engine.tick_account("test")
         submit.assert_called_once()
@@ -214,12 +217,13 @@ class ConfigurablePolicyExecutionTests(unittest.TestCase):
         self.assertGreater(long.qty, 0)
         self.assertEqual((long.qty, long.leverage, short.leverage), (short.qty, 7, 7))
 
-    def test_higher_selection_never_uses_an_available_tier_below_configured_minimum(self):
+    def test_higher_selection_keeps_base_tiers_below_configured_opening_minimum(self):
         self.configure_fixture(minimum=7, leverage=2)
         snapshot = self.f.broker.snapshot([SYMBOL])
-        for capacities, expected in (({4: dec(500000), 5: dec(500000), 7: dec(500000)}, 7),
-                                     ({4: dec(500000), 5: dec(500000), 7: dec(0), 10: dec(500000)}, 10),
-                                     ({4: dec(500000), 5: dec(500000), 7: dec(0), 10: dec(0)}, None)):
+        for capacities, expected in (({4: dec(500000), 5: dec(500000), 7: dec(500000)}, 4),
+                                     ({4: dec(10000), 5: dec(500000), 7: dec(0), 10: dec(500000)}, 5),
+                                     ({4: dec(0), 5: dec(0), 7: dec(0), 10: dec(500000)}, 10),
+                                     ({4: dec(0), 5: dec(0), 7: dec(0), 10: dec(0)}, None)):
             with self.subTest(capacities=capacities):
                 self.assertEqual(next_leverage(snapshot, SYMBOL, capacities, threshold=10000, min_open_leverage=7), expected)
 

@@ -127,7 +127,7 @@ class EngineHardeningTests(unittest.TestCase):
     def test_nonpositive_post_fill_equity_persists_pause_and_finishes_campaign(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         book = self.f.market.book("XAUUSD1")
-        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {5: dec(500000)}, self.f.account["policy"])
         Executor(self.f.store, self.f.broker, self.f.market).open_pair(self.f.account, snapshot, "XAUUSD1", plan, book)
         after = replace(self.f.broker.snapshot(["XAUUSD1"]), equity=dec(0))
         with patch.object(self.f.broker, "snapshot", return_value=after), \

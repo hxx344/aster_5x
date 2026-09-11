@@ -14,6 +14,7 @@ from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, positive
 
 
 CAPACITY_ALERT_MAX_AGE = 8
+CAPACITY_ALERT_KEYS = frozenset(f"capacity_alert:{symbol}:{tier}" for symbol in SYMBOLS for tier in TIERS)
 
 
 def dumps(value):
@@ -62,6 +63,9 @@ class Store:
                 normalized = self.account_defaults(account)
                 if normalized != account:
                     db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(normalized), row["id"]))
+            placeholders = ",".join("?" for _ in CAPACITY_ALERT_KEYS)
+            db.execute(f"""UPDATE outbox SET expires_at=0 WHERE delivered_at IS NULL
+                AND capacity_key IS NOT NULL AND capacity_key NOT IN ({placeholders})""", tuple(CAPACITY_ALERT_KEYS))
 
     @contextmanager
     def connect(self):
@@ -78,8 +82,15 @@ class Store:
     @staticmethod
     def account_defaults(account):
         policy = account.get("policy")
-        if isinstance(policy, dict) and "min_open_leverage" not in policy:
-            return {**account, "policy": {**policy, "min_open_leverage": MIN_OPEN_LEVERAGE}}
+        if isinstance(policy, dict):
+            previous = policy.get("min_open_leverage", MIN_OPEN_LEVERAGE)
+            if type(previous) is int and 1 <= previous <= 125:
+                minimum = next((tier for tier in TIERS if tier >= previous), TIERS[-1])
+                normalized = {**account, "policy": {**policy, "min_open_leverage": minimum}}
+                if previous > TIERS[-1]:
+                    normalized.update(enabled=False, pause_reason="原最低开仓杠杆超出支持范围，已暂停；请在 5x、10x、20x 中确认设置后启动")
+                    normalized["leverage_setting_required"] = True
+                return normalized
         return account
 
     def accounts(self):
@@ -279,6 +290,8 @@ class Store:
     def _notification_item(db, row):
         item = dict(row)
         if item["capacity_key"]:
+            if item["capacity_key"] not in CAPACITY_ALERT_KEYS:
+                return None
             saved = db.execute("SELECT data FROM kv WHERE key=?", (item["capacity_key"],)).fetchone()
             gate = json.loads(saved[0]) if saved else None
             if not gate or gate.get("pending_id") != item["id"] or not gate.get("above"):

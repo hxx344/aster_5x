@@ -34,7 +34,7 @@ class MarketPriorityTests(unittest.TestCase):
         self.engine.brokers["test"] = self.f.broker
         for symbol in SYMBOLS:
             self.engine.poll_market(symbol)
-            self.capacities(symbol, {4: 500000})
+            self.capacities(symbol, {5: 500000})
 
     def capacities(self, symbol, values):
         self.engine.markets[symbol]["capacities"] = {str(k): str(v) for k, v in values.items()}
@@ -81,7 +81,7 @@ class MarketPriorityTests(unittest.TestCase):
         self.open_tick(CL)
 
     def test_capacity_at_threshold_does_not_displace_a_usable_market(self):
-        self.capacities(SPCX, {4: 10000})
+        self.capacities(SPCX, {5: 10000})
         self.open_tick(CL)
         self.assertIn("额度未超过阈值", self.engine.views["test"]["strategies"][SPCX]["reason"])
 
@@ -115,14 +115,14 @@ class MarketPriorityTests(unittest.TestCase):
             self.open_tick(CL)
 
     def test_higher_tier_precedes_a_lower_tier_with_a_better_spread(self):
-        self.f.broker.state["leverages"][XAU] = 5
-        self.capacities(XAU, {5: 500000})
+        self.f.broker.state["leverages"][XAU] = 10
+        self.capacities(XAU, {10: 500000})
         self.engine.rotation["test"] = 1
         self.open_tick(XAU)
 
     def test_higher_tier_precedes_lower_tier_slots_in_rotation(self):
-        self.f.broker.state["leverages"][SPCX] = 5
-        self.capacities(SPCX, {5: 500000})
+        self.f.broker.state["leverages"][SPCX] = 10
+        self.capacities(SPCX, {10: 500000})
         self.engine.rotation["test"] = 2
         self.open_tick(SPCX)
 
@@ -130,7 +130,7 @@ class MarketPriorityTests(unittest.TestCase):
         self.f.broker.state["leverages"] = dict.fromkeys(SYMBOLS, 1)
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change:
             self.engine.tick_account("test")
-            change.assert_called_once_with(SPCX, 4)
+            change.assert_called_once_with(SPCX, 5)
             self.assertEqual(self.f.store.intent("test")["symbol"], SPCX)
             self.assertEqual(self.f.broker.state["orders"], {})
             self.engine.tick_account("test")  # Confirm before comparing again.
@@ -138,14 +138,14 @@ class MarketPriorityTests(unittest.TestCase):
             self.open_tick(SPCX)
             self.assertEqual(change.call_count, 1)
 
-    def test_custom_minimum_tier_uses_the_same_priority(self):
-        self.f.account["policy"]["min_open_leverage"] = 7
+    def test_higher_minimum_tier_uses_the_same_priority(self):
+        self.f.account["policy"]["min_open_leverage"] = 10
         self.f.store.save_account(self.f.account)
         for symbol in SYMBOLS:
-            self.capacities(symbol, {7: 500000})
+            self.capacities(symbol, {10: 500000})
         self.engine.tick_account("test")
         intent = self.f.store.intent("test")
-        self.assertEqual((intent["symbol"], intent["target"]), (SPCX, 7))
+        self.assertEqual((intent["symbol"], intent["target"]), (SPCX, 10))
         self.engine.tick_account("test")
         self.open_tick(SPCX)
 
@@ -155,7 +155,7 @@ class MarketPriorityTests(unittest.TestCase):
         def changed(symbol):
             reads.append(symbol)
             if symbol == SPCX and reads.count(SPCX) == 2:
-                self.capacities(SPCX, {4: 10000})
+                self.capacities(SPCX, {5: 10000})
             return capacity(symbol)
         with patch.object(self.engine, "capacities", side_effect=changed):
             self.open_tick(CL)
@@ -167,12 +167,12 @@ class MarketPriorityTests(unittest.TestCase):
         def changed(symbol):
             reads.append(symbol)
             if symbol == SPCX and reads.count(SPCX) == 2:
-                self.capacities(SPCX, {4: 0, 5: 500000})
+                self.capacities(SPCX, {5: 0, 10: 500000})
             return capacity(symbol)
         with patch.object(self.engine, "capacities", side_effect=changed), \
              patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change:
             self.engine.tick_account("test")
-        change.assert_called_once_with(CL, 4)
+        change.assert_called_once_with(CL, 5)
 
     def test_comparison_reads_each_book_once_and_reuses_shared_capacities(self):
         snapshot = self.f.broker.snapshot(SYMBOLS)

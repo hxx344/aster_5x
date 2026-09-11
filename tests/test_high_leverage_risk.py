@@ -24,7 +24,7 @@ class HighLeverageRiskTests(unittest.TestCase):
         self.broker = PaperBroker("test", self.market, self.f.store)
         self.account = self.f.account
         self.policy = self.account["policy"]
-        self.policy.update(symbols=list(SYMBOLS), margin_limit=".9", order_notional="10000", min_open_leverage=2)
+        self.policy.update(symbols=list(SYMBOLS), margin_limit=".9", order_notional="10000", min_open_leverage=5)
         self.f.store.save_account(self.account)
         self.broker.state["wallet"] = "20000"
         self.broker.state["leverages"].update(XAUUSD1=5, SPCXUSD1=10, CLUSD1=20)

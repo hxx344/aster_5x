@@ -98,23 +98,25 @@ class SnapshotHardeningTests(unittest.TestCase):
 
     def test_newer_position_loss_prevents_stale_equity_crossing_half_margin(self):
         account = self.responses["/fapi/v3/accountWithJoinMargin"]
-        account["assets"][0].update(crossWalletBalance="10004.3064", crossUnPnl="0", availableBalance="5500")
+        account["assets"][0].update(crossWalletBalance="8003.6064", crossUnPnl="0", availableBalance="5500")
         account["positions"][1]["positionAmt"] = "0.999"
         rows = self.responses["/fapi/v3/positionRisk"]
+        for row in account["positions"] + rows:
+            row["leverage"] = "5"
         rows[0].update(entryPrice="10000", markPrice="9000", unRealizedProfit="-1000")
         rows[1].update(entryPrice="10000", markPrice="9000", positionAmt="0.999", unRealizedProfit="999")
         snapshot = self.snapshot()
-        self.assertEqual(snapshot.wallet, dec("10004.3064"))
+        self.assertEqual(snapshot.wallet, dec("8003.6064"))
         self.assertEqual(snapshot.unrealized, dec("-1"))
         self.assertEqual(snapshot.equity, snapshot.wallet + snapshot.unrealized)
         self.assertEqual(snapshot.available, dec("5499"))
         book = replace(self.market.book("XAUUSD1"), bid=dec(9000), ask=dec(9000), mark=dec(9000))
-        plan = plan_pair(snapshot, book, self.market.rules["XAUUSD1"], {4: dec(500000)}, {**DEFAULT_POLICY, "order_notional": "100000"})
+        plan = plan_pair(snapshot, book, self.market.rules["XAUUSD1"], {5: dec(500000)}, {**DEFAULT_POLICY, "order_notional": "100000"})
         self.assertEqual(plan.qty, dec(".111"))
 
         def realized_ratio(qty):
             equity = snapshot.wallet + sum(p.unrealized for p in snapshot.positions) - qty * dec("18000") * dec(".0004")
-            occupied = snapshot.occupied_margin + 2 * qty * dec(9000) / 4
+            occupied = snapshot.occupied_margin + 2 * qty * dec(9000) / 5
             return occupied / equity
 
         self.assertEqual(plan.projected_ratio, realized_ratio(plan.qty))
@@ -122,7 +124,7 @@ class SnapshotHardeningTests(unittest.TestCase):
         self.assertGreater(realized_ratio(plan.qty + dec(".001")), dec(".5"))
         # Without the loss adjustment this next lot appeared to fit exactly at 50%.
         old_equity = snapshot.wallet - dec(".112") * dec(18000) * dec(".0004")
-        self.assertEqual((snapshot.occupied_margin + dec(".112") * dec(4500)) / old_equity, dec(".5"))
+        self.assertEqual((snapshot.occupied_margin + dec(".112") * dec(3600)) / old_equity, dec(".5"))
 
     def test_newer_position_gain_does_not_increase_equity_or_available_cash(self):
         account = self.responses["/fapi/v3/accountWithJoinMargin"]
@@ -402,7 +404,7 @@ class RateBudgetHardeningTests(unittest.TestCase):
             market = MarketData(api)
             with self.subTest(delay=delay), patch("monitor.sample", side_effect=monitor.MonitorError("HTTP 429", delay)):
                 with self.assertRaises(ExchangeError) as caught:
-                    market.capacities("XAUUSD1", [4, 5, 10, 20])
+                    market.capacities("XAUUSD1", [5, 10, 20])
                 self.assertEqual(caught.exception.retry_after, 180)
                 with self.assertRaises(ExchangeError) as blocked:
                     api.budget.reserve(1)

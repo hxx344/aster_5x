@@ -313,12 +313,6 @@ td:last-child {
   border-radius: 4px;
   font-size: 13px;
 }
-.current-capacity {
-  display: block;
-  margin-top: 4px;
-  color: #a8b5bf;
-  font-size: 12px;
-}
 .table-footer {
   display: flex;
   justify-content: space-between;
@@ -506,7 +500,8 @@ label > span {
   color: #83949e;
   font-size: 12px;
 }
-label input {
+label input,
+.settings-panel label [data-slot='select-trigger'] {
   margin-top: 8px;
   margin-bottom: 15px;
   height: 38px !important;

@@ -28,7 +28,7 @@ def measure_plan(fixture, iterations):
     samples = []
     for index in range(iterations + 20):
         started = perf_counter_ns()
-        plan = plan_pair(snapshot, book, rule, {4: dec(500000)}, fixture.account["policy"], now=book.timestamp)
+        plan = plan_pair(snapshot, book, rule, {5: dec(500000)}, fixture.account["policy"], now=book.timestamp)
         elapsed = (perf_counter_ns() - started) / 1_000_000
         if not plan.qty:
             raise RuntimeError("Benchmark scenario unexpectedly blocked")

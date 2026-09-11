@@ -107,7 +107,7 @@ class ReconciliationSnapshotTests(unittest.TestCase):
         self.assertIsNone(self.executor.last_snapshot)
         self.executor.last_snapshot = self.f.broker.snapshot([self.symbol])
         self.f.broker.state["leverages"][self.symbol] = 3
-        with self.assertRaisesRegex(TradingError, "低于 4x"):
+        with self.assertRaisesRegex(TradingError, "低于 5x"):
             self.open()
         self.assertIsNone(self.executor.last_snapshot)
 
@@ -178,7 +178,7 @@ class ReconciliationSnapshotTests(unittest.TestCase):
                  patch.object(self.f.broker, "query", side_effect=check_order):
                 self.executor.reconcile(self.f.account)
             with patch.object(self.f.broker, "set_leverage", side_effect=change):
-                self.executor.leverage(self.f.account, self.symbol, 4, 5)
+                self.executor.leverage(self.f.account, self.symbol, 5, 10)
             with patch.object(self.f.broker, "snapshot", side_effect=confirmed):
                 self.executor.reconcile(self.f.account)
         self.assertIsNone(self.executor.last_snapshot)

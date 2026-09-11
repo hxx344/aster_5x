@@ -18,7 +18,7 @@ class EngineRequestBudgetTests(unittest.TestCase):
         self.engine = Engine(self.f.store, market=self.f.market)
         self.engine.brokers["test"] = self.f.broker
         self.engine.poll_market("XAUUSD1")
-        self.engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
+        self.engine.markets["XAUUSD1"]["capacities"] = {"5": "500000"}
 
     def expire(self, orders):
         return [{**o, "clientOrderId": o["newClientOrderId"], "status": "EXPIRED", "executedQty": "0", "avgPrice": "0"}
@@ -42,17 +42,17 @@ class EngineRequestBudgetTests(unittest.TestCase):
         read.assert_called_once_with(["XAUUSD1"])
 
     def test_low_actual_leverage_waits_even_with_existing_holdings_and_current_capacity(self):
-        for leverage in (1, 2, 3):
+        for leverage in (1, 2, 3, 4):
             with self.subTest(leverage=leverage):
                 self.f.broker.state["leverages"]["XAUUSD1"] = leverage
                 for side in ("LONG", "SHORT"):
                     self.f.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "0.01", "entry": "4412"}
-                self.engine.markets["XAUUSD1"]["capacities"] = {str(leverage): "500000", "4": "0", "5": "0"}
-                with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not open below 4x")), \
+                self.engine.markets["XAUUSD1"]["capacities"] = {str(leverage): "500000", "5": "0", "10": "0", "20": "0"}
+                with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not open below 5x")), \
                      patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("no higher capacity")):
                     self.engine.tick_account("test")
                 self.assertIsNone(self.f.store.intent("test"))
-                self.assertIn("低于 4x", self.engine.state()["accounts"][0]["strategies"]["XAUUSD1"]["reason"])
+                self.assertIn("低于 5x", self.engine.state()["accounts"][0]["strategies"]["XAUUSD1"]["reason"])
 
     def test_zero_fill_cooldown_survives_restart_and_does_not_resubmit(self):
         with patch.object(self.f.broker, "submit", side_effect=self.expire) as send, \
@@ -66,7 +66,7 @@ class EngineRequestBudgetTests(unittest.TestCase):
         restored = Engine(Store(self.f.store.path), market=self.f.market)
         restored.brokers["test"] = self.f.broker
         restored.poll_market("XAUUSD1")
-        restored.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
+        restored.markets["XAUUSD1"]["capacities"] = {"5": "500000"}
         with patch.object(self.f.broker, "submit", side_effect=AssertionError("cooldown must persist")):
             restored.tick_account("test")
         self.assertIn("冷却中", restored.state()["accounts"][0]["reason"])
@@ -91,16 +91,16 @@ class EngineRequestBudgetTests(unittest.TestCase):
         self.f.broker.state["leverages"]["XAUUSD1"] = 1
         with patch.object(self.f.broker, "submit", side_effect=AssertionError("confirm leverage first")):
             self.engine.tick_account("test")
-        self.assertEqual(self.f.store.intent("test")["target"], 4)
+        self.assertEqual(self.f.store.intent("test")["target"], 5)
 
     def test_cooldown_does_not_block_pending_reconciliation(self):
         self.f.store.put("order_cooldown:test:XAUUSD1", {"failures": 2, "until": time.time() + 120})
         intent = {"id": "pending", "kind": "leverage", "symbol": "XAUUSD1", "account_id": "test",
-                  "status": "pending", "previous": 1, "target": 4, "created_at": time.time()}
+                  "status": "pending", "previous": 1, "target": 5, "created_at": time.time()}
         self.f.store.save_intent(intent)
         self.engine.tick_account("test")
         self.assertIsNone(self.f.store.intent("test"))
-        self.assertEqual(self.f.store.get("open_after_leverage:test:XAUUSD1"), 4)
+        self.assertEqual(self.f.store.get("open_after_leverage:test:XAUUSD1"), 5)
 
     def test_many_account_intervals_fit_ordinary_budget_with_public_allowance(self):
         for active in range(9):
@@ -118,12 +118,12 @@ class EngineRequestBudgetTests(unittest.TestCase):
         row = account(mode="live")
         unknown = self.engine.scheduling([row])["test"]
         self.engine.view("test", snapshot={"positions": [
-            {"symbol": "XAUUSD1", "leverage": 4, "qty": "0", "side": side} for side in ("LONG", "SHORT")]})
+            {"symbol": "XAUUSD1", "leverage": 5, "qty": "0", "side": side} for side in ("LONG", "SHORT")]})
         warm = self.engine.scheduling([row])["test"]
         self.assertLess(warm["gap"], unknown["gap"])
-        self.engine.markets["XAUUSD1"]["capacities"]["5"] = "500000"
+        self.engine.markets["XAUUSD1"]["capacities"]["10"] = "500000"
         self.engine.view("test", snapshot={"positions": [
-            {"symbol": "XAUUSD1", "leverage": 4, "qty": "1", "side": side} for side in ("LONG", "SHORT")]})
+            {"symbol": "XAUUSD1", "leverage": 5, "qty": "1", "side": side} for side in ("LONG", "SHORT")]})
         upgrading = self.engine.scheduling([row])["test"]
         self.assertEqual(upgrading["gap"], unknown["gap"])
 

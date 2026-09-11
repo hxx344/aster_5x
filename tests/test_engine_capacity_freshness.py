@@ -19,7 +19,7 @@ class CapacityFreshnessTests(unittest.TestCase):
     def test_capacity_request_latency_cannot_renew_cache_or_alert_freshness(self):
         def slow_capacity(*args):
             self.now += 9
-            return {4: dec(20000)}
+            return {5: dec(20000)}
 
         with patch("trading.engine.time.time", side_effect=lambda: self.now), \
              patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": "https://open.feishu.cn/open-apis/bot/v2/hook/test"}, clear=True), \
@@ -37,11 +37,11 @@ class CapacityFreshnessTests(unittest.TestCase):
             return replace(self.book, timestamp=self.now)
 
         with patch("trading.engine.time.time", side_effect=lambda: self.now), \
-             patch.object(self.f.market, "capacities", return_value={4: dec(20000)}), \
+             patch.object(self.f.market, "capacities", return_value={5: dec(20000)}), \
              patch.object(self.f.market, "book", side_effect=slow_book):
             self.engine.poll_market("XAUUSD1")
             self.engine.poll_book("XAUUSD1")
-            self.assertEqual(self.engine.capacities("XAUUSD1"), {4: dec(20000)})
+            self.assertEqual(self.engine.capacities("XAUUSD1"), {5: dec(20000)})
             self.now += 2
             with self.assertRaisesRegex(TradingError, "额度快照"):
                 self.engine.capacities("XAUUSD1")

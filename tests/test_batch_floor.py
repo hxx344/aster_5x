@@ -31,7 +31,7 @@ class BatchFloorTests(unittest.TestCase):
 
     def plan(self, *, snapshot=None, book=None, rule=None, policy=None):
         return plan_pair(snapshot or self.snapshot, book or self.book, rule or self.rule,
-                         {4: dec(500000)}, policy or self.policy)
+                         {5: dec(500000)}, policy or self.policy)
 
     def test_exactly_500_per_side_can_open_with_aligned_quantity(self):
         policy = {**self.policy, "order_notional": "500"}
@@ -76,13 +76,13 @@ class BatchFloorTests(unittest.TestCase):
         self.assertEqual(self.plan(book=book).qty, 0)
 
     def test_small_remaining_cash_does_not_force_a_larger_order(self):
-        self.assertEqual(self.plan(snapshot=replace(self.snapshot, available=dec(250))).qty, 0)
-        plan = self.plan(snapshot=replace(self.snapshot, available=dec("250.4")))
+        self.assertEqual(self.plan(snapshot=replace(self.snapshot, available=dec(200))).qty, 0)
+        plan = self.plan(snapshot=replace(self.snapshot, available=dec("200.4")))
         self.assertEqual(plan.qty, dec(".5"))
 
     def test_risk_limit_is_not_relaxed_to_make_a_minimum_batch(self):
         tight = replace(self.snapshot, equity=dec(1000), wallet=dec(1000), available=dec(1000))
-        self.assertEqual(self.plan(snapshot=tight, policy={**self.policy, "margin_limit": ".25"}).qty, 0)
+        self.assertEqual(self.plan(snapshot=tight, policy={**self.policy, "margin_limit": ".20"}).qty, 0)
 
     def test_old_lower_cap_is_preserved_and_cannot_open(self):
         policy = {**self.policy, "order_notional": "100"}

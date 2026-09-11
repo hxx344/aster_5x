@@ -22,7 +22,7 @@ class MinimumOpenLeverageTests(unittest.TestCase):
         self.f.broker.save()
 
     def test_planner_blocks_low_leverage_even_with_capacity_for_existing_or_flat_positions(self):
-        for leverage in (1, 2, 3):
+        for leverage in (1, 2, 3, 4):
             for qty in ("0", "1"):
                 with self.subTest(leverage=leverage, qty=qty):
                     self.position(leverage, qty)
@@ -30,25 +30,25 @@ class MinimumOpenLeverageTests(unittest.TestCase):
                     plan = plan_pair(self.f.broker.snapshot([self.symbol]), self.f.market.book(self.symbol),
                                      self.f.market.rules[self.symbol], {leverage: dec(500000)}, self.f.account["policy"])
                     self.assertEqual(plan.qty, 0)
-                    self.assertIn("低于 4x", plan.reason)
+                    self.assertIn("低于 5x", plan.reason)
                     self.assertEqual(self.f.broker.state, before)
 
-    def test_execution_boundary_rejects_a_supplied_plan_below_four_before_creating_intent(self):
-        for leverage in (1, 2, 3):
+    def test_execution_boundary_rejects_a_supplied_plan_below_five_before_creating_intent(self):
+        for leverage in (1, 2, 3, 4):
             for qty in ("0", "1"):
                 with self.subTest(leverage=leverage, qty=qty):
                     self.position(leverage, qty)
                     before = copy.deepcopy(self.f.broker.state)
                     with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")):
-                        with self.assertRaisesRegex(TradingError, "低于 4x"):
+                        with self.assertRaisesRegex(TradingError, "低于 5x"):
                             self.executor.open_pair(self.f.account, self.f.broker.snapshot([self.symbol]),
                                                     self.symbol, Plan(dec("0.005")), self.f.market.book(self.symbol))
                     self.assertIsNone(self.f.store.intent("test"))
                     self.assertEqual(self.f.store.events(), [])
                     self.assertEqual(self.f.broker.state, before)
 
-    def test_four_and_higher_actual_leverages_can_plan_and_open(self):
-        for leverage in (4, 5, 10, 20):
+    def test_supported_actual_leverages_can_plan_and_open(self):
+        for leverage in (5, 10, 20):
             with self.subTest(leverage=leverage):
                 self.position(leverage)
                 snapshot, book = self.f.broker.snapshot([self.symbol]), self.f.market.book(self.symbol)
@@ -60,17 +60,33 @@ class MinimumOpenLeverageTests(unittest.TestCase):
                 self.assertEqual((long.qty, short.qty), (dec(1) + plan.qty, dec(1) + plan.qty))
                 self.assertEqual(long.leverage, leverage)
 
+    def test_unsupported_actual_tiers_above_the_floor_cannot_open(self):
+        for leverage in (7, 15, 125):
+            for qty in ("0", "1"):
+                with self.subTest(leverage=leverage, qty=qty):
+                    self.position(leverage, qty)
+                    snapshot = self.f.broker.snapshot([self.symbol])
+                    book = self.f.market.book(self.symbol)
+                    plan = plan_pair(snapshot, book, self.f.market.rules[self.symbol],
+                                     {leverage: dec(500000)}, self.f.account["policy"])
+                    self.assertEqual(plan.qty, 0)
+                    self.assertIn("支持档位", plan.reason)
+                    with patch.object(self.f.broker, "submit") as submit, self.assertRaises(TradingError):
+                        self.executor.open_pair(self.f.account, snapshot, self.symbol, Plan(dec("0.12")), book)
+                    submit.assert_not_called()
+                    self.assertIsNone(self.f.store.intent("test"))
+
     def test_low_leverage_holdings_can_still_upgrade_and_confirm(self):
-        for leverage in (1, 2, 3):
+        for leverage in (1, 2, 3, 4):
             with self.subTest(leverage=leverage):
                 self.position(leverage)
                 snapshot = self.f.broker.snapshot([self.symbol])
-                self.assertEqual(next_leverage(snapshot, self.symbol, {4: dec(500000)}, threshold=10000), 4)
+                self.assertEqual(next_leverage(snapshot, self.symbol, {5: dec(500000)}, threshold=10000), 5)
                 with patch.object(self.f.broker, "submit", side_effect=AssertionError("upgrade must not open")):
-                    self.executor.leverage(self.f.account, self.symbol, leverage, 4)
+                    self.executor.leverage(self.f.account, self.symbol, leverage, 5)
                     self.executor.reconcile(self.f.account)
                 long, short = self.f.broker.snapshot([self.symbol]).pair(self.symbol)
-                self.assertEqual((long.qty, short.qty, long.leverage), (1, 1, 4))
+                self.assertEqual((long.qty, short.qty, long.leverage), (1, 1, 5))
                 self.assertIsNone(self.f.store.intent("test"))
 
     def legacy_batch(self, leverage, one_leg):
@@ -92,7 +108,7 @@ class MinimumOpenLeverageTests(unittest.TestCase):
         self.f.store.save_intent(intent)
 
     def test_legacy_low_leverage_fills_can_still_be_reconciled_without_new_orders(self):
-        for leverage in (1, 2, 3):
+        for leverage in (1, 2, 3, 4):
             with self.subTest(leverage=leverage):
                 self.legacy_batch(leverage, one_leg=False)
                 with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not resubmit legacy orders")):
@@ -102,7 +118,7 @@ class MinimumOpenLeverageTests(unittest.TestCase):
                 self.assertEqual((long.qty, short.qty, long.leverage), (dec("1.005"), dec("1.005"), leverage))
 
     def test_legacy_low_leverage_single_leg_can_still_be_closed_without_touching_old_holdings(self):
-        for leverage in (1, 2, 3):
+        for leverage in (1, 2, 3, 4):
             with self.subTest(leverage=leverage):
                 self.legacy_batch(leverage, one_leg=True)
                 with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:

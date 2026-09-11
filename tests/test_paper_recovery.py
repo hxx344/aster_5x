@@ -154,17 +154,17 @@ class PaperRecoveryTests(unittest.TestCase):
                 fixture = self.fixture()
                 executor = Executor(fixture.store, fixture.broker, fixture.market)
                 with self.failed_commit(fixture.store, 1), self.assertRaises(sqlite3.OperationalError):
-                    executor.leverage(fixture.account, self.symbol, 4, 5)
+                    executor.leverage(fixture.account, self.symbol, 5, 10)
                 executor = self.recovered(fixture, executor, restart)
                 with patch.object(executor.broker, "set_leverage", side_effect=AssertionError("reconcile must not change leverage")):
                     executor.reconcile(fixture.account)
                 self.assertIsNone(executor.store.intent("test"))
                 self.assertIsNone(executor.store.get("open_after_leverage:test:XAUUSD1"))
-                self.assertEqual(executor.broker.state["leverages"][self.symbol], 4)
-                executor.leverage(fixture.account, self.symbol, 4, 5)
+                self.assertEqual(executor.broker.state["leverages"][self.symbol], 5)
+                executor.leverage(fixture.account, self.symbol, 5, 10)
                 executor.reconcile(fixture.account)
                 self.assertIsNone(executor.store.intent("test"))
-                self.assertEqual(executor.store.get("open_after_leverage:test:XAUUSD1"), 5)
+                self.assertEqual(executor.store.get("open_after_leverage:test:XAUUSD1"), 10)
 
     def test_leverage_committed_before_error_is_confirmed_from_ledger(self):
         for restart in (False, True):
@@ -172,13 +172,13 @@ class PaperRecoveryTests(unittest.TestCase):
                 fixture = self.fixture()
                 executor = Executor(fixture.store, fixture.broker, fixture.market)
                 with self.failed_commit(fixture.store, 1, after_commit=True), self.assertRaises(sqlite3.OperationalError):
-                    executor.leverage(fixture.account, self.symbol, 4, 5)
+                    executor.leverage(fixture.account, self.symbol, 5, 10)
                 executor = self.recovered(fixture, executor, restart)
                 with patch.object(executor.broker, "set_leverage", side_effect=AssertionError("must not repeat committed change")):
                     executor.reconcile(fixture.account)
                 self.assertIsNone(executor.store.intent("test"))
-                self.assertEqual(executor.store.get("open_after_leverage:test:XAUUSD1"), 5)
-                self.assertEqual(executor.broker.state["leverages"][self.symbol], 5)
+                self.assertEqual(executor.store.get("open_after_leverage:test:XAUUSD1"), 10)
+                self.assertEqual(executor.broker.state["leverages"][self.symbol], 10)
 
     def test_live_order_not_found_or_query_not_sent_stays_unknown(self):
         for error in (ExchangeError("not yet visible", code=-2013), RequestNotSent("query budget unavailable")):
@@ -203,9 +203,9 @@ class PaperRecoveryTests(unittest.TestCase):
         executor = Executor(fixture.store, broker, fixture.market)
         with patch.object(broker, "snapshot", side_effect=fixture.broker.snapshot), \
              patch.object(broker, "set_leverage", side_effect=AmbiguousOrder("change response lost")) as change:
-            executor.leverage(fixture.account, self.symbol, 4, 5)
+            executor.leverage(fixture.account, self.symbol, 5, 10)
             executor.reconcile(fixture.account)
             executor.reconcile(fixture.account)
         change.assert_called_once()
-        self.assertEqual(fixture.store.intent("test")["target"], 5)
+        self.assertEqual(fixture.store.intent("test")["target"], 10)
         self.assertIsNone(fixture.store.get("open_after_leverage:test:XAUUSD1"))

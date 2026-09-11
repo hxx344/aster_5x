@@ -9,8 +9,8 @@ import time
 
 ZERO = Decimal("0")
 HEDGE_TOLERANCE = Decimal("0.001")
-TIERS = (4, 5, 10, 20)
-MIN_OPEN_LEVERAGE = 4
+TIERS = (5, 10, 20)
+MIN_OPEN_LEVERAGE = TIERS[0]
 MIN_BATCH_NOTIONAL = Decimal("500")
 TAKER_FEE_ESTIMATE = Decimal("0.0004")
 SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
@@ -49,17 +49,22 @@ def positive(value, allow_zero=False):
 
 
 def minimum_open_leverage(policy):
-    """Read the account floor, retaining the historical default for old policies."""
+    """Read the supported opening floor, defaulting to the lowest tier."""
     value = policy.get("min_open_leverage", MIN_OPEN_LEVERAGE)
-    if type(value) is not int or not 1 <= value <= 125:
-        raise TradingError("最低开仓杠杆必须为 1 至 125 的整数")
+    if type(value) is not int or value not in TIERS:
+        raise TradingError("最低开仓杠杆仅支持 5x、10x、20x")
     return value
 
 
 def leverage_candidates(min_open_leverage=MIN_OPEN_LEVERAGE):
-    """Keep every base upgrade tier; the opening floor only adds a custom tier."""
-    minimum = minimum_open_leverage({"min_open_leverage": min_open_leverage})
-    return tuple(sorted({*TIERS, minimum}))
+    """The opening floor does not authorize unsupported upgrade targets."""
+    minimum_open_leverage({"min_open_leverage": min_open_leverage})
+    return TIERS
+
+
+def require_supported_leverage(leverage):
+    if type(leverage) is not int or leverage not in TIERS:
+        raise TradingError("新增开仓和杠杆调整仅支持 5x、10x、20x")
 
 
 def floor_step(value, step):
@@ -319,6 +324,8 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     minimum = minimum_open_leverage(policy)
     if long.leverage < minimum:
         return Plan(reason=f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
+    if long.leverage not in TIERS:
+        return Plan(reason=f"当前 {long.leverage}x 不在支持档位，禁止新增开仓，等待升杠杆至 5x、10x、20x")
     if dec(policy["order_notional"]) < MIN_BATCH_NOTIONAL:
         return Plan(reason="单批每边上限低于固定最低批次金额 500 USD1，请修改策略设置")
     limit = Fraction(opening_margin_limit(policy, long.leverage))

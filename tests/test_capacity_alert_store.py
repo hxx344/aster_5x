@@ -26,11 +26,11 @@ class CapacityAlertStoreTests(unittest.TestCase):
         clock.start()
         self.addCleanup(clock.stop)
 
-    def observe(self, value="11000", *, symbol="XAUUSD1", leverage=4, checked_at=None, identity=IDENTITY, cooldown=300):
+    def observe(self, value="11000", *, symbol="XAUUSD1", leverage=5, checked_at=None, identity=IDENTITY, cooldown=300):
         return self.store.observe_capacity_alert(symbol, leverage, value, threshold="10000", cooldown=cooldown,
                                                  identity=identity, checked_at=self.now if checked_at is None else checked_at)
 
-    def gate(self, symbol="XAUUSD1", leverage=4):
+    def gate(self, symbol="XAUUSD1", leverage=5):
         return self.store.get(self.store.capacity_alert_key(symbol, leverage))
 
     def row(self, notification_id):
@@ -192,19 +192,19 @@ class CapacityAlertStoreTests(unittest.TestCase):
         self.assertTrue(self.gate()["notified"])
         event = self.store.events()[0]
         self.assertEqual((event["account_id"], event["kind"], event["message"]),
-                         ("", "capacity", "XAUUSD1 4x 额度达标提醒已发送飞书"))
+                         ("", "capacity", "XAUUSD1 5x 额度达标提醒已发送飞书"))
 
     def test_all_symbols_and_tiers_have_independent_gates(self):
         for symbol in SYMBOLS:
             for leverage in TIERS:
                 self.assertTrue(self.observe(symbol=symbol, leverage=leverage))
-        self.assertEqual(self.store.pending_notifications(), 12)
+        self.assertEqual(self.store.pending_notifications(), 9)
         ids = {self.gate(symbol, leverage)["pending_id"] for symbol in SYMBOLS for leverage in TIERS}
-        self.assertEqual(len(ids), 12)
-        self.observe("0", symbol="XAUUSD1", leverage=4)
-        self.assertEqual(self.store.pending_notifications(), 11)
-        self.assertTrue(self.gate("XAUUSD1", 5)["above"])
-        self.assertTrue(self.gate("CLUSD1", 4)["above"])
+        self.assertEqual(len(ids), 9)
+        self.observe("0", symbol="XAUUSD1", leverage=5)
+        self.assertEqual(self.store.pending_notifications(), 8)
+        self.assertTrue(self.gate("XAUUSD1", 10)["above"])
+        self.assertTrue(self.gate("CLUSD1", 5)["above"])
 
     def test_expiration_is_based_on_sample_time_and_send_rechecks_it(self):
         self.observe(checked_at=995)
@@ -243,8 +243,8 @@ class CapacityAlertStoreTests(unittest.TestCase):
 
     def test_invalidating_failed_source_pauses_pending_without_claiming_a_fall(self):
         self.observe()
-        self.observe(symbol="XAUUSD1", leverage=5)
-        self.observe(symbol="CLUSD1", leverage=4)
+        self.observe(symbol="XAUUSD1", leverage=10)
+        self.observe(symbol="CLUSD1", leverage=5)
         gate = self.gate()
         self.store.invalidate_capacity_alert("XAUUSD1")
         self.assertEqual(self.gate(), gate)
@@ -259,7 +259,7 @@ class CapacityAlertStoreTests(unittest.TestCase):
         self.observe()
         self.store.notification_result(self.store.due_notifications()[0], True)
         before = self.gate()
-        self.store.invalidate_capacity_alert("XAUUSD1", 4)
+        self.store.invalidate_capacity_alert("XAUUSD1", 5)
         self.assertEqual(self.gate(), before)
         self.now += 1000
         self.assertFalse(self.observe())
@@ -270,7 +270,7 @@ class CapacityAlertStoreTests(unittest.TestCase):
         barrier = threading.Barrier(len(stores))
         def observe(store):
             barrier.wait()
-            return store.observe_capacity_alert("XAUUSD1", 4, "11000", threshold="10000", cooldown=300,
+            return store.observe_capacity_alert("XAUUSD1", 5, "11000", threshold="10000", cooldown=300,
                                                 identity=IDENTITY, checked_at=self.now, now=self.now)
         with ThreadPoolExecutor(max_workers=len(stores)) as pool:
             self.assertEqual(sum(pool.map(observe, stores)), 1)
@@ -348,6 +348,30 @@ class CapacityAlertStoreTests(unittest.TestCase):
         legacy.notification_result(item, True)
         self.assertEqual(Store(path).pending_notifications(), 0)
 
+    def test_retired_pending_alert_is_not_delivered_and_restart_preserves_sent_history(self):
+        self.observe()
+        supported_id = self.gate()["pending_id"]
+        retired_key = "capacity_alert:XAUUSD1:4"
+        historical_gate = {"pending_id": "retired-pending", "above": True, "identity": IDENTITY,
+                           "last_alert": 900, "notified": False}
+        self.store.put(retired_key, historical_gate)
+        with self.store.connect() as db:
+            db.executemany("""INSERT INTO outbox(id,message,due_at,delivered_at,expires_at,capacity_key)
+                VALUES (?,?,?,?,?,?)""", [
+                    ("retired-pending", "old pending 4x alert", self.now, None, self.now + 8, retired_key),
+                    ("retired-sent", "old sent 4x alert", 900, 900, 908, retired_key),
+                ])
+        sent_before = self.row("retired-sent")
+        self.assertIsNone(self.store.notification_for_delivery("retired-pending"))
+        self.store = Store(self.path)
+        self.assertEqual(self.row("retired-pending")["expires_at"], 0)
+        self.assertIsNone(self.row("retired-pending")["delivered_at"])
+        self.assertEqual(self.row("retired-sent"), sent_before)
+        self.assertEqual(self.store.get(retired_key), historical_gate)
+        self.assertEqual(self.store.pending_notifications(), 1)
+        self.assertEqual([item["id"] for item in self.store.due_notifications()], [supported_id])
+        self.assertIsNone(self.store.notification_for_delivery("retired-pending"))
+
     def test_concurrent_legacy_migration_adds_columns_once_without_losing_trade_rows(self):
         path = Path(self.directory.name) / "legacy-concurrent.sqlite3"
         with closing(sqlite3.connect(path)) as db, db:
@@ -367,7 +391,7 @@ class CapacityAlertStoreTests(unittest.TestCase):
         self.assertIsNone(item["capacity_key"])
 
     def test_invalid_market_tier_identity_and_values_do_not_create_state(self):
-        for changes in ({"symbol": "BTCUSDT"}, {"leverage": 2}, {"leverage": True}, {"identity": "secret-webhook"},
+        for changes in ({"symbol": "BTCUSDT"}, {"leverage": 2}, {"leverage": 4}, {"leverage": True}, {"identity": "secret-webhook"},
                         {"value": "NaN"}, {"cooldown": -1}):
             with self.subTest(changes=changes), self.assertRaises(TradingError):
                 self.observe(**changes)

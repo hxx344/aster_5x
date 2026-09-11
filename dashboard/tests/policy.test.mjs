@@ -47,21 +47,29 @@ test('invalid and out-of-range percentages never produce a policy', () => {
     assert.throws(() => marginLimitFromPercent(value), undefined, value);
 });
 
-test('minimum leverage accepts integer bounds and custom tiers only', () => {
-  for (const value of [1, 2, 4, 7, 10, 125])
+test('minimum leverage accepts only supported opening tiers', () => {
+  for (const value of [5, 10, 20])
     assert.equal(parseMinimumLeverage(String(value)), value);
-  assert.equal(parseMinimumLeverage('7.0'), 7);
+  assert.equal(parseMinimumLeverage('5.0'), 5);
   assert.equal(parseMinimumLeverage('1e1'), 10);
   for (const value of [
     '',
     '0',
     '-1',
     '126',
-    '4.5',
-    '4.0000000000000001',
+    '5.5',
+    '5.0000000000000001',
     '0x10',
     'NaN',
     'Infinity',
   ])
     assert.throws(() => parseMinimumLeverage(value), undefined, value);
+  for (let value = 1; value <= 125; value++) {
+    if ([5, 10, 20].includes(value)) continue;
+    assert.throws(
+      () => parseMinimumLeverage(String(value)),
+      /只能选择 5x、10x 或 20x/,
+      String(value),
+    );
+  }
 });

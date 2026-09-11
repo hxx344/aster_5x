@@ -26,6 +26,7 @@ OI_PATH = "/bapi/futures/v1/public/future/common/symbol/leverageoi/remaining"
 BRACKETS_PATH = "/bapi/futures/v1/friendly/future/common/brackets"
 LOG = logging.getLogger("aster")
 SUPPORTED_SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
+SUPPORTED_LEVERAGES = (5, 10, 20)
 
 
 class MonitorError(Exception):
@@ -143,10 +144,13 @@ def validate_config(config):
     legacy_leverage = config.pop("leverage", None)
     if legacy_symbol not in (None, "XAUUSD1") or legacy_leverage not in (None, 5):
         raise MonitorError("Unsupported legacy symbol or leverage")
-    leverages = config.get("leverages", [4, 5, 10, 20])
-    if not isinstance(leverages, list) or not leverages or any(type(v) is not int or v not in (4, 5, 10, 20) for v in leverages) or len(set(leverages)) != len(leverages):
-        raise MonitorError("leverages must contain unique supported tiers: 4, 5, 10, 20")
-    config["leverages"] = leverages.copy()
+    leverages = config.get("leverages", list(SUPPORTED_LEVERAGES))
+    # Drop the retired tier from old installations without discarding their settings.
+    if (not isinstance(leverages, list) or not leverages
+            or any(type(v) is not int or (v not in SUPPORTED_LEVERAGES and v != 4) for v in leverages)
+            or len(set(leverages)) != len(leverages)):
+        raise MonitorError("leverages must contain unique supported tiers: 5, 10, 20")
+    config["leverages"] = [v for v in leverages if v in SUPPORTED_LEVERAGES] or list(SUPPORTED_LEVERAGES)
     symbols = config.get("symbols", list(SUPPORTED_SYMBOLS))
     if not isinstance(symbols, list) or not symbols or any(s not in SUPPORTED_SYMBOLS for s in symbols) or len(set(symbols)) != len(symbols):
         raise MonitorError("symbols must contain unique supported symbols: XAUUSD1, SPCXUSD1, CLUSD1")
@@ -377,8 +381,9 @@ def run(config, once=False, shutdown=None):
             saved = {}
     trackers = {symbol: SymbolMonitor(config, symbol, saved, shutdown) for symbol in config["symbols"]}
     tiers = {key: tier for tracker in trackers.values() for key, tier in tracker.trackers.items()}
-    records = {key: {"identity": alert_identity(tier.config, tier.symbol), "gate": tier.gate.state.copy()}
-               for key, tier in tiers.items()}
+    records = saved.get("markets", {}).copy()
+    records.update({key: {"identity": alert_identity(tier.config, tier.symbol), "gate": tier.gate.state.copy()}
+                    for key, tier in tiers.items()})
     status = {"pid": os.getpid(), "symbols": config["symbols"], "leverages": config["leverages"],
               "threshold": str(config["threshold"]), "poll_seconds": config["poll_seconds"],
               "feishu_enabled": config["feishu_enabled"], "scope": "public_capacity_without_account_positions",

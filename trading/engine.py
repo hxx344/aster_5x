@@ -225,13 +225,9 @@ class Engine:
         try:
             accounts = self.store.accounts()
             tiers = set(TIERS)
-            tiers.update(minimum_open_leverage(account["policy"]) for account in accounts if symbol in account["policy"]["symbols"])
-            with self.lock:
-                for view in self.views.values():
-                    tiers.update(p["leverage"] for p in view.get("snapshot", {}).get("positions", []) if p["symbol"] == symbol)
             # Network latency is part of the capacity snapshot's age.
             checked_at = time.time()
-            capacities = self.market.capacities(symbol, tiers)
+            capacities = {tier: value for tier, value in self.market.capacities(symbol, tiers).items() if tier in TIERS}
             row = {"status": "ok", "capacities": {str(k): wire(v) for k, v in capacities.items()},
                    "checked_at": checked_at}
             with self.lock:
@@ -619,6 +615,8 @@ class Engine:
                 raise TradingError("策略配置字段类型无效")
             account["policy"] = {**account["policy"], **changes}
             validate_account(account)
+            if "min_open_leverage" in changes:
+                account.pop("leverage_setting_required", None)
             self.store.save_account(account)
             with self.lock:
                 self.accounts_generation += 1
@@ -631,6 +629,8 @@ class Engine:
                 raise TradingError("账户不存在")
             view_updates = {}
             if enabled:
+                if account.get("leverage_setting_required"):
+                    raise TradingError("请先在 5x、10x、20x 中保存最低开仓杠杆设置")
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
                 if dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:

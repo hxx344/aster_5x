@@ -65,7 +65,7 @@ class FixedModeTests(unittest.TestCase):
         self.assertFalse(self.f.store.account("test")["enabled"])
 
     def test_pending_intent_is_preserved_without_reconciliation_when_mode_invalid(self):
-        Executor(self.f.store, self.f.broker, self.f.market).leverage(self.f.account, "XAUUSD1", 4, 5)
+        Executor(self.f.store, self.f.broker, self.f.market).leverage(self.f.account, "XAUUSD1", 5, 10)
         original = self.f.store.intent("test")
         bad = replace(self.f.broker.snapshot(["XAUUSD1"]), multi_assets=True)
         with patch.object(self.f.broker, "snapshot", return_value=bad), \
@@ -79,7 +79,7 @@ class FixedModeTests(unittest.TestCase):
     def test_mode_change_after_one_leg_fill_blocks_compensation(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         book = self.f.market.book("XAUUSD1")
-        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {5: dec(500000)}, self.f.account["policy"])
         original = self.f.broker.submit
         def one_leg(orders):
             return [original(orders[:1])[0], {"code": -2019}]
@@ -98,5 +98,5 @@ class FixedModeTests(unittest.TestCase):
         with patch.object(self.f.broker, "snapshot", return_value=bad), \
              patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("must not change leverage")):
             with self.assertRaises(AccountModeError):
-                Executor(self.f.store, self.f.broker, self.f.market).leverage(self.f.account, "XAUUSD1", 4, 5)
+                Executor(self.f.store, self.f.broker, self.f.market).leverage(self.f.account, "XAUUSD1", 5, 10)
         self.assertIsNone(self.f.store.intent("test"))

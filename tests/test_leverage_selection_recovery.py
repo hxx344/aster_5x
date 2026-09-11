@@ -24,7 +24,7 @@ class HigherLeverageSelectionTests(unittest.TestCase):
     def setUp(self):
         self.f = Fixture()
         self.addCleanup(self.f.close)
-        self.f.account["policy"].update(symbols=list(SYMBOLS), min_open_leverage=2)
+        self.f.account["policy"].update(symbols=list(SYMBOLS), min_open_leverage=5)
         self.f.store.save_account(self.f.account)
         self.f.broker.state["leverages"] = dict.fromkeys(SYMBOLS, 2)
         self.f.broker.save()
@@ -58,11 +58,11 @@ class HigherLeverageSelectionTests(unittest.TestCase):
 
     def test_largest_held_xau_upgrades_confirms_adds_then_checks_next_tier(self):
         self.seed_held_markets()
-        self.engine.markets[XAU]["capacities"].update({"4": "1984153", "5": "1984153"})
+        self.engine.markets[XAU]["capacities"].update({"5": "1984153", "10": "1984153"})
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.engine.tick_account("test")
-            change.assert_called_once_with(XAU, 4)
+            change.assert_called_once_with(XAU, 5)
             submit.assert_not_called()
             self.engine.tick_account("test")
             self.assertIsNone(self.f.store.intent("test"))
@@ -72,17 +72,17 @@ class HigherLeverageSelectionTests(unittest.TestCase):
             self.assertEqual({o["symbol"] for o in submit.call_args.args[0]}, {XAU})
             self.assertEqual(change.call_count, 1)
             self.engine.tick_account("test")
-            self.assertEqual(change.call_args.args, (XAU, 5))
+            self.assertEqual(change.call_args.args, (XAU, 10))
             self.assertEqual(change.call_count, 2)
         self.assertTrue(self.f.store.account("test")["enabled"])
 
-    def test_largest_held_xau_skips_unavailable_four_and_upgrades_before_spcx(self):
+    def test_largest_held_xau_skips_unavailable_five_and_upgrades_before_spcx(self):
         self.seed_held_markets()
-        self.engine.markets[XAU]["capacities"].update({"4": "0", "5": "1984153"})
+        self.engine.markets[XAU]["capacities"].update({"5": "0", "10": "1984153"})
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.engine.tick_account("test")
-            change.assert_called_once_with(XAU, 5)
+            change.assert_called_once_with(XAU, 10)
             submit.assert_not_called()
 
     def test_largest_held_xau_at_five_receives_next_add_before_spcx(self):
@@ -97,12 +97,12 @@ class HigherLeverageSelectionTests(unittest.TestCase):
         self.assertTrue(self.f.store.account("test")["enabled"])
 
     def test_flat_current_capacity_does_not_hide_available_higher_tier(self):
-        self.engine.markets[XAU]["capacities"].update({"4": "500000", "5": "500000"})
+        self.engine.markets[XAU]["capacities"].update({"5": "500000", "10": "500000"})
         with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.engine.tick_account("test")
         intent = self.f.store.intent("test")
         self.assertIsNotNone(intent)
-        self.assertEqual((intent["symbol"], intent["target"]), (XAU, 4))
+        self.assertEqual((intent["symbol"], intent["target"]), (XAU, 5))
         submit.assert_not_called()
 
     def test_xau_five_precedes_spcx_two_even_when_rotation_starts_at_spcx(self):
@@ -129,7 +129,7 @@ class HigherLeverageSelectionTests(unittest.TestCase):
             {"symbol": symbol, "leverage": 2, "qty": "0", "side": side}
             for symbol in SYMBOLS for side in ("LONG", "SHORT")]})
         before = self.engine.scheduling([row])["test"]["gap"]
-        self.engine.markets[XAU]["capacities"]["4"] = "500000"
+        self.engine.markets[XAU]["capacities"]["5"] = "500000"
         self.assertGreater(self.engine.scheduling([row])["test"]["gap"], before)
 
 
@@ -142,7 +142,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
                      self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
             for row in rows:
                 row.update(leverage="2", positionAmt="0", entryPrice="0")
-        self.result = {"symbol": XAU, "leverage": 4}
+        self.result = {"symbol": XAU, "leverage": 5}
         self.http_status = 200
         self.writes = []
 
@@ -164,13 +164,13 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
 
     def begin(self):
         try:
-            return self.executor.leverage(self.f.account, XAU, 2, 4)
+            return self.executor.leverage(self.f.account, XAU, 2, 5)
         except ExchangeError as exc:
             return str(exc)
 
     def engine_at_risk_limit(self):
         self.f.account["mode"] = "live"
-        self.f.account["policy"]["min_open_leverage"] = 2
+        self.f.account["policy"]["min_open_leverage"] = 5
         self.f.store.save_account(self.f.account)
         for rows in (self.responses["/fapi/v3/positionRisk"],
                      self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
@@ -186,7 +186,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
         engine = Engine(self.f.store, market=self.f.market)
         engine.brokers["test"] = self.broker
         engine.poll_market(XAU)
-        engine.markets[XAU]["capacities"] = {"2": "11178592", "4": "1984153", "5": "1984153"}
+        engine.markets[XAU]["capacities"] = {"5": "1984153", "10": "1984153"}
         self.assertEqual(self.broker.snapshot([XAU]).ratio, dec(".5"))
         return engine
 
@@ -203,7 +203,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
                 self.result = (httpx.Response(status, json={"code": code, "msg": "private server details"}) if code else
                                httpx.Response(status, text="private gateway page", headers={"Retry-After": "240"}))
                 with self.assertRaises(LeverageRejected) as raised:
-                    self.executor.leverage(self.f.account, XAU, 2, 4)
+                    self.executor.leverage(self.f.account, XAU, 2, 5)
                 self.assertIsNone(self.f.store.intent("test"))
                 self.assertTrue(self.f.store.account("test")["enabled"])
                 self.assertEqual(raised.exception.http_status, status)
@@ -238,19 +238,19 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
             self.assertTrue(self.f.store.account("test")["enabled"])
             engine.tick_account("test")
             self.assertEqual(self.writes, ["/fapi/v3/leverage"])
-            self.result = {"symbol": XAU, "leverage": 4}
+            self.result = {"symbol": XAU, "leverage": 5}
             with patch("trading.exchange.time.monotonic", return_value=self.api.budget.until + 1):
                 engine.tick_account("test")
-                self.assertEqual(self.f.store.intent("test")["target"], 4)
+                self.assertEqual(self.f.store.intent("test")["target"], 5)
                 engine.tick_account("test")
                 self.assertIsNotNone(self.f.store.intent("test"))
                 for rows in (self.responses["/fapi/v3/positionRisk"],
                              self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
                     for row in rows:
-                        row["leverage"] = "4"
-                self.responses["/fapi/v3/accountWithJoinMargin"]["assets"][0]["availableBalance"] = "37500"
+                        row["leverage"] = "5"
+                self.responses["/fapi/v3/accountWithJoinMargin"]["assets"][0]["availableBalance"] = "40000"
                 engine.tick_account("test")
-                self.assertEqual(self.broker.snapshot([XAU]).ratio, dec(".25"))
+                self.assertEqual(self.broker.snapshot([XAU]).ratio, dec(".2"))
             self.assertIsNone(self.f.store.intent("test"))
             self.assertTrue(self.f.store.account("test")["enabled"])
             self.assertEqual(self.writes, ["/fapi/v3/leverage"] * 2)
@@ -272,7 +272,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
             for rows in (self.responses["/fapi/v3/positionRisk"],
                          self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
                 for row in rows:
-                    row["leverage"] = "4"
+                    row["leverage"] = "5"
             engine.tick_account("test")
             self.assertIsNone(self.f.store.intent("test"))
             self.assertFalse(self.f.store.account("test")["enabled"])
@@ -296,16 +296,16 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
         self.result = {"code": -2027}
         self.begin()
         self.assertIsNone(self.f.store.intent("test"))
-        self.result = {"symbol": XAU, "leverage": 4}
+        self.result = {"symbol": XAU, "leverage": 5}
         self.begin()
         self.assertIsNotNone(self.f.store.intent("test"))
         for rows in (self.responses["/fapi/v3/positionRisk"],
                      self.responses["/fapi/v3/accountWithJoinMargin"]["positions"]):
             for row in rows:
-                row["leverage"] = "4"
+                row["leverage"] = "5"
         self.executor.reconcile(self.f.account)
         self.assertIsNone(self.f.store.intent("test"))
-        self.assertEqual(self.f.store.get("open_after_leverage:test:XAUUSD1"), 4)
+        self.assertEqual(self.f.store.get("open_after_leverage:test:XAUUSD1"), 5)
         self.assertEqual(len(self.writes), 2)
 
     def test_legacy_pending_two_to_four_or_five_confirms_actual_five_without_resending(self):
@@ -349,7 +349,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
         self.assertEqual(self.writes, [])
 
     def test_malformed_acknowledgement_keeps_pending_until_account_confirmation(self):
-        for response in (None, [], {}, {"symbol": SPCX, "leverage": 4},
+        for response in (None, [], {}, {"symbol": SPCX, "leverage": 5},
                          {"symbol": XAU, "leverage": True}, {"symbol": XAU, "leverage": 3}):
             with self.subTest(response=response):
                 previous = self.f.store.intent("test")
@@ -368,7 +368,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
     def test_success_response_is_saved_but_stale_actual_leverage_cannot_confirm(self):
         self.begin()
         intent = self.f.store.intent("test")
-        self.assertEqual(intent.get("change_response"), {"symbol": XAU, "leverage": 4})
+        self.assertEqual(intent.get("change_response"), {"symbol": XAU, "leverage": 5})
         self.executor.reconcile(self.f.account)
         self.assertIsNotNone(self.f.store.intent("test"))
         for rows in (self.responses["/fapi/v3/positionRisk"],
@@ -389,7 +389,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
         restored = Executor(Store(self.f.store.path), self.broker, self.f.market)
         reason = restored.reconcile(self.f.account)
         self.assertIn(XAU, reason)
-        self.assertIn("4x", reason)
+        self.assertIn("5x", reason)
         self.assertIn("2x", reason)
         self.assertIn("-1007", reason)
         self.assertNotIn("private", reason)

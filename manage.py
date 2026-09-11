@@ -31,7 +31,10 @@ def systemctl(*args, check=True):
 def save_config(path, config):
     """Validate before replacing; preserve owner/group and keep secrets private."""
     defaults = json.loads((m.ROOT / "config.json").read_text(encoding="utf-8"))
-    m.validate_config({**defaults, **config})
+    validated = m.validate_config({**defaults, **config})
+    config = config.copy()
+    if "leverages" in config:
+        config["leverages"] = validated["leverages"]
     parent = path.parent
     fd, temporary = tempfile.mkstemp(prefix=".config-", dir=parent)
     try:

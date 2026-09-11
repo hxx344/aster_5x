@@ -29,14 +29,14 @@ class LeverageRulesTests(unittest.TestCase):
     def capacities(self, values):
         self.engine.markets["XAUUSD1"]["capacities"] = {str(k): str(v) for k, v in values.items()}
 
-    def test_existing_1x_upgrades_to_4x_confirms_then_opens_before_further_upgrade(self):
+    def test_existing_1x_upgrades_to_5x_confirms_then_opens_before_further_upgrade(self):
         self.position(1, "1")
         # All higher tiers are available; the initial snapshot has no 1x capacity.
         self.assertNotIn("1", self.engine.markets["XAUUSD1"]["capacities"])
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.engine.tick_account("test")
-            change.assert_called_once_with("XAUUSD1", 4)
+            change.assert_called_once_with("XAUUSD1", 5)
             submit.assert_not_called()
             self.assertIsNotNone(self.f.store.intent("test"))
             self.engine.tick_account("test")
@@ -50,24 +50,24 @@ class LeverageRulesTests(unittest.TestCase):
             self.assertEqual(change.call_count, 1)
             submit.assert_called_once()
             long = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")[0]
-            self.assertEqual(long.leverage, 4)
+            self.assertEqual(long.leverage, 5)
             self.assertGreater(long.qty, 1)
             self.assertIsNone(self.f.store.get("open_after_leverage:test:XAUUSD1"))
             restarted.tick_account("test")
-            self.assertEqual(change.call_args.args, ("XAUUSD1", 5))
+            self.assertEqual(change.call_args.args, ("XAUUSD1", 10))
 
     def test_skips_unavailable_intermediate_tier_and_respects_threshold(self):
         self.position(1, "1")
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
-        self.assertEqual(next_leverage(snapshot, "XAUUSD1", {4: dec(0), 5: dec(10000), 10: dec(20000)}, threshold=10000), 10)
-        self.assertIsNone(next_leverage(snapshot, "XAUUSD1", {4: dec(10000)}, threshold=10000))
-        self.capacities({4: 0, 10: 20000})
+        self.assertEqual(next_leverage(snapshot, "XAUUSD1", {5: dec(10000), 10: dec(20000)}, threshold=10000), 10)
+        self.assertIsNone(next_leverage(snapshot, "XAUUSD1", {5: dec(10000)}, threshold=10000))
+        self.capacities({5: 0, 10: 20000})
         self.engine.tick_account("test")
         self.assertEqual(self.f.store.intent("test")["target"], 10)
 
     def test_high_leverage_flat_account_never_resets_to_lower_available_tier(self):
         self.position(10)
-        self.capacities({4: 100000, 5: 100000, 10: 0, 20: 0})
+        self.capacities({5: 100000, 10: 0, 20: 0})
         with patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("must not reduce")), \
              patch.object(self.f.broker, "submit", side_effect=AssertionError("no 10x capacity")):
             self.engine.tick_account("test")
@@ -76,7 +76,7 @@ class LeverageRulesTests(unittest.TestCase):
 
     def test_high_leverage_flat_account_can_open_at_current_available_tier(self):
         self.position(10)
-        self.capacities({4: 100000, 10: 100000, 20: 0})
+        self.capacities({5: 100000, 10: 100000, 20: 0})
         with patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("must retain 10x")):
             self.engine.tick_account("test")
         long = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")[0]
@@ -91,7 +91,7 @@ class LeverageRulesTests(unittest.TestCase):
         with patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("must not write")):
             for old in (10, 1):
                 with self.subTest(old=old), self.assertRaises(TradingError):
-                    executor.leverage(self.f.account, "XAUUSD1", old, 4, snapshot=stale)
+                    executor.leverage(self.f.account, "XAUUSD1", old, 5, snapshot=stale)
         self.assertIsNone(self.f.store.intent("test"))
 
     def test_equal_leverage_is_a_noop(self):
@@ -100,6 +100,24 @@ class LeverageRulesTests(unittest.TestCase):
             Executor(self.f.store, self.f.broker, self.f.market).leverage(self.f.account, "XAUUSD1", 5, 5)
         self.assertIsNone(self.f.store.intent("test"))
 
+    def test_unsupported_new_leverage_targets_are_rejected_at_all_mutation_boundaries(self):
+        self.position(1)
+        snapshot = self.f.broker.snapshot(["XAUUSD1"])
+        api = Mock()
+        live = LiveBroker({}, self.f.market, api=api)
+        executor = Executor(self.f.store, self.f.broker, self.f.market)
+        for target in (1, 2, 3, 4, 7, 15, 125):
+            with self.subTest(target=target), patch.object(live, "snapshot", return_value=snapshot):
+                with self.assertRaises(TradingError):
+                    live.set_leverage("XAUUSD1", target)
+                with self.assertRaises(TradingError):
+                    self.f.broker.set_leverage("XAUUSD1", target)
+                with self.assertRaises(TradingError):
+                    executor.leverage(self.f.account, "XAUUSD1", 1, target)
+                self.assertIsNone(self.f.store.intent("test"))
+                self.assertEqual(self.f.broker.state["leverages"]["XAUUSD1"], 1)
+        api.call.assert_not_called()
+
     def test_live_and_paper_brokers_block_reduction_at_mutation_boundary(self):
         self.position(10)
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
@@ -107,11 +125,11 @@ class LeverageRulesTests(unittest.TestCase):
         live = LiveBroker({}, self.f.market, api=api)
         with patch.object(live, "snapshot", return_value=snapshot):
             with self.assertRaises(TradingError):
-                live.set_leverage("XAUUSD1", 4)
+                live.set_leverage("XAUUSD1", 5)
             self.assertEqual(live.set_leverage("XAUUSD1", 10)["leverage"], 10)
         api.call.assert_not_called()
         with self.assertRaises(TradingError):
-            self.f.broker.set_leverage("XAUUSD1", 4)
+            self.f.broker.set_leverage("XAUUSD1", 5)
         self.assertEqual(self.f.broker.state["leverages"]["XAUUSD1"], 10)
 
     def test_old_pending_downgrade_is_held_without_execution(self):
@@ -138,7 +156,7 @@ class LeverageRulesTests(unittest.TestCase):
             self.engine.tick_account("test")
             self.engine.tick_account("test")
         self.assertEqual(change.call_count, 1)
-        self.assertEqual(self.f.store.intent("test")["target"], 4)
+        self.assertEqual(self.f.store.intent("test")["target"], 5)
 
     def test_higher_actual_leverage_satisfies_confirmation_without_reduction(self):
         self.position(1, "1")
@@ -160,4 +178,4 @@ class LeverageRulesTests(unittest.TestCase):
              patch.object(self.f.broker, "submit", side_effect=AssertionError("cannot fund a minimum pair")):
             self.engine.tick_account("test")
         self.engine.tick_account("test")
-        self.assertEqual(self.f.store.intent("test")["target"], 5)
+        self.assertEqual(self.f.store.intent("test")["target"], 10)

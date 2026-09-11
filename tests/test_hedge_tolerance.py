@@ -16,7 +16,7 @@ class HedgeToleranceTests(unittest.TestCase):
         self.addCleanup(self.f.close)
         self.executor = Executor(self.f.store, self.f.broker, self.f.market)
 
-    def seed(self, long="120", short="120", leverage=4):
+    def seed(self, long="120", short="120", leverage=5):
         self.f.broker.state["leverages"]["XAUUSD1"] = leverage
         self.f.broker.state["wallet"] = str(max(dec(25000), max(dec(long), dec(short)) * 5000))
         for side, qty in (("LONG", long), ("SHORT", short)):
@@ -54,10 +54,10 @@ class HedgeToleranceTests(unittest.TestCase):
                     snapshot = self.f.broker.snapshot([symbol])
                     long, short = snapshot.pair(symbol)
                     long.qty, short.qty = dec(1), dec(smaller)
-                    caps = {4: dec(500000), 5: dec(500000)}
+                    caps = {5: dec(500000), 10: dec(500000)}
                     plan = plan_pair(snapshot, self.f.market.book(symbol), self.f.market.rules[symbol], caps, self.f.account["policy"])
                     self.assertEqual(plan.qty > 0, allowed)
-                    self.assertEqual(next_leverage(snapshot, symbol, caps) == 5, allowed)
+                    self.assertEqual(next_leverage(snapshot, symbol, caps) == 10, allowed)
                     if not allowed:
                         self.assertIn("0.1%", plan.reason)
 
@@ -67,11 +67,11 @@ class HedgeToleranceTests(unittest.TestCase):
         engine.brokers["test"] = self.f.broker
         engine.poll_market("XAUUSD1")
         engine.tick_account("test")
-        self.assertEqual(self.f.store.intent("test")["target"], 4)
+        self.assertEqual(self.f.store.intent("test")["target"], 5)
         engine.tick_account("test")
         engine.tick_account("test")
         long, short = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")
-        self.assertEqual(long.leverage, 4)
+        self.assertEqual(long.leverage, 5)
         self.assertGreater(long.qty, 1)
         self.assertEqual(long.qty - short.qty, dec(".001"))
         self.assertIsNone(self.f.store.intent("test"))
@@ -83,7 +83,7 @@ class HedgeToleranceTests(unittest.TestCase):
             with self.assertRaisesRegex(TradingError, "0.1%"):
                 self.executor.open_pair(self.f.account, current, "XAUUSD1", Plan(dec(".12")), self.f.market.book("XAUUSD1"))
             with self.assertRaisesRegex(TradingError, "0.1%"):
-                self.executor.leverage(self.f.account, "XAUUSD1", 4, 5, snapshot=stale)
+                self.executor.leverage(self.f.account, "XAUUSD1", 5, 10, snapshot=stale)
             submit.assert_not_called()
             change.assert_not_called()
         self.assertIsNone(self.f.store.intent("test"))
@@ -200,18 +200,18 @@ class HedgeToleranceTests(unittest.TestCase):
                     long.qty, short.qty = dec(long_qty), dec(short_qty)
                     long.mark = short.mark = dec(old_mark)
                     book = replace(self.f.market.book("XAUUSD1"), bid=dec(new_mark), ask=dec(new_mark), mark=dec(new_mark))
-                    plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)},
+                    plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {5: dec(500000)},
                                      {**self.f.account["policy"], "order_notional": "100000"})
                     self.assertGreater(plan.qty, 0)
                     pnl = long.qty * (book.mark - long.mark) - short.qty * (book.mark - short.mark)
                     loss = max(dec(0), -pnl)
-                    adjustment = max(dec(0), (long.qty + short.qty) * book.mark / 4 - long.occupied_margin - short.occupied_margin)
+                    adjustment = max(dec(0), (long.qty + short.qty) * book.mark / 5 - long.occupied_margin - short.occupied_margin)
 
                     def ratio(qty):
-                        return (snapshot.occupied_margin + adjustment + 2 * qty * book.mark / 4) / (snapshot.equity - loss - qty * 2 * book.mark * dec(".0004"))
+                        return (snapshot.occupied_margin + adjustment + 2 * qty * book.mark / 5) / (snapshot.equity - loss - qty * 2 * book.mark * dec(".0004"))
 
                     self.assertEqual(plan.projected_ratio, ratio(plan.qty))
                     self.assertLessEqual(ratio(plan.qty), dec(".5"))
-                    self.assertLessEqual(plan.qty * (2 * book.mark / 4 + 2 * book.mark * dec(".0004")) + loss + adjustment, snapshot.available)
+                    self.assertLessEqual(plan.qty * (2 * book.mark / 5 + 2 * book.mark * dec(".0004")) + loss + adjustment, snapshot.available)
                     next_qty = plan.qty + self.f.market.rules["XAUUSD1"].step
-                    self.assertTrue(ratio(next_qty) > dec(".5") or next_qty * dec("5008") + loss + adjustment > snapshot.available)
+                    self.assertTrue(ratio(next_qty) > dec(".5") or next_qty * dec("4008") + loss + adjustment > snapshot.available)

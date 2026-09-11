@@ -28,7 +28,7 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.engine = Engine(self.f.store, market=self.f.market)
 
     def publish(self, capacities=None, symbol="XAUUSD1"):
-        values = {4: dec(20000)} if capacities is None else capacities
+        values = {5: dec(20000)} if capacities is None else capacities
         with patch.object(self.f.market, "capacities", return_value=values):
             self.engine.poll_market(symbol)
 
@@ -43,14 +43,21 @@ class CapacityAlertEngineTests(unittest.TestCase):
             self.engine.poll_market("XAUUSD1")
         capacities.assert_called_once()
         book.assert_not_called()
-        self.assertEqual(self.f.store.pending_notifications(), 4)
+        self.assertEqual(self.f.store.pending_notifications(), 3)
         self.engine.notify()
         self.engine.notify()
         messages = [call.args[1] for call in self.sender.call_args_list]
-        self.assertEqual(len(messages), 4)
-        for tier in (4, 5, 10, 20):
+        self.assertEqual(len(messages), 3)
+        for tier in (5, 10, 20):
             self.assertTrue(any(f" · {tier}x" in message for message in messages))
+        self.assertFalse(any(" · 4x" in message for message in messages))
         self.assertTrue(all("公开" in m and "检查时间" in m for m in messages))
+
+    def test_retired_tier_response_does_not_create_or_send_alerts(self):
+        self.publish({4: dec(20000)})
+        self.engine.notify()
+        self.assertEqual(self.f.store.pending_notifications(), 0)
+        self.sender.assert_not_called()
 
     def test_no_accounts_means_no_web_threshold_and_no_capacity_alert(self):
         with self.f.store.connect() as db:
@@ -61,19 +68,19 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.assertEqual(self.f.store.pending_notifications(), 0)
         self.assertNotIn("ASTER_ALLOW_LIVE", os.environ)
 
-    def test_all_twelve_combinations_are_independent_and_high_values_do_not_repeat(self):
+    def test_all_nine_combinations_are_independent_and_high_values_do_not_repeat(self):
         for symbol in ("XAUUSD1", "SPCXUSD1", "CLUSD1"):
-            self.publish({t: dec(20000) for t in (4, 5, 10, 20)}, symbol)
-        self.assertEqual(self.f.store.pending_notifications(), 12)
+            self.publish({t: dec(20000) for t in (5, 10, 20)}, symbol)
+        self.assertEqual(self.f.store.pending_notifications(), 9)
         for _ in range(6):
             self.engine.notify()
-        self.assertEqual(self.sender.call_count, 12)
+        self.assertEqual(self.sender.call_count, 9)
         restored = Engine(Store(self.f.store.path), market=self.f.market)
         for symbol in ("XAUUSD1", "SPCXUSD1", "CLUSD1"):
-            with patch.object(self.f.market, "capacities", return_value={t: dec(30000) for t in (4, 5, 10, 20)}):
+            with patch.object(self.f.market, "capacities", return_value={t: dec(30000) for t in (5, 10, 20)}):
                 restored.poll_market(symbol)
         restored.notify()
-        self.assertEqual(self.sender.call_count, 12)
+        self.assertEqual(self.sender.call_count, 9)
 
     def test_no_webhook_does_not_accumulate_history_and_new_sample_enables_alert(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -95,7 +102,7 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.sender.assert_not_called()
 
     def test_book_failure_does_not_hide_successful_capacity_alert(self):
-        with patch.object(self.f.market, "capacities", return_value={4: dec(20000)}), \
+        with patch.object(self.f.market, "capacities", return_value={5: dec(20000)}), \
              patch.object(self.f.market, "book", side_effect=TradingError("BBO unavailable")):
             self.engine.poll_market("XAUUSD1")
             self.engine.poll_book("XAUUSD1")
@@ -115,11 +122,11 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.sender.assert_called_once()
 
     def test_missing_tier_does_not_send_its_older_queued_value(self):
-        self.publish({4: dec(20000), 5: dec(20000)})
-        self.publish({4: dec(21000)})
+        self.publish({5: dec(20000), 10: dec(20000)})
+        self.publish({5: dec(21000)})
         self.engine.notify()
         self.sender.assert_called_once()
-        self.assertIn(" · 4x", self.sender.call_args.args[1])
+        self.assertIn(" · 5x", self.sender.call_args.args[1])
 
     def test_alert_setting_failure_does_not_block_market_or_trade_completion(self):
         self.trade_notification()
@@ -144,7 +151,7 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.trade_notification()
         def send(config, message):
             self.assertEqual(message, "Aster 双向开仓完成")
-            self.publish({4: dec(10000)})
+            self.publish({5: dec(10000)})
         self.sender.side_effect = send
         self.engine.notify()
         self.sender.assert_called_once()
@@ -161,7 +168,7 @@ class CapacityAlertEngineTests(unittest.TestCase):
         with patch("trading.engine.time.time", return_value=stamp + 20):
             restored.notify()
             self.assertEqual(self.sender.call_count, 1)
-            with patch.object(self.f.market, "capacities", return_value={4: dec(31000)}):
+            with patch.object(self.f.market, "capacities", return_value={5: dec(31000)}):
                 restored.poll_market("XAUUSD1")
             restored.notify()
         self.assertEqual(self.sender.call_count, 2)
@@ -179,9 +186,9 @@ class CapacityAlertEngineTests(unittest.TestCase):
     def test_alerts_use_web_threshold_and_ignore_legacy_environment_override(self):
         self.configure_threshold('25000')
         with patch.dict(os.environ, {"ASTER_CAPACITY_ALERT_THRESHOLD": "1", "ASTER_CAPACITY_ALERT_COOLDOWN_SECONDS": "600"}):
-            self.publish({4: dec(25000)})
+            self.publish({5: dec(25000)})
             self.assertEqual(self.f.store.pending_notifications(), 0)
-            self.publish({4: dec(25001)})
+            self.publish({5: dec(25001)})
             self.engine.notify()
             self.assertIn("25,000.00", self.sender.call_args.args[1])
             self.assertEqual(self.f.store.account("test")["policy"]["threshold"], "25000")
@@ -197,10 +204,10 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.configure_threshold('100000')
         with patch.dict(os.environ, {'ASTER_CAPACITY_ALERT_THRESHOLD': 'NaN'}):
             for value in (20000, 99999, 100000):
-                self.publish({4: dec(value)})
+                self.publish({5: dec(value)})
                 self.engine.notify()
             self.sender.assert_not_called()
-            self.publish({4: dec('100000.01')})
+            self.publish({5: dec('100000.01')})
             self.engine.notify()
         self.sender.assert_called_once()
         message = self.sender.call_args.args[1]
@@ -216,7 +223,7 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.publish()
         self.engine.notify()
         self.sender.assert_not_called()
-        self.publish({4: dec(100001)})
+        self.publish({5: dec(100001)})
         self.engine.notify()
         self.sender.assert_called_once()
 
@@ -250,10 +257,10 @@ class CapacityAlertEngineTests(unittest.TestCase):
         second.update(name='低阈值账户', enabled=False)
         second['policy']['threshold'] = '20000'
         self.f.store.save_account(second)  # XAU only.
-        self.publish({4: dec(30000)}, 'CLUSD1')
+        self.publish({5: dec(30000)}, 'CLUSD1')
         self.engine.notify()
         self.sender.assert_not_called()
-        self.publish({4: dec(30000)})
+        self.publish({5: dec(30000)})
         self.engine.notify()
         self.sender.assert_called_once()
         message = self.sender.call_args.args[1]
@@ -273,19 +280,19 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.assertIn('第二个账户', message)
 
     def test_web_change_during_delivery_blocks_next_old_threshold_message(self):
-        self.publish({4: dec(20000), 5: dec(20000)})
+        self.publish({5: dec(20000), 10: dec(20000)})
         self.sender.side_effect = lambda config, message: self.configure_threshold('100000')
         self.engine.notify()
         self.sender.assert_called_once()
 
     def test_restart_and_equivalent_threshold_notation_preserve_deduplication(self):
         self.configure_threshold('100000')
-        self.publish({4: dec(100001)})
+        self.publish({5: dec(100001)})
         self.engine.notify()
         self.sender.assert_called_once()
         self.configure_threshold('1e5')
         self.engine = Engine(Store(self.f.store.path), market=self.f.market)
-        self.publish({4: dec(100002)})
+        self.publish({5: dec(100002)})
         self.engine.notify()
         self.sender.assert_called_once()
 

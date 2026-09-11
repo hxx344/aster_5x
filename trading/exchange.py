@@ -17,7 +17,7 @@ from eth_account.messages import encode_typed_data
 
 import monitor
 from .market_stream import PublicQuoteStream
-from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 
@@ -648,6 +648,7 @@ class LiveBroker:
         return int(leverage)
 
     def set_leverage(self, symbol, leverage, *, checked_snapshot=None, before_submit=None):
+        require_supported_leverage(leverage)
         verified, self.leverage_snapshot = self.leverage_snapshot, None
         snapshot = (checked_snapshot if verified is not None and checked_snapshot is verified[0]
                     and 0 <= time.monotonic() - verified[1] <= 1 else None)

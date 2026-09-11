@@ -70,7 +70,7 @@ class ExecutionNotSentTests(unittest.TestCase):
         with patch.object(self.f.broker, "set_leverage", side_effect=rejection), \
              patch.object(self.f.store, "save_intent", wraps=self.f.store.save_intent) as save:
             with self.assertRaises(RequestNotSent) as caught:
-                self.executor.leverage(self.f.account, "XAUUSD1", 4, 5)
+                self.executor.leverage(self.f.account, "XAUUSD1", 5, 10)
         self.assertIs(caught.exception, rejection)
         self.assertEqual(caught.exception.retry_after, 45)
         self.assertEqual(save.call_args.args[0]["status"], "aborted")
@@ -78,7 +78,7 @@ class ExecutionNotSentTests(unittest.TestCase):
         self.assertIsNone(self.f.store.intent("test"))
         self.assertIsNone(self.f.store.get("post_fill_check:test"))
         self.assertTrue(self.f.store.account("test")["enabled"])
-        self.assertEqual(self.f.broker.state["leverages"]["XAUUSD1"], 4)
+        self.assertEqual(self.f.broker.state["leverages"]["XAUUSD1"], 5)
         self.assertIsNone(self.executor.last_snapshot)
         self.assertIsNone(self.executor.last_completed_intent)
 
@@ -86,7 +86,7 @@ class ExecutionNotSentTests(unittest.TestCase):
         with patch.object(self.f.broker, "snapshot", side_effect=RequestNotSent("read budget exhausted", retry_after=10)), \
              patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("must not write")):
             with self.assertRaises(RequestNotSent):
-                self.executor.leverage(self.f.account, "XAUUSD1", 4, 5)
+                self.executor.leverage(self.f.account, "XAUUSD1", 5, 10)
         self.assertIsNone(self.f.store.intent("test"))
 
     def test_failed_repair_budget_keeps_legacy_exposure_for_recovery_without_querying_absent_repairs(self):

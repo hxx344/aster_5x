@@ -47,6 +47,7 @@ import {
   marginLimitFromPercent,
   parseMinimumLeverage,
   percentFromMarginLimit,
+  SUPPORTED_LEVERAGES,
 } from '@/lib/policy';
 
 type Position = {
@@ -215,15 +216,16 @@ export default function Home() {
     account?.risk_limits?.high_leverage ?? account?.policy.margin_limit ?? '0.5';
   const highMarginLimit = Number(highMarginLimitValue);
   const highMarginPercent = percentFromMarginLimit(highMarginLimitValue);
-  const minimumLeverage = account?.policy.min_open_leverage ?? 4;
-  const displayedTiers = [...new Set([4, 5, 10, 20, minimumLeverage])].sort(
-    (a, b) => a - b,
-  );
+  const minimumLeverage = account?.policy.min_open_leverage ?? 5;
+  const minimumLeverageSupported =
+    SUPPORTED_LEVERAGES.includes(minimumLeverage);
   const form = drafts[selected] || {
     threshold: account?.policy.threshold || '10000',
     order_notional: account?.policy.order_notional || '1000',
     margin_percent: marginPercent,
-    min_open_leverage: String(minimumLeverage),
+    min_open_leverage: minimumLeverageSupported
+      ? String(minimumLeverage)
+      : '',
   };
   const setForm = (value: typeof form) =>
     setDrafts((previous) => ({ ...previous, [selected]: value }));
@@ -288,6 +290,8 @@ export default function Home() {
   const currentLeverage =
     snapshot?.positions.find((p) => p.symbol === focus)?.leverage ||
     minimumLeverage;
+  const currentLeverageSupported =
+    SUPPORTED_LEVERAGES.includes(currentLeverage);
   const highLeverage = currentLeverage === 10 || currentLeverage === 20;
   const openingLimit = highLeverage ? highMarginLimit : marginLimit;
   const openingPercent = highLeverage ? highMarginPercent : marginPercent;
@@ -562,7 +566,7 @@ export default function Home() {
                       <TableHeader>
                         <TableRow>
                           <TableHead>市场</TableHead>
-                          {displayedTiers.map((v) => (
+                          {SUPPORTED_LEVERAGES.map((v) => (
                             <TableHead key={v} className="number">
                               {v}x
                             </TableHead>
@@ -595,7 +599,7 @@ export default function Home() {
                                   </span>
                                 </button>
                               </TableCell>
-                              {displayedTiers.map((v) => (
+                              {SUPPORTED_LEVERAGES.map((v) => (
                                 <TableCell
                                   key={v}
                                   className={`number ${live && Number(m.capacities[v]) > Number(account?.policy.threshold || 10000) ? 'mint' : ''}`}
@@ -608,12 +612,6 @@ export default function Home() {
                                   <span className="leverage-chip">{lev}x</span>
                                 ) : (
                                   '—'
-                                )}
-                                {lev && !displayedTiers.includes(lev) && (
-                                  <small className="current-capacity">
-                                    额度{' '}
-                                    {live ? fmt(m?.capacities[lev], 0) : '—'}
-                                  </small>
                                 )}
                               </TableCell>
                               <TableCell
@@ -868,18 +866,24 @@ export default function Home() {
                   </div>
                   <Gate
                     label={
-                      currentLeverage < minimumLeverage
-                        ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
-                        : `${currentLeverage}x 额度超过阈值`
+                      !minimumLeverageSupported
+                        ? '请先选择受支持的最低开仓杠杆'
+                        : !currentLeverageSupported
+                          ? `当前 ${currentLeverage}x 不支持新增开仓`
+                          : currentLeverage < minimumLeverage
+                            ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
+                            : `${currentLeverage}x 额度超过阈值`
                     }
                     pass={
+                      currentLeverageSupported &&
+                      minimumLeverageSupported &&
                       currentLeverage >= minimumLeverage &&
                       market?.status === 'ok' &&
                       Number(market.capacities[currentLeverage]) >
                         Number(account?.policy.threshold || 10000)
                     }
                     value={
-                      market?.status === 'ok'
+                      currentLeverageSupported && market?.status === 'ok'
                         ? fmt(market.capacities[currentLeverage], 0)
                         : '—'
                     }
@@ -1035,28 +1039,34 @@ export default function Home() {
                     </label>
                     <label htmlFor="min-open-leverage">
                       最低开仓杠杆 <span>x</span>
-                      <Input
-                        id="min-open-leverage"
-                        type="number"
-                        min="1"
-                        max="125"
-                        step="1"
+                      <Select
                         required
                         disabled={busy || !account || account.enabled}
-                        value={form.min_open_leverage}
-                        onChange={(e) =>
-                          setForm({
-                            ...form,
-                            min_open_leverage: e.target.value,
-                          })
+                        value={form.min_open_leverage || null}
+                        onValueChange={(value) =>
+                          value && setForm({ ...form, min_open_leverage: value })
                         }
-                      />
+                      >
+                        <SelectTrigger
+                          id="min-open-leverage"
+                          className="full-width"
+                        >
+                          <SelectValue placeholder="请选择最低开仓杠杆" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {SUPPORTED_LEVERAGES.map((value) => (
+                            <SelectItem key={value} value={String(value)}>
+                              {value}x
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </label>
                     <p className="muted">
                       修改前请暂停策略。基础风险约束大于
                       0%、不超过
                       100%；10x / 20x 共同额外增加 5 个百分点，最高 100%。实际下单量还受余额与盘口限制。最低杠杆可设
-                      1–125，调低该值不会降低已有杠杆。
+                      5x、10x 或 20x，调低该值不会降低已有杠杆。
                     </p>
                     <Button
                       variant="outline"

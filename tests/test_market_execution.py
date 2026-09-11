@@ -107,12 +107,12 @@ class MarketExecutionTests(unittest.TestCase):
         self.assertEqual(self.f.store.get("campaign:test")["batches"][0]["quantities"]["long_qty"], "0.003")
 
     def test_market_slippage_that_exceeds_actual_margin_limit_persistently_pauses(self):
-        self.f.broker.state["wallet"] = "1000"
+        self.f.broker.state["wallet"] = "800"
         self.f.broker.save()
         engine = Engine(self.f.store, market=self.f.market)
         engine.brokers["test"] = self.f.broker
         engine.poll_market("XAUUSD1")
-        engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
+        engine.markets["XAUUSD1"]["capacities"] = {"5": "500000"}
         submit = self.f.broker.submit
         moved = replace(self.f.market.book("XAUUSD1"), ask=dec(4500), bid=dec(4300))
 
@@ -146,7 +146,7 @@ class MarketExecutionTests(unittest.TestCase):
         for depth, expected in ((".03", 0), (".05", ".05")):
             with self.subTest(depth=depth):
                 current = replace(book, bid_qty=dec(depth), ask_qty=dec(depth))
-                plan = plan_pair(snapshot, current, self.f.market.rules["XAUUSD1"], {4: dec(500000)},
+                plan = plan_pair(snapshot, current, self.f.market.rules["XAUUSD1"], {5: dec(500000)},
                                  {**self.f.account["policy"], "order_notional": "2000"})
                 self.assertEqual(plan.qty, dec(expected))
 

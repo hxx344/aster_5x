@@ -1,5 +1,6 @@
 """Per-account risk settings across API, restart, planning and paper execution."""
 import copy
+import json
 from dataclasses import replace
 from fractions import Fraction
 import os
@@ -42,24 +43,24 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
     def update(self, changes, account_id="test"):
         return self.client.patch("/api/accounts/" + account_id, json=changes)
 
-    def test_new_account_defaults_are_fifty_percent_and_four(self):
+    def test_new_account_defaults_are_fifty_percent_and_five(self):
         response = self.client.post("/api/accounts", json={"id": "second", "name": "第二个模拟账户",
                                                             "mode": "paper", "env_prefix": "ASTER_SECOND"})
         self.assertEqual(response.status_code, 200, response.text)
         saved = self.f.store.account("second")
         self.assertFalse(saved["enabled"])
         self.assertEqual(dec(saved["policy"]["margin_limit"]), dec(".5"))
-        self.assertEqual(saved["policy"]["min_open_leverage"], 4)
+        self.assertEqual(saved["policy"]["min_open_leverage"], 5)
 
     def test_legacy_two_field_patch_and_each_new_field_can_be_updated_independently(self):
         before = copy.deepcopy(self.f.broker.state)
         for changes in ({"threshold": "25000", "order_notional": "700"},
-                        {"margin_limit": "0.7"}, {"min_open_leverage": 7}):
+                        {"margin_limit": "0.7"}, {"min_open_leverage": 10}):
             response = self.update(changes)
             self.assertEqual(response.status_code, 200, response.text)
         policy = self.f.store.account("test")["policy"]
         self.assertEqual((policy["threshold"], policy["order_notional"], policy["margin_limit"], policy["min_open_leverage"]),
-                         ("25000", "700", "0.7", 7))
+                         ("25000", "700", "0.7", 10))
         self.assertEqual(self.f.broker.state, before)
 
     def test_margin_accepts_thirty_seventy_and_one_hundred_percent(self):
@@ -69,8 +70,8 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(dec(self.f.store.account("test")["policy"]["margin_limit"]), dec(value))
 
-    def test_minimum_leverage_accepts_both_bounds_and_nonstandard_tiers(self):
-        for value in (1, 2, 7, 10, 125):
+    def test_minimum_leverage_accepts_only_supported_tiers(self):
+        for value in (5, 10, 20):
             with self.subTest(value=value):
                 response = self.update({"min_open_leverage": value})
                 self.assertEqual(response.status_code, 200, response.text)
@@ -80,14 +81,14 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
 
     def test_margin_scientific_notation_can_be_resaved_as_expanded_decimal(self):
         for value in ("1e-50", "0." + "0" * 49 + "1"):
-            response = self.update({"margin_limit": value, "min_open_leverage": 7})
+            response = self.update({"margin_limit": value, "min_open_leverage": 10})
             self.assertEqual(response.status_code, 200, response.text)
             saved = self.f.store.account("test")["policy"]
             self.assertEqual(dec(saved["margin_limit"]), dec("1e-50"))
-            self.assertEqual(saved["min_open_leverage"], 7)
+            self.assertEqual(saved["min_open_leverage"], 10)
 
     def test_invalid_updates_are_atomic_and_do_not_persist_any_other_supplied_field(self):
-        invalid = [{"min_open_leverage": value} for value in (None, True, False, 0, 126, 7.0, 1.5, "7", [], {})]
+        invalid = [{"min_open_leverage": value} for value in (None, True, False, 0, 1, 2, 4, 7, 125, 126, 5.0, 1.5, "5", [], {})]
         invalid += [{"margin_limit": value} for value in (None, True, False, 0.7, "0", "-0.1", "1.00001", "NaN", "Infinity", "")]
         invalid += [{"unknown_setting": "value"}, {"symbols": [SYMBOL]}, {"hedge_mode": False}]
         original = self.f.store.account("test")
@@ -108,7 +109,7 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
                                           "status": "pending", "created_at": time.time()})
             before = self.f.store.account("test")
             with self.subTest(running=running, pending=pending):
-                response = self.update({"margin_limit": "0.7", "min_open_leverage": 7})
+                response = self.update({"margin_limit": "0.7", "min_open_leverage": 10})
                 self.assertEqual(response.status_code, 409, response.text)
                 self.assertEqual(self.f.store.account("test"), before)
 
@@ -116,14 +117,14 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
         second = account("second")
         second["enabled"] = False
         self.f.store.save_account(second)
-        for account_id, margin, minimum in (("test", "0.3", 2), ("second", "0.7", 7)):
+        for account_id, margin, minimum in (("test", "0.3", 5), ("second", "0.7", 10)):
             response = self.update({"margin_limit": margin, "min_open_leverage": minimum}, account_id)
             self.assertEqual(response.status_code, 200, response.text)
         restarted = Store(self.f.store.path)
         state = Engine(restarted, market=self.f.market).state()
         policies = {saved["id"]: saved["policy"] for saved in state["accounts"]}
-        self.assertEqual((policies["test"]["margin_limit"], policies["test"]["min_open_leverage"]), ("0.3", 2))
-        self.assertEqual((policies["second"]["margin_limit"], policies["second"]["min_open_leverage"]), ("0.7", 7))
+        self.assertEqual((policies["test"]["margin_limit"], policies["test"]["min_open_leverage"]), ("0.3", 5))
+        self.assertEqual((policies["second"]["margin_limit"], policies["second"]["min_open_leverage"]), ("0.7", 10))
 
     def test_old_accounts_gain_default_minimum_without_overwriting_custom_margin(self):
         for name, margin in (("old_low", "0.30"), ("old_high", "0.70")):
@@ -138,9 +139,57 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
             with self.subTest(account=name):
                 saved = restarted.account(name)
                 self.assertEqual(saved["policy"]["margin_limit"], margin)
-                self.assertEqual(saved["policy"]["min_open_leverage"], 4)
+                self.assertEqual(saved["policy"]["min_open_leverage"], 5)
                 self.assertEqual(validate_account(saved), saved)
-        self.assertTrue(all(saved["policy"]["min_open_leverage"] == 4 for saved in restarted.accounts()))
+        self.assertTrue(all(saved["policy"]["min_open_leverage"] == 5 for saved in restarted.accounts()))
+
+    def test_legacy_minimum_migrates_upward_without_rewriting_actual_positions(self):
+        self.f.broker.state["leverages"][SYMBOL] = 4
+        self.f.broker.save()
+        before = copy.deepcopy(self.f.broker.state)
+        for previous, expected in ((1, 5), (4, 5), (5, 5), (7, 10), (10, 10), (13, 20), (20, 20)):
+            legacy = account("legacy_" + str(previous))
+            legacy["policy"].update(min_open_leverage=previous, margin_limit="0.7")
+            with self.f.store.connect() as db:
+                db.execute("INSERT INTO accounts VALUES (?,?)", (legacy["id"], dumps(legacy)))
+        restarted = Store(self.f.store.path)
+        for previous, expected in ((1, 5), (4, 5), (5, 5), (7, 10), (10, 10), (13, 20), (20, 20)):
+            with self.subTest(previous=previous):
+                saved = restarted.account("legacy_" + str(previous))
+                self.assertEqual(saved["policy"]["min_open_leverage"], expected)
+                self.assertEqual(saved["policy"]["margin_limit"], "0.7")
+                self.assertTrue(saved["enabled"])
+                with restarted.connect() as db:
+                    persisted, = db.execute("SELECT data FROM accounts WHERE id=?", (saved["id"],)).fetchone()
+                self.assertEqual(json.loads(persisted)["policy"]["min_open_leverage"], expected)
+        self.assertEqual(self.f.broker.state, before)
+        self.assertEqual(self.f.broker.snapshot([SYMBOL]).pair(SYMBOL)[0].leverage, 4)
+
+    def test_legacy_minimum_above_twenty_requires_saved_selection_before_restart(self):
+        legacy = self.f.store.account("test")
+        legacy["enabled"] = True
+        legacy["policy"]["min_open_leverage"] = 125
+        with self.f.store.connect() as db:
+            db.execute("UPDATE accounts SET data=? WHERE id='test'", (dumps(legacy),))
+        restarted = Store(self.f.store.path)
+        saved = restarted.account("test")
+        self.assertEqual(saved["policy"]["min_open_leverage"], 20)
+        self.assertFalse(saved["enabled"])
+        self.assertTrue(saved["leverage_setting_required"])
+        engine = Engine(restarted, market=self.f.market)
+        engine.brokers["test"] = self.f.broker
+        with self.assertRaisesRegex(TradingError, "保存最低开仓杠杆"):
+            engine.enable("test", True)
+        engine.configure("test", {"margin_limit": "0.7"})
+        with self.assertRaisesRegex(TradingError, "保存最低开仓杠杆"):
+            engine.enable("test", True)
+        with self.assertRaises(TradingError):
+            engine.configure("test", {"min_open_leverage": 4})
+        self.assertTrue(restarted.account("test")["leverage_setting_required"])
+        engine.configure("test", {"min_open_leverage": 10})
+        self.assertNotIn("leverage_setting_required", restarted.account("test"))
+        engine.enable("test", True)
+        self.assertTrue(restarted.account("test")["enabled"])
 
 
 class ConfigurablePolicyExecutionTests(unittest.TestCase):
@@ -154,7 +203,7 @@ class ConfigurablePolicyExecutionTests(unittest.TestCase):
         self.engine.brokers["test"] = self.f.broker
         self.executor = Executor(self.f.store, self.f.broker, self.f.market)
 
-    def configure_fixture(self, *, minimum=4, margin="0.5", leverage=4, qty="0", enabled=True):
+    def configure_fixture(self, *, minimum=5, margin="0.5", leverage=5, qty="0", enabled=True):
         self.f.account.update(enabled=enabled)
         self.f.account["policy"].update(min_open_leverage=minimum, margin_limit=margin)
         self.f.store.save_account(self.f.account)
@@ -167,17 +216,17 @@ class ConfigurablePolicyExecutionTests(unittest.TestCase):
         with patch.object(self.f.market, "capacities", return_value=capacities):
             self.engine.poll_market(SYMBOL)
 
-    def test_minimum_two_allows_real_paper_market_fills_at_two(self):
-        self.configure_fixture(minimum=2, leverage=2)
+    def test_minimum_five_allows_real_paper_market_fills_at_five(self):
+        self.configure_fixture(minimum=5, leverage=5)
         snapshot, book = self.f.broker.snapshot([SYMBOL]), self.f.market.book(SYMBOL)
-        plan = plan_pair(snapshot, book, self.f.market.rules[SYMBOL], {2: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, self.f.market.rules[SYMBOL], {5: dec(500000)}, self.f.account["policy"])
         self.assertGreater(plan.qty, 0)
         with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.executor.open_pair(self.f.account, snapshot, SYMBOL, plan, book)
         submit.assert_called_once()
         self.assertTrue(all(order["type"] == "MARKET" for order in submit.call_args.args[0]))
         long, short = self.f.broker.snapshot([SYMBOL]).pair(SYMBOL)
-        self.assertEqual((long.qty, short.qty, long.leverage), (plan.qty, plan.qty, 2))
+        self.assertEqual((long.qty, short.qty, long.leverage), (plan.qty, plan.qty, 5))
 
     def test_minimum_ten_rejects_plans_and_supplied_entry_at_four_or_five(self):
         for leverage in (4, 5):
@@ -194,13 +243,13 @@ class ConfigurablePolicyExecutionTests(unittest.TestCase):
                 self.assertIsNone(self.f.store.intent("test"))
                 self.assertEqual(self.f.broker.state, before)
 
-    def test_nonstandard_minimum_seven_is_selected_confirmed_and_then_used_for_entry(self):
-        self.configure_fixture(minimum=7, leverage=2)
-        capacities = {tier: dec(500000) for tier in (2, 4, 5, 7, 10, 20)}
+    def test_minimum_twenty_is_reached_through_supported_tiers_before_entry(self):
+        self.configure_fixture(minimum=20, leverage=2)
+        capacities = {tier: dec(500000) for tier in (5, 10, 20)}
         self.publish(capacities)
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
-            for index, target in enumerate((4, 5, 7), start=1):
+            for index, target in enumerate((5, 10, 20), start=1):
                 self.publish(capacities)
                 self.engine.tick_account("test")
                 self.assertEqual(change.call_count, index)
@@ -215,24 +264,24 @@ class ConfigurablePolicyExecutionTests(unittest.TestCase):
         submit.assert_called_once()
         long, short = self.f.broker.snapshot([SYMBOL]).pair(SYMBOL)
         self.assertGreater(long.qty, 0)
-        self.assertEqual((long.qty, long.leverage, short.leverage), (short.qty, 7, 7))
+        self.assertEqual((long.qty, long.leverage, short.leverage), (short.qty, 20, 20))
 
     def test_higher_selection_keeps_base_tiers_below_configured_opening_minimum(self):
-        self.configure_fixture(minimum=7, leverage=2)
+        self.configure_fixture(minimum=20, leverage=2)
         snapshot = self.f.broker.snapshot([SYMBOL])
-        for capacities, expected in (({4: dec(500000), 5: dec(500000), 7: dec(500000)}, 4),
-                                     ({4: dec(10000), 5: dec(500000), 7: dec(0), 10: dec(500000)}, 5),
-                                     ({4: dec(0), 5: dec(0), 7: dec(0), 10: dec(500000)}, 10),
-                                     ({4: dec(0), 5: dec(0), 7: dec(0), 10: dec(0)}, None)):
+        for capacities, expected in (({5: dec(500000), 10: dec(500000), 20: dec(500000)}, 5),
+                                     ({5: dec(10000), 10: dec(500000), 20: dec(0)}, 10),
+                                     ({5: dec(0), 10: dec(0), 20: dec(500000)}, 20),
+                                     ({5: dec(0), 10: dec(0), 20: dec(0)}, None)):
             with self.subTest(capacities=capacities):
-                self.assertEqual(next_leverage(snapshot, SYMBOL, capacities, threshold=10000, min_open_leverage=7), expected)
+                self.assertEqual(next_leverage(snapshot, SYMBOL, capacities, threshold=10000, min_open_leverage=20), expected)
 
     def test_lowering_minimum_does_not_reduce_existing_actual_leverage(self):
         self.configure_fixture(minimum=10, leverage=10, enabled=False)
         with patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("configuration must not lower leverage")):
-            self.engine.configure("test", {"min_open_leverage": 2})
+            self.engine.configure("test", {"min_open_leverage": 5})
             self.engine.enable("test", True)
-            self.publish({tier: dec(500000) for tier in (2, 4, 5, 10)})
+            self.publish({tier: dec(500000) for tier in (5, 10)})
             self.engine.tick_account("test")
         long, short = self.f.broker.snapshot([SYMBOL]).pair(SYMBOL)
         self.assertEqual((long.leverage, short.leverage), (10, 10))
@@ -283,31 +332,31 @@ class ConfigurableMarginPlanningTests(unittest.TestCase):
         self.engine = Engine(self.f.store, market=self.f.market)
         base = self.f.broker.snapshot([SYMBOL])
         self.snapshot = replace(base, equity=dec(1000), wallet=dec(1000), available=dec(1000), maintenance=dec(0),
-                                positions=[Position(SYMBOL, side, dec(0), dec(0), dec(100), 4) for side in ("LONG", "SHORT")],
+                                positions=[Position(SYMBOL, side, dec(0), dec(0), dec(100), 5) for side in ("LONG", "SHORT")],
                                 fees={SYMBOL: dec(0)}, unrealized=dec(0))
         self.book = Book(dec(100), dec(100), dec(1000), dec(1000), dec(100), time.time())
-        self.policy = {**DEFAULT_POLICY, "symbols": [SYMBOL], "order_notional": "100000", "min_open_leverage": 4}
+        self.policy = {**DEFAULT_POLICY, "symbols": [SYMBOL], "order_notional": "100000", "min_open_leverage": 5}
 
     def test_exact_thirty_seventy_and_one_hundred_percent_planning_boundaries(self):
-        for margin, expected_qty in (("0.3", 6), ("0.7", 14), ("1", 20)):
+        for margin, expected_qty in (("0.3", dec("7.5")), ("0.7", dec("17.5")), ("1", 25)):
             policy = {**self.policy, "margin_limit": margin}
             with self.subTest(margin=margin):
-                plan = plan_pair(self.snapshot, self.book, self.f.market.rules[SYMBOL], {4: dec(500000)}, policy)
+                plan = plan_pair(self.snapshot, self.book, self.f.market.rules[SYMBOL], {5: dec(500000)}, policy)
                 self.assertEqual(plan.qty, expected_qty)
                 self.assertEqual(plan.projected_ratio, dec(margin))
                 next_qty = Fraction(plan.qty + self.f.market.rules[SYMBOL].step)
-                self.assertGreater(2 * next_qty * 100 / 4, Fraction(dec(margin)) * 1000)
+                self.assertGreater(2 * next_qty * 100 / 5, Fraction(dec(margin)) * 1000)
 
     def test_fees_and_spread_still_limit_the_last_quantity_step_for_each_margin_setting(self):
         snapshot = replace(self.snapshot, fees={SYMBOL: dec(".0004")})
         book = replace(self.book, ask=dec("100.01"), mark=dec("100.005"))
         for margin in ("0.3", "0.7", "1"):
             with self.subTest(margin=margin):
-                plan = plan_pair(snapshot, book, self.f.market.rules[SYMBOL], {4: dec(500000)},
+                plan = plan_pair(snapshot, book, self.f.market.rules[SYMBOL], {5: dec(500000)},
                                  {**self.policy, "margin_limit": margin})
                 quantity, limit = Fraction(plan.qty), Fraction(dec(margin))
                 cost_per_qty = Fraction(dec(".01")) + Fraction(dec("200.01")) * Fraction(dec(".0004"))
-                used_per_qty = Fraction(dec("200.02")) / 4
+                used_per_qty = Fraction(dec("200.02")) / 5
                 self.assertGreater(quantity, 0)
                 self.assertLessEqual(quantity * used_per_qty, limit * (1000 - quantity * cost_per_qty))
                 next_qty = quantity + Fraction(self.f.market.rules[SYMBOL].step)
@@ -317,12 +366,12 @@ class ConfigurableMarginPlanningTests(unittest.TestCase):
         for margin in ("0.3", "0.7", "1"):
             for exceeds in (False, True):
                 current = account()
-                current["policy"].update(margin_limit=margin, min_open_leverage=4)
+                current["policy"].update(margin_limit=margin, min_open_leverage=5)
                 self.f.store.save_account(current)
                 ratio = dec(margin) + (dec(".000001") if exceeds else dec(0))
-                qty = ratio * 20
+                qty = ratio * 25
                 snapshot = replace(self.snapshot, timestamp=time.time(), available=1000 * (1 - ratio),
-                                   positions=[Position(SYMBOL, side, qty, dec(100), dec(100), 4) for side in ("LONG", "SHORT")])
+                                   positions=[Position(SYMBOL, side, qty, dec(100), dec(100), 5) for side in ("LONG", "SHORT")])
                 self.f.store.put("post_fill_check:test", True)
                 with self.subTest(margin=margin, exceeds=exceeds):
                     self.assertEqual(snapshot.ratio, ratio)
@@ -332,17 +381,17 @@ class ConfigurableMarginPlanningTests(unittest.TestCase):
 
 
 class ConfigurablePolicyMarketTests(unittest.TestCase):
-    def test_single_poll_requests_all_relevant_configured_and_actual_tiers_but_alerts_only_original_four(self):
+    def test_single_poll_requests_and_announces_only_supported_tiers_despite_legacy_positions(self):
         f = Fixture()
         self.addCleanup(f.close)
         first = f.store.account("test")
-        first["policy"]["min_open_leverage"] = 7
+        first["policy"]["min_open_leverage"] = 10
         f.store.save_account(first)
         second = account("second")
-        second["policy"]["min_open_leverage"] = 2
+        second["policy"]["min_open_leverage"] = 5
         f.store.save_account(second)
         other_symbol = account("other_symbol")
-        other_symbol["policy"].update(symbols=["CLUSD1"], min_open_leverage=9)
+        other_symbol["policy"].update(symbols=["CLUSD1"], min_open_leverage=20)
         f.store.save_account(other_symbol)
         engine = Engine(f.store, market=f.market)
         engine.views["test"] = {"snapshot": {"positions": [{"symbol": SYMBOL, "leverage": 13},
@@ -358,13 +407,13 @@ class ConfigurablePolicyMarketTests(unittest.TestCase):
             book.assert_not_called()
             queried_symbol, queried_tiers = capacities.call_args.args
             self.assertEqual(queried_symbol, SYMBOL)
-            self.assertEqual(set(queried_tiers), {2, 4, 5, 7, 10, 13, 20})
-            self.assertEqual(f.store.pending_notifications(), 4)
+            self.assertEqual(set(queried_tiers), {5, 10, 20})
+            self.assertEqual(f.store.pending_notifications(), 3)
             engine.notify()
             engine.notify()
-        self.assertEqual(sender.call_count, 4)
+        self.assertEqual(sender.call_count, 3)
         announced = {int(re.search(r" · (\d+)x", call.args[1]).group(1)) for call in sender.call_args_list}
-        self.assertEqual(announced, {4, 5, 10, 20})
+        self.assertEqual(announced, {5, 10, 20})
 
 
 if __name__ == "__main__":

@@ -15,9 +15,10 @@ class OccupancyTests(unittest.TestCase):
         self.snapshot = self.f.broker.snapshot(["XAUUSD1"])
         self.book = self.f.market.book("XAUUSD1")
         self.rules = self.f.market.rules["XAUUSD1"]
+        self.f.account["policy"]["order_notional"] = "2000"
 
     def plan(self, snapshot=None, book=None):
-        return plan_pair(snapshot or self.snapshot, book or self.book, self.rules, {4: dec(500000)}, self.f.account["policy"])
+        return plan_pair(snapshot or self.snapshot, book or self.book, self.rules, {5: dec(500000)}, self.f.account["policy"])
 
     def test_all_positions_and_leverages_count_without_long_short_netting(self):
         positions = [
@@ -44,17 +45,17 @@ class OccupancyTests(unittest.TestCase):
         snapshot = replace(self.snapshot, equity=dec(1000), available=dec(1000), fees={"XAUUSD1": dec(0)})
         book = replace(self.book, bid=dec(100), ask=dec(100), mark=dec(100))
         plan = self.plan(snapshot, book)
-        self.assertEqual(plan.qty, 10)
+        self.assertEqual(plan.qty, dec("12.5"))
         self.assertEqual(plan.projected_ratio, dec(".5"))
 
     def test_fees_reduce_equity_and_prevent_the_next_quantity_step(self):
         snapshot = replace(self.snapshot, equity=dec(1000), available=dec(1000))
         book = replace(self.book, bid=dec(100), ask=dec(100), mark=dec(100))
         plan = self.plan(snapshot, book)
-        self.assertLess(plan.qty, 10)
+        self.assertLess(plan.qty, dec("12.5"))
         self.assertLessEqual(plan.projected_ratio, dec(".5"))
         larger = plan.qty + self.rules.step
-        independent_ratio = (2 * larger * 100 / 4) / (1000 - 2 * larger * 100 * dec(".0004"))
+        independent_ratio = (2 * larger * 100 / 5) / (1000 - 2 * larger * 100 * dec(".0004"))
         self.assertGreater(independent_ratio, dec(".5"))
 
     def test_invalid_position_leverage_and_nonpositive_equity_are_rejected(self):
@@ -81,7 +82,7 @@ class OccupancyTests(unittest.TestCase):
             engine.tick_account("test")
             submit.assert_not_called()
             after_upgrade = self.f.broker.snapshot(["XAUUSD1"])
-            self.assertEqual(after_upgrade.pair("XAUUSD1")[0].leverage, 4)
+            self.assertEqual(after_upgrade.pair("XAUUSD1")[0].leverage, 5)
             self.assertLess(after_upgrade.ratio, dec(".5"))
             engine.tick_account("test")
             submit.assert_called_once()
@@ -93,7 +94,7 @@ class OccupancyTests(unittest.TestCase):
         engine = Engine(self.f.store, market=self.f.market)
         engine.brokers["test"] = self.f.broker
         engine.poll_market("XAUUSD1")
-        engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
+        engine.markets["XAUUSD1"]["capacities"] = {"5": "500000"}
         original = self.f.broker.submit
         def fill_then_equity_changes(orders):
             receipts = original(orders)
@@ -113,7 +114,7 @@ class OccupancyTests(unittest.TestCase):
                 try:
                     snapshot = f.broker.snapshot(["XAUUSD1"])
                     book = f.market.book("XAUUSD1")
-                    plan = plan_pair(snapshot, book, f.market.rules["XAUUSD1"], {4: dec(500000)}, f.account["policy"])
+                    plan = plan_pair(snapshot, book, f.market.rules["XAUUSD1"], {5: dec(500000)}, f.account["policy"])
                     executor = Executor(f.store, f.broker, f.market)
                     if leave_pending:
                         with patch.object(executor, "reconcile", return_value="simulated process interruption"):

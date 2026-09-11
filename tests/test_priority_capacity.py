@@ -41,7 +41,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
     def test_only_capacity_strictly_above_the_account_threshold_wakes(self):
         self.f.account["policy"]["threshold"] = "20000"
         self.f.store.save_account(self.f.account)
-        self.assertEqual(self.publish({4: 500000, 5: 500000, 10: 20000, 20: 19999}), 2)
+        self.assertEqual(self.publish({5: 500000, 10: 20000, 20: 19999}), 2)
         self.assertNotIn("test", self.engine.priority_accounts)
 
         self.publish({10: "20000.0001", 20: 20000})
@@ -166,7 +166,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
         submit.assert_not_called()
 
     def test_priority_10x_upgrade_confirms_then_opens_before_another_upgrade(self):
-        self.publish({4: 500000, 5: 500000, 10: 500000, 20: 500000})
+        self.publish({5: 500000, 10: 500000, 20: 500000})
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.take_priority_tick()
@@ -192,7 +192,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.assertEqual(self.f.broker.state["leverages"][SYMBOL], 10)
 
     def test_20x_is_used_when_10x_capacity_is_unavailable(self):
-        self.publish({4: 500000, 5: 500000, 10: 10000, 20: 500000})
+        self.publish({5: 500000, 10: 10000, 20: 500000})
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.take_priority_tick()
@@ -243,7 +243,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
         self.assertNotIn("test", self.engine.priority_followups)
 
     def test_priority_upgrade_still_respects_a_higher_opening_floor(self):
-        self.f.account["policy"]["min_open_leverage"] = 125
+        self.f.account["policy"]["min_open_leverage"] = 20
         self.f.store.save_account(self.f.account)
         self.publish({10: 500000})
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change, \
@@ -253,7 +253,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.take_priority_tick()
             self.take_priority_tick()
             submit.assert_not_called()
-        self.assertIn("低于 125x", self.engine.views["test"]["strategies"][SYMBOL]["reason"])
+        self.assertIn("低于 20x", self.engine.views["test"]["strategies"][SYMBOL]["reason"])
 
 
 class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
@@ -297,7 +297,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
             self.assertTrue(calls[1][1])
 
     def test_scheduler_completes_upgrade_confirmation_and_first_open_without_ordinary_wait(self):
-        self.publish({4: 0, 5: 0, 10: 0, 20: 0})
+        self.publish({5: 0, 10: 0, 20: 0})
         ordinary_done, opened = threading.Event(), threading.Event()
         real_tick, real_submit = self.engine.tick_account, self.f.broker.submit
         calls, confirmed_at_submission = [], []
@@ -321,7 +321,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
             self.assertTrue(ordinary_done.wait(1))
             sending.assert_not_called()
             started = time.monotonic()
-            self.publish({4: 500000, 5: 500000, 10: 500000, 20: 500000})
+            self.publish({5: 500000, 10: 500000, 20: 500000})
             self.assertTrue(opened.wait(3), "upgrade/confirmation/opening waited for the ordinary interval")
             self.assertLess(time.monotonic() - started, 3)
             change.assert_called_once_with(SYMBOL, 10)

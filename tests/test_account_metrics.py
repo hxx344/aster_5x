@@ -100,7 +100,7 @@ class AccountMetricsTests(unittest.TestCase):
     def test_display_metrics_leave_existing_occupancy_based_planning_unchanged(self):
         book = self.f.market.book(SYMBOL)
         rules, policy = self.f.market.rules[SYMBOL], self.f.account["policy"]
-        capacities = {4: dec(500000)}
+        capacities = {5: dec(500000)}
         baseline = plan_pair(self.base, book, rules, capacities, policy)
         self.assertGreater(baseline.qty, 0)
         expensive_maintenance = replace(self.base, maintenance=self.base.equity)
@@ -108,7 +108,7 @@ class AccountMetricsTests(unittest.TestCase):
         snapshot_json(expensive_maintenance, [SYMBOL])
         self.assertEqual(plan_pair(expensive_maintenance, book, rules, capacities, policy), baseline)
         occupied = replace(self.base, equity=dec(1000), maintenance=dec(1),
-                           positions=[Position(SYMBOL, side, dec(1), book.mark, book.mark, 4)
+                           positions=[Position(SYMBOL, side, dec(1), book.mark, book.mark, 5)
                                       for side in ("LONG", "SHORT")])
         self.assertLess(occupied.margin_ratio, dec(policy["margin_limit"]))
         self.assertGreater(occupied.ratio, dec(policy["margin_limit"]))

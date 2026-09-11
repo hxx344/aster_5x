@@ -1,3 +1,5 @@
+export const SUPPORTED_LEVERAGES: readonly number[] = [5, 10, 20];
+
 // Shift decimal strings without introducing binary floating-point rounding.
 function shiftDecimal(value: string, places: number): string {
   const text = value.trim();
@@ -40,10 +42,10 @@ export function parseMinimumLeverage(value: string): number {
   try {
     normalized = shiftDecimal(value, 0);
   } catch {
-    throw new Error('最低开仓杠杆必须为 1 至 125 的整数');
+    throw new Error('最低开仓杠杆只能选择 5x、10x 或 20x');
   }
   const minimum = /^\d+$/.test(normalized) ? Number(normalized) : NaN;
-  if (!Number.isInteger(minimum) || minimum < 1 || minimum > 125)
-    throw new Error('最低开仓杠杆必须为 1 至 125 的整数');
+  if (!SUPPORTED_LEVERAGES.includes(minimum))
+    throw new Error('最低开仓杠杆只能选择 5x、10x 或 20x');
   return minimum;
 }

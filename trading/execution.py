@@ -5,7 +5,7 @@ from contextlib import nullcontext
 from fractions import Fraction
 
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
-from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, wire
+from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
@@ -25,6 +25,7 @@ class Executor:
         minimum = minimum_open_leverage(account["policy"])
         if long.leverage < minimum:
             raise TradingError(f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
+        require_supported_leverage(long.leverage)
         book.require_fresh()
         qty = positive(plan.qty)
         rule = self.market.rules[symbol]
@@ -104,6 +105,7 @@ class Executor:
     def leverage(self, account, symbol, old, target, snapshot=None, before_submit=None):
         self.last_snapshot = None
         self.last_completed_intent = None
+        require_supported_leverage(target)
         require_non_decreasing_leverage(old, target)
         # Re-read before creating intent; the selection snapshot may now be stale.
         snapshot = self.broker.snapshot(account["policy"]["symbols"], fresh_modes=True)

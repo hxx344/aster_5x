@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from starlette.datastructures import MutableHeaders
 
 from .engine import Engine
-from .models import TradingError
+from .models import TIERS, TradingError
 from .store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,11 +112,13 @@ class PolicyEdit(BaseModel):
     threshold: str | None = Field(default=None, min_length=1, max_length=40)
     order_notional: str | None = Field(default=None, min_length=1, max_length=40)
     margin_limit: str | None = Field(default=None, min_length=1, max_length=128)
-    min_open_leverage: StrictInt | None = Field(default=None, ge=1, le=125)
+    min_open_leverage: StrictInt | None = Field(default=None, ge=5, le=20, json_schema_extra={"enum": list(TIERS)})
 
     @model_validator(mode="before")
     @classmethod
     def require_present_values(cls, values):
+        if isinstance(values, dict) and "min_open_leverage" in values and values["min_open_leverage"] not in TIERS:
+            raise ValueError("最低开仓杠杆仅支持 5x、10x、20x")
         if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
             raise ValueError("请提供非空的策略配置字段")
         return values

@@ -26,11 +26,11 @@ def reading(value):
 
 class MultiMarketTests(unittest.TestCase):
     def test_invalid_leverages_rejected(self):
-        for tiers in ([], [4, 4], [3], [True], [4.0], "4,5", [{}]):
+        for tiers in ([], [5, 5], [4, 4], [3], [7], [4, 7], [True], [4.0], "5,10", [{}]):
             with self.subTest(tiers=tiers), self.assertRaises(m.MonitorError):
                 m.validate_config({**config(), "leverages": tiers})
 
-    def test_all_old_5x_gates_survive_without_suppressing_4x(self):
+    def test_all_old_5x_gates_survive_without_suppressing_10x(self):
         current = config()
         saved = {"version": 2, "markets": {s: {
             "identity": m.alert_identity(current, s),
@@ -38,35 +38,35 @@ class MultiMarketTests(unittest.TestCase):
             for s in current["symbols"]}}
         for symbol in current["symbols"]:
             self.assertTrue(m.restore_gate(saved, current, symbol).state["notified"])
-            self.assertFalse(m.restore_gate(saved, {**current, "leverage": 4}, symbol).state["notified"])
+            self.assertFalse(m.restore_gate(saved, {**current, "leverage": 10}, symbol).state["notified"])
 
     @patch("monitor.request_json")
     def test_shared_snapshot_uses_exact_tiers_and_isolates_missing_tier(self, request):
         oi = {"success": True, "code": "000000", "data": {
-            "symbol": "XAUUSD1", "leverageOiRemainingMap": {"4": "20000", "5": "0"}}}
+            "symbol": "XAUUSD1", "leverageOiRemainingMap": {"5": "20000", "10": "0"}}}
         brackets = {"success": True, "code": "000000", "data": {"brackets": [{
             "symbol": "XAUUSD1", "riskBrackets": [{"minOpenPosLeverage": 1,
-                "maxOpenPosLeverage": 5, "bracketNotionalCap": "5000000"}]}]}}
+                "maxOpenPosLeverage": 20, "bracketNotionalCap": "5000000"}]}]}}
         request.side_effect = [brackets, oi]
         result = m.sample({**config(), "symbol": "XAUUSD1"})
         self.assertEqual(request.call_count, 2)
-        self.assertEqual(result[4]["value"], "20000")
-        self.assertEqual(result[5]["value"], "0")
-        del oi["data"]["leverageOiRemainingMap"]["4"]
+        self.assertEqual(result[5]["value"], "20000")
+        self.assertEqual(result[10]["value"], "0")
+        del oi["data"]["leverageOiRemainingMap"]["5"]
         request.side_effect = [brackets, oi]
         result = m.sample({**config(), "symbol": "XAUUSD1"})
-        self.assertIsInstance(result[4], m.MonitorError)
-        self.assertEqual(result[5]["value"], "0")
+        self.assertIsInstance(result[5], m.MonitorError)
+        self.assertEqual(result[10]["value"], "0")
 
     @patch("monitor.send_feishu")
-    def test_six_combinations_alert_reset_and_retry_independently(self, send):
-        current = {**config(), "leverages": [4, 5], "feishu_enabled": True, "cooldown_seconds": 0}
+    def test_nine_combinations_alert_reset_and_retry_independently(self, send):
+        current = {**config(), "leverages": [5, 10, 20], "feishu_enabled": True, "cooldown_seconds": 0}
         trackers = [m.MarketMonitor({**current, "leverage": v}, s, {}, threading.Event())
                     for s in current["symbols"] for v in current["leverages"]]
         for tracker in trackers:
             tracker.check(reading(15000))
             tracker.check(reading(15000))
-        self.assertEqual(send.call_count, 6)
+        self.assertEqual(send.call_count, 9)
         for tracker, call in zip(trackers, send.call_args_list):
             self.assertIn(f"{tracker.symbol} · {tracker.config['leverage']}x", call.args[1])
         trackers[0].check(reading(10000))
@@ -77,34 +77,48 @@ class MultiMarketTests(unittest.TestCase):
         send.side_effect = None
         for tracker in trackers:
             tracker.check(reading(15000))
-        self.assertEqual(send.call_count, 8)
+        self.assertEqual(send.call_count, 11)
 
     @patch("monitor.time.monotonic")
     @patch("monitor.sample")
     def test_failed_tier_backs_off_while_other_tier_keeps_updating(self, sample, monotonic):
-        tracker = m.SymbolMonitor({**config(), "leverages": [4, 5]}, "XAUUSD1", {}, threading.Event())
-        sample.return_value = {4: m.MonitorError("test missing tier"), 5: reading(0)}
+        tracker = m.SymbolMonitor({**config(), "leverages": [5, 10]}, "XAUUSD1", {}, threading.Event())
+        sample.return_value = {5: m.MonitorError("test missing tier"), 10: reading(0)}
         monotonic.return_value = 100
         first = tracker.check()[0]
-        self.assertEqual(first["XAUUSD1:4"]["status"], "error")
-        self.assertEqual(first["XAUUSD1:5"]["status"], "ok")
+        self.assertEqual(first["XAUUSD1:5"]["status"], "error")
+        self.assertEqual(first["XAUUSD1:10"]["status"], "ok")
         monotonic.return_value = 105
-        self.assertEqual(set(tracker.check()[0]), {"XAUUSD1:5"})
-        sample.return_value = {4: reading(0), 5: reading(0)}
+        self.assertEqual(set(tracker.check()[0]), {"XAUUSD1:10"})
+        sample.return_value = {5: reading(0), 10: reading(0)}
         monotonic.return_value = 110
         self.assertTrue(all(row["status"] == "ok" for row in tracker.check()[0].values()))
 
     def test_defaults_and_legacy_config_adopt_all_three(self):
         current = config()
         self.assertEqual(current["symbols"], list(m.SUPPORTED_SYMBOLS))
+        self.assertEqual(current["leverages"], [5, 10, 20])
         legacy = {**current, "symbol": "XAUUSD1", "threshold": "22000"}
         legacy.pop("symbols")
         legacy.pop("leverages")
         upgraded = m.validate_config(legacy)
         self.assertEqual(upgraded["symbols"], list(m.SUPPORTED_SYMBOLS))
         self.assertEqual(upgraded["threshold"], 22000)
-        self.assertEqual(upgraded["leverages"], [4, 5, 10, 20])
+        self.assertEqual(upgraded["leverages"], [5, 10, 20])
         self.assertFalse(upgraded["feishu_enabled"])
+
+    def test_retired_tier_is_removed_from_legacy_config_without_losing_settings(self):
+        for before, expected in (([4, 5, 10, 20], [5, 10, 20]), ([4, 10], [10]),
+                                 ([4], [5, 10, 20])):
+            legacy = {**config(), "leverages": before, "threshold": "22000", "poll_seconds": 7}
+            with self.subTest(before=before):
+                upgraded = m.validate_config(legacy)
+                self.assertEqual(upgraded["leverages"], expected)
+                self.assertEqual(legacy["leverages"], before)
+                self.assertEqual(upgraded["threshold"], 22000)
+                self.assertEqual(upgraded["poll_seconds"], 7)
+                tracker = m.SymbolMonitor(upgraded, "XAUUSD1", {}, threading.Event())
+                self.assertEqual(set(tracker.trackers), {f"XAUUSD1:{tier}" for tier in expected})
 
     def test_invalid_and_duplicate_symbols_rejected(self):
         for symbols in ([], "XAUUSD1", ["XAUUSD1", "XAUUSD1"], ["OTHER"], [None], [{}]):
@@ -162,11 +176,11 @@ class MultiMarketTests(unittest.TestCase):
             pending = pool.submit(slow.check)
             try:
                 self.assertTrue(waiting.wait(2))
-                self.assertEqual(pool.submit(fast.check).result(timeout=2)[0]["CLUSD1:4"]["status"], "ok")
+                self.assertEqual(pool.submit(fast.check).result(timeout=2)[0]["CLUSD1:5"]["status"], "ok")
                 self.assertFalse(pending.done())
             finally:
                 release.set()
-            self.assertEqual(pending.result(timeout=2)[0]["SPCXUSD1:4"]["status"], "error")
+            self.assertEqual(pending.result(timeout=2)[0]["SPCXUSD1:5"]["status"], "error")
 
     @patch("monitor.socket.socket")
     def test_once_persists_per_market_results_and_reports_partial_failure(self, socket):
@@ -181,10 +195,25 @@ class MultiMarketTests(unittest.TestCase):
             status = json.loads(out.getvalue())
             self.assertEqual(result, 1)
             self.assertEqual(status["status"], "partial")
-            self.assertEqual(status["markets"]["CLUSD1:4"]["status"], "ok")
+            self.assertEqual(status["markets"]["CLUSD1:5"]["status"], "ok")
             self.assertEqual(status["markets"]["SPCXUSD1:5"]["status"], "error")
             persisted = json.loads((Path(directory) / "alerts.json").read_text())
             self.assertEqual(set(persisted["markets"]), {m.market_key(s, v) for s in current["symbols"] for v in current["leverages"]})
+
+    @patch("monitor.socket.socket")
+    def test_removed_tier_history_is_preserved_without_sampling_or_delivery(self, socket):
+        current = m.validate_config({**config(), "leverages": [4, 5, 10, 20]})
+        historical = {"identity": "legacy-retired-tier", "gate": {"notified": True, "last_alert": 123}}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"ASTER_RUNTIME_DIR": directory}), \
+                patch("monitor.sample", side_effect=lambda cfg: {v: reading(0) for v in cfg["leverages"]}) as sample, \
+                patch("monitor.send_feishu") as send, redirect_stdout(StringIO()) as out:
+            path = Path(directory) / "alerts.json"
+            path.write_text(json.dumps({"version": 3, "markets": {"XAUUSD1:4": historical}}), encoding="utf-8")
+            self.assertEqual(m.run(current, once=True), 0)
+            self.assertEqual(json.loads(path.read_text())["markets"]["XAUUSD1:4"], historical)
+            self.assertNotIn("XAUUSD1:4", json.loads(out.getvalue())["markets"])
+            self.assertTrue(all(call.args[0]["leverages"] == [5, 10, 20] for call in sample.call_args_list))
+            send.assert_not_called()
 
     @patch("manage.systemctl")
     def test_status_lists_all_symbols_and_rejects_partial_or_stale_success(self, systemctl):
@@ -238,7 +267,7 @@ class MultiMarketTests(unittest.TestCase):
             delivered.append((cfg["symbol"], cfg["leverage"]))
             shutdown.set()
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"ASTER_RUNTIME_DIR": directory}), \
-                patch("monitor.sample", return_value={4: reading(15000), 5: reading(15000)}), patch("monitor.send_feishu", side_effect=send):
+                patch("monitor.sample", return_value={v: reading(15000) for v in current["leverages"]}), patch("monitor.send_feishu", side_effect=send):
             m.run(current, shutdown=shutdown)
             self.assertTrue(delivered)
             saved = json.loads((Path(directory) / "alerts.json").read_text())

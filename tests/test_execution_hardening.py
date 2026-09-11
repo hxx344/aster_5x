@@ -20,7 +20,7 @@ class ExecutionHardeningTests(unittest.TestCase):
     def prepared(self, partial=False):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         book = self.f.market.book("XAUUSD1")
-        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {5: dec(500000)}, self.f.account["policy"])
         original = self.f.broker.submit
 
         def send(orders):
@@ -128,7 +128,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         self.assertFalse(self.f.store.account("test")["enabled"])
 
     def test_stale_snapshot_cannot_confirm_leverage(self):
-        self.executor.leverage(self.f.account, "XAUUSD1", 4, 5)
+        self.executor.leverage(self.f.account, "XAUUSD1", 5, 10)
         snapshot = replace(self.f.broker.snapshot(["XAUUSD1"]), timestamp=time.time() - 9)
         with patch.object(self.f.broker, "snapshot", return_value=snapshot):
             with self.assertRaisesRegex(TradingError, "快照已过期"):

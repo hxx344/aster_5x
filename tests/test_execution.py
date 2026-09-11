@@ -21,7 +21,7 @@ class ExecutionTests(unittest.TestCase):
     def open(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         book = self.f.market.book("XAUUSD1")
-        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {5: dec(500000)}, self.f.account["policy"])
         return self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", plan, book)
 
     def test_timeout_after_acceptance_is_queried_without_resubmission(self):
@@ -98,7 +98,7 @@ class ExecutionTests(unittest.TestCase):
             original(symbol, leverage)
             raise AmbiguousOrder("test leverage timeout")
         with patch.object(self.f.broker, "set_leverage", side_effect=change) as update:
-            self.executor.leverage(self.f.account, "XAUUSD1", 4, 5)
+            self.executor.leverage(self.f.account, "XAUUSD1", 5, 10)
             self.executor.reconcile(self.f.account)
             self.assertEqual(update.call_count, 1)
         self.assertIsNone(self.f.store.intent("test"))
@@ -149,19 +149,19 @@ class EngineTests(unittest.TestCase):
         self.engine.poll_market("XAUUSD1")
 
     def test_open_then_upgrade_and_continue_using_new_tier(self):
-        self.engine.markets["XAUUSD1"]["capacities"] = {"4": "500000"}
+        self.engine.markets["XAUUSD1"]["capacities"] = {"5": "500000"}
         self.engine.tick_account("test")
         initial_qty = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")[0].qty
         self.assertGreater(initial_qty, 0)
-        self.engine.markets["XAUUSD1"]["capacities"]["5"] = "500000"
+        self.engine.markets["XAUUSD1"]["capacities"]["10"] = "500000"
         self.engine.tick_account("test")
-        self.assertEqual(self.f.store.intent("test")["target"], 5)
+        self.assertEqual(self.f.store.intent("test")["target"], 10)
         self.engine.tick_account("test")
         with self.engine.lock:
-            self.engine.markets["XAUUSD1"]["capacities"].update({"4": "0", "10": "0", "20": "0"})
+            self.engine.markets["XAUUSD1"]["capacities"].update({"5": "0", "20": "0"})
         self.engine.tick_account("test")
         long = self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")[0]
-        self.assertEqual(long.leverage, 5)
+        self.assertEqual(long.leverage, 10)
         self.assertGreater(long.qty, initial_qty)
 
     def test_pause_prevents_new_orders(self):

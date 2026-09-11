@@ -13,7 +13,7 @@ class RiskTests(unittest.TestCase):
         self.snapshot = self.f.broker.snapshot(["XAUUSD1"])
         self.book = self.f.market.book("XAUUSD1")
         self.rules = self.f.market.rules["XAUUSD1"]
-        self.capacities = {4: dec(500000), 5: dec(500000), 10: dec(500000), 20: dec(500000)}
+        self.capacities = {5: dec(500000), 10: dec(500000), 20: dec(500000)}
 
     def plan(self, **changes):
         return plan_pair(changes.get("snapshot", self.snapshot), changes.get("book", self.book), self.rules,
@@ -22,17 +22,17 @@ class RiskTests(unittest.TestCase):
     def test_current_tier_drives_additions_after_upgrade(self):
         for p in self.snapshot.positions:
             if p.symbol == "XAUUSD1":
-                p.leverage = 5
-        self.capacities[4] = dec(0)
+                p.leverage = 10
+        self.capacities[5] = dec(0)
         self.assertGreater(self.plan().qty, 0)
-        self.capacities[5] = dec(10000)
+        self.capacities[10] = dec(10000)
         self.assertEqual(self.plan().qty, 0)
-        self.assertIn("5x", self.plan().reason)
+        self.assertIn("10x", self.plan().reason)
 
     def test_threshold_is_strict_and_missing_tier_is_not_zero(self):
-        self.capacities[4] = dec(10000)
+        self.capacities[5] = dec(10000)
         self.assertEqual(self.plan().qty, 0)
-        del self.capacities[4]
+        del self.capacities[5]
         with self.assertRaises(TradingError):
             self.plan()
 
@@ -44,7 +44,7 @@ class RiskTests(unittest.TestCase):
 
     def test_risk_at_fifty_percent_blocks(self):
         for p in self.snapshot.pair("XAUUSD1"):
-            p.qty, p.mark = dec(25), dec(1000)
+            p.qty, p.mark = dec("31.25"), dec(1000)
         self.assertEqual(self.snapshot.ratio, dec("0.5"))
         self.assertEqual(self.plan().qty, 0)
 
@@ -62,7 +62,7 @@ class RiskTests(unittest.TestCase):
         snapshot = replace(self.snapshot, available=dec("300"))
         plan = self.plan(snapshot=snapshot)
         self.assertGreater(plan.qty, 0)
-        cost = plan.qty * (2 * max(self.book.ask, self.book.mark) / 4 + (self.book.ask + self.book.bid) * dec("0.0004") + self.book.ask - self.book.bid)
+        cost = plan.qty * (2 * max(self.book.ask, self.book.mark) / 5 + (self.book.ask + self.book.bid) * dec("0.0004") + self.book.ask - self.book.bid)
         self.assertLessEqual(cost, snapshot.available)
 
     def test_book_depth_and_minimum_order_are_respected(self):
@@ -87,10 +87,10 @@ class RiskTests(unittest.TestCase):
     def test_upgrade_requires_more_than_gross_notional(self):
         for p in self.snapshot.pair("XAUUSD1"):
             p.qty, p.mark = dec(1), dec(100)
-        self.capacities = {5: dec(200)}
+        self.capacities = {10: dec(200)}
         self.assertIsNone(next_leverage(self.snapshot, "XAUUSD1", self.capacities))
-        self.capacities[5] = dec("200.01")
-        self.assertEqual(next_leverage(self.snapshot, "XAUUSD1", self.capacities), 5)
+        self.capacities[10] = dec("200.01")
+        self.assertEqual(next_leverage(self.snapshot, "XAUUSD1", self.capacities), 10)
         self.assertIsNone(next_leverage(self.snapshot, "XAUUSD1", self.capacities, mark=dec(101)))
 
     def test_account_brackets_and_tiered_maintenance(self):

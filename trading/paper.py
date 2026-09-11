@@ -3,7 +3,7 @@ from dataclasses import asdict
 import time
 
 from .exchange import ExchangeError
-from .models import AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, TradingError, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, wire
+from .models import AccountSnapshot, Book, MIN_OPEN_LEVERAGE, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, TradingError, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 
 
 PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
@@ -29,7 +29,8 @@ class DemoMarket:
         return Book(bid, bid + dec("0.01"), dec(50), dec(50), bid + dec("0.005"), time.time())
 
     def capacities(self, symbol, leverages):
-        return {v: dec({4: "425600", 5: "156800", 10: "85000", 20: "32000"}.get(v, "20000")) for v in leverages}
+        values = {5: "156800", 10: "85000", 20: "32000"}
+        return {v: dec(values[v]) for v in leverages if v in TIERS}
 
 
 class PaperBroker:
@@ -39,7 +40,7 @@ class PaperBroker:
         self.account_id, self.market, self.store = account_id, market, store
         state = store.get("paper:" + account_id)
         if state is None:
-            state = {"wallet": "25000", "positions": {}, "leverages": dict.fromkeys(SYMBOLS, 4), "orders": {}}
+            state = {"wallet": "25000", "positions": {}, "leverages": dict.fromkeys(SYMBOLS, MIN_OPEN_LEVERAGE), "orders": {}}
             for symbol in SYMBOLS:
                 for side in ("LONG", "SHORT"):
                     qty = {"XAUUSD1": "5", "SPCXUSD1": "10", "CLUSD1": "30"}[symbol] if seed else "0"
@@ -67,6 +68,7 @@ class PaperBroker:
             started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), {s: PAPER_BRACKETS for s in symbols})
 
     def set_leverage(self, symbol, leverage):
+        require_supported_leverage(leverage)
         require_non_decreasing_leverage(self.state["leverages"][symbol], leverage)
         state = {**self.state, "leverages": {**self.state["leverages"], symbol: leverage}}
         self.store.put("paper:" + self.account_id, state)

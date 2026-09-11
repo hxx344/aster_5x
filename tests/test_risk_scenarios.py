@@ -36,7 +36,7 @@ class RiskScenarioTests(unittest.TestCase):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         book = replace(self.f.market.book("XAUUSD1"), bid=dec("99.975"),
                        ask=dec("100.0250000000000000000000000000000000000001"), mark=dec(100))
-        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {4: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, self.f.market.rules["XAUUSD1"], {5: dec(500000)}, self.f.account["policy"])
         self.assertEqual(plan.qty, 0)
         self.assertIn("价差", plan.reason)
 
@@ -45,7 +45,7 @@ class RiskScenarioTests(unittest.TestCase):
         long, short = snapshot.pair("XAUUSD1")
         long.qty = short.qty = dec(1)
         long.mark = short.mark = dec(1)
-        snapshot.equity = dec(".999999999999999999999999999999999999")
+        snapshot.equity = dec(".799999999999999999999999999999999999")
         self.assertEqual(snapshot.ratio, dec(".5"))
         self.assertTrue(snapshot.margin_exceeds(".5"))
         engine = Engine(self.f.store, market=self.f.market)
@@ -54,18 +54,19 @@ class RiskScenarioTests(unittest.TestCase):
 
         long.qty = dec("1.0000000000000000000000000001")
         short.qty = dec(0)
-        snapshot.equity = dec(".5")
+        snapshot.equity = dec(".4")
         self.assertTrue(snapshot.margin_exceeds(".5"))
-        self.assertEqual(long.occupied_margin_exact, Fraction(long.qty) / 4)
+        self.assertEqual(long.occupied_margin_exact, Fraction(long.qty) / 5)
 
     def test_sizing_uses_exact_constraint_at_last_quantity_step(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         snapshot.equity = dec("999.999999999999999999999999999999999")
         snapshot.available = dec(2000)
         snapshot.fees["XAUUSD1"] = dec(0)
-        book = replace(self.f.market.book("XAUUSD1"), bid=dec(1000), ask=dec(1000), mark=dec(1000))
+        book = replace(self.f.market.book("XAUUSD1"), bid=dec(1250), ask=dec(1250), mark=dec(1250))
         rule = replace(self.f.market.rules["XAUUSD1"], step=dec(".1"), min_qty=dec(".1"), min_notional=dec(".1"))
-        plan = plan_pair(snapshot, book, rule, {4: dec(500000)}, self.f.account["policy"])
+        plan = plan_pair(snapshot, book, rule, {5: dec(500000)},
+                         {**self.f.account["policy"], "order_notional": "2000"})
         self.assertEqual(plan.qty, dec(".9"))
         self.assertGreater(Fraction(500) / Fraction(snapshot.equity), Fraction(1, 2))
 
@@ -90,7 +91,7 @@ class RiskScenarioTests(unittest.TestCase):
                     market.depth = dec(50)
                     for symbol in market.rules:
                         market.prices[symbol] = dec(randomizer.choice((100, 1000, 5000, 10000)))
-                        broker.state["leverages"][symbol] = randomizer.choice((4, 5, 10, 20))
+                        broker.state["leverages"][symbol] = randomizer.choice((5, 10, 20))
                         quantity = dec(randomizer.randint(10, 100)) / 10
                         difference = dec(randomizer.randint(0, int(quantity))) / 1000
                         smaller = randomizer.choice(("LONG", "SHORT"))

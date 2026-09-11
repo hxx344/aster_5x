@@ -168,7 +168,7 @@ class MarketOrderRuleTests(unittest.TestCase):
                                        lot={"minQty": ".002", "stepSize": ".002"})).rules["XAUUSD1"]
         snapshot = fixture.broker.snapshot(["XAUUSD1"])
         book = fixture.market.book("XAUUSD1")
-        plan = plan_pair(snapshot, book, rule, {4: dec("500000")}, fixture.account["policy"])
+        plan = plan_pair(snapshot, book, rule, {5: dec("500000")}, fixture.account["policy"])
         self.assertEqual(plan.qty, dec(".198"))
         self.assertLessEqual(plan.qty, dec(".200"))
         self.assertEqual(plan.qty % dec(".002"), 0)

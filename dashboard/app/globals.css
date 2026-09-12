@@ -474,6 +474,18 @@ td:last-child {
 .details dd {
   margin: 0;
 }
+.mode-check-note {
+  margin: -4px 22px 16px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mode-check-note p {
+  margin: 0;
+}
+.mode-check-note p + p {
+  margin-top: 4px;
+}
 .risk-caption {
   background: #1a262a;
   border-top: 1px solid #2c3f42;

@@ -44,6 +44,7 @@ import {
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
 import { createStatePoller } from '@/lib/state-poller';
+import { accountModeView } from '@/lib/account-modes';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
 import {
   marginLimitFromPercent,
@@ -332,6 +333,7 @@ export default function Home() {
   };
   const snapshot = account?.snapshot;
   const fresh = snapshot && now - snapshot.timestamp < 8 && !connectionError;
+  const modeView = accountModeView(snapshot, now, connectionError);
   const ratio = snapshot ? Number(snapshot.ratio ?? 1) : 0;
   const market = state?.markets[focus];
   const strategy = account?.strategies[focus];
@@ -897,51 +899,27 @@ export default function Home() {
                       <dt>总占用保证金 · USD1</dt>
                       <dd>{fmt(snapshot?.occupied_margin)}</dd>
                     </div>
-                    <div>
-                      <dt>全仓保证金模式</dt>
-                      <dd
-                        className={
-                          fresh && !snapshot?.mode_checks?.cross ? 'danger' : ''
-                        }
-                      >
-                        {fresh
-                          ? snapshot.mode_checks?.cross
-                            ? '已核实'
-                            : '不符合要求'
-                          : '待核实'}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>双向持仓模式</dt>
-                      <dd
-                        className={
-                          fresh && !snapshot?.mode_checks?.hedge ? 'danger' : ''
-                        }
-                      >
-                        {fresh
-                          ? snapshot.mode_checks?.hedge
-                            ? '已核实'
-                            : '不符合要求'
-                          : '待核实'}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>单币保证金模式 · USD1</dt>
-                      <dd
-                        className={
-                          fresh && !snapshot?.mode_checks?.single_asset
-                            ? 'danger'
-                            : ''
-                        }
-                      >
-                        {fresh
-                          ? snapshot.mode_checks?.single_asset
-                            ? '已核实'
-                            : '不符合要求'
-                          : '待核实'}
-                      </dd>
-                    </div>
+                    {modeView.rows.map((mode) => (
+                      <div key={mode.key}>
+                        <dt>{mode.label}</dt>
+                        <dd className={mode.failed ? 'danger' : ''}>
+                          {mode.value}
+                        </dd>
+                      </div>
+                    ))}
                   </dl>
+                  <div className="mode-check-note">
+                    <p title="模式结果来自这次账户快照">
+                      {modeView.recordedAt
+                        ? `账户快照 ${modeView.recordedAt}${modeView.elapsed ? ` · ${modeView.elapsed}` : ''}`
+                        : modeView.hasSnapshot
+                          ? '账户快照时间未知'
+                          : '等待首次账户核验'}
+                    </p>
+                    {modeView.notice && (
+                      <p className="amber">{modeView.notice}</p>
+                    )}
+                  </div>
                   <div className="risk-caption">
                     三项账户模式必须满足，仅核验，不自动修改。下单前与成交后均检查风险。
                   </div>

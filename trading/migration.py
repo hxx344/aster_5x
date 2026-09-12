@@ -136,10 +136,14 @@ class _Sweep:
         raise TradingError("迁移深度不足以成交全部数量")
 
 
-def _depth(depth, now):
+def _require_depth_fresh(depth, now):
     depth.require_fresh(now)
     if not -1 <= now - depth.timestamp <= MIGRATION_DEPTH_MAX_AGE:
         raise TradingError("迁移交易深度已过期，等待 3 秒内的新快照")
+
+
+def _depth(depth, now):
+    _require_depth_fresh(depth, now)
     bids, asks = _Sweep(depth.bids, bids=True), _Sweep(depth.asks, bids=False)
     if bids.levels[0][0] > asks.levels[0][0]:
         raise TradingError("迁移深度买卖价格交叉")
@@ -424,6 +428,11 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
                 facts, failure = resources(high_qty, quantities, amounts)
                 if facts is not None:
                     target_amounts, spread, cost, ratio = facts
+                    # A legal depth/quantity search can itself consume the
+                    # remaining quote lifetime, including during before_open.
+                    finished_at = time.time()
+                    _require_depth_fresh(source_depth, finished_at)
+                    _require_depth_fresh(target_depth, finished_at)
                     return MigrationPlan(source_symbol, target_symbol,
                         {s: decimal_value(quantities[s], exact=True) for s in SIDES}, decimal_value(high_qty, exact=True),
                         source_leverage, leverage, decimal_value(spread),

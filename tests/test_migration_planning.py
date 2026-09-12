@@ -3,6 +3,7 @@ from dataclasses import replace
 from fractions import Fraction
 import time
 import unittest
+from unittest.mock import patch
 
 from trading.depth import DepthSnapshot
 from trading.migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
@@ -98,6 +99,24 @@ class MigrationPlanningTests(unittest.TestCase):
             self.assertLessEqual(abs(plan.target_notionals[side] - plan.source_notionals[side]),
                                  plan.source_notionals[side] * dec("0.05"))
         self.assertGreater((plan.target_qty + self.target_rule.step) * self.target_book.ask, dec(1000))
+
+    def test_depth_expiring_during_planning_cannot_produce_an_opening_plan(self):
+        started = self.source_book.timestamp
+        source_book = replace(self.source_book, timestamp=started + 2.5)
+        target_book = replace(self.target_book, timestamp=started + 2.5)
+        for stale_side in ("source", "target"):
+            with self.subTest(stale_side=stale_side), \
+                 patch("trading.migration.time.time", side_effect=[started + 2.9, started + 3.01]):
+                with self.assertRaisesRegex(TradingError, "迁移交易深度已过期"):
+                    self.plan(source_book=source_book, target_book=target_book,
+                              source_depth=replace(self.source_depth, timestamp=started if stale_side == "source" else started + 2.5),
+                              target_depth=replace(self.target_depth, timestamp=started if stale_side == "target" else started + 2.5))
+
+    def test_depth_at_three_second_boundary_after_planning_remains_usable(self):
+        started = self.source_book.timestamp
+        with patch("trading.migration.time.time", side_effect=[started + 2.9, started + 3]):
+            plan = self.plan()
+        self.assertGreater(plan.target_qty, 0)
 
     def test_zero_5x_blocks_even_with_higher_tier_capacity(self):
         self.capacities["5"] = dec(0)

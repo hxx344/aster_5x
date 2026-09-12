@@ -151,6 +151,31 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
         self.assertFalse(worker.is_alive())
         self.assertEqual(results, [5])
 
+    def test_a_blocked_depth_worker_does_not_delay_capacity_publication(self):
+        depth = self.f.market.depth(SYMBOL)
+        entered, release = threading.Event(), threading.Event()
+        results = []
+
+        def blocked_depth(symbol):
+            entered.set()
+            release.wait(3)
+            return depth
+
+        with patch.object(self.f.market, "depth", side_effect=blocked_depth):
+            worker = threading.Thread(target=lambda: results.append(self.engine.poll_depth(SYMBOL)))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.publish({10: 500000}), 2)
+                self.assertIn("test", self.engine.priority_accounts)
+                self.assertEqual(self.engine.capacities(SYMBOL)[10], dec(500000))
+                self.assertTrue(worker.is_alive())
+            finally:
+                release.set()
+                worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [10])
+
 
 class PriorityCapacityExecutionTests(PriorityCapacityFixture):
     def test_budget_denial_keeps_priority_continuation_and_the_full_backoff(self):
@@ -272,6 +297,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
              patch.object(self.engine, "tick_account", side_effect=worker), \
              patch.object(self.engine, "poll_market", return_value=60), \
              patch.object(self.engine, "poll_book", return_value=60), \
+             patch.object(self.engine, "poll_depth", return_value=60), \
              patch.object(self.engine, "notify", return_value=60):
             self.engine.start()
             try:

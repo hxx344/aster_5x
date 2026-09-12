@@ -111,6 +111,16 @@ class CapacityAlertEngineTests(unittest.TestCase):
         self.engine.notify()
         self.sender.assert_called_once()
 
+    def test_depth_failure_does_not_hide_successful_capacity_alert(self):
+        with patch.object(self.f.market, "capacities", return_value={5: dec(20000)}), \
+             patch.object(self.f.market, "depth", side_effect=TradingError("depth unavailable")):
+            self.engine.poll_market("XAUUSD1")
+            self.engine.poll_depth("XAUUSD1")
+        self.assertEqual(self.engine.markets["XAUUSD1"]["status"], "ok")
+        self.assertIn("depth_error", self.engine.markets["XAUUSD1"])
+        self.engine.notify()
+        self.sender.assert_called_once()
+
     def test_capacity_failure_suspends_queued_alert_until_a_new_valid_sample(self):
         self.publish()
         with patch.object(self.f.market, "capacities", side_effect=TradingError("capacity unavailable")):

@@ -13,6 +13,7 @@ import threading
 import time
 
 import monitor
+from .depth import DEPTH_POLL_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
@@ -25,7 +26,7 @@ MAX_ACCOUNTS = 8
 ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
 CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * 2 * 60 // CAPACITY_POLL_INTERVAL
-PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120  # Includes REST quote fallback.
+PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_POLL_INTERVAL
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
                   "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE}
@@ -247,7 +248,7 @@ class Engine:
             return max(10, getattr(exc, "retry_after", 0))
 
     def poll_book(self, symbol):
-        """Display quotes cannot hold up the shared capacity feed."""
+        """Keep the strategy's BBO indicator independent of display depth."""
         if self.shutdown.is_set():
             return 5
         try:
@@ -264,6 +265,27 @@ class Engine:
                 row.pop("book", None)
                 row["book_error"] = str(exc) if isinstance(exc, TradingError) else "盘口数据格式异常"
             return max(10, getattr(exc, "retry_after", 0))
+
+    def poll_depth(self, symbol):
+        """Display depth cannot hold up the shared capacity feed."""
+        if self.shutdown.is_set():
+            return DEPTH_POLL_INTERVAL
+        try:
+            depth = self.market.depth(symbol)
+            depth.require_fresh()
+            display = depth.display()
+            depth.require_fresh()
+            with self.lock:
+                row = self.markets.setdefault(symbol, {})
+                row["depth"] = display
+                row.pop("depth_error", None)
+            return DEPTH_POLL_INTERVAL
+        except (TradingError, KeyError, ValueError, TypeError) as exc:
+            with self.lock:
+                row = self.markets.setdefault(symbol, {})
+                # Preserve the last sample as visibly stale context on failures.
+                row["depth_error"] = str(exc) if isinstance(exc, TradingError) else "深度数据格式异常"
+            return max(DEPTH_POLL_INTERVAL, getattr(exc, "retry_after", 0))
 
     def wake_capacity_accounts(self, symbol, capacities, checked_at, accounts):
         """Merge availability edges without polling private accounts at the feed cadence."""
@@ -824,7 +846,7 @@ class Engine:
         pending, due = {}, {}
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
-        # Capacity, quotes, accounts and the outbox each have worker capacity.
+        # Capacity, BBO, display depth, accounts and the outbox have worker capacity.
         try:
             if isinstance(self.market, MarketData) and not self.shutdown.is_set():
                 self.market.api.budget.configure_capacity_reserve(CAPACITY_MONITOR_RESERVE)
@@ -832,7 +854,7 @@ class Engine:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + 2 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + 3 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 try:
                     while not self.shutdown.is_set():
                         self.scheduler_event.clear()
@@ -890,6 +912,7 @@ class Engine:
                                     priority_accounts.add(aid)
                         jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
                         jobs.update({"book:" + s: (self.poll_book, s) for s in SYMBOLS})
+                        jobs.update({"depth:" + s: (self.poll_depth, s) for s in SYMBOLS})
                         jobs["notify"] = (self.notify,)
                         ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts, aid not in priority_accounts))
                         jobs.update({"account:" + aid: (self.tick_account, aid) for aid in ordered_accounts})

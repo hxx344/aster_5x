@@ -313,6 +313,37 @@ td:last-child {
   border-radius: 4px;
   font-size: 13px;
 }
+.depth-heading {
+  display: block;
+  font-size: 12px;
+  font-weight: 400;
+  margin-top: 3px;
+}
+.mobile-cell-label {
+  display: none;
+}
+.depth-quote {
+  display: grid;
+  gap: 5px;
+  min-width: 125px;
+}
+.depth-quote small {
+  color: #a0aeb7;
+  font-size: 11px;
+  white-space: normal;
+  max-width: 180px;
+  justify-self: end;
+}
+.depth-stale > span {
+  color: #a0aeb7;
+}
+.depth-method {
+  margin: 0;
+  padding: 0 22px 15px;
+  color: #a0aeb7;
+  font-size: 12px;
+  line-height: 1.7;
+}
 .table-footer {
   display: flex;
   justify-content: space-between;
@@ -658,6 +689,72 @@ label input,
   }
 }
 @media (max-width: 640px) {
+  .market-table thead {
+    display: none;
+  }
+  .market-table tbody {
+    display: block;
+  }
+  .market-table tr {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 16px 10px;
+    padding: 16px;
+  }
+  .market-table td {
+    height: auto;
+    padding: 0;
+    min-width: 0;
+  }
+  .market-table td:first-child {
+    grid-column: 1 / 5;
+    grid-row: 1;
+  }
+  .market-table td:nth-child(5) {
+    grid-column: 5 / 7;
+    grid-row: 1;
+    align-self: center;
+  }
+  .market-table td:nth-child(2) {
+    grid-column: 1 / 3;
+    grid-row: 2;
+    text-align: left;
+  }
+  .market-table td:nth-child(3) {
+    grid-column: 3 / 5;
+    grid-row: 2;
+    text-align: center;
+  }
+  .market-table td:nth-child(4) {
+    grid-column: 5 / 7;
+    grid-row: 2;
+  }
+  .market-table td:nth-child(6) {
+    grid-column: 1 / 4;
+    grid-row: 3;
+    text-align: left;
+  }
+  .market-table td:nth-child(7) {
+    grid-column: 4 / 7;
+    grid-row: 3;
+  }
+  .market-table .mobile-cell-label {
+    display: block;
+    margin-bottom: 5px;
+    color: #a0aeb7;
+    font-size: 11px;
+    font-weight: 400;
+  }
+  .market-table td:nth-child(6) small {
+    justify-self: start;
+  }
+  .depth-quote {
+    min-width: 0;
+  }
+  .depth-method {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
   .topbar {
     height: 64px;
     padding: 0 17px;

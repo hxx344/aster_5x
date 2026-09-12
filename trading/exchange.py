@@ -16,6 +16,7 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
+from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_WEIGHT, DepthSnapshot
 from .market_stream import PublicQuoteStream
 from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
@@ -483,6 +484,18 @@ class MarketData:
                     positive(row["askQty"]), positive(mark["markPrice"]), min(timestamps))
         book.require_fresh(now)
         return book
+
+    def depth(self, symbol):
+        """One public snapshot supplies both display notionals for all accounts."""
+        if symbol not in SYMBOLS:
+            raise TradingError("不支持的深度市场")
+        started, requested_at = time.monotonic(), time.time()
+        data = self.api.call("GET", "/fapi/v3/depth", {"symbol": symbol, "limit": DEPTH_LIMIT}, weight=DEPTH_WEIGHT)
+        if time.monotonic() - started > DEPTH_MAX_AGE:
+            raise TradingError("深度请求耗时过长，等待更新")
+        if isinstance(data, dict) and data.get("symbol", symbol) != symbol:
+            raise TradingError("深度交易代码不匹配")
+        return DepthSnapshot.from_response(data, requested_at=requested_at)
 
     def capacities(self, symbol, leverages):
         with self.api.budget.capacity_monitoring():

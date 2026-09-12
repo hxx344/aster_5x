@@ -3,6 +3,7 @@ from dataclasses import asdict
 import time
 
 from .exchange import ExchangeError
+from .depth import DepthSnapshot
 from .models import AccountSnapshot, Book, MIN_OPEN_LEVERAGE, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, TradingError, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 
 
@@ -31,6 +32,15 @@ class DemoMarket:
     def capacities(self, symbol, leverages):
         values = {5: "156800", 10: "85000", 20: "32000"}
         return {v: dec(values[v]) for v in leverages if v in TIERS}
+
+    def depth(self, symbol):
+        book = self.book(symbol)
+        # Explicit demo liquidity, separate from the paper broker's fill model.
+        return DepthSnapshot.from_response({
+            "E": int(book.timestamp * 1000),
+            "bids": [[wire(book.bid - book.bid * dec(i) / 10000), "100"] for i in range(10)],
+            "asks": [[wire(book.ask + book.ask * dec(i) / 10000), "100"] for i in range(10)],
+        }, requested_at=book.timestamp)
 
 
 class PaperBroker:

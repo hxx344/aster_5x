@@ -43,6 +43,7 @@ import {
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
 import { createStatePoller } from '@/lib/state-poller';
+import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
 import {
   marginLimitFromPercent,
   parseMinimumLeverage,
@@ -117,6 +118,8 @@ type Market = {
   checked_at: number;
   capacities: Record<string, string>;
   book?: { bid: string; ask: string; mark: string; spread: string };
+  depth?: DepthQuote;
+  depth_error?: string;
 };
 type Event = {
   id: number;
@@ -561,8 +564,11 @@ export default function Home() {
                       才触发
                     </span>
                   </div>
-                  <div className="table-scroll">
-                    <Table>
+                  <section
+                    className="table-scroll"
+                    aria-label="市场额度与深度价差，可横向滚动"
+                  >
+                    <Table className="market-table">
                       <TableHeader>
                         <TableRow>
                           <TableHead>市场</TableHead>
@@ -572,7 +578,12 @@ export default function Home() {
                             </TableHead>
                           ))}
                           <TableHead className="number">当前杠杆</TableHead>
-                          <TableHead className="number">BBO 价差</TableHead>
+                          {DEPTH_NOTIONALS.map((amount) => (
+                            <TableHead key={amount} className="number">
+                              {amount / 10000} 万 USD1
+                              <span className="depth-heading">深度价差</span>
+                            </TableHead>
+                          ))}
                         </TableRow>
                       </TableHeader>
                       <TableBody>
@@ -604,29 +615,50 @@ export default function Home() {
                                   key={v}
                                   className={`number ${live && Number(m.capacities[v]) > Number(account?.policy.threshold || 10000) ? 'mint' : ''}`}
                                 >
+                                  <span className="mobile-cell-label">
+                                    {v}x 额度
+                                  </span>
                                   {live ? fmt(m.capacities[v], 0) : '—'}
                                 </TableCell>
                               ))}
                               <TableCell className="number">
+                                <span className="mobile-cell-label">
+                                  当前杠杆
+                                </span>
                                 {lev ? (
                                   <span className="leverage-chip">{lev}x</span>
                                 ) : (
                                   '—'
                                 )}
                               </TableCell>
-                              <TableCell
-                                className={`number ${Number(m?.book?.spread) > 0.0005 ? 'danger' : ''}`}
-                              >
-                                {live && m.book
-                                  ? `${fmt(Number(m.book.spread) * 10000)} bp`
-                                  : '—'}
-                              </TableCell>
+                              {DEPTH_NOTIONALS.map((amount) => {
+                                const quote = depthQuoteView(
+                                  m?.depth,
+                                  amount,
+                                  now,
+                                  connectionError || m?.depth_error,
+                                );
+                                return (
+                                  <TableCell key={amount} className="number">
+                                    <span className="mobile-cell-label">
+                                      {amount / 10000} 万 USD1 深度价差
+                                    </span>
+                                    <div
+                                      className={`depth-quote ${quote.stale ? 'depth-stale' : ''}`}
+                                      title={quote.title}
+                                    >
+                                      <span>{quote.value}</span>
+                                      <small>{quote.detail}</small>
+                                    </div>
+                                  </TableCell>
+                                );
+                              })}
                             </TableRow>
                           );
                         })}
                       </TableBody>
                     </Table>
-                  </div>
+                  </section>
                   <div className="table-footer">
                     <span>
                       <i className="dot mint-bg" />
@@ -634,6 +666,11 @@ export default function Home() {
                     </span>
                     <span>1 bp = 万分之一</span>
                   </div>
+                  <p className="depth-method">
+                    深度价差按买入、卖出每边各 1 万 / 5 万 USD1
+                    的成交均价计算，不含手续费。 每 10 秒采样，超过 15
+                    秒标记过期；买卖盘各最多 1,000 档，1 bp = 万分之一。
+                  </p>
                 </section>
                 <section className="panel activity-panel">
                   <Tabs defaultValue="positions">

@@ -544,6 +544,49 @@ label input,
 .full-width {
   width: 100%;
 }
+.migration-badge {
+  color: var(--primary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.migration-state {
+  padding: 0 22px 14px;
+  color: #b5c3cb;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.migration-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 10px;
+  margin: 0 22px;
+  padding: 16px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.migration-details dt {
+  color: #83949e;
+  font-size: 11px;
+}
+.migration-details dd {
+  margin-top: 5px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.migration-footnote {
+  margin: 10px 22px 20px;
+  color: #83949e;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.migration-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
 .notification-state {
   padding: 0 6px;
   display: flex;

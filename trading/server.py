@@ -107,12 +107,28 @@ class NewAccount(BaseModel):
     mode: Literal["paper", "live"]
 
 
+class MigrationEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
+    batch_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    notional_tolerance: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_present_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的迁移配置字段")
+        return values
+
+
 class PolicyEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     threshold: str | None = Field(default=None, min_length=1, max_length=40)
     order_notional: str | None = Field(default=None, min_length=1, max_length=40)
     margin_limit: str | None = Field(default=None, min_length=1, max_length=128)
     min_open_leverage: StrictInt | None = Field(default=None, ge=5, le=20, json_schema_extra={"enum": list(TIERS)})
+    migration: MigrationEdit | None = None
 
     @model_validator(mode="before")
     @classmethod

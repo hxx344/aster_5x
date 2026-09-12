@@ -102,14 +102,15 @@ class Executor:
         if qty:
             positive(row.get("avgPrice"))
 
-    def leverage(self, account, symbol, old, target, snapshot=None, before_submit=None):
+    def leverage(self, account, symbol, old, target, snapshot=None, before_submit=None, *, purpose=None, symbols=None):
         self.last_snapshot = None
         self.last_completed_intent = None
         require_supported_leverage(target)
         require_non_decreasing_leverage(old, target)
         # Re-read before creating intent; the selection snapshot may now be stale.
-        snapshot = self.broker.snapshot(account["policy"]["symbols"], fresh_modes=True)
-        snapshot.require_modes(account["policy"]["symbols"])
+        symbols = symbols or account["policy"]["symbols"]
+        snapshot = self.broker.snapshot(symbols, fresh_modes=True)
+        snapshot.require_modes(symbols)
         long, short = snapshot.require_ready(symbol)
         old = long.leverage
         require_non_decreasing_leverage(old, target)
@@ -123,6 +124,8 @@ class Executor:
             before_submit(snapshot)
         intent = {"id": uuid.uuid4().hex, "kind": "leverage", "account_id": account["id"], "symbol": symbol,
                   "previous": old, "target": target, "created_at": time.time(), "status": "pending"}
+        if purpose is not None:
+            intent.update(purpose=purpose, symbols=list(symbols))
         self.store.save_intent(intent)
         try:
             if isinstance(self.broker, LiveBroker):
@@ -182,10 +185,11 @@ class Executor:
                 return self.attention(account, intent, "发现旧降杠杆批次，全局禁止继续执行；请核对实际杠杆")
             if isinstance(self.broker, PaperBroker):
                 self.broker.reload()
-            snapshot = self.broker.snapshot(account["policy"]["symbols"])
+            symbols = intent.get("symbols", account["policy"]["symbols"])
+            snapshot = self.broker.snapshot(symbols)
             snapshot.require_fresh()
             try:
-                snapshot.require_modes(account["policy"]["symbols"])
+                snapshot.require_modes(symbols)
             except AccountModeError as exc:
                 return self.attention(account, intent, str(exc))
             long, short = snapshot.pair(intent["symbol"])

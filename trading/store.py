@@ -1,6 +1,7 @@
 """Durable execution intents and notification outbox, isolated per account."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -10,7 +11,8 @@ import threading
 import time
 import uuid
 
-from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, positive
+from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
+from .migration import DEFAULT_MIGRATION
 
 
 CAPACITY_ALERT_MAX_AGE = 8
@@ -81,17 +83,19 @@ class Store:
 
     @staticmethod
     def account_defaults(account):
+        migration = account.get("migration")
+        normalized = {**account, "migration": {**DEFAULT_MIGRATION, **migration} if isinstance(migration, dict)
+                      else {**DEFAULT_MIGRATION} if "migration" not in account else migration}
         policy = account.get("policy")
         if isinstance(policy, dict):
             previous = policy.get("min_open_leverage", MIN_OPEN_LEVERAGE)
             if type(previous) is int and 1 <= previous <= 125:
                 minimum = next((tier for tier in TIERS if tier >= previous), TIERS[-1])
-                normalized = {**account, "policy": {**policy, "min_open_leverage": minimum}}
+                normalized["policy"] = {**policy, "min_open_leverage": minimum}
                 if previous > TIERS[-1]:
                     normalized.update(enabled=False, pause_reason="原最低开仓杠杆超出支持范围，已暂停；请在 5x、10x、20x 中确认设置后启动")
                     normalized["leverage_setting_required"] = True
-                return normalized
-        return account
+        return normalized
 
     def accounts(self):
         with self.connect() as db:
@@ -146,8 +150,42 @@ class Store:
             if row and row[0] == "complete":
                 return
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
-            key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
-            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
+            if intent.get("purpose") != "migration":
+                key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
+                db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
+
+    def complete_migration(self, intent, result, snapshot_remaining):
+        """Commit the four-leg ledger and migration totals exactly once."""
+        with self.connect() as db:
+            row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
+            if row and row[0] in ("complete", "aborted"):
+                return
+            key = "migration:" + intent["account_id"]
+            row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+            progress = json.loads(row[0]) if row else None
+            if not progress or progress.get("run_id") != intent.get("run_id"):
+                raise TradingError("迁移周期记录与批次不一致，等待人工核对")
+            status = "aborted" if intent.get("status") == "aborted" else "complete"
+            intent.update(status=status, result=result, completed_at=time.time())
+            db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (status, dumps(intent), intent["id"]))
+            for side in ("LONG", "SHORT"):
+                source = Fraction(positive(result["source_notional"][side], True))
+                target = Fraction(positive(result["target_notional"][side], True))
+                progress["migrated_notional"][side] = wire(Fraction(dec(progress["migrated_notional"][side])) + source)
+                progress["cumulative_notional_delta"][side] = wire(Fraction(dec(progress["cumulative_notional_delta"][side])) + target - source)
+            moved = any(dec(result["source_qty"][side]) > 0 for side in ("LONG", "SHORT"))
+            remaining = {side: wire(positive(snapshot_remaining[side], True)) for side in ("LONG", "SHORT")}
+            done = not any(dec(value) for value in remaining.values())
+            progress.update(source_remaining_qty=remaining, updated_at=time.time(),
+                            completed_batches=progress.get("completed_batches", 0) + int(moved),
+                            phase="complete" if done else "waiting", target_symbol=intent["target_symbol"],
+                            target_leverage=intent["target_leverage"], required_leverage=intent["target_leverage"], active_batch=None,
+                            reason="XAU 多空仓位已全部迁出" if done else "本批迁移已核对，等待下一批" if moved else "本批目标新增已回退，等待重新评估")
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(progress)))
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("post_fill_check:" + intent["account_id"], dumps({"symbol": intent["target_symbol"], "leverage": intent["target_leverage"]})))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
+                       (intent["account_id"], "migration", progress["reason"], time.time()))
 
     def complete_pair(self, intent, quantities):
         """Commit the acknowledgement and aggregate progress in one transaction."""

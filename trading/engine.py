@@ -11,12 +11,15 @@ import os
 import re
 import threading
 import time
+import uuid
 
 import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
+from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
+from .migration_execution import MigrationExecutor
 from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
@@ -72,6 +75,7 @@ def validate_account(account):
         raise TradingError("价差上限不得超过万 5")
     minimum_open_leverage(policy)
     account["policy"] = policy
+    account["migration"] = validate_migration(account.get("migration", {**DEFAULT_MIGRATION}))
     return account
 
 
@@ -169,6 +173,9 @@ class Engine:
             def cost(account):
                 if not account["enabled"]:
                     return 90
+                if account.get("migration", {}).get("enabled"):
+                    # Fresh execution depth is separate from shared display depth.
+                    return 360
                 positions = self.views.get(account["id"], {}).get("snapshot", {}).get("positions", [])
                 minimum = minimum_open_leverage(account["policy"])
                 for symbol in account["policy"]["symbols"]:
@@ -296,7 +303,10 @@ class Engine:
             for aid in ids:
                 account = by_id.get(aid)
                 levels = ()
-                if fresh and account and account["enabled"] and self.live_allowed(account) and symbol in account["policy"]["symbols"]:
+                if fresh and account and account["enabled"] and self.live_allowed(account) and account.get("migration", {}).get("enabled"):
+                    if symbol in ("SPCXUSD1", "CLUSD1") and capacities.get(5, dec(0)) > 0:
+                        levels = (5,)
+                elif fresh and account and account["enabled"] and self.live_allowed(account) and symbol in account["policy"]["symbols"]:
                     positions = [p for p in self.views.get(aid, {}).get("snapshot", {}).get("positions", []) if p["symbol"] == symbol]
                     current = max((p["leverage"] for p in positions), default=0)
                     threshold = dec(account["policy"]["threshold"])
@@ -387,6 +397,144 @@ class Engine:
             raise exc
         return reason
 
+    def migration_progress(self, account, snapshot):
+        key = "migration:" + account["id"]
+        progress = self.store.get(key)
+        configured_run = account.get("migration_run_id")
+        if not progress or (configured_run and configured_run != progress.get("run_id")):
+            long, short = snapshot.require_ready("XAUUSD1")
+            quantities = {"LONG": wire(long.qty), "SHORT": wire(short.qty)}
+            progress = {"run_id": configured_run or uuid.uuid4().hex, "started_at": time.time(),
+                        "updated_at": time.time(), "source_leverage": long.leverage,
+                        "source_initial_qty": quantities.copy(), "source_remaining_qty": quantities.copy(),
+                        "migrated_notional": {"LONG": "0", "SHORT": "0"},
+                        "cumulative_notional_delta": {"LONG": "0", "SHORT": "0"},
+                        "completed_batches": 0, "phase": "waiting", "reason": "等待符合条件的迁移目标"}
+            self.store.put(key, progress)
+        return progress
+
+    def migration_view(self, account, **updates):
+        progress = self.store.get("migration:" + account["id"]) or {}
+        with self.lock:
+            previous = self.views.get(account["id"], {}).get("migration_state", {})
+            if previous.get("run_id") != progress.get("run_id"):
+                previous = {}
+            progress = {**previous, **progress, **updates, "updated_at": time.time()}
+        self.view(account["id"], migration_state=progress)
+        if "reason" in updates:
+            phase = updates.get("phase", "waiting")
+            self.view(account["id"], reason=updates["reason"], status="running" if phase == "complete" else phase)
+
+    def tick_migration(self, account, snapshot, broker):
+        aid = account["id"]
+        progress = self.migration_progress(account, snapshot)
+        source = "XAUUSD1"
+        long, short = snapshot.require_ready(source)
+        actual = {"LONG": wire(long.qty), "SHORT": wire(short.qty)}
+        if any(dec(actual[side]) != dec(progress["source_remaining_qty"][side]) for side in actual):
+            reason = "XAU 实仓与已核对迁移记录不一致，已暂停；请核对外部交易或仓位变化"
+            self.store.pause_account(account, reason)
+            self.migration_view(account, phase="attention", reason=reason, source_remaining_qty=actual)
+            return 5
+        if not long.qty and not short.qty:
+            progress.update(phase="complete", reason="XAU 多空仓位已全部迁出；迁移模式保持开启，普通新增已停止", updated_at=time.time())
+            self.store.put("migration:" + aid, progress)
+            self.migration_view(account, **progress)
+            return 5
+        for symbol in account["policy"]["symbols"]:
+            self.strategy(aid, symbol, "迁移模式已开启，普通新增已停止", "paused")
+        targets, reasons = [], []
+        for target in ("SPCXUSD1", "CLUSD1"):
+            try:
+                caps = self.capacities(target)
+                if caps.get(5, dec(0)) <= 0:
+                    raise TradingError("5x 公开额度不足")
+                targets.append(target)
+            except TradingError as exc:
+                reasons.append(f"{target}：{exc}")
+        if not targets:
+            self.migration_view(account, phase="waiting", reason="；".join(reasons))
+            return 5
+        if isinstance(broker, LiveBroker):
+            broker.api.budget.require_available(DEPTH_WEIGHT * (len(targets) + 1) + broker.snapshot_weight(migration_symbols(account)))
+        # Fetch the independent execution snapshots together so network latency
+        # cannot make the first source sample stale while comparing the targets.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="migration-depth") as pool:
+            jobs = {symbol: pool.submit(self.market.depth, symbol) for symbol in [source, *targets]}
+            depths = {}
+            for symbol, job in jobs.items():
+                try:
+                    depths[symbol] = job.result()
+                except TradingError as exc:
+                    reasons.append(f"{symbol}：{exc}")
+        if source not in depths:
+            self.migration_view(account, phase="waiting", reason="；".join(reasons))
+            return 5
+        source_book = self.market.book(source)
+        candidates = []
+        for target in targets:
+            if target not in depths:
+                continue
+            try:
+                book = self.market.book(target)
+                plan = plan_migration(account, snapshot, source_book, book, depths[source], depths[target],
+                                      self.market.rules[source], self.market.rules[target],
+                                      {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], progress)
+                candidates.append((plan, book))
+            except TradingError as exc:
+                reasons.append(f"{target}：{exc}")
+        candidates.sort(key=lambda entry: (getattr(entry[0], "spread_exact", entry[0].spread), 0 if entry[0].target_symbol == "SPCXUSD1" else 1))
+        if not candidates:
+            self.migration_view(account, phase="residual" if any("尾仓" in r for r in reasons) else "waiting", reason="；".join(reasons))
+            return 5
+        plan, target_book = candidates[0]
+        target = plan.target_symbol
+        self.migration_view(account, phase="executing", reason=f"准备迁移至 {target} {plan.target_leverage}x",
+                            target_symbol=target, required_leverage=plan.target_leverage, target_leverage=snapshot.pair(target)[0].leverage)
+
+        def source_unchanged(fresh):
+            if self.shutdown.is_set() or not self.live_allowed(account):
+                raise TradingError("迁移新增执行已停止")
+            fresh.require_ready(source)
+            pair = fresh.pair(source)
+            if any(position.qty != dec(actual[side]) for side, position in zip(("LONG", "SHORT"), pair)):
+                raise TradingError("XAU 仓位已变化，等待重新核对")
+            if pair[0].leverage > plan.target_leverage:
+                raise TradingError("XAU 杠杆已提高，目标需要重新评估")
+
+        if snapshot.pair(target)[0].leverage < plan.target_leverage:
+            def before_leverage(fresh):
+                source_unchanged(fresh)
+                target_book.require_fresh()
+                caps = self.capacities(target)
+                amount = sum(plan.target_notionals.values(), dec(0))
+                existing = sum((p.qty * target_book.mark for p in fresh.pair(target)), dec(0))
+                if caps.get(5, dec(0)) < amount or caps.get(plan.target_leverage, dec(0)) < existing + amount:
+                    raise TradingError("迁移目标额度已变化，等待重新评估")
+            reason = Executor(self.store, broker, self.market).leverage(
+                account, target, snapshot.pair(target)[0].leverage, plan.target_leverage,
+                before_submit=before_leverage, purpose="migration", symbols=migration_symbols(account))
+            self.migration_view(account, phase="reconciling", reason=reason)
+            return 5
+
+        def before_open(fresh):
+            source_unchanged(fresh)
+            current = plan_migration(account, fresh, source_book, target_book, depths[source], depths[target],
+                                     self.market.rules[source], self.market.rules[target],
+                                     {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], progress)
+            if (current.target_qty != plan.target_qty or current.source_quantities != plan.source_quantities
+                    or current.target_leverage != plan.target_leverage or current.source_leverage != plan.source_leverage):
+                raise TradingError("迁移计划因账户或额度变化需要重新计算")
+        executor = MigrationExecutor(self.store, broker, self.market)
+        reason = executor.start(account, snapshot, plan, run_id=progress["run_id"], before_submit=before_open)
+        pending = self.store.intent(aid)
+        self.migration_view(account, phase="attention" if pending and pending["status"] == "attention" else "reconciling" if pending else "waiting", reason=reason)
+        if not pending:
+            after = self.completed_snapshot(executor, broker, migration_symbols(account))
+            self.view(aid, snapshot=snapshot_json(after, migration_symbols(account)))
+            self.check_post_fill_occupancy(account, after)
+        return 5
+
     def tick_account(self, account_id):
         with self.account_lock(account_id):
             with self.lock:
@@ -398,24 +546,28 @@ class Engine:
             account = self.store.account(account_id)
             if not account:
                 return 5
+            pending = None
             try:
                 broker = self.broker(account)
                 pending = self.store.intent(account_id)
+                symbols = migration_symbols(account)
+                if pending and (pending["kind"] == "migration" or pending.get("purpose") == "migration"):
+                    symbols = list(dict.fromkeys([*symbols, *SYMBOLS]))
                 recovery = bool(pending or self.store.get("post_fill_check:" + account_id))
                 with self.recovery_budget(broker) if recovery else nullcontext():
                     if isinstance(broker, LiveBroker) and not recovery:
-                        broker.api.budget.require_available(broker.snapshot_weight(account["policy"]["symbols"]))
-                    snapshot = broker.snapshot(account["policy"]["symbols"])
-                self.view(account_id, snapshot=snapshot_json(snapshot, account["policy"]["symbols"]), credential_ready=True)
-                snapshot.require_modes(account["policy"]["symbols"])
+                        broker.api.budget.require_available(broker.snapshot_weight(symbols))
+                    snapshot = broker.snapshot(symbols)
+                self.view(account_id, snapshot=snapshot_json(snapshot, symbols), credential_ready=True)
+                snapshot.require_modes(symbols)
                 if self.shutdown.is_set():
                     return 5
-                if self.store.get("post_fill_check:" + account_id) and self.check_post_fill_occupancy(account, snapshot):
+                if (not pending or pending["kind"] != "migration") and self.store.get("post_fill_check:" + account_id) and self.check_post_fill_occupancy(account, snapshot):
                     return 5
                 pause_reason = account.get("pause_reason") if not account["enabled"] else None
                 self.view(account_id, status="running" if account["enabled"] else "attention" if pause_reason else "paused",
                           reason="策略运行中" if account["enabled"] else pause_reason or "策略已暂停")
-                executor = Executor(self.store, broker, self.market)
+                executor = (MigrationExecutor if pending and pending["kind"] == "migration" else Executor)(self.store, broker, self.market)
                 if pending:
                     if self.live_allowed(account):
                         reason = executor.reconcile(account, pending)
@@ -426,7 +578,15 @@ class Engine:
                     self.view(account_id, status=status, reason=reason)
                     self.strategy(account_id, pending["symbol"], reason, status)
                     progressed = True
-                    if pending["kind"] == "pair" and not self.store.intent(account_id):
+                    if pending["kind"] == "migration":
+                        still_pending = self.store.intent(account_id)
+                        phase = status if still_pending else (self.store.get("migration:" + account_id) or {}).get("phase", "waiting")
+                        self.migration_view(account, phase=phase, reason=reason)
+                        if not still_pending:
+                            after = self.completed_snapshot(executor, broker, symbols)
+                            self.view(account_id, snapshot=snapshot_json(after, symbols))
+                            self.check_post_fill_occupancy(account, after)
+                    elif pending["kind"] == "pair" and not self.store.intent(account_id):
                         consumed_symbol = pending["symbol"]
                         self.record_batch_outcome(account_id, executor)
                         after = self.completed_snapshot(executor, broker, account["policy"]["symbols"])
@@ -438,6 +598,8 @@ class Engine:
                         self.priority_continuation(account_id)
                     return 5
                 if not account["enabled"] or self.shutdown.is_set():
+                    if account.get("migration", {}).get("enabled"):
+                        self.migration_view(account, phase="attention" if account.get("pause_reason") else "paused", reason=account.get("pause_reason") or "账户已暂停，迁移进度已保存")
                     for symbol in account["policy"]["symbols"]:
                         self.strategy(account_id, symbol, "策略已暂停", "paused")
                     if snapshot.equity > 0:
@@ -445,6 +607,8 @@ class Engine:
                     return 5
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
+                if account.get("migration", {}).get("enabled"):
+                    return self.tick_migration(account, snapshot, broker)
                 policy = account["policy"]
                 minimum = minimum_open_leverage(policy)
                 markets = policy["symbols"]
@@ -584,6 +748,8 @@ class Engine:
                         self.strategy(account_id, symbol, message, "attention")
                     status = "attention"
                 self.view(account_id, status=status, reason=message, credential_ready=account_id in self.brokers)
+                if account.get("migration", {}).get("enabled") or (pending and pending.get("kind") == "migration"):
+                    self.migration_view(account, phase="attention" if status == "attention" else "waiting", reason=message)
                 delay = max(10, getattr(exc, "retry_after", 0))
                 with self.lock:
                     self.account_backoff[account_id] = time.monotonic() + delay
@@ -629,13 +795,39 @@ class Engine:
             account = self.store.account(account_id)
             if not account:
                 raise TradingError("账户不存在")
-            if account["enabled"] or self.store.intent(account_id):
+            pending = self.store.intent(account_id)
+            stop_migration = (isinstance(changes, dict) and set(changes) == {"migration"}
+                              and isinstance(changes["migration"], dict)
+                              and set(changes["migration"]) == {"enabled"}
+                              and changes["migration"]["enabled"] is False)
+            if stop_migration:
+                account.update(enabled=False, migration={**account.get("migration", DEFAULT_MIGRATION), "enabled": False})
+                self.store.save_account(account)
+                with self.lock:
+                    self.wake_accounts.add(account_id)
+                    if pending:
+                        self.urgent_accounts.add(account_id)
+                    self.accounts_generation += 1
+                reason = "迁移已停止，账户已暂停" + ("；已提交批次继续核对" if pending else "")
+                self.view(account_id, status="reconciling" if pending else "paused", reason=reason)
+                self.store.event(account_id, "control", reason)
+                return
+            if account["enabled"] or pending:
                 raise TradingError("请先暂停策略并等待当前批次完成")
-            if not isinstance(changes, dict) or not changes or set(changes) - EDITABLE_POLICY_FIELDS:
+            if not isinstance(changes, dict) or not changes or set(changes) - (EDITABLE_POLICY_FIELDS | {"migration"}):
                 raise TradingError("请选择有效的策略配置字段")
-            if any(value is None or (key != "min_open_leverage" and not isinstance(value, str)) for key, value in changes.items()):
+            policy_changes = {key: value for key, value in changes.items() if key != "migration"}
+            if any(value is None or (key != "min_open_leverage" and not isinstance(value, str)) for key, value in policy_changes.items()):
                 raise TradingError("策略配置字段类型无效")
-            account["policy"] = {**account["policy"], **changes}
+            if "migration" in changes:
+                migration_changes = changes["migration"]
+                if not isinstance(migration_changes, dict) or not migration_changes:
+                    raise TradingError("请提供非空的迁移配置字段")
+                migration_was_enabled = account.get("migration", DEFAULT_MIGRATION)["enabled"]
+                account["migration"] = validate_migration({**account.get("migration", DEFAULT_MIGRATION), **migration_changes})
+                if account["migration"]["enabled"] and not migration_was_enabled:
+                    account["migration_run_id"] = uuid.uuid4().hex
+            account["policy"] = {**account["policy"], **policy_changes}
             validate_account(account)
             if "min_open_leverage" in changes:
                 account.pop("leverage_setting_required", None)
@@ -655,14 +847,15 @@ class Engine:
                     raise TradingError("请先在 5x、10x、20x 中保存最低开仓杠杆设置")
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
-                if dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
+                if not account.get("migration", {}).get("enabled") and dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
                     raise TradingError("单批每边上限低于固定最低批次金额 500 USD1，请先修改策略设置")
                 if self.store.intent(account_id):
                     raise TradingError("请先核对未完成批次")
-                snapshot = self.broker(account).snapshot(account["policy"]["symbols"], fresh_modes=True)
-                for symbol in account["policy"]["symbols"]:
+                symbols = migration_symbols(account)
+                snapshot = self.broker(account).snapshot(symbols, fresh_modes=True)
+                for symbol in symbols:
                     snapshot.require_ready(symbol)
-                view_updates = {"snapshot": snapshot_json(snapshot, account["policy"]["symbols"]), "credential_ready": True,
+                view_updates = {"snapshot": snapshot_json(snapshot, symbols), "credential_ready": True,
                                 "strategies": {symbol: {"phase": "waiting", "reason": "策略已启动，等待下一轮检查"}
                                                for symbol in account["policy"]["symbols"]}}
                 # High existing occupancy blocks additions in plan_pair, while an
@@ -686,6 +879,9 @@ class Engine:
             intent["status"] = "pending"
             if intent["kind"] == "pair":
                 intent["repair_attempts"] = 0
+            elif intent["kind"] == "migration":
+                intent["repair_attempts"] = 0
+                intent["attempts"] = {}
             self.store.save_intent(intent)
             with self.lock:
                 self.urgent_accounts.add(account_id)
@@ -830,6 +1026,7 @@ class Engine:
         saved_accounts = self.store.accounts()
         events = self.store.events()
         pending_notifications = self.store.pending_notifications()
+        migration_records = {a["id"]: (self.store.get("migration:" + a["id"]) or {}, self.store.intent(a["id"])) for a in saved_accounts}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
@@ -837,6 +1034,32 @@ class Engine:
                          **self.views.get(a["id"], {
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
+            for account in accounts:
+                saved, pending = migration_records[account["id"]]
+                if account.get("migration_run_id") and account["migration_run_id"] != saved.get("run_id"):
+                    saved = {}
+                current = account.get("migration_state", {})
+                if current.get("run_id") != saved.get("run_id"):
+                    current = {}
+                migration = {**saved, **current}
+                active = pending and (pending["kind"] == "migration" or pending.get("purpose") == "migration")
+                if active:
+                    migration.update(phase="attention" if pending["status"] == "attention" else "reconciling",
+                                     reason=pending.get("last_error") or account["reason"],
+                                     active_batch={"stage": pending.get("phase", "leverage"), "source_symbol": "XAUUSD1",
+                                                   "target_symbol": pending.get("target_symbol", pending["symbol"])})
+                elif not account.get("migration", {}).get("enabled"):
+                    migration.update(phase="disabled", reason="迁移已关闭", active_batch=None)
+                elif not account["enabled"]:
+                    migration.update(phase="attention" if account.get("pause_reason") else "paused",
+                                     reason=account.get("pause_reason") or "账户已暂停，迁移进度已保存", active_batch=None)
+                elif saved.get("phase") == "complete":
+                    migration.update(saved, active_batch=None)
+                else:
+                    migration.setdefault("phase", "waiting")
+                    migration.setdefault("reason", "等待迁移检查")
+                    migration["active_batch"] = None
+                account["migration_state"] = migration
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
                 "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,

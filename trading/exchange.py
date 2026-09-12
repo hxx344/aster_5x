@@ -486,7 +486,7 @@ class MarketData:
         return book
 
     def depth(self, symbol):
-        """One public snapshot supplies both display notionals for all accounts."""
+        """Fetch raw depth; each consumer applies its own freshness limit."""
         if symbol not in SYMBOLS:
             raise TradingError("不支持的深度市场")
         started, requested_at = time.monotonic(), time.time()

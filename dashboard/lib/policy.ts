@@ -37,6 +37,18 @@ export function percentFromMarginLimit(ratio: string): string {
   return shiftDecimal(ratio, 2);
 }
 
+export function migrationToleranceFromPercent(percent: string): string {
+  let ratio: string;
+  try {
+    ratio = shiftDecimal(percent, -2);
+  } catch {
+    throw new Error('迁移金额误差必须是 0% 至 50% 的有效数字');
+  }
+  if (ratio !== '0' && (!ratio.startsWith('0.') || ratio > '0.5'))
+    throw new Error('迁移金额误差必须介于 0% 至 50%');
+  return ratio;
+}
+
 export function parseMinimumLeverage(value: string): number {
   let normalized: string;
   try {

@@ -1,4 +1,8 @@
-"""Display-only order-book sweeps; never used to size or execute orders."""
+"""Depth snapshots and fixed-notional display sweeps.
+
+Execution planners must obtain their own snapshot and enforce their stricter
+freshness and quantity checks; the display aggregates are never order inputs.
+"""
 from dataclasses import dataclass
 from fractions import Fraction
 import time

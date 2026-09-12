@@ -142,8 +142,13 @@ class PolicyEdit(BaseModel):
 
 def create_app(engine=None, *, demo=False, start_engine=True):
     if engine is None:
-        runtime = Path(os.environ.get("ASTER_TRADING_RUNTIME", ROOT / "runtime" / "trading"))
-        engine = Engine(Store(runtime / "trading.sqlite3"), demo=demo)
+        runtime = Path(os.environ.get("ASTER_TRADING_RUNTIME", ROOT / "runtime" / ("demo" if demo else "trading")))
+        store = Store(runtime / "trading.sqlite3", demo=demo)
+        engine = Engine(store, demo=demo)
+    else:
+        # Injected Engines can bypass the default path selection, but must not
+        # publish an authenticated or unclassified ledger through demo's API.
+        engine.store.bind_runtime_mode(demo=engine.demo)
     password = os.environ.get("ASTER_DASHBOARD_PASSWORD", "")
     password_digest = hashlib.sha256(password.encode()).digest()
     failures, fail_lock = OrderedDict(), threading.Lock()
@@ -298,8 +303,6 @@ def main():
     args = parser.parse_args()
     if args.demo and args.host not in ("127.0.0.1", "localhost"):
         parser.error("Demo mode is restricted to loopback")
-    if args.demo:
-        os.environ.setdefault("ASTER_TRADING_RUNTIME", str(ROOT / "runtime" / "demo"))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # Signed query URLs must not be emitted by an HTTP client's diagnostic logger.
     logging.getLogger("httpx").setLevel(logging.WARNING)

@@ -21,7 +21,7 @@ PASSWORD = "server-security-test-password"
 
 
 def app_fixture(*, start_engine=False):
-    engine = SimpleNamespace(demo=False, ready=True, state=Mock(return_value={"ok": True}),
+    engine = SimpleNamespace(demo=False, store=Mock(), ready=True, state=Mock(return_value={"ok": True}),
                              start=Mock(), stop=Mock(), add_account=Mock(), configure=Mock(),
                              enable=Mock(), retry=Mock(), shutdown=threading.Event(), thread=None)
     with patch.dict(os.environ, {"ASTER_DASHBOARD_PASSWORD": PASSWORD}, clear=True):

@@ -1,6 +1,7 @@
 """Exact, side-effect-free XAU migration sizing from executable depth."""
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
@@ -85,6 +86,8 @@ class _Sweep:
 
     def __init__(self, levels, *, bids):
         self.levels = []
+        self._quantities, self._notionals = [], []
+        quantity_sum = notional_sum = Fraction(0)
         previous = None
         if not isinstance(levels, (list, tuple)) or not 0 < len(levels) <= 1000:
             raise TradingError("迁移深度不足或档位无效")
@@ -101,39 +104,37 @@ class _Sweep:
             previous = price
             if quantity:
                 self.levels.append((price, quantity))
+                quantity_sum += quantity
+                notional_sum += price * quantity
+                self._quantities.append(quantity_sum)
+                self._notionals.append(notional_sum)
         if not self.levels:
             raise TradingError("迁移深度不足")
-        self.quantity = sum((q for _, q in self.levels), Fraction(0))
-        self.notional = sum((p * q for p, q in self.levels), Fraction(0))
+        self.quantity, self.notional = quantity_sum, notional_sum
 
     def amount(self, quantity):
-        remaining, amount = quantity, Fraction(0)
         if quantity < 0 or quantity > self.quantity:
             raise TradingError("迁移深度不足以成交全部数量")
-        for price, available in self.levels:
-            filled = min(available, remaining)
-            amount += filled * price
-            remaining -= filled
-            if not remaining:
-                return amount
-        return amount
+        index = bisect_left(self._quantities, quantity)
+        previous_quantity = self._quantities[index - 1] if index else Fraction(0)
+        previous_notional = self._notionals[index - 1] if index else Fraction(0)
+        return previous_notional + (quantity - previous_quantity) * self.levels[index][0]
 
     def quantity_for(self, amount):
-        remaining, quantity = max(Fraction(0), amount), Fraction(0)
-        for price, available in self.levels:
-            filled = min(available, remaining / price)
-            quantity += filled
-            remaining -= filled * price
-            if not remaining:
-                break
-        return quantity
+        if amount <= 0:
+            return Fraction(0)
+        if amount >= self.notional:
+            return self.quantity
+        index = bisect_left(self._notionals, amount)
+        previous_quantity = self._quantities[index - 1] if index else Fraction(0)
+        previous_notional = self._notionals[index - 1] if index else Fraction(0)
+        return previous_quantity + (amount - previous_notional) / self.levels[index][0]
 
     def last_price(self, quantity):
-        for price, available in self.levels:
-            quantity -= available
-            if quantity <= 0:
-                return price
-        raise TradingError("迁移深度不足以成交全部数量")
+        if quantity > self.quantity:
+            raise TradingError("迁移深度不足以成交全部数量")
+        # An exact level boundary still executes at that level's price.
+        return self.levels[bisect_left(self._quantities, quantity)][0]
 
 
 def _require_depth_fresh(depth, now):
@@ -208,6 +209,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
         raise TradingError("迁移仅支持 XAUUSD1 到 SPCXUSD1 或 CLUSD1")
     if source_rule.margin_asset != "USD1" or target_rule.margin_asset != "USD1":
         raise TradingError("迁移仅允许 USD1 保证金市场")
+    started_at = time.monotonic()
     now = time.time()
     snapshot.require_modes(migration_symbols(account))
     source_pair = snapshot.require_ready(SOURCE_SYMBOL, now)
@@ -216,6 +218,15 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
     target_book.require_fresh(now)
     source_bids, source_asks = _depth(source_depth, now)
     target_bids, target_asks = _depth(target_depth, now)
+    # Only the remaining lifetime of the oldest input is useful for searching.
+    # A monotonic deadline cannot be extended by a wall-clock adjustment.
+    deadline = started_at + MIGRATION_DEPTH_MAX_AGE - max(
+        now - source_depth.timestamp, now - target_depth.timestamp)
+
+    def require_search_time():
+        if time.monotonic() > deadline:
+            raise TradingError("迁移交易深度已过期，停止本轮计算并等待新快照")
+
     if not hedge_balanced(*[p.qty for p in source_pair]) or not hedge_balanced(*[p.qty for p in target_pair]):
         raise TradingError("迁移前已有多空数量差超过 0.1%，等待核对")
     if not source_pair[0].qty or not source_pair[1].qty:
@@ -346,6 +357,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
     target_existing_mark = max(target_mark, *[Fraction(p.mark) for p in target_pair])
     other_margin = sum((p.occupied_margin_exact for p in snapshot.positions
                         if p.symbol not in (source_symbol, target_symbol)), Fraction(0))
+    snapshot_occupied = snapshot.occupied_margin_exact
     source_occupied = sum(source_qty.values(), Fraction(0)) * source_existing_high / source_leverage
     existing_loss = Fraction(0)
     for pair, mark in ((source_pair, source_mark), (target_pair, target_mark)):
@@ -361,6 +373,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
     first_failure = prefix + "无法同时满足金额误差、数量步长及对冲约束"
     attempted_tier = False
     for leverage in leverages:
+        require_search_time()
         if caps[leverage] <= 0:
             if not attempted_tier:
                 first_failure = f"目标 {leverage}x 没有新增额度，禁止降低迁移杠杆"
@@ -391,7 +404,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
             baseline_occupied = other_margin + source_occupied + existing_gross / leverage
             added_margin = new_gross / leverage
             equity = Fraction(snapshot.equity) - existing_loss - cost
-            available = Fraction(snapshot.available) - existing_loss - (baseline_occupied - snapshot.occupied_margin_exact)
+            available = Fraction(snapshot.available) - existing_loss - (baseline_occupied - snapshot_occupied)
             if available < added_margin + cost:
                 return None, "可用余额不足以先开目标仓位并支付四腿成本"
             occupied = baseline_occupied + added_margin
@@ -402,6 +415,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
         nodes = 0
         stack = [(int(target_min / target_step), int(target_max / target_step))]
         while stack:
+            require_search_time()
             low, high = stack.pop()
             if low > high:
                 continue
@@ -428,6 +442,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
                 facts, failure = resources(high_qty, quantities, amounts)
                 if facts is not None:
                     target_amounts, spread, cost, ratio = facts
+                    require_search_time()
                     # A legal depth/quantity search can itself consume the
                     # remaining quote lifetime, including during before_open.
                     finished_at = time.time()
@@ -449,4 +464,5 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
             middle = (low + high) // 2
             stack.append((low, middle))
             stack.append((middle + 1, high - 1))  # The failed high endpoint was already checked.
+    require_search_time()
     raise TradingError(first_failure if "尾仓" in first_failure or not tail else "迁移尾仓：" + first_failure)

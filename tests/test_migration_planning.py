@@ -118,6 +118,46 @@ class MigrationPlanningTests(unittest.TestCase):
             plan = self.plan()
         self.assertGreater(plan.target_qty, 0)
 
+    def test_impossible_search_stops_when_either_depth_expires(self):
+        self.flat_prices()
+        # Synthetic mismatched grids require searching rather than accepting
+        # the largest batch. Advance only elapsed time, without a real sleep.
+        self.target_book = replace(self.target_book, bid=dec("10.000000000001"),
+                                   ask=dec("10.000000000001"))
+        self.target_depth = depth(self.target_book)
+        self.target_rule = replace(self.target_rule, step=dec("1e-12"))
+        self.account["migration"]["notional_tolerance"] = "0"
+        now = self.snapshot.timestamp
+        for oldest in ("source", "target"):
+            elapsed = [0.0]
+
+            def clock():
+                value = elapsed[0]
+                elapsed[0] += .02
+                return value
+
+            with self.subTest(oldest=oldest), \
+                    patch("trading.migration.time.time", return_value=now), \
+                    patch("trading.migration.time.monotonic", side_effect=clock), \
+                    self.assertRaisesRegex(TradingError, "深度已过期"):
+                self.plan(source_depth=replace(self.source_depth, timestamp=now - 2.9 if oldest == "source" else now),
+                          target_depth=replace(self.target_depth, timestamp=now - 2.9 if oldest == "target" else now))
+            self.assertLess(elapsed[0], .2)
+
+    def test_frozen_wall_clock_cannot_extend_search_lifetime(self):
+        elapsed = iter((0, 4))
+        with patch("trading.migration.time.time", return_value=self.snapshot.timestamp), \
+                patch("trading.migration.time.monotonic", side_effect=lambda: next(elapsed, 4)), \
+                self.assertRaisesRegex(TradingError, "深度已过期"):
+            self.plan()
+
+    def test_monotonic_deadline_is_inclusive(self):
+        elapsed = iter((10, 13))
+        with patch("trading.migration.time.time", return_value=self.snapshot.timestamp), \
+                patch("trading.migration.time.monotonic", side_effect=lambda: next(elapsed, 13)):
+            plan = self.plan()
+        self.assertGreater(plan.target_qty, 0)
+
     def test_zero_5x_blocks_even_with_higher_tier_capacity(self):
         self.capacities["5"] = dec(0)
         with self.assertRaisesRegex(TradingError, "5x"):

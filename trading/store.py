@@ -24,14 +24,19 @@ def dumps(value):
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, *, demo=None):
         # All aliases of one database must share its process lock and WAL files.
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         with self.connect() as db:
-            db.executescript("""
-                PRAGMA journal_mode=WAL;
+            # Decide HTTP exposure before touching historical schema or state.
+            # Keep the claim and migrations in one rollback-capable transaction;
+            # executescript would implicitly commit the claim before migrating.
+            db.execute("BEGIN IMMEDIATE")
+            if demo is not None:
+                self._bind_runtime_mode(db, demo=demo)
+            schema = """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id TEXT PRIMARY KEY, data TEXT NOT NULL
                 );
@@ -52,10 +57,11 @@ class Store:
                     due_at REAL NOT NULL, delivered_at REAL, expires_at REAL, capacity_key TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(due_at) WHERE delivered_at IS NULL;
-                PRAGMA optimize;
-            """)
+            """
+            for statement in schema.split(";"):
+                if statement.strip():
+                    db.execute(statement)
             # Existing trade notifications keep NULL expiry and remain deliverable.
-            db.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in db.execute("PRAGMA table_info(outbox)")}
             for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT")):
                 if name not in columns:
@@ -68,6 +74,11 @@ class Store:
             placeholders = ",".join("?" for _ in CAPACITY_ALERT_KEYS)
             db.execute(f"""UPDATE outbox SET expires_at=0 WHERE delivered_at IS NULL
                 AND capacity_key IS NOT NULL AND capacity_key NOT IN ({placeholders})""", tuple(CAPACITY_ALERT_KEYS))
+        # WAL cannot be enabled inside the initialization transaction. A rejected
+        # mode or failed migration never reaches these database-level changes.
+        with self.connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA optimize")
 
     @contextmanager
     def connect(self):
@@ -80,6 +91,42 @@ class Store:
                     yield db
             finally:
                 db.close()
+
+    def bind_runtime_mode(self, *, demo):
+        """Bind HTTP exposure before an Engine can seed or publish account data."""
+        with self.connect() as db:
+            # Different Store objects/processes must not claim an empty ledger
+            # with different exposure modes between the check and the write.
+            db.execute("BEGIN IMMEDIATE")
+            self._bind_runtime_mode(db, demo=demo)
+
+    @staticmethod
+    def _bind_runtime_mode(db, *, demo):
+        if type(demo) is not bool:
+            raise TradingError("账本运行用途无效")
+        mode = "demo" if demo else "authenticated"
+        tables = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                  if not row["name"].startswith("sqlite_")}
+        row = db.execute("SELECT data FROM kv WHERE key='runtime_mode'").fetchone() if "kv" in tables else None
+        if row is not None:
+            try:
+                saved = json.loads(row["data"])
+            except (TypeError, ValueError):
+                raise TradingError("账本用途标记无效，拒绝启动") from None
+            if saved not in ("demo", "authenticated"):
+                raise TradingError("账本用途标记无效，拒绝启动")
+            if saved != mode:
+                raise TradingError("账本用途与启动模式不符；演示与正式服务必须使用独立的数据目录")
+            return
+        if demo:
+            expected = {"accounts", "kv", "intents", "events", "outbox"}
+            # New databases may have no tables yet. Historical paper data and
+            # unknown tables must never be claimed by the anonymous interface.
+            if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                                        for table in sorted(tables)):
+                raise TradingError("演示模式不能使用用途未确认的已有账本；请指定新的空数据目录，原数据保留")
+        db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
+        db.execute("INSERT INTO kv(key,data) VALUES ('runtime_mode',?)", (dumps(mode),))
 
     @staticmethod
     def account_defaults(account):

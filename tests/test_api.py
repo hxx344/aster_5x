@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from trading.engine import Engine
 from trading.server import create_app
+from trading.store import Store
 from .helpers import Fixture
 
 PASSWORD = "test-only-dashboard-password"
@@ -90,7 +92,9 @@ class DashboardAPITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/state").status_code, 401)
 
     def test_demo_rejects_live_accounts(self):
-        demo = Engine(self.f.store, demo=True, market=self.f.market)
+        store = Store(Path(self.f.directory.name) / "demo.sqlite3")
+        store.bind_runtime_mode(demo=True)
+        demo = Engine(store, demo=True, market=self.f.market)
         with TestClient(create_app(demo, start_engine=False)) as client:
             response = client.post("/api/accounts", headers={"origin": "http://testserver"}, json={"id": "live", "name": "live", "mode": "live", "env_prefix": "ASTER_LIVE"})
         self.assertEqual(response.status_code, 409)

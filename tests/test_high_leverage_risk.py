@@ -253,8 +253,8 @@ class HighLeverageRiskTests(unittest.TestCase):
         other["policy"]["margin_limit"] = ".98"
         self.f.store.save_account(other)
         state = {row["id"]: row for row in self.engine().state()["accounts"]}
-        self.assertEqual(state["test"]["risk_limits"], {"base": ".9", "high_leverage": "0.95"})
-        self.assertEqual(state["other"]["risk_limits"], {"base": ".98", "high_leverage": "1"})
+        self.assertEqual(state["test"]["risk_limits"], {"base": ".9", "high_leverage": "0.95", "migration": "0.95"})
+        self.assertEqual(state["other"]["risk_limits"], {"base": ".98", "high_leverage": "1", "migration": "1"})
         self.assertEqual(self.f.store.account("test")["policy"]["margin_limit"], ".9")
 
     def test_campaign_above_base_waits_for_shared_limit_or_idle_timeout(self):

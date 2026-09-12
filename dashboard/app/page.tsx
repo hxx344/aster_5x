@@ -47,6 +47,7 @@ import { createStatePoller } from '@/lib/state-poller';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
 import {
   marginLimitFromPercent,
+  migrationMarginLimit,
   migrationToleranceFromPercent,
   parseMinimumLeverage,
   percentFromMarginLimit,
@@ -97,7 +98,7 @@ type Account = {
   policy: Policy;
   migration?: MigrationConfig;
   migration_state?: MigrationState;
-  risk_limits?: { base: string; high_leverage: string };
+  risk_limits?: { base: string; high_leverage: string; migration?: string };
   snapshot?: {
     equity: string;
     maintenance: string;
@@ -239,6 +240,12 @@ export default function Home() {
     '0.5';
   const highMarginLimit = Number(highMarginLimitValue);
   const highMarginPercent = percentFromMarginLimit(highMarginLimitValue);
+  const migrationMarginPercent = percentFromMarginLimit(
+    migrationMarginLimit(
+      account?.policy.margin_limit ?? '0.5',
+      account?.risk_limits,
+    ),
+  );
   const minimumLeverage = account?.policy.min_open_leverage ?? 5;
   const minimumLeverageSupported =
     SUPPORTED_LEVERAGES.includes(minimumLeverage);
@@ -846,7 +853,7 @@ export default function Home() {
                     <span className={riskAccent}>
                       {snapshot ? pct(snapshot.ratio) : '—'}
                     </span>
-                    <small>基础 ≤ {marginPercent}%</small>
+                    <small>普通 5x ≤ {marginPercent}%</small>
                   </div>
                   <div className="risk-track">
                     <Progress
@@ -856,13 +863,13 @@ export default function Home() {
                     <i
                       className="limit-marker"
                       style={{ left: `${marginPercent}%` }}
-                      title={`基础上限 ${marginPercent}%`}
+                      title={`普通 5x 基础上限 ${marginPercent}%`}
                     />
                     {highMarginLimit > marginLimit && (
                       <i
                         className="limit-marker high-limit-marker"
                         style={{ left: `${highMarginPercent}%` }}
-                        title={`10x / 20x 上限 ${highMarginPercent}%`}
+                        title={`普通 10x / 20x 上限 ${highMarginPercent}%`}
                       />
                     )}
                   </div>
@@ -873,8 +880,12 @@ export default function Home() {
                   </div>
                   <div className="risk-explanation muted">
                     <p className="risk-bonus">
-                      <span>10x / 20x 加仓上限</span>
+                      <span>普通 10x / 20x 加仓上限</span>
                       <strong>{highMarginPercent}%</strong>
+                    </p>
+                    <p className="risk-bonus">
+                      <span>迁移上限 · 含 5x</span>
+                      <strong>{migrationMarginPercent}%</strong>
                     </p>
                     <p>共用额外 5 个百分点，最高 100%。</p>
                     <p>
@@ -976,7 +987,7 @@ export default function Home() {
                     }
                   />
                   <Gate
-                    label={`${currentLeverage}x 加仓占用率 < ${openingPercent}%`}
+                    label={`普通 ${currentLeverage}x 加仓占用率 < ${openingPercent}%`}
                     pass={!!fresh && ratio < openingLimit}
                     value={snapshot ? pct(snapshot.ratio) : '—'}
                   />
@@ -1110,6 +1121,14 @@ export default function Home() {
                           ? `≥ ${migration.required_leverage}x`
                           : '—'}
                       </dd>
+                    </div>
+                    <div>
+                      <dt>临时迁移占用上限</dt>
+                      <dd>{migrationMarginPercent}%</dd>
+                    </div>
+                    <div>
+                      <dt>适用迁移杠杆</dt>
+                      <dd>5x / 10x / 20x</dd>
                     </div>
                     <div>
                       <dt>多头累计已迁 · USD1</dt>
@@ -1263,7 +1282,8 @@ export default function Home() {
                     <p className="muted">
                       只在 SPCX / CL 有有效 5x
                       额度、实际杠杆不低于原仓位时迁移，优先选择本批深度价差较小的目标。先开目标多空并确认，再平
-                      XAU；临时保证金不足时等待。常规批次每边至少 500
+                      XAU。迁移临时上限为基础加 5 个百分点，最高
+                      100%，计入未平 XAU 占用并预留四腿成本；保证金不足时等待。常规批次每边至少 500
                       USD1，最后尾批可按交易所最小下单规则收尾。
                     </p>
                     <p className="muted">
@@ -1399,8 +1419,9 @@ export default function Home() {
                       </Select>
                     </label>
                     <p className="muted">
-                      修改前请暂停策略。基础风险约束大于 0%、不超过 100%；10x /
-                      20x 共同额外增加 5 个百分点，最高
+                      修改前请暂停策略。基础风险约束大于 0%、不超过 100%。普通
+                      5x 新增使用基础上限；普通 10x / 20x 和迁移各档（含
+                      5x）共用额外 5 个百分点，最高
                       100%。实际下单量还受余额与盘口限制。最低杠杆可设 5x、10x
                       或 20x，调低该值不会降低已有杠杆。
                     </p>

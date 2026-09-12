@@ -126,6 +126,37 @@ class MigrationRecoveryIntegrationTests(TestCase):
         self.assertIsNone(store.get("post_fill_check:test"))
         self.assertEqual(store.get("migration:test")["completed_batches"], 1)
 
+    def test_restart_after_completion_preserves_five_x_migration_headroom(self):
+        saved = self.f.store.account("test")
+        saved["policy"]["margin_limit"] = ".93"
+        self.f.store.save_account(saved)
+        for side in ("LONG", "SHORT"):
+            self.f.broker.state["positions"][SOURCE + ":" + side]["qty"] = "13.316"
+        self.f.broker.save()
+        complete = self.f.store.complete_migration
+
+        def commit_then_stop(intent, result, remaining):
+            complete(intent, result, remaining)
+            raise RuntimeError("process stopped after completion commit")
+
+        with patch.object(self.f.store, "complete_migration", side_effect=commit_then_stop), \
+             self.assertRaisesRegex(RuntimeError, "completion commit"):
+            self.engine.tick_account("test")
+        marker = {"kind": "migration", "symbol": TARGET, "leverage": 5}
+        self.assertEqual(self.f.store.get("post_fill_check:test"), marker)
+        store, broker, engine = self.restart()
+        snapshot = broker.snapshot(SYMBOLS)
+        self.assertGreater(snapshot.ratio, dec(".93"))
+        self.assertFalse(snapshot.margin_exceeds(".98"))
+        # No new capacity has been polled. Only the durable post-fill check runs,
+        # and the completed migration must not fall back to the ordinary 5x cap.
+        with patch.object(broker, "submit", side_effect=AssertionError("no new capacity")):
+            engine.tick_account("test")
+        self.assertTrue(store.account("test")["enabled"])
+        self.assertNotIn("pause_reason", store.account("test"))
+        self.assertIsNone(store.get("post_fill_check:test"))
+        self.assertEqual(store.get("migration:test")["completed_batches"], 1)
+
     def test_five_x_capacity_edge_below_ordinary_threshold_wakes_only_once(self):
         ordinary = account("ordinary")
         ordinary["policy"]["symbols"] = [TARGET]

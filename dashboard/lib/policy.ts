@@ -37,6 +37,21 @@ export function percentFromMarginLimit(ratio: string): string {
   return shiftDecimal(ratio, 2);
 }
 
+export function migrationMarginLimit(
+  base: string,
+  limits?: { migration?: string; high_leverage?: string },
+): string {
+  const reported = limits?.migration ?? limits?.high_leverage;
+  if (reported !== undefined) return reported;
+  const normalized = shiftDecimal(base, 0);
+  if (normalized >= '0.95') return '1';
+  const [whole, fraction = ''] = normalized.split('.');
+  const places = Math.max(2, fraction.length);
+  const units = BigInt(whole + fraction.padEnd(places, '0'));
+  const bonus = BigInt(`5${'0'.repeat(places - 2)}`);
+  return shiftDecimal(String(units + bonus), -places);
+}
+
 export function migrationToleranceFromPercent(percent: string): string {
   let ratio: string;
   try {

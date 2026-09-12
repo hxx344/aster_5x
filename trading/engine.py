@@ -20,7 +20,7 @@ from .execution import Executor
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
-from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
+from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -366,7 +366,10 @@ class Engine:
             batch = pending if pending and pending["kind"] == "pair" else None
         # Old boolean markers retain the base limit. An unrelated high-leverage
         # position must never grant a low-leverage batch extra opening room.
-        if isinstance(batch, dict) and batch.get("leverage") in (10, 20):
+        if isinstance(batch, dict) and batch.get("kind") == "migration":
+            snapshot.pair(batch["symbol"])
+            limit = migration_margin_limit(account["policy"])
+        elif isinstance(batch, dict) and batch.get("leverage") in (10, 20):
             actual, _ = snapshot.pair(batch["symbol"])
             limit = opening_margin_limit(account["policy"], actual.leverage)
         ratio = snapshot.ratio if snapshot.equity > 0 else None
@@ -1030,7 +1033,8 @@ class Engine:
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
-                                            "high_leverage": wire(opening_margin_limit(a["policy"], 10))},
+                                            "high_leverage": wire(opening_margin_limit(a["policy"], 10)),
+                                            "migration": wire(migration_margin_limit(a["policy"]))},
                          **self.views.get(a["id"], {
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]

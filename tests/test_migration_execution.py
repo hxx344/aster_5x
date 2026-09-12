@@ -64,7 +64,8 @@ class MigrationExecutionTests(unittest.TestCase):
         self.assert_complete()
         self.assertEqual(self.f.store.get("migration:test")["completed_batches"], 1)
         self.assertIsNone(self.f.store.get("campaign:test"))
-        self.assertTrue(self.f.store.get("post_fill_check:test"))
+        self.assertEqual(self.f.store.get("post_fill_check:test"),
+                         {"kind": "migration", "symbol": TARGET, "leverage": 5})
 
     def test_target_single_leg_rejection_rolls_back_only_new_target(self):
         original = self.f.broker.submit

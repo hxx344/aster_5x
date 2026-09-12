@@ -13,6 +13,7 @@ TIERS = (5, 10, 20)
 MIN_OPEN_LEVERAGE = TIERS[0]
 MIN_BATCH_NOTIONAL = Decimal("500")
 TAKER_FEE_ESTIMATE = Decimal("0.0004")
+EXTRA_MARGIN_ALLOWANCE = Fraction(1, 20)
 SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
 
 
@@ -313,8 +314,14 @@ class Plan:
 def opening_margin_limit(policy, leverage):
     """10x and 20x share five percentage points above the account base limit."""
     base = Fraction(dec(policy["margin_limit"]))
-    bonus = Fraction(1, 20) if leverage in (10, 20) else Fraction(0)
+    bonus = EXTRA_MARGIN_ALLOWANCE if leverage in (10, 20) else Fraction(0)
     return decimal_value(min(Fraction(1), base + bonus), exact=True)
+
+
+def migration_margin_limit(policy):
+    """Migration at every tier shares the same account-wide five-point allowance."""
+    base = Fraction(dec(policy["margin_limit"]))
+    return decimal_value(min(Fraction(1), base + EXTRA_MARGIN_ALLOWANCE), exact=True)
 
 
 def plan_pair(snapshot, book, rules, capacities, policy, now=None):

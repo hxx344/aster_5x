@@ -230,7 +230,7 @@ class Store:
                             reason="XAU 多空仓位已全部迁出" if done else "本批迁移已核对，等待下一批" if moved else "本批目标新增已回退，等待重新评估")
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(progress)))
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                       ("post_fill_check:" + intent["account_id"], dumps({"symbol": intent["target_symbol"], "leverage": intent["target_leverage"]})))
+                       ("post_fill_check:" + intent["account_id"], dumps({"kind": "migration", "symbol": intent["target_symbol"], "leverage": intent["target_leverage"]})))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
                        (intent["account_id"], "migration", progress["reason"], time.time()))
 

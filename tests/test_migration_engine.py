@@ -83,6 +83,48 @@ class MigrationEngineTests(TestCase):
         self.assertEqual(state["phase"], "waiting")
         self.assertIn("5x", state["reason"])
 
+    def test_five_x_migration_above_base_completes_without_upgrade_or_false_pause(self):
+        account = self.f.store.account("test")
+        account["policy"]["margin_limit"] = ".93"
+        self.f.store.save_account(account)
+        for side in ("LONG", "SHORT"):
+            self.f.broker.state["positions"]["XAUUSD1:" + side]["qty"] = "13.316"
+        self.save_paper()
+        before = self.f.broker.snapshot(SYMBOLS)
+        self.assertGreater(before.ratio, dec(".93"))
+        with patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("5x has enough migration room")), \
+             patch("trading.engine.Executor.open_pair", side_effect=AssertionError("ordinary additions forbidden")):
+            self.tick()
+        progress = self.f.store.get("migration:test")
+        self.assertEqual((progress["completed_batches"], progress["target_leverage"]), (1, 5))
+        self.assertLess(dec(progress["source_remaining_qty"]["LONG"]), dec("13.316"))
+        after = self.f.broker.snapshot(SYMBOLS)
+        self.assertGreater(after.ratio, dec(".93"))
+        self.assertFalse(after.margin_exceeds(".98"))
+        self.assertTrue(self.f.store.account("test")["enabled"])
+        self.assertIsNone(self.f.store.get("post_fill_check:test"))
+
+    def test_migration_post_fill_limit_is_exact_and_does_not_grant_ordinary_room(self):
+        snapshot = self.f.broker.snapshot(SYMBOLS)
+        for p in snapshot.positions:
+            p.mark = dec(100)
+            p.qty = dec("137.5") if p.symbol == "XAUUSD1" else dec(0)
+            p.leverage = 5
+        snapshot.equity = dec(10000)
+        account = self.f.store.account("test")
+        migration = {"kind": "migration", "symbol": "SPCXUSD1", "leverage": 5}
+        ordinary = {"symbol": "SPCXUSD1", "leverage": 5}
+        for marker, should_pause in ((migration, False), (ordinary, True), (True, True)):
+            with self.subTest(marker=marker):
+                self.f.store.put("post_fill_check:test", marker)
+                self.assertEqual(self.engine.check_post_fill_occupancy(account, snapshot), should_pause)
+        # Decimal's displayed ratio still rounds to .55; the exact comparison
+        # must reject a loss beyond the shared five-point allowance.
+        snapshot.equity = dec("9999.999999999999999999999999999999999999")
+        self.assertEqual(snapshot.ratio, dec(".55"))
+        self.f.store.put("post_fill_check:test", migration)
+        self.assertTrue(self.engine.check_post_fill_occupancy(account, snapshot))
+
     def test_full_margin_waits_and_does_not_credit_unfilled_source_reduction(self):
         account = self.f.store.account("test")
         account["policy"]["margin_limit"] = "1"

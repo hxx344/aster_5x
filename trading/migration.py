@@ -9,7 +9,7 @@ import time
 
 from .models import (HEDGE_TOLERANCE, MIN_BATCH_NOTIONAL, SYMBOLS, TIERS, TradingError, dec,
                      decimal_value, hedge_balanced, leverage_cap,
-                     minimum_open_leverage, opening_margin_limit, positive, wire)
+                     migration_margin_limit, minimum_open_leverage, positive, wire)
 
 
 SOURCE_SYMBOL = "XAUUSD1"
@@ -380,7 +380,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
             continue
         attempted_tier = True
         cap = Fraction(leverage_cap(snapshot.brackets[target_symbol], leverage))
-        limit = Fraction(opening_margin_limit(account["policy"], leverage))
+        limit = Fraction(migration_margin_limit(account["policy"]))
 
         def resources(quantity, source_quantities, source_amounts):
             amounts = {s: target_sweeps[s].amount(quantity) for s in SIDES}

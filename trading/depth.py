@@ -1,11 +1,13 @@
 """Depth snapshots and fixed-notional display sweeps.
 
-Execution planners must obtain their own snapshot and enforce their stricter
-freshness and quantity checks; the display aggregates are never order inputs.
+Display and execution may share immutable, validated order-book snapshots.
+Execution applies its stricter freshness checks; display aggregates are never
+order inputs.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 import time
+from typing import Callable
 
 from .models import TradingError, decimal_value, positive, wire
 
@@ -13,7 +15,8 @@ from .models import TradingError, decimal_value, positive, wire
 DEPTH_NOTIONALS = (10000, 50000)
 DEPTH_LIMIT = 1000
 DEPTH_WEIGHT = 20
-DEPTH_POLL_INTERVAL = 10
+DEPTH_POLL_INTERVAL = 1
+DEPTH_RESYNC_INTERVAL = 30
 DEPTH_MAX_AGE = 15
 
 
@@ -50,6 +53,8 @@ class DepthSnapshot:
     bids: tuple
     asks: tuple
     timestamp: float
+    monotonic_timestamp: float | None = None
+    validity: Callable[[], bool] | None = field(default=None, compare=False, repr=False)
 
     @classmethod
     def from_response(cls, data, *, requested_at, now=None):
@@ -67,8 +72,18 @@ class DepthSnapshot:
         snapshot.require_fresh(now)
         return snapshot
 
-    def require_fresh(self, now=None):
+    def age(self, now=None):
         age = (time.time() if now is None else now) - self.timestamp
+        if self.monotonic_timestamp is not None:
+            age = max(age, time.monotonic() - self.monotonic_timestamp)
+        return age
+
+    def require_fresh(self, now=None):
+        if self.validity is not None and not self.validity():
+            raise TradingError("深度连接或更新序号已失效，等待重新同步")
+        if (time.time() if now is None else now) - self.timestamp < -1:
+            raise TradingError("深度报价时间无效，等待更新")
+        age = self.age(now)
         if not -1 <= age <= DEPTH_MAX_AGE:
             raise TradingError("深度报价已过期，等待更新")
 

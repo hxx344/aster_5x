@@ -42,6 +42,9 @@ class DemoMarket:
             "asks": [[wire(book.ask + book.ask * dec(i) / 10000), "100"] for i in range(10)],
         }, requested_at=book.timestamp)
 
+    def depth_weight(self, symbols):
+        return 0
+
 
 class PaperBroker:
     mode = "paper"

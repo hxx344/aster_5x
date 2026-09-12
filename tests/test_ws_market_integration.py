@@ -75,7 +75,10 @@ class WSQuoteIntegrationTests(unittest.TestCase):
         self.addCleanup(self.api.close)
         self.stream = Mock(spec=["book", "start", "close"])
         self.stream.book.return_value = None
-        self.market = MarketData(self.api, stream=self.stream)
+        self.depth_stream = Mock(spec=["snapshot", "seed_token", "seed", "start", "close"])
+        self.depth_stream.snapshot.return_value = None
+        self.depth_stream.seed_token.return_value = None
+        self.market = MarketData(self.api, stream=self.stream, depth_stream=self.depth_stream)
 
     def test_constructor_does_not_start_network_and_lifecycle_is_explicit(self):
         self.stream.start.assert_not_called()
@@ -244,7 +247,10 @@ class WSStreamLifecycleTests(unittest.TestCase):
         self.stream.book.return_value = None
         self.api = Mock()
         self.api.budget = RateBudget()
-        self.market = MarketData(self.api, stream=self.stream)
+        self.depth_stream = Mock(spec=["snapshot", "seed_token", "seed", "start", "close"])
+        self.depth_stream.snapshot.return_value = None
+        self.depth_stream.seed_token.return_value = None
+        self.market = MarketData(self.api, stream=self.stream, depth_stream=self.depth_stream)
         self.market.rules = self.f.market.rules
         self.engine = Engine(self.f.store, market=self.market)
 

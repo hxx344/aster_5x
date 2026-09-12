@@ -6,6 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from trading.depth import DEPTH_POLL_INTERVAL
 from trading.engine import Engine, snapshot_json
 from trading.exchange import BudgetWait
 from trading.models import TradingError, dec
@@ -174,7 +175,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
                 release.set()
                 worker.join(3)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(results, [10])
+        self.assertEqual(results, [DEPTH_POLL_INTERVAL])
 
 
 class PriorityCapacityExecutionTests(PriorityCapacityFixture):

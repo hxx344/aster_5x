@@ -16,7 +16,8 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
-from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_WEIGHT, DepthSnapshot
+from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
+from .depth_stream import PublicDepthStream
 from .market_stream import PublicQuoteStream
 from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
@@ -351,19 +352,28 @@ def credentials_for(prefix):
 
 
 class MarketData:
-    def __init__(self, api=None, *, stream=None):
+    def __init__(self, api=None, *, stream=None, depth_stream=None):
         self.api = api or API()
         self.stream = stream if stream is not None else PublicQuoteStream()
+        self.depth_stream = depth_stream if depth_stream is not None else PublicDepthStream()
         self.rules = {}
         self.assets = {}
         self.books, self.book_locks = {}, {}
         self.book_guard = threading.Lock()
+        self.depth_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
+        self.depth_retry_at = {}
 
     def start_stream(self):
-        self.stream.start()
+        try:
+            self.stream.start()
+        finally:
+            self.depth_stream.start()
 
     def close_stream(self):
-        self.stream.close()
+        try:
+            self.stream.close()
+        finally:
+            self.depth_stream.close()
 
     @staticmethod
     def market_quantity_limits(lot, market_lot=None):
@@ -485,17 +495,60 @@ class MarketData:
         book.require_fresh(now)
         return book
 
+    def depth_weight(self, symbols):
+        """Only missing stream seeds may require REST; healthy reads are free."""
+        return sum(DEPTH_WEIGHT for symbol in set(symbols)
+                   if self.depth_stream.seed_token(symbol) is not None
+                   and time.monotonic() >= self.depth_retry_at.get(symbol, 0))
+
     def depth(self, symbol):
-        """Fetch raw depth; each consumer applies its own freshness limit."""
+        """Read shared WS depth, obtaining REST only to seed a connected stream."""
         if symbol not in SYMBOLS:
             raise TradingError("不支持的深度市场")
+        depth = self.depth_stream.snapshot(symbol)
+        if depth is not None:
+            depth.require_fresh()
+            return depth
+        with self.depth_locks[symbol]:
+            depth = self.depth_stream.snapshot(symbol)
+            if depth is not None:
+                depth.require_fresh()
+                return depth
+            token = self.depth_stream.seed_token(symbol)
+            if token is None:
+                raise TradingError("深度 WS 正在连接或同步，等待有效推送")
+            retry_after = self.depth_retry_at.get(symbol, 0) - time.monotonic()
+            if retry_after > 0:
+                raise ExchangeError("深度正在重新同步，等待重试", retry_after=retry_after)
+            # Per-symbol single-flight and cooldown also bound repeated gaps or
+            # reconnects. Never turn a failed WS feed into continuous REST polls.
+            self.depth_retry_at[symbol] = time.monotonic() + DEPTH_RESYNC_INTERVAL
+            started, requested_at = time.monotonic(), time.time()
+            try:
+                data = self._read_depth(symbol)
+            except TradingError as exc:
+                self.depth_retry_at[symbol] = max(self.depth_retry_at[symbol],
+                    time.monotonic() + getattr(exc, "retry_after", 0))
+                raise
+            if time.monotonic() - started > DEPTH_MAX_AGE:
+                raise TradingError("深度请求耗时过长，等待更新")
+            self.depth_stream.seed(symbol, data, token=token, requested_at=requested_at)
+            depth = self.depth_stream.snapshot(symbol)
+            if depth is None:
+                raise TradingError("深度 WS 正在同步，等待连续更新")
+            depth.require_fresh()
+            return depth
+
+    def _read_depth(self, symbol):
+        """Raw REST seed; never expose an unbridged snapshot to consumers."""
         started, requested_at = time.monotonic(), time.time()
         data = self.api.call("GET", "/fapi/v3/depth", {"symbol": symbol, "limit": DEPTH_LIMIT}, weight=DEPTH_WEIGHT)
         if time.monotonic() - started > DEPTH_MAX_AGE:
             raise TradingError("深度请求耗时过长，等待更新")
         if isinstance(data, dict) and data.get("symbol", symbol) != symbol:
             raise TradingError("深度交易代码不匹配")
-        return DepthSnapshot.from_response(data, requested_at=requested_at)
+        DepthSnapshot.from_response(data, requested_at=requested_at)
+        return data
 
     def capacities(self, symbol, leverages):
         with self.api.budget.capacity_monitoring():

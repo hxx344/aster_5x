@@ -139,7 +139,7 @@ class _Sweep:
 
 def _require_depth_fresh(depth, now):
     depth.require_fresh(now)
-    if not -1 <= now - depth.timestamp <= MIGRATION_DEPTH_MAX_AGE:
+    if not -1 <= depth.age(now) <= MIGRATION_DEPTH_MAX_AGE:
         raise TradingError("迁移交易深度已过期，等待 3 秒内的新快照")
 
 
@@ -221,7 +221,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
     # Only the remaining lifetime of the oldest input is useful for searching.
     # A monotonic deadline cannot be extended by a wall-clock adjustment.
     deadline = started_at + MIGRATION_DEPTH_MAX_AGE - max(
-        now - source_depth.timestamp, now - target_depth.timestamp)
+        source_depth.age(now), target_depth.age(now))
 
     def require_search_time():
         if time.monotonic() > deadline:

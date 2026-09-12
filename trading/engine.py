@@ -14,7 +14,7 @@ import time
 import uuid
 
 import monitor
-from .depth import DEPTH_POLL_INTERVAL, DEPTH_WEIGHT
+from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
 from .lock import ProcessLock
@@ -29,7 +29,7 @@ MAX_ACCOUNTS = 8
 ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
 CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * 2 * 60 // CAPACITY_POLL_INTERVAL
-PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_POLL_INTERVAL
+PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_RESYNC_INTERVAL
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
                   "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE}
@@ -174,8 +174,8 @@ class Engine:
                 if not account["enabled"]:
                     return 90
                 if account.get("migration", {}).get("enabled"):
-                    # Fresh execution depth is separate from shared display depth.
-                    return 360
+                    # Depth reads share the WS book; retain private rechecks.
+                    return 300
                 positions = self.views.get(account["id"], {}).get("snapshot", {}).get("positions", [])
                 minimum = minimum_open_leverage(account["policy"])
                 for symbol in account["policy"]["symbols"]:
@@ -459,9 +459,10 @@ class Engine:
             self.migration_view(account, phase="waiting", reason="；".join(reasons))
             return 5
         if isinstance(broker, LiveBroker):
-            broker.api.budget.require_available(DEPTH_WEIGHT * (len(targets) + 1) + broker.snapshot_weight(migration_symbols(account)))
-        # Fetch the independent execution snapshots together so network latency
-        # cannot make the first source sample stale while comparing the targets.
+            seed_weight = self.market.depth_weight([source, *targets])
+            if seed_weight:
+                broker.api.budget.require_available(seed_weight)
+        # Shared snapshots are immutable; missing stream seeds may perform REST.
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="migration-depth") as pool:
             jobs = {symbol: pool.submit(self.market.depth, symbol) for symbol in [source, *targets]}
             depths = {}
@@ -492,6 +493,11 @@ class Engine:
             return 5
         plan, target_book = candidates[0]
         target = plan.target_symbol
+        if isinstance(broker, LiveBroker):
+            # Both migration execution and leverage changes reload private modes.
+            # WS depth requires no recurring REST allowance, but these reads do.
+            broker.api.budget.require_available(
+                broker.snapshot_weight(migration_symbols(account), fresh_modes=True) + 5)
         self.migration_view(account, phase="executing", reason=f"准备迁移至 {target} {plan.target_leverage}x",
                             target_symbol=target, required_leverage=plan.target_leverage, target_leverage=snapshot.pair(target)[0].leverage)
 
@@ -522,7 +528,10 @@ class Engine:
 
         def before_open(fresh):
             source_unchanged(fresh)
-            current = plan_migration(account, fresh, source_book, target_book, depths[source], depths[target],
+            current_source_depth, current_target_depth = self.market.depth(source), self.market.depth(target)
+            current_source_book, current_target_book = self.market.book(source), self.market.book(target)
+            current = plan_migration(account, fresh, current_source_book, current_target_book,
+                                     current_source_depth, current_target_depth,
                                      self.market.rules[source], self.market.rules[target],
                                      {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], progress)
             if (current.target_qty != plan.target_qty or current.source_quantities != plan.source_quantities

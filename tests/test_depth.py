@@ -4,7 +4,7 @@ from fractions import Fraction
 import unittest
 from unittest.mock import Mock, patch
 
-from trading.depth import DEPTH_MAX_AGE, DEPTH_POLL_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
+from trading.depth import DEPTH_MAX_AGE, DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from trading.engine import CAPACITY_MONITOR_RESERVE, Engine, PUBLIC_POLL_ALLOWANCE
 from trading.exchange import ExchangeError, MarketData
 from trading.models import SYMBOLS, TradingError, dec, decimal_value
@@ -99,7 +99,8 @@ class DepthMarketTests(unittest.TestCase):
 
     def test_one_unsigned_request_supplies_both_amounts_without_bbo_or_mark_requests(self):
         with patch("trading.exchange.time.time", return_value=100):
-            result = self.market.depth("CLUSD1").display()
+            data = self.market._read_depth("CLUSD1")
+            result = DepthSnapshot.from_response(data, requested_at=100, now=100).display()
         self.api.call.assert_called_once_with("GET", "/fapi/v3/depth", {"symbol": "CLUSD1", "limit": 1000}, weight=20)
         self.stream.book.assert_not_called()
         self.assertEqual(set(result["spreads"]), {"10000", "50000"})
@@ -107,7 +108,7 @@ class DepthMarketTests(unittest.TestCase):
     def test_symbol_mismatch_and_unrequested_symbols_are_rejected(self):
         self.api.call.return_value["symbol"] = "XAUUSD1"
         with self.assertRaises(TradingError):
-            self.market.depth("CLUSD1")
+            self.market._read_depth("CLUSD1")
         self.api.call.reset_mock()
         with self.assertRaises(TradingError):
             self.market.depth("BTCUSDT")
@@ -117,12 +118,12 @@ class DepthMarketTests(unittest.TestCase):
         with patch("trading.exchange.time.time", return_value=100), \
              patch("trading.exchange.time.monotonic", side_effect=[100, 100 + DEPTH_MAX_AGE + .001]), \
              self.assertRaisesRegex(TradingError, "耗时过长"):
-            self.market.depth("CLUSD1")
+            self.market._read_depth("CLUSD1")
 
     def test_exchange_failure_is_not_replaced_by_bbo_liquidity(self):
         self.api.call.side_effect = ExchangeError("rate limited", retry_after=60)
         with self.assertRaises(ExchangeError):
-            self.market.depth("CLUSD1")
+            self.market._read_depth("CLUSD1")
         self.stream.book.assert_not_called()
 
 
@@ -162,7 +163,7 @@ class DepthPollingTests(unittest.TestCase):
 
     def test_public_schedule_accounts_for_depth_and_existing_fallback_cost(self):
         self.assertGreaterEqual(PUBLIC_POLL_ALLOWANCE,
-                                CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 / DEPTH_POLL_INTERVAL)
+                                CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 / DEPTH_RESYNC_INTERVAL)
 
 
 if __name__ == "__main__":

@@ -189,10 +189,11 @@ class CyclePlanningTests(unittest.TestCase):
         with self.assertRaisesRegex(TradingError, "最小金额"):
             self.plan()
 
-    def test_open_requires_known_empty_orders_and_selected_flat_position(self):
+    def test_open_ignores_external_orders_but_requires_selected_flat_position(self):
+        expected = self.plan().qty
         for orders in (None, [{"symbol": "CLUSD1"}]):
-            with self.subTest(orders=orders), self.assertRaises(TradingError):
-                self.plan(snapshot=replace(self.snapshot, open_orders=orders))
+            with self.subTest(orders=orders):
+                self.assertEqual(self.plan(snapshot=replace(self.snapshot, open_orders=orders)).qty, expected)
         self.snapshot.positions[0].qty = dec("0.001")
         with self.assertRaises(CyclePositionError):
             self.plan()
@@ -306,12 +307,11 @@ class CyclePlanningTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(CyclePositionError):
                 self.plan(progress={**self.progress, **change})
 
-    def test_close_requires_full_depth_and_known_empty_orders(self):
+    def test_close_requires_full_depth_without_external_orders_read(self):
         self.hold(qty="200")
         with self.assertRaisesRegex(TradingError, "全部平仓.*深度不足"):
             self.plan(depth=depth(self.now, bids=[("100", "100")]))
-        with self.assertRaises(TradingError):
-            self.plan(snapshot=replace(self.snapshot, open_orders=None))
+        self.assertEqual(self.plan(snapshot=replace(self.snapshot, open_orders=None)).qty, dec(200))
 
 
 if __name__ == "__main__":

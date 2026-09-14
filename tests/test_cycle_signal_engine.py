@@ -140,7 +140,7 @@ class CycleSignalEngineTests(TestCase):
         api = API(transport=httpx.MockTransport(lambda request: seen.append(request) or httpx.Response(500)), budget=budget)
         self.addCleanup(api.close)
         self.engine.brokers["test"] = LiveBroker({}, self.f.market, api=api)
-        budget.reserve(1490)
+        budget.reserve(1496)
         with patch.object(self.f.market, "depth_weight", return_value=20, create=True):
             self.engine.tick_account("test", cycle_signal=signal)
         self.assertEqual(seen, [])

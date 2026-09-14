@@ -20,17 +20,43 @@ from .paper import PaperBroker, PaperOrderAbsent
 SIDES = ("LONG", "SHORT")
 
 
+class _GuardedCycleBroker:
+    """Fail a revoked local admission inside the known-not-sent boundary."""
+    def __init__(self, broker, validate):
+        self.broker, self.validate = broker, validate
+
+    def __getattr__(self, name):
+        return getattr(self.broker, name)
+
+    def submit(self, orders):
+        try:
+            if self.validate is None:
+                raise TradingError("循环账户热快照尚未授权，等待后台更新")
+            self.validate()
+        except Exception as exc:
+            raise RequestNotSent(str(exc)) from exc
+        return self.broker.submit(orders)
+
+
 class CycleExecutor(Executor):
     def prepare_snapshot(self, account, symbol=None):
-        """Read the one account snapshot this executor may admit once."""
+        """Admit one background live snapshot, or read the local paper ledger."""
         self._cycle_admission = None
+        self._cycle_submit_guard = None
         account_id = account["id"]
         symbol = account["cycle"]["symbol"] if symbol is None else symbol
-        started = monotonic()
-        snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+        if isinstance(self.broker, LiveBroker):
+            lease = self.broker.cycle_hot_snapshot([symbol])
+            snapshot, started, validate = lease.snapshot, lease.started_monotonic, lease.require_fresh
+            validate()
+            snapshot.require_fresh()
+        else:
+            started = monotonic()
+            snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+            validate = None
         # Keep the authority local to this executor. Neither a copied snapshot
         # nor later changes to its wall-clock timestamp can renew admission.
-        self._cycle_admission = (snapshot, account_id, symbol, started)
+        self._cycle_admission = (snapshot, account_id, symbol, started, validate)
         return snapshot
 
     @staticmethod
@@ -39,6 +65,9 @@ class CycleExecutor(Executor):
         if type(started) not in (int, float) or type(now) not in (int, float) \
                 or not math.isfinite(started) or not math.isfinite(now) or not 0 <= now - started <= 8:
             raise TradingError("循环本轮账户快照已过期，等待重新核对")
+        if admission[4] is not None:
+            admission[4]()
+            admission[0].require_fresh()
 
     def _observe_quality(self, intent):
         if not intent or intent.get("kind") != "cycle":
@@ -60,8 +89,14 @@ class CycleExecutor(Executor):
 
     def send(self, intent, orders, *, repair=False):
         self._cycle_admission = None
+        guard = getattr(self, "_cycle_submit_guard", None)
+        self._cycle_submit_guard = None
         if repair or intent.get("kind") != "cycle":
             return super().send(intent, orders, repair=repair)
+        broker = self.broker
+        if isinstance(broker, LiveBroker):
+            validate = guard[1] if guard and guard[0] == intent["id"] else None
+            broker = _GuardedCycleBroker(broker, validate)
         observed = None
         try:
             quality = intent.get("execution_quality")
@@ -69,15 +104,13 @@ class CycleExecutor(Executor):
                 quality = intent["execution_quality"] = new_quality(intent)
             clocks = getattr(self, "_quality_clocks", None)
             trigger_ticks, final_ticks = clocks[1:] if clocks and clocks[0] == intent["id"] else (None, None)
-            observed = ObservedBroker(self.broker, quality, trigger_ticks, final_ticks)
+            observed = ObservedBroker(broker, quality, trigger_ticks, final_ticks)
         except Exception:
             pass
         try:
-            if observed is None:
-                return super().send(intent, orders, repair=repair)
             # Reuse the original one-call send, validation and persistence logic.
-            # The adapter belongs to this send only; self.broker is never mutated.
-            return Executor(self.store, observed, self.market).send(intent, orders, repair=repair)
+            # A failed observation setup must still use the live admission guard.
+            return Executor(self.store, observed or broker, self.market).send(intent, orders, repair=repair)
         finally:
             self._observe_quality(intent)
 
@@ -133,6 +166,13 @@ class CycleExecutor(Executor):
         if intent.get("account_id") != account["id"]:
             intent["volume_error"] = "循环成交补账的账户不一致"
             return False
+        original = {key: copy.deepcopy(intent.get(key)) for key in ("volume_queries", "volume_receipts")}
+        def save_state():
+            synced = self.store.save_cycle_volume_state(intent, original)
+            if synced:
+                intent.pop("volume_error", None)
+                intent["volume_synced"] = True
+            return synced
         errors = []
         orders = intent.get("orders", []) + intent.get("repairs", [])
         with getattr(self.broker, "cycle_volume_budget", nullcontext)():
@@ -166,7 +206,8 @@ class CycleExecutor(Executor):
                     fills = self.broker.cycle_trades(order, receipt, created_at, checkpoint=checkpoint)
                     # A historical paper adapter may attach its stable synthetic
                     # orderId here; the ledger validates against the durable copy.
-                    self.store.save_intent(intent)
+                    if save_state():
+                        return True
                     self._record_volume_fills(intent, fills)
                     signature = [str(receipt.get("orderId", "")), wire(dec(receipt["executedQty"])), receipt["status"]]
                     intent["volume_receipts"][cid] = signature
@@ -176,7 +217,8 @@ class CycleExecutor(Executor):
                     # Valid matching fills from an incomplete page are useful
                     # accounting evidence even before the whole order is visible.
                     try:
-                        self.store.save_intent(intent)
+                        if save_state():
+                            return True
                         partial = list(checkpoint.get("fills", {}).values())
                         if partial:
                             self._record_volume_fills(intent, partial)
@@ -186,10 +228,10 @@ class CycleExecutor(Executor):
             try:
                 if errors:
                     intent["volume_error"] = "；".join(dict.fromkeys(errors))[:1000]
-                    self.store.save_intent(intent)
-                    return False
+                    return save_state()
                 intent.pop("volume_error", None)
-                self.store.save_intent(intent)
+                if save_state():
+                    return True
                 if intent.get("status") in ("complete", "aborted"):
                     self.store.mark_cycle_volume_synced(intent["id"])
                     intent["volume_synced"] = True
@@ -197,7 +239,8 @@ class CycleExecutor(Executor):
             except Exception as exc:
                 intent["volume_error"] = str(exc)[:1000]
                 try:
-                    self.store.save_intent(intent)
+                    if save_state():
+                        return True
                 except Exception:
                     pass
                 # Accounting failure is surfaced to the scheduler; never turn it
@@ -221,13 +264,12 @@ class CycleExecutor(Executor):
         snapshot.require_modes([symbol])
         if not snapshot.can_trade:
             raise TradingError("账户没有交易权限")
-        if snapshot.open_orders is None or snapshot.open_orders:
-            raise TradingError("独立循环需要确认所选品种没有未完成挂单")
         return snapshot.pair(symbol)
 
     def start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None):
         admission = getattr(self, "_cycle_admission", None)
         self._cycle_admission = None
+        self._cycle_submit_guard = None
         self.last_snapshot = self.last_completed_intent = None
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
@@ -259,10 +301,16 @@ class CycleExecutor(Executor):
             self._require_admission_fresh(admission)
             long, short = self._ready(snapshot, symbol)
         else:
-            # Preserve the direct-call contract for callers that did not obtain
-            # this exact snapshot through this executor's one-shot preparation.
+            # Direct callers must compare a newly admitted live cache version;
+            # only the local paper broker retains the old ledger-read fallback.
             selected = self._ready(snapshot, symbol)
-            snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+            if isinstance(self.broker, LiveBroker):
+                snapshot = self.prepare_snapshot(account, symbol)
+                admission, self._cycle_admission = self._cycle_admission, None
+                prepared = True
+                self._require_admission_fresh(admission)
+            else:
+                snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
             long, short = self._ready(snapshot, symbol)
             if any(current.qty != previous.qty or current.leverage != previous.leverage
                    for current, previous in zip((long, short), selected)):
@@ -286,7 +334,7 @@ class CycleExecutor(Executor):
             opened_at = progress.get("opened_at")
             if type(opened_at) not in (int, float) or not math.isfinite(opened_at) or time.time() - opened_at < config["hold_seconds"]:
                 raise TradingError("独立循环尚未达到本轮最短持仓时间")
-        book = self.market.book(symbol)
+        book = self.market.cycle_book(symbol) if isinstance(self.broker, LiveBroker) else self.market.book(symbol)
         book.require_fresh()
         final_observation = None
         if before_submit is not None:
@@ -342,17 +390,21 @@ class CycleExecutor(Executor):
             intent["execution_quality"] = quality
         action = "开仓" if plan.phase == "open" else "平仓"
         persist_started = clock_tick()
-        self.store.create_cycle_intent(intent, f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
-        record_duration(quality, "persist_ms", persist_started)
-        self._quality_clocks = (token, trigger_ticks, final_ticks)
+        if isinstance(self.broker, LiveBroker):
+            self._cycle_submit_guard = (token, lambda: self._require_admission_fresh(admission))
         try:
+            self.store.create_cycle_intent(intent, f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
+            record_duration(quality, "persist_ms", persist_started)
+            self._quality_clocks = (token, trigger_ticks, final_ticks)
             self.send(intent, orders)
         finally:
             self._quality_clocks = None
+            self._cycle_submit_guard = None
         return self.reconcile(account, intent)
 
     def set_leverage(self, account, snapshot, progress, before_submit=None):
         self._cycle_admission = None
+        self._cycle_submit_guard = None
         self.last_snapshot = self.last_completed_intent = None
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
@@ -403,6 +455,7 @@ class CycleExecutor(Executor):
 
     def reconcile(self, account, intent=None):
         self._cycle_admission = None
+        self._cycle_submit_guard = None
         self.last_snapshot = self.last_completed_intent = None
         with getattr(self.broker, "reconciliation_budget", nullcontext)():
             intent = intent or self.store.intent(account["id"])

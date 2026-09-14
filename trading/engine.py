@@ -18,6 +18,7 @@ import uuid
 import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
+from .account_cache import HotAccountUnavailable
 from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
@@ -38,6 +39,7 @@ LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
 CYCLE_SIGNAL_MAX_AGE = 3
 CYCLE_SIGNAL_MIN_INTERVAL = 1
+CYCLE_HOT_POLL_INTERVAL = 2
 ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
 CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * 2 * 60 // CAPACITY_POLL_INTERVAL
@@ -135,6 +137,8 @@ class Engine:
         self.cycle_market_updates, self.cycle_market_order, self.cycle_signal_seen = {}, {}, {}
         self.cycle_signals, self.cycle_signal_ready, self.cycle_signal_after = {}, {}, {}
         self.cycle_signal_deferred = set()
+        self.cycle_hot_wakes, self.cycle_hot_waiting = set(), set()
+        self.cycle_hot_backoff = {}
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
@@ -160,7 +164,11 @@ class Engine:
 
     def broker(self, account):
         aid = account["id"]
-        if aid not in self.brokers:
+        # Background refresh and trading may first reach an account together.
+        # Construction is local; serialize registration, never an HTTP read.
+        with self.lock:
+            if aid in self.brokers:
+                return self.brokers[aid]
             if account["mode"] == "paper":
                 self.brokers[aid] = PaperBroker(aid, self.market, self.store)
             else:
@@ -169,19 +177,130 @@ class Engine:
                 creds = credentials_for(account["env_prefix"])
                 signer = creds["signer"].lower()
                 user = creds["user"].lower()
-                with self.lock:
-                    if signer in self.signers and self.signers[signer] != aid:
-                        raise TradingError("同一 API signer 不能由多个账户执行器共用")
-                    if user in self.users and self.users[user] != aid:
-                        raise TradingError("同一真实账户不能通过不同 API signer 重复接入")
-                    broker = LiveBroker(creds, self.market)
-                    self.signers[signer] = aid
-                    self.users[user] = aid
-                    self.brokers[aid] = broker
-        return self.brokers[aid]
+                if signer in self.signers and self.signers[signer] != aid:
+                    raise TradingError("同一 API signer 不能由多个账户执行器共用")
+                if user in self.users and self.users[user] != aid:
+                    raise TradingError("同一真实账户不能通过不同 API signer 重复接入")
+                broker = LiveBroker(creds, self.market)
+                self.signers[signer] = aid
+                self.users[user] = aid
+                self.brokers[aid] = broker
+            return self.brokers[aid]
 
     def live_allowed(self, account):
         return account["mode"] == "paper" or (not self.demo and os.environ.get("ASTER_ALLOW_LIVE") == "1")
+
+    def wake_cycle_hot_data(self, account_id):
+        """A stream callback only queues refresh; it never takes the trade lock."""
+        if self.shutdown.is_set():
+            return
+        with self.lock:
+            self.cycle_hot_wakes.add(account_id)
+        self.scheduler_event.set()
+
+    def cycle_hot_ready(self, account_id):
+        with self.lock:
+            self.cycle_hot_waiting.discard(account_id)
+            self.cycle_signal_seen.pop(account_id, None)
+            self.cycle_signal_ready.pop(account_id, None)
+        self.scheduler_event.set()
+
+    def revoke_cycle_hot_data(self, account_id, reason):
+        with self.lock:
+            broker = self.brokers.get(account_id)
+        if isinstance(broker, LiveBroker):
+            broker.invalidate_cycle_hot_data(reason, refresh_modes=True)
+        self.wake_cycle_hot_data(account_id)
+
+    def poll_cycle_hot_data(self, account_id):
+        """Refresh independently of the account execution slot and quote trigger."""
+        account = self.store.account(account_id)
+        with self.lock:
+            existing = self.brokers.get(account_id)
+        active = (account and account["mode"] == "live" and account["enabled"]
+                  and account.get("cycle", {}).get("enabled") and self.live_allowed(account)
+                  and not self.shutdown.is_set())
+        if not active:
+            if isinstance(existing, LiveBroker):
+                existing.stop_cycle_hot_data()
+            return 30
+        broker = self.broker(account)
+        broker.start_cycle_hot_data([account["cycle"]["symbol"]],
+                                    on_invalidate=lambda: self.wake_cycle_hot_data(account_id))
+        if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+            broker.invalidate_cycle_hot_data("本账户未完成批次正在核对")
+            with self.lock:
+                self.cycle_hot_backoff[account_id] = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
+            return CYCLE_HOT_POLL_INTERVAL
+        try:
+            # A hot refresh spends ordinary quota only. Keep room for one
+            # batch, in addition to the existing monitoring/repair reserves.
+            budget = getattr(broker.api, "budget", None)
+            if budget is not None:
+                budget.require_available(
+                    broker.cycle_snapshot_weight([account["cycle"]["symbol"]], fresh_modes=True) + 5)
+            published = broker.refresh_cycle_hot_snapshot()
+            latest = self.store.account(account_id)
+            if (self.shutdown.is_set() or not latest or not latest["enabled"] or latest.get("cycle") != account.get("cycle")
+                    or self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id)):
+                broker.invalidate_cycle_hot_data("账户或批次在后台更新期间发生变化", refresh_modes=True)
+                return CYCLE_HOT_POLL_INTERVAL
+            if published:
+                self.cycle_hot_ready(account_id)
+            return CYCLE_HOT_POLL_INTERVAL
+        except HotAccountUnavailable:
+            with self.lock:
+                self.cycle_hot_backoff[account_id] = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
+            return CYCLE_HOT_POLL_INTERVAL
+        except AccountModeError as exc:
+            broker.invalidate_cycle_hot_data("账户模式不符合要求", refresh_modes=True)
+            # The network read is over; serialize the persisted pause with
+            # account controls without holding the execution lock during I/O.
+            with self.account_lock(account_id):
+                latest = self.store.account(account_id)
+                if latest and latest["enabled"] and latest.get("cycle") == account.get("cycle"):
+                    self.store.pause_account(latest, str(exc))
+                    self.view(account_id, status="attention", reason=str(exc))
+                    self.cycle_view(latest, phase="attention", reason=str(exc))
+                    with self.lock:
+                        self.accounts_generation += 1
+            return 30
+        except (TradingError, KeyError, ValueError, TypeError) as exc:
+            broker.invalidate_cycle_hot_data("账户后台更新暂不可用")
+            delay = max(CYCLE_HOT_POLL_INTERVAL, getattr(exc, "retry_after", 0))
+            with self.lock:
+                self.cycle_hot_backoff[account_id] = time.monotonic() + delay
+            return delay
+
+    def poll_cycle_history(self, account_id):
+        """Only completed batches are backfilled; new orders read the local ledger."""
+        account = self.store.account(account_id)
+        if (not account or account["mode"] != "live" or not account["enabled"]
+                or not account.get("cycle", {}).get("enabled") or not self.live_allowed(account)
+                or self.shutdown.is_set()):
+            return 30
+        if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+            return 2
+        broker = self.broker(account)
+        executor = CycleExecutor(self.store, broker, self.market)
+        backlog = self.store.cycle_volume_backlog(account_id, limit=4, since=max(0, time.time() - 86400))
+        if not backlog:
+            backlog = self.store.cycle_volume_backlog(account_id, limit=1, since=0)
+        try:
+            for intent in backlog:
+                if self.shutdown.is_set() or not executor.sync_volume(account, intent):
+                    return 5
+            if backlog:
+                self.cycle_hot_ready(account_id)
+            return 5 if backlog else 10
+        except (TradingError, KeyError, ValueError, TypeError) as exc:
+            return max(5, getattr(exc, "retry_after", 0))
+
+    def cycle_book(self, symbol):
+        return self.market.cycle_book(symbol) if isinstance(self.market, MarketData) else self.market.book(symbol)
+
+    def cycle_depth(self, symbol):
+        return self.market.cycle_depth(symbol) if isinstance(self.market, MarketData) else self.market.depth(symbol)
 
     def on_cycle_market_update(self, symbol, source, received_at, received_monotonic):
         """The WS receiver only replaces a bounded signal and wakes scheduling."""
@@ -723,6 +842,8 @@ class Engine:
         state = self.cycle_volume_state(account)
         daily, rolling = state["daily_volume"], state["rolling_volume"]
         if daily["sync_pending"]:
+            if account["mode"] == "live":
+                raise HotAccountUnavailable("循环成交明细正在后台同步，完成后再开仓")
             raise TradingError("循环成交明细仍在同步，完成 UTC 日及滚动 24 小时累计量核对后再开仓")
         def quota_error(error_type, title, code):
             checks = [{"code": key, "label": label, "actual": diagnostic_number(record["volume"]),
@@ -783,11 +904,17 @@ class Engine:
             if executor.last_snapshot is not None:
                 self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]), credential_ready=True)
             return 5
-        # History synchronization cannot change exchange positions. Complete it
-        # before the single live account read, so a slow backlog cannot age the
-        # snapshot that will authorize this batch.
+        if not account["enabled"] or self.shutdown.is_set():
+            reason = account.get("pause_reason") or "循环已暂停，已有仓位和持仓计时保留"
+            phase = "attention" if account.get("pause_reason") else "paused"
+            self.view(aid, status=phase, reason=reason)
+            self.cycle_view(account, phase=phase, reason=reason)
+            return 60
+        if not self.live_allowed(account):
+            raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
+        # Paper accounting is local; live history runs on its background worker.
         previous = self.store.get("cycle:" + aid)
-        if (account["enabled"] and not self.shutdown.is_set() and self.live_allowed(account)
+        if (not isinstance(broker, LiveBroker) and account["enabled"] and not self.shutdown.is_set() and self.live_allowed(account)
                 and (not previous or previous.get("phase", "waiting_open") == "waiting_open")):
             backlog = self.store.cycle_volume_backlog(aid, limit=4, since=max(0, time.time() - 86400))
             if not backlog:
@@ -797,14 +924,12 @@ class Engine:
                     break
         public_prepare_ms = None
         if trigger is not None:
-            # The WS prefilter already checked these caches. If a feed failed
-            # meanwhile, finish its possible REST recovery before reading cash.
+            # Only inspect local quotes here; dedicated market workers recover
+            # a missing stream without delaying the trading worker with REST.
             public_prepare_started = clock_tick()
-            self.market.book(symbol)
-            self.market.depth(symbol)
+            self.cycle_book(symbol)
+            self.cycle_depth(symbol)
             public_prepare_ms = observed_elapsed(public_prepare_started, clock_tick())
-        if isinstance(broker, LiveBroker):
-            broker.api.budget.require_available(broker.cycle_snapshot_weight([symbol], fresh_modes=True))
         initial_read_started = clock_tick() if trigger is not None else None
         snapshot = executor.prepare_snapshot(account, symbol)
         if trigger is not None:
@@ -857,9 +982,9 @@ class Engine:
             self.cycle_view(account, phase="reconciling", reason=reason)
             return 5
         if isinstance(broker, LiveBroker):
-            broker.api.budget.require_available(self.market.depth_weight([symbol]) + 5)
+            broker.api.budget.require_available(5)
         planning_started = clock_tick() if trigger is not None else None
-        book, depth = self.market.book(symbol), self.market.depth(symbol)
+        book, depth = self.cycle_book(symbol), self.cycle_depth(symbol)
         plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress,
                           **allowances)
         if trigger is not None:
@@ -871,7 +996,7 @@ class Engine:
         def before_submit(fresh):
             if self.shutdown.is_set() or not self.live_allowed(account):
                 raise TradingError("多空循环已停止提交")
-            final_book, final_depth = self.market.book(symbol), self.market.depth(symbol)
+            final_book, final_depth = self.cycle_book(symbol), self.cycle_depth(symbol)
             current = plan_cycle(account, fresh, final_book, final_depth,
                                  self.market.rules[symbol], progress,
                                  **(self.cycle_open_allowances(account) if plan.phase == "open" else {}))
@@ -955,10 +1080,8 @@ class Engine:
                     cycle_context = True
                     if isinstance(broker, LiveBroker):
                         symbol = account["cycle"]["symbol"]
-                        # Admit the complete read/check/send path before its first
-                        # private read; the broker retains per-request admission.
-                        broker.api.budget.require_available(broker.cycle_snapshot_weight([symbol], fresh_modes=True) +
-                            self.market.depth_weight([symbol]) + 5)
+                        # Only the order request spends quota on this hot path.
+                        broker.api.budget.require_available(5)
                     return self.tick_cycle_account(account, broker, None, trigger=cycle_signal)
                 if pending and pending["kind"] in ("cycle", "cycle_leverage"):
                     cycle_context = True
@@ -1171,6 +1294,18 @@ class Engine:
                 if campaign and (snapshot.margin_exceeds(campaign_limit, include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):
                     self.store.finish_campaign(account, last_reason, snapshot.ratio)
                 return 5
+            except HotAccountUnavailable as exc:
+                # Missing hot data queues background work; it must never cause
+                # an on-demand query or a long account-wide network backoff.
+                with self.lock:
+                    self.cycle_hot_waiting.add(account_id)
+                    self.cycle_signal_ready.pop(account_id, None)
+                self.wake_cycle_hot_data(account_id)
+                self.view(account_id, status="waiting", reason=str(exc), credential_ready=True)
+                progress = self.store.get("cycle:" + account_id) or {}
+                self.cycle_view(account, phase="waiting_close" if progress.get("opened_at") is not None else "waiting_open",
+                                reason=str(exc))
+                return 1
             except (TradingError, KeyError, ValueError, TypeError) as exc:
                 message = str(exc) if isinstance(exc, TradingError) else "账户响应格式异常，已停止本轮操作"
                 with self.lock:
@@ -1260,6 +1395,7 @@ class Engine:
             if stop_migration:
                 account.update(enabled=False, migration={**account.get("migration", DEFAULT_MIGRATION), "enabled": False})
                 self.store.save_account(account)
+                self.revoke_cycle_hot_data(account_id, "账户已暂停")
                 with self.lock:
                     self.wake_accounts.add(account_id)
                     if pending:
@@ -1296,6 +1432,7 @@ class Engine:
             if "min_open_leverage" in changes:
                 account.pop("leverage_setting_required", None)
             self.store.save_account(account)
+            self.revoke_cycle_hot_data(account_id, "账户配置已更新")
             with self.lock:
                 self.accounts_generation += 1
             self.store.event(account_id, "config", "策略设置已更新")
@@ -1325,8 +1462,8 @@ class Engine:
                     snapshot = broker.cycle_snapshot(symbols, fresh_modes=True)
                     snapshot.require_fresh()
                     snapshot.require_modes(symbols)
-                    if not snapshot.can_trade or snapshot.open_orders is None or snapshot.open_orders:
-                        raise TradingError("多空循环需要交易权限及已确认无挂单的账户")
+                    if not snapshot.can_trade:
+                        raise TradingError("多空循环需要账户交易权限")
                     self.cycle_progress(account, snapshot)
                     if ordinary_markets:
                         symbols = list(dict.fromkeys([*account["policy"]["symbols"], account["cycle"]["symbol"]]))
@@ -1348,6 +1485,7 @@ class Engine:
             if enabled:
                 account.pop("pause_reason", None)
             self.store.save_account(account)
+            self.revoke_cycle_hot_data(account_id, "账户运行状态已更新")
             with self.lock:
                 self.wake_accounts.add(account_id)
                 self.accounts_generation += 1
@@ -1650,7 +1788,7 @@ class Engine:
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
         saved_accounts = []
-        # Capacity, BBO, display depth, accounts and the outbox have worker capacity.
+        # Account refresh and history never occupy an execution worker's slot.
         try:
             if isinstance(self.market, MarketData) and not self.shutdown.is_set():
                 self.market.api.budget.configure_capacity_reserve(CAPACITY_MONITOR_RESERVE)
@@ -1659,7 +1797,7 @@ class Engine:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS + 3 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=3 * MAX_ACCOUNTS + 3 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 try:
                     while not self.shutdown.is_set():
                         self.scheduler_event.clear()
@@ -1685,6 +1823,9 @@ class Engine:
                                         with self.lock:
                                             self.account_backoff[failed_aid] = time.monotonic() + delay
                                             self.cycle_quote_backoff.pop(failed_aid, None)
+                                    elif key.startswith("cycle-data:"):
+                                        with self.lock:
+                                            self.cycle_hot_backoff[key.removeprefix("cycle-data:")] = time.monotonic() + delay
                                 aid = key.removeprefix("account:")
                                 with self.lock:
                                     urgent = aid in self.urgent_accounts
@@ -1723,6 +1864,11 @@ class Engine:
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
                         cycle_candidates = self.cycle_wake_candidates(saved_accounts, pending)
                         with self.lock:
+                            for aid in list(self.cycle_hot_wakes):
+                                key = "cycle-data:" + aid
+                                if key not in pending and time.monotonic() >= self.cycle_hot_backoff.get(aid, 0):
+                                    due[key] = 0
+                                    self.cycle_hot_wakes.discard(aid)
                             for aid in list(self.wake_accounts):
                                 key = "account:" + aid
                                 if key not in pending:
@@ -1739,6 +1885,9 @@ class Engine:
                         jobs.update({"book:" + s: (self.poll_book, s) for s in SYMBOLS})
                         jobs.update({"depth:" + s: (self.poll_depth, s) for s in SYMBOLS})
                         jobs["notify"] = (self.notify,)
+                        live_ids = [a["id"] for a in saved_accounts if a["mode"] == "live"]
+                        jobs.update({"cycle-data:" + aid: (self.poll_cycle_hot_data, aid) for aid in live_ids})
+                        jobs.update({"cycle-history:" + aid: (self.poll_cycle_history, aid) for aid in live_ids})
                         ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts,
                             aid not in cycle_candidates, aid not in priority_accounts))
                         jobs.update({"account:" + aid: (self.tick_account, aid) for aid in ordered_accounts})
@@ -1754,6 +1903,10 @@ class Engine:
                             if priority or ordinary_due:
                                 cycle_signal = None
                             if key not in pending and (cycle_signal or priority or time.monotonic() >= due.get(key, 0)):
+                                if key.startswith("cycle-data:"):
+                                    with self.lock:
+                                        if time.monotonic() < self.cycle_hot_backoff.get(key.removeprefix("cycle-data:"), 0):
+                                            continue
                                 if is_account:
                                     with self.lock:
                                         backoff = self.account_backoff.get(aid, 0)
@@ -1786,6 +1939,9 @@ class Engine:
                     self.shutdown.set()
                     with self.lock:
                         self.ready, self.error = False, "交易调度已停止"
+                        closing_ids = list(self.brokers)
+                    for aid in closing_ids:
+                        self.revoke_cycle_hot_data(aid, "交易调度已停止")
         except Exception:
             with self.lock:
                 self.error = "交易调度异常停止，请检查服务后重启"
@@ -1833,6 +1989,10 @@ class Engine:
         with self.lifecycle_lock:
             self.shutdown.set()
             self.scheduler_event.set()
+            with self.lock:
+                closing_ids = list(self.brokers)
+            for aid in closing_ids:
+                self.revoke_cycle_hot_data(aid, "交易服务正在停止")
             if self.thread:
                 self.thread.join(timeout=90)
             if not self.thread or not self.thread.is_alive():

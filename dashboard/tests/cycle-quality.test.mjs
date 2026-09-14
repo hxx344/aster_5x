@@ -295,7 +295,7 @@ test('pre-submit measurements remain separate from the existing overlapping tota
     view.preSubmit.map((item) => item.label),
     [
       '触发→账户任务开始',
-      '首轮账户查询',
+      '账户热数据读取',
       '首轮规划与盘口',
       '提交前账户复核',
       '最终盘口与风控检查',

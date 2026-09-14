@@ -3,6 +3,7 @@ import json
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from fractions import Fraction
 import math
@@ -17,9 +18,11 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
+from .account_cache import CycleAccountCache, HotAccountUnavailable
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from .depth_stream import PublicDepthStream
 from .market_stream import PublicQuoteStream
+from .user_stream import PrivateAccountStream
 from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
@@ -515,6 +518,14 @@ class MarketData:
             self.books[symbol] = (started, book)
             return book
 
+    def cycle_book(self, symbol):
+        """A trading trigger reads only the current local WS book."""
+        book = self._stream_book(symbol)
+        if book is None:
+            raise HotAccountUnavailable("循环报价热数据尚未就绪，等待行情更新")
+        book.require_fresh()
+        return book
+
     def _read_book(self, symbol):
         # Fetch mark first so the executable BBO is as recent as possible.
         mark = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
@@ -546,6 +557,7 @@ class MarketData:
         if depth is not None:
             depth.require_fresh()
             return depth
+
         with self.depth_locks[symbol]:
             depth = self.depth_stream.snapshot(symbol)
             if depth is not None:
@@ -576,6 +588,16 @@ class MarketData:
             depth.require_fresh()
             return depth
 
+    def cycle_depth(self, symbol):
+        """Read local bridged depth without starting a REST seed on demand."""
+        if symbol not in SYMBOLS:
+            raise TradingError("不支持的深度市场")
+        depth = self.depth_stream.snapshot(symbol)
+        if depth is None:
+            raise HotAccountUnavailable("循环深度热数据尚未就绪，等待行情更新")
+        depth.require_fresh()
+        return depth
+
     def _read_depth(self, symbol):
         """Raw REST seed; never expose an unbridged snapshot to consumers."""
         started, requested_at = time.monotonic(), time.time()
@@ -605,8 +627,111 @@ class LiveBroker:
         self.api = api or API(credentials)
         self.market = market
         self.cached, self.cached_at = {}, {}
+        self._snapshot_lock = threading.RLock()
+        self._cycle_lifecycle_lock = threading.Lock()
+        self._cycle_stream_callback_lock = threading.RLock()
+        self._cycle_stream_token = None
+        self._cycle_hot_closed = False
+        self.cycle_cache = CycleAccountCache()
+        self.cycle_stream = None
         self.leverage_snapshot = None
         self.cycle_trade_queries = {}
+
+    def start_cycle_hot_data(self, symbols, *, on_invalidate=None):
+        """Configure one private stream; neither construction nor start reads REST here."""
+        with self._cycle_lifecycle_lock:
+            if self._cycle_hot_closed:
+                raise HotAccountUnavailable("循环账户热数据已关闭")
+            self.cycle_cache.set_listener(on_invalidate)
+            self.cycle_cache.configure(symbols)
+            if self.cycle_stream is None:
+                token = object()
+                stream = PrivateAccountStream(self.api,
+                    on_state=lambda connected: self._cycle_stream_state(token, connected),
+                    on_event=lambda kind: self._cycle_stream_event(token, kind))
+                with self._cycle_stream_callback_lock:
+                    self._cycle_stream_token = token
+                self.cycle_stream = stream
+            self.cycle_stream.start()
+
+    def stop_cycle_hot_data(self):
+        """Stop private monitoring while keeping this broker's API reusable."""
+        with self._cycle_lifecycle_lock:
+            stream, self.cycle_stream = self.cycle_stream, None
+            with self._cycle_stream_callback_lock:
+                self._cycle_stream_token = None
+                self.cycle_cache.set_listener(None)
+                self.cycle_cache.set_connected(False)
+            if stream is not None:
+                stream.close()
+
+    def _cycle_stream_state(self, token, connected):
+        # A stopped stream may finish after a replacement has connected.
+        with self._cycle_stream_callback_lock:
+            if token is self._cycle_stream_token:
+                self.cycle_cache.set_connected(connected)
+
+    def _cycle_stream_event(self, token, kind):
+        with self._cycle_stream_callback_lock:
+            if token is self._cycle_stream_token:
+                self._cycle_account_event(kind)
+
+    def invalidate_cycle_hot_data(self, reason, *, refresh_modes=False):
+        self.cycle_cache.invalidate(reason, refresh_modes=refresh_modes)
+
+    def _cycle_account_event(self, kind):
+        self.cycle_cache.invalidate("账户事件：" + str(kind),
+            refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
+
+    def _cycle_write(self, method, path, params, *, weight=1, refresh_modes=False):
+        # No snapshot HTTP lock: in-flight background results are revoked by
+        # generation instead of making a ready order wait for another request.
+        self.leverage_snapshot = None
+        self.cycle_cache.invalidate("账户写入开始", refresh_modes=refresh_modes)
+        try:
+            return self.api.call(method, path, params, signed=True, weight=weight)
+        finally:
+            # A refresh that started during this write must also be discarded.
+            self.leverage_snapshot = None
+            self.cycle_cache.invalidate("账户写入结束", refresh_modes=refresh_modes)
+
+    def refresh_cycle_hot_snapshot(self):
+        """Only the background scheduler calls this network refresh."""
+        ticket = self.cycle_cache.begin_refresh()
+        started = time.monotonic()
+        try:
+            # Ordinary and cycle parsers share small mode/tier caches. Their
+            # network reads serialize here, but leases and writes never take it.
+            with self._snapshot_lock:
+                try:
+                    snapshot = self.cycle_snapshot(ticket.symbols, fresh_modes=ticket.refresh_modes)
+                    valid_until = self.cached_at["multi"] + 15
+                finally:
+                    # Background maintenance never grants a leverage-write token.
+                    self.leverage_snapshot = None
+            snapshot.require_modes(ticket.symbols)
+            return self.cycle_cache.publish(ticket, snapshot, started,
+                valid_until_monotonic=valid_until)
+        except BaseException as exc:
+            self.cycle_cache.fail(ticket, exc)
+            raise
+
+    def cycle_hot_snapshot(self, symbols):
+        """Lease account state and revalue locally, without any HTTP or read lock."""
+        lease = self.cycle_cache.lease(symbols)
+        snapshot = lease.snapshot
+        marks = {symbol: self._cycle_local_mark(symbol) for symbol in dict.fromkeys(p.symbol for p in snapshot.positions)}
+        positions = [replace(position, mark=marks[position.symbol] if marks[position.symbol] is not None else position.mark)
+                     for position in snapshot.positions]
+        marked = sum((Fraction(position.qty) * (Fraction(position.mark) - Fraction(position.entry))
+                      * (1 if position.side == "LONG" else -1) for position in positions), Fraction(0))
+        pnl = min(Fraction(snapshot.unrealized), marked)
+        loss = Fraction(snapshot.unrealized) - pnl
+        lease.snapshot = replace(snapshot, positions=positions, unrealized=decimal_value(pnl, exact=True),
+            equity=decimal_value(Fraction(snapshot.equity) - loss, exact=True),
+            available=decimal_value(Fraction(snapshot.available) - loss, exact=True))
+        lease.require_fresh()
+        return lease
 
     def reconciliation_budget(self):
         budget = getattr(self.api, "budget", None)
@@ -617,14 +742,19 @@ class LiveBroker:
         return budget.cycle_accounting() if budget is not None else nullcontext()
 
     def cached_call(self, key, path, params=None, ttl=300, weight=1):
-        started = time.monotonic()
-        if started - self.cached_at.get(key, -1e9) >= ttl:
-            self.cached[key] = self.api.call("GET", path, params, signed=True, weight=weight)
-            # Network time counts towards cache age; slow reads must not renew it.
-            self.cached_at[key] = started
-        return self.cached[key]
+        with self._snapshot_lock:
+            started = time.monotonic()
+            if started - self.cached_at.get(key, -1e9) >= ttl:
+                self.cached[key] = self.api.call("GET", path, params, signed=True, weight=weight)
+                # Network time counts towards cache age; slow reads must not renew it.
+                self.cached_at[key] = started
+            return self.cached[key]
 
     def snapshot_weight(self, symbols, *, fresh_modes=False):
+        with self._snapshot_lock:
+            return self._snapshot_weight(symbols, fresh_modes=fresh_modes)
+
+    def _snapshot_weight(self, symbols, *, fresh_modes=False):
         """Conservative admission estimate using cache expiries, without a request."""
         now = time.monotonic()
         def due(key, ttl):
@@ -636,15 +766,20 @@ class LiveBroker:
         return weight
 
     def snapshot(self, symbols, fresh_modes=False):
-        return self._snapshot(symbols, fresh_modes=fresh_modes)
+        with self._snapshot_lock:
+            return self._snapshot(symbols, fresh_modes=fresh_modes)
 
     def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
+        with self._snapshot_lock:
+            return self._cycle_snapshot_weight(symbols, fresh_modes=fresh_modes)
+
+    def _cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
         """Include conditional risk/flat-mark/tier reads without issuing them."""
         symbols = tuple(dict.fromkeys(symbols))
         now = time.monotonic()
-        # Account + selected orders; reserve for one full risk fallback and the
+        # Account; reserve for one full risk fallback and the
         # existing two-request flat quote fallback when risk omits a symbol.
-        weight = 5 + len(symbols) + 5 + 2 * len(symbols)
+        weight = 5 + 5 + 2 * len(symbols)
         if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= 15:
             weight += 30
         weight += sum(1 for symbol in symbols if now - self.cached_at.get("bracket:" + symbol, -1e9) + 8 >= 5)
@@ -900,6 +1035,10 @@ class LiveBroker:
         return caps
 
     def cycle_snapshot(self, symbols, fresh_modes=False):
+        with self._snapshot_lock:
+            return self._cycle_snapshot(symbols, fresh_modes=fresh_modes)
+
+    def _cycle_snapshot(self, symbols, fresh_modes=False):
         """Join independent cycle GETs before validating one complete snapshot.
 
         Aster V3 keeps the latest 100 unique nonces per signer, allowing a small
@@ -913,8 +1052,6 @@ class LiveBroker:
             self.cached_at.pop("multi", None)
         specs = [("multi", "/fapi/v3/multiAssetsMargin", None, 15, 30),
                  ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5)]
-        specs.extend(("orders:" + str(index), "/fapi/v3/openOrders", {"symbol": symbol}, None, 1)
-                     for index, symbol in enumerate(symbols))
         values, fetched, pending = {}, {}, []
         for key, path, params, ttl, weight in specs:
             stamp = self.cached_at.get(key, -1e9)
@@ -991,13 +1128,6 @@ class LiveBroker:
                          else self.cached_at["bracket:" + symbol])
                 for symbol in caps if "bracket:" + symbol in values
             }
-            orders = []
-            for index, symbol in enumerate(symbols):
-                rows = values["orders:" + str(index)]
-                if not isinstance(rows, list) or any(not isinstance(row, dict) or row.get("symbol") != symbol for row in rows):
-                    raise TradingError("独立循环未完成挂单响应无效")
-                orders.extend(rows)
-            snapshot.open_orders = orders
             snapshot.require_fresh()
             for key in caps:
                 cache_key = "bracket:" + key
@@ -1051,7 +1181,7 @@ class LiveBroker:
             except TradingError as exc:
                 raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
         try:
-            return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
+            return self._cycle_write("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, refresh_modes=True)
         except ExchangeError as exc:
             status_rejected = exc.http_status in LEVERAGE_REJECTION_HTTP_STATUSES and exc.code not in (-1006, -1007)
             code_rejected = not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES
@@ -1064,20 +1194,20 @@ class LiveBroker:
         """The independent cycle may choose any integer leverage, only while flat."""
         if type(leverage) is not int or not 1 <= leverage <= 125:
             raise TradingError("独立循环杠杆必须为 1 至 125 的整数")
-        # Always refresh: an earlier flat read cannot authorize lowering leverage
-        # after an intervening external fill or a newly submitted order.
+        # The executor protects its own in-flight orders; verify actual flat
+        # positions without querying external open orders in this taker cycle.
         self.leverage_snapshot = None
         try:
             snapshot = self.cycle_snapshot([symbol], fresh_modes=True)
             snapshot.require_modes([symbol])
             long, short = snapshot.require_ready(symbol)
-            if snapshot.open_orders is None or snapshot.open_orders or long.qty or short.qty:
-                raise TradingError("独立循环仅允许在所选品种确认空仓且没有挂单时设置杠杆")
+            if long.qty or short.qty:
+                raise TradingError("独立循环仅允许在所选品种确认空仓时设置杠杆")
             if before_submit is not None:
                 before_submit(snapshot)
                 long, short = snapshot.require_ready(symbol)
-                if snapshot.open_orders is None or snapshot.open_orders or long.qty or short.qty:
-                    raise TradingError("独立循环杠杆提交前必须仍为空仓且没有挂单")
+                if long.qty or short.qty:
+                    raise TradingError("独立循环杠杆提交前必须仍为空仓")
             if leverage == long.leverage:
                 return {"symbol": symbol, "leverage": leverage}
         except RequestNotSent:
@@ -1085,7 +1215,7 @@ class LiveBroker:
         except TradingError as exc:
             raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
         try:
-            return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
+            return self._cycle_write("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, refresh_modes=True)
         except ExchangeError as exc:
             status_rejected = exc.http_status in LEVERAGE_REJECTION_HTTP_STATUSES and exc.code not in (-1006, -1007)
             code_rejected = not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES
@@ -1191,8 +1321,8 @@ class LiveBroker:
     def submit(self, orders):
         self.leverage_snapshot = None
         if len(orders) == 1:
-            return [self.api.call("POST", "/fapi/v3/order", orders[0], signed=True)]
-        return self.api.call("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, signed=True, weight=5)
+            return [self._cycle_write("POST", "/fapi/v3/order", orders[0])]
+        return self._cycle_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5)
 
     def query(self, symbol, client_id):
         with self.reconciliation_budget():
@@ -1200,7 +1330,12 @@ class LiveBroker:
 
     def cancel(self, symbol, client_id):
         with self.reconciliation_budget():
-            return self.api.call("DELETE", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
+            return self._cycle_write("DELETE", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id})
 
     def close(self):
-        self.api.close()
+        with self._cycle_lifecycle_lock:
+            self._cycle_hot_closed = True
+        try:
+            self.stop_cycle_hot_data()
+        finally:
+            self.api.close()

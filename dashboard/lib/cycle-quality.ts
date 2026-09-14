@@ -184,7 +184,7 @@ const REQUEST_STATUS: Record<string, string> = {
 
 const PRE_SUBMIT_STAGES = [
   ['queue_ms', '触发→账户任务开始'],
-  ['initial_account_ms', '首轮账户查询'],
+  ['initial_account_ms', '账户热数据读取'],
   ['planning_ms', '首轮规划与盘口'],
   ['final_account_ms', '提交前账户复核'],
   ['final_check_ms', '最终盘口与风控检查'],

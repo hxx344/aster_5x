@@ -196,8 +196,6 @@ class CycleParallelSnapshotTests(TestCase):
                               "entryPrice": "100" if quantity != "0" else "0", "markPrice": "100",
                               "leverage": leverage, "unRealizedProfit": "0", "liquidationPrice": "0", "marginType": "cross"}
                              for side in ("LONG", "SHORT"))
-        self.selected_orders = []
-        self.other_orders = [{"symbol": "SPCXUSD1", "orderId": 123}]
         self.api = Mock()
         self.api.budget = None
         self.api.call.side_effect = self.api_call
@@ -220,27 +218,27 @@ class CycleParallelSnapshotTests(TestCase):
         if path == "/fapi/v3/leverageBracket":
             return {"symbol": params["symbol"], "brackets": PAPER_BRACKETS}
         if path == "/fapi/v3/openOrders":
-            return deepcopy(self.selected_orders if params["symbol"] == CYCLE_SYMBOL else self.other_orders)
+            raise AssertionError("taker cycle must not query external order inventory")
         raise AssertionError("unexpected request: " + path)
 
-    def test_cycle_snapshot_keeps_other_exposure_but_only_queries_selected_orders(self):
+    def test_cycle_snapshot_keeps_other_exposure_without_querying_orders(self):
         snapshot = self.live.cycle_snapshot([CYCLE_SYMBOL])
         self.assertEqual(snapshot.occupied_margin_exact,
                          6 * Fraction(self.f.market.book("SPCXUSD1").mark) / 10
                          + 8 * Fraction(self.f.market.book("CLUSD1").mark) / 20)
         self.assertEqual({position.symbol for position in snapshot.positions if position.qty}, {"SPCXUSD1", "CLUSD1"})
-        self.assertEqual(snapshot.open_orders, [])
+        self.assertIsNone(snapshot.open_orders)
         self.assertEqual(tuple(position.qty for position in CycleExecutor._ready(snapshot, CYCLE_SYMBOL)), (0, 0))
         validate_cycle_positions(self.f.account, snapshot)
         order_reads = [call for call in self.api.call.call_args_list if call.args[1] == "/fapi/v3/openOrders"]
-        self.assertEqual(len(order_reads), 1)
-        self.assertEqual(order_reads[0].args[2], {"symbol": CYCLE_SYMBOL})
+        self.assertEqual(order_reads, [])
 
-    def test_selected_open_order_still_blocks_cycle_with_other_markets_present(self):
-        self.selected_orders = [{"symbol": CYCLE_SYMBOL, "orderId": 456}]
+    def test_selected_external_position_still_blocks_cycle_with_other_markets_present(self):
+        self.rows[0].update(positionAmt="1", entryPrice="100")
         snapshot = self.live.cycle_snapshot([CYCLE_SYMBOL])
-        with self.assertRaisesRegex(TradingError, "所选品种没有未完成挂单"):
-            CycleExecutor._ready(snapshot, CYCLE_SYMBOL)
+        self.assertIsNone(snapshot.open_orders)
+        with self.assertRaises(CyclePositionError):
+            validate_cycle_positions(self.f.account, snapshot)
 
     def test_other_active_isolated_position_still_blocks_account_mode_check(self):
         self.rows[2]["marginType"] = "isolated"

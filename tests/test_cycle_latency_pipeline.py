@@ -1,7 +1,8 @@
-"""Exercise the complete WS-to-submit path with delayed, signed mock reads."""
+"""Warm in the background, then prove WS-to-submit performs zero HTTP reads."""
 from collections import Counter
 from copy import deepcopy
 from fractions import Fraction
+from types import SimpleNamespace
 import threading
 import time
 import unittest
@@ -14,20 +15,22 @@ from tests.helpers import Fixture
 from tests.test_exchange_hardening import account_responses
 from trading.cycle import DEFAULT_CYCLE
 from trading.engine import Engine
-from trading.exchange import API, LiveBroker, RateBudget
+from trading.exchange import API, LiveBroker, MarketData, RateBudget
 
 
 class _StopAtSubmit(RuntimeError):
     """Observe the send boundary without sending any order or recovery request."""
 
 
-def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_modes=True, during_history=False):
+def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_modes=True,
+                     during_history=False, hot_state="ready"):
     fixture = Fixture()
     api = None
     try:
         owner = fixture.store.account("test")
         config = {**DEFAULT_CYCLE, "enabled": True, "spread_notional": "1000", "max_notional": "1000"}
         owner["cycle"] = config
+        owner["mode"] = "live"
         owner["policy"]["symbols"] = ["XAUUSD1"]
         fixture.store.save_account(owner)
         if phase == "close":
@@ -60,13 +63,7 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
             elif changed == "multi":
                 responses["/fapi/v3/multiAssetsMargin"] = {"multiAssetsMargin": True}
 
-        if not during_history:
-            change_account()
-
-        def sync_history(*args):
-            events.append("history")
-            change_account()
-            return True
+        change_account()
 
         def handle(request):
             nonlocal inflight, peak
@@ -91,16 +88,41 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
         key = bytes(range(1, 33))
         credentials = {"private_key": key, "signer": Account.from_key(key).address, "user": "0x" + "22" * 20}
         api = API(credentials, transport=httpx.MockTransport(handle), budget=RateBudget())
-        broker = LiveBroker(credentials, fixture.market, api=api)
+        market = MarketData(api, stream=SimpleNamespace(book=fixture.market.book),
+            depth_stream=SimpleNamespace(snapshot=fixture.market.depth))
+        market.rules, market.assets = fixture.market.rules, fixture.market.assets
+        broker = LiveBroker(credentials, market, api=api)
         # No dual-mode or tier caches are needed for this fixed-leverage path.
         if warm_modes:
             broker.cached["multi"] = {"multiAssetsMargin": False}
             broker.cached_at["multi"] = time.monotonic()
 
-        engine = Engine(fixture.store, market=fixture.market)
+        broker.cycle_cache.configure(["XAUUSD1"])
+        broker.cycle_cache.set_connected(True)
+        engine = Engine(fixture.store, market=market)
         engine.brokers["test"] = broker
+        if hot_state != "cold":
+            with patch.dict("os.environ", {"ASTER_ALLOW_LIVE": "1"}), patch.object(broker, "start_cycle_hot_data"):
+                engine.poll_cycle_hot_data("test")
+        background_calls = dict(calls)
+        calls.clear()
+        events.clear()
+        if hot_state == "event":
+            broker._cycle_account_event("ACCOUNT_UPDATE")
+        elif hot_state == "disconnected":
+            broker.cycle_cache.set_connected(False)
+        elif hot_state == "config":
+            broker.cycle_cache.configure(["CLUSD1"])
+        elif hot_state == "expired":
+            broker.cycle_cache._monotonic = lambda: time.monotonic() + 9
+        elif hot_state == "missing_quote":
+            market.stream.book = lambda symbol: None
+        elif hot_state == "missing_depth":
+            market.depth_stream.snapshot = lambda symbol: None
+
         engine.on_cycle_market_update("XAUUSD1", "depth", time.time(), time.monotonic())
-        signal = engine.cycle_wake_candidates([owner])["test"]
+        signal = {"symbol": "XAUUSD1", "source": "depth", "received_at": time.time(),
+                  "received_monotonic": time.monotonic()}
         original_signal_keys = set(signal)
         submitted = []
 
@@ -110,8 +132,9 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
             # monotonic submit boundary. Do not continue into POST/reconcile.
             raise _StopAtSubmit()
 
-        with patch.object(fixture.store, "cycle_volume_backlog", return_value=[{"id": "prior"}] if during_history else []), \
-             patch("trading.cycle_execution.CycleExecutor.sync_volume", side_effect=sync_history), \
+        with patch.dict("os.environ", {"ASTER_ALLOW_LIVE": "1"}), \
+             patch.object(fixture.store, "cycle_volume_backlog", return_value=[{"id": "prior"}] if during_history else []), \
+             patch("trading.cycle_execution.CycleExecutor.sync_volume", side_effect=AssertionError("history ran on trade worker")) as history, \
              patch.object(broker, "submit", side_effect=observe):
             try:
                 engine.tick_account("test", cycle_signal=signal)
@@ -120,6 +143,7 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
         quality = fixture.store.get("cycle_execution:test")
         return {"response_delay_ms": response_delay * 1000, "phase": phase, "events": events,
                 "quality": quality, "orders": submitted, "private_gets": sum(calls.values()),
+                "background_calls": background_calls, "history_reads": history.call_count,
                 "calls": dict(calls), "peak_requests": peak, "inflight_at_return": inflight,
                 "signal_was_mutated": set(signal) != original_signal_keys,
                 "pending": fixture.store.intent("test"), "account_enabled": fixture.store.account("test")["enabled"],
@@ -131,17 +155,19 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
 
 
 class CycleLatencyPipelineTests(unittest.TestCase):
-    def test_one_account_and_one_orders_read_authorize_open_and_close(self):
+    def test_background_snapshot_authorizes_open_and_close_with_zero_trigger_http(self):
         for phase in ("open", "close"):
             result = measure_pipeline(phase=phase)
-            self.assertEqual(result["private_gets"], 3)
+            self.assertEqual(result["private_gets"], 0)
             self.assertEqual(result["inflight_at_return"], 0)
             self.assertEqual(len(result["orders"]), 1)
             self.assertEqual(len(result["orders"][0]), 2)
             self.assertFalse(result["signal_was_mutated"])
-            self.assertEqual(result["calls"], {"/fapi/v3/accountWithJoinMargin": 1, "/fapi/v3/openOrders": 1,
-                                               "/fapi/v3/multiAssetsMargin": 1})
-            self.assertEqual(result["peak_requests"], 3)
+            self.assertEqual(result["calls"], {})
+            self.assertEqual(result["background_calls"], {"/fapi/v3/accountWithJoinMargin": 1,
+                                                          "/fapi/v3/multiAssetsMargin": 1})
+            self.assertEqual(result["history_reads"], 0)
+            self.assertEqual(result["peak_requests"], 2)
             timing = result["quality"]["timing"]
             stages = timing["pre_submit"]
             self.assertEqual(set(stages), {"queue_ms", "initial_account_ms", "planning_ms", "final_account_ms",
@@ -149,8 +175,8 @@ class CycleLatencyPipelineTests(unittest.TestCase):
             self.assertTrue(all(type(value) in (int, float) and value >= 0 for value in stages.values()), stages)
             self.assertAlmostEqual(sum(stages.values()), timing["trigger_to_request_ms"], places=5)
 
-    def test_unique_current_read_blocks_invalid_account_or_open_orders(self):
-        for changed in ("positions", "mode", "balance", "cap", "orders"):
+    def test_hot_snapshot_still_blocks_invalid_account(self):
+        for changed in ("positions", "mode", "balance", "cap"):
             with self.subTest(changed=changed):
                 result = measure_pipeline(response_delay=0, changed=changed)
                 self.assertEqual(result["orders"], [])
@@ -161,26 +187,39 @@ class CycleLatencyPipelineTests(unittest.TestCase):
                 if changed == "mode":
                     self.assertFalse(result["account_enabled"])
 
-    def test_every_batch_checks_multi_mode_even_when_a_recent_false_value_is_cached(self):
+    def test_background_mode_baseline_overrides_preexisting_cached_false(self):
         for warm_modes in (False, True):
             with self.subTest(warm_modes=warm_modes):
                 result = measure_pipeline(response_delay=0, warm_modes=warm_modes)
-                self.assertEqual(result["private_gets"], 3)
-                self.assertEqual(result["calls"]["/fapi/v3/multiAssetsMargin"], 1)
+                self.assertEqual(result["private_gets"], 0)
+                self.assertEqual(result["background_calls"]["/fapi/v3/multiAssetsMargin"], 1)
                 self.assertEqual(len(result["orders"]), 1)
                 changed = measure_pipeline(response_delay=0, warm_modes=warm_modes, changed="multi")
                 self.assertFalse(changed["account_enabled"])
                 self.assertEqual(changed["orders"], [])
                 self.assertIsNone(changed["pending"])
 
-    def test_history_sync_finishes_before_the_current_balance_and_position_read(self):
-        for changed in ("positions", "balance"):
-            with self.subTest(changed=changed):
-                result = measure_pipeline(response_delay=0, changed=changed, during_history=True)
-                self.assertLess(result["events"].index("history"), result["events"].index("/fapi/v3/accountWithJoinMargin"))
-                self.assertEqual(result["calls"]["/fapi/v3/accountWithJoinMargin"], 1)
+    def test_missing_hot_state_waits_without_any_http_fallback(self):
+        for state in ("cold", "event", "disconnected", "config", "expired", "missing_quote", "missing_depth"):
+            with self.subTest(state=state):
+                result = measure_pipeline(response_delay=0, hot_state=state)
+                self.assertEqual(result["calls"], {})
                 self.assertEqual(result["orders"], [])
                 self.assertIsNone(result["pending"])
+                self.assertTrue(result["account_enabled"])
+
+    def test_unsynced_history_blocks_open_locally_without_querying_on_trade_worker(self):
+        result = measure_pipeline(response_delay=0, during_history=True)
+        self.assertEqual(result["private_gets"], 0)
+        self.assertEqual(result["history_reads"], 0)
+        self.assertEqual(result["orders"], [])
+        self.assertIsNone(result["pending"])
+
+    def test_external_order_response_is_never_requested(self):
+        result = measure_pipeline(response_delay=0, changed="orders")
+        self.assertEqual(len(result["orders"]), 1)
+        self.assertNotIn("/fapi/v3/openOrders", result["background_calls"])
+        self.assertEqual(result["calls"], {})
 
     def test_close_plan_observation_uses_correct_buy_sell_mapping_and_complete_timings(self):
         result = measure_pipeline(response_delay=0, phase="close")

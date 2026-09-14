@@ -60,19 +60,19 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         self.addCleanup(api.close)
         return LiveBroker(credentials, market or LocalQuoteMarket(), api=api), observed
 
-    def test_three_http_reads_overlap_with_unique_valid_signatures(self):
-        barrier = threading.Barrier(3)
+    def test_two_http_reads_overlap_with_unique_valid_signatures(self):
+        barrier = threading.Barrier(2)
         def hook(request, observed):
             barrier.wait(timeout=3)
         broker, observed = self.make_broker(hook=hook)
         fixed_nonce_time = time.time_ns()
         with patch("trading.exchange.time.time_ns", return_value=fixed_nonce_time):
             result = broker.cycle_snapshot([SYMBOL], fresh_modes=True)
-        self.assertEqual(observed.peak, 3)
+        self.assertEqual(observed.peak, 2)
         self.assertEqual(observed.active, 0)
-        self.assertEqual(len(observed.requests), 3)
+        self.assertEqual(len(observed.requests), 2)
         self.assertEqual(broker.api.budget.inflight, {})
-        self.assertEqual(broker.api.budget.local_weight, 36)
+        self.assertEqual(broker.api.budget.local_weight, 35)
         nonces = []
         for request in observed.requests:
             self.assertEqual(request.method, "GET")
@@ -83,18 +83,18 @@ class CycleSnapshotParallelTests(unittest.TestCase):
                 "verifyingContract": "0x" + "00" * 20}, message_types={"Message": [{"name": "msg", "type": "string"}]},
                 message_data={"msg": urlencode(params)})
             self.assertEqual(Account.recover_message(message, signature=signature), broker.api.credentials["signer"])
-        self.assertEqual(sorted(nonces), list(range(min(nonces), min(nonces) + 3)))
+        self.assertEqual(sorted(nonces), list(range(min(nonces), min(nonces) + 2)))
         self.assertEqual(result.current_leverage_caps, {SYMBOL: (5, dec(1000000))})
         self.assertEqual(result.brackets, {})
-        self.assertEqual(result.open_orders, [])
+        self.assertIsNone(result.open_orders)
         self.assertTrue(all(p.liquidation is None for p in result.positions))
 
-    def test_multiple_symbols_keep_at_most_six_inflight_and_join_all(self):
-        first_six, release = threading.Event(), threading.Event()
+    def test_multiple_symbols_share_two_account_reads_and_join_both(self):
+        arrived, release = threading.Event(), threading.Event()
         def hook(request, observed):
             with observed.lock:
-                if len(observed.requests) == 6:
-                    first_six.set()
+                if len(observed.requests) == 2:
+                    arrived.set()
             self.assertTrue(release.wait(timeout=3))
         symbols = (SYMBOL, "SPCXUSD1", "CLUSD1", "OTHER1USD1", "OTHER2USD1")
         market = LocalQuoteMarket()
@@ -106,18 +106,18 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(broker.cycle_snapshot, symbols, True)
             try:
-                self.assertTrue(first_six.wait(timeout=3))
+                self.assertTrue(arrived.wait(timeout=3))
                 with observed.lock:
-                    self.assertEqual(len(observed.requests), 6)
-                    self.assertEqual(observed.active, 6)
+                    self.assertEqual(len(observed.requests), 2)
+                    self.assertEqual(observed.active, 2)
                 self.assertFalse(future.done())
             finally:
                 release.set()
             result = future.result(timeout=3)
-        self.assertEqual(len(observed.requests), 7)
-        self.assertEqual(observed.peak, 6)
+        self.assertEqual(len(observed.requests), 2)
+        self.assertEqual(observed.peak, 2)
         self.assertEqual(observed.active, 0)
-        self.assertEqual(result.open_orders, [])
+        self.assertIsNone(result.open_orders)
         self.assertEqual(set(result.current_leverage_caps), set(symbols))
 
     def test_ordinary_snapshot_remains_sequential_and_does_not_query_orders(self):
@@ -131,21 +131,21 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         responses = cycle_account_responses()
         broker, observed = self.make_broker(responses=responses)
         broker.cycle_snapshot([SYMBOL], fresh_modes=True)
-        self.assertEqual(len(observed.requests), 3)
+        self.assertEqual(len(observed.requests), 2)
         responses[MULTI]["multiAssetsMargin"] = True
         reused = broker.cycle_snapshot([SYMBOL])
         self.assertFalse(reused.multi_assets)
-        self.assertCountEqual([request.url.path for request in observed.requests[3:]], [ACCOUNT, ORDERS])
+        self.assertCountEqual([request.url.path for request in observed.requests[2:]], [ACCOUNT])
         fresh = broker.cycle_snapshot([SYMBOL], fresh_modes=True)
         self.assertTrue(fresh.multi_assets)
-        self.assertEqual(len(observed.requests), 8)
-        self.assertCountEqual([request.url.path for request in observed.requests[5:]], [MULTI, ACCOUNT, ORDERS])
+        self.assertEqual(len(observed.requests), 5)
+        self.assertCountEqual([request.url.path for request in observed.requests[3:]], [MULTI, ACCOUNT])
         with self.assertRaises(AccountModeError):
             fresh.require_modes([SYMBOL])
 
     def test_parallel_cache_age_starts_before_request_instead_of_on_completion(self):
         clock = SimpleNamespace(now=100.0)
-        barrier = threading.Barrier(3, action=lambda: setattr(clock, "now", 102.0))
+        barrier = threading.Barrier(2, action=lambda: setattr(clock, "now", 102.0))
         api = FixtureAPI(cycle_account_responses())
         original = api.call
         def call(*args, **kwargs):
@@ -167,14 +167,14 @@ class CycleSnapshotParallelTests(unittest.TestCase):
             api.calls.clear()
             clock.now = 114.9
             original = api.call
-            barrier = threading.Barrier(2, action=lambda: setattr(clock, "now", 115.1))
+            barrier = threading.Barrier(1, action=lambda: setattr(clock, "now", 115.1))
             def call(method, path, *args, **kwargs):
                 if path != MULTI:
                     barrier.wait(timeout=3)
                 return original(method, path, *args, **kwargs)
             api.call = call
             broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS, MULTI])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, MULTI])
         self.assertEqual(broker.cached_at, {"multi": 115.1})
 
     def test_conditional_bracket_expiring_during_account_reads_is_refetched(self):
@@ -190,14 +190,14 @@ class CycleSnapshotParallelTests(unittest.TestCase):
             api.calls.clear()
             clock.now = 104.9
             original = api.call
-            barrier = threading.Barrier(2, action=lambda: setattr(clock, "now", 105.1))
+            barrier = threading.Barrier(1, action=lambda: setattr(clock, "now", 105.1))
             def call(method, path, *args, **kwargs):
                 if path != BRACKET:
                     barrier.wait(timeout=3)
                 return original(method, path, *args, **kwargs)
             api.call = call
             broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS, BRACKET])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, BRACKET])
         self.assertEqual(broker.cached_at["bracket:" + SYMBOL], 105.1)
         self.assertEqual(broker.cached_at["multi"], 100)
 
@@ -219,13 +219,13 @@ class CycleSnapshotParallelTests(unittest.TestCase):
              patch("trading.exchange.time.time", side_effect=lambda: clock.wall):
             with self.assertRaisesRegex(TradingError, "查询已过期"):
                 broker.cycle_snapshot([SYMBOL], fresh_modes=True)
-        self.assertEqual(len(api.calls), 4)
+        self.assertEqual(len(api.calls), 3)
         self.assertEqual(broker.cached_at, {})
         self.assertIsNone(broker.leverage_snapshot)
 
     def test_slow_entire_round_is_stale_and_cannot_publish_cache_or_leverage_token(self):
         wall = SimpleNamespace(now=1000.0)
-        barrier = threading.Barrier(3, action=lambda: setattr(wall, "now", 1009.0))
+        barrier = threading.Barrier(2, action=lambda: setattr(wall, "now", 1009.0))
         api = FixtureAPI(cycle_account_responses())
         original = api.call
         def call(*args, **kwargs):
@@ -239,7 +239,7 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         self.assertIsNone(broker.leverage_snapshot)
 
     def test_all_reads_finish_after_one_failure_before_return_or_next_round(self):
-        barrier = threading.Barrier(3)
+        barrier = threading.Barrier(2)
         failed, release = threading.Event(), threading.Event()
         def hook(request, observed):
             barrier.wait(timeout=3)
@@ -262,16 +262,16 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, -1000)
         self.assertEqual(observed.active, 0)
         self.assertEqual(broker.api.budget.inflight, {})
-        self.assertEqual(len(observed.requests), 3)
+        self.assertEqual(len(observed.requests), 2)
         self.assertEqual(broker.cached_at, {})
 
     def test_explicit_rate_limit_survives_other_errors_and_blocks_the_next_round(self):
-        barrier = threading.Barrier(3)
+        barrier = threading.Barrier(2)
         def hook(request, observed):
             barrier.wait(timeout=3)
             if request.url.path == MULTI:
                 return httpx.Response(500, json={"code": -1000})
-            if request.url.path == ORDERS:
+            if request.url.path == ACCOUNT:
                 return httpx.Response(429, headers={"Retry-After": "250"})
         broker, observed = self.make_broker(hook=hook)
         with self.assertRaises(ExchangeError) as caught:
@@ -280,13 +280,13 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         self.assertEqual(caught.exception.retry_after, 250)
         with self.assertRaises(RequestNotSent):
             broker.cycle_snapshot([SYMBOL], fresh_modes=True)
-        self.assertEqual(len(observed.requests), 3)
+        self.assertEqual(len(observed.requests), 2)
         self.assertEqual(observed.active, 0)
         self.assertEqual(broker.api.budget.inflight, {})
 
     def test_mode_error_is_not_hidden_by_another_local_budget_failure(self):
         api = FixtureAPI(cycle_account_responses())
-        barrier = threading.Barrier(3)
+        barrier = threading.Barrier(2)
         original = api.call
         mode = AccountModeError("mode needs attention")
         def call(method, path, *args, **kwargs):
@@ -332,8 +332,8 @@ class CycleSnapshotParallelTests(unittest.TestCase):
                             broker.cycle_snapshot([SYMBOL], fresh_modes=True)
                     self.assertEqual(budget._priority_flags(), flags)
                 self.assertEqual(budget._priority_flags(), (False, False, False))
-                self.assertEqual(len(observed.requests), 3 if allowed else 0)
-                self.assertEqual(seen_flags, [flags] * (3 if allowed else 0))
+                self.assertEqual(len(observed.requests), 2 if allowed else 0)
+                self.assertEqual(seen_flags, [flags] * (2 if allowed else 0))
                 self.assertEqual(budget.inflight, {})
 
     def test_inherited_priority_does_not_leak_after_worker_exception(self):
@@ -352,8 +352,7 @@ class CycleSnapshotParallelTests(unittest.TestCase):
     def test_invalid_or_inconsistent_responses_never_publish_partial_snapshot(self):
         for path, change in ((MULTI, lambda value: []),
                              (ACCOUNT, lambda value: {**value, "assets": value["assets"] * 2}),
-                             (ACCOUNT, lambda value: {**value, "positions": [{**value["positions"][0], "positionSide": "BOTH"}, value["positions"][1]]}),
-                             (ORDERS, lambda value: [{"symbol": "CLUSD1"}])):
+                             (ACCOUNT, lambda value: {**value, "positions": [{**value["positions"][0], "positionSide": "BOTH"}, value["positions"][1]]})):
             with self.subTest(path=path):
                 responses = cycle_account_responses()
                 responses[path] = change(responses[path])
@@ -377,7 +376,7 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         self.assertEqual(broker.cached_at, {})
         self.assertEqual(observed.active, 0)
         self.assertTrue(all(request.method == "GET" for request in observed.requests))
-        self.assertEqual(len(observed.requests), 3)
+        self.assertEqual(len(observed.requests), 2)
 
 
 if __name__ == "__main__":

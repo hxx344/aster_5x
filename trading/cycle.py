@@ -275,19 +275,17 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     started_at = time.monotonic()
     now = time.time() if now is None else now
     pair = validate_cycle_positions(account, snapshot, progress)
-    if snapshot.open_orders is None:
-        raise TradingError("循环交易前必须查询账户未完成挂单")
+    # All cycle orders are tracked MARKET batches. The durable intent/recovery
+    # gate owns in-flight orders; an external open-order inventory is not read.
+    snapshot.require_fresh(now)
+    snapshot.require_modes([config["symbol"]])
+    if not snapshot.can_trade:
+        raise TradingError("账户没有交易权限")
     if phase == "waiting_open":
-        snapshot.require_ready(config["symbol"], now)
+        snapshot.ratio
     else:
         # require_ready also requires positive equity; that opening requirement
         # must not prevent a fully tracked position from being reduced.
-        snapshot.require_fresh(now)
-        snapshot.require_modes([config["symbol"]])
-        if not snapshot.can_trade:
-            raise TradingError("账户没有交易权限")
-        if snapshot.open_orders:
-            raise TradingError("账户存在未完成挂单，等待核对")
         opened_at = (progress or {}).get("opened_at")
         if (isinstance(opened_at, bool) or not isinstance(opened_at, (int, float))
                 or not math.isfinite(opened_at) or not 0 < opened_at <= now):

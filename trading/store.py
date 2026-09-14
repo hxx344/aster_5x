@@ -281,6 +281,74 @@ class Store:
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
             self._index_cycle_volume(db, intent)
 
+    def save_cycle_volume_state(self, intent, original):
+        """Merge terminal backfill metadata without replacing execution state."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = self._cycle_ledger_intent(db, intent)
+            status = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()[0]
+            if status not in ("complete", "aborted"):
+                # Active reconciliation still owns this intent exclusively.
+                db.execute("UPDATE intents SET status=?,data=? WHERE id=?",
+                           (intent["status"], dumps(intent), intent["id"]))
+                self._index_cycle_volume(db, intent)
+                return False
+            saved["status"] = status
+            indexed = db.execute("SELECT synced_at FROM cycle_volume_sync WHERE intent_id=?", (intent["id"],)).fetchone()
+            if indexed is not None and indexed[0] is not None:
+                saved.pop("volume_error", None)
+                saved["volume_synced"] = True
+                db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
+                return True
+            bindings = order_bindings(saved)
+            signatures = {}
+            for cid, (order, receipt, _) in bindings.items():
+                qty = receipt_quantity(order, receipt, require_terminal=True)
+                incoming = intent.get("receipts", {}).get(cid)
+                if incoming is not None and receipt_quantity(order, incoming) == qty:
+                    old_id, new_id = receipt.get("orderId"), incoming.get("orderId")
+                    if old_id is not None and new_id is not None and str(old_id) != str(new_id):
+                        raise TradingError("循环补账订单编号与已完成回执冲突")
+                    # Terminal economics and status stay fixed. A query or a
+                    # legacy paper adapter may only add previously absent data.
+                    receipt.update({key: value for key, value in incoming.items() if receipt.get(key) is None})
+                signatures[cid] = [str(receipt.get("orderId", "")), wire(qty), receipt["status"]]
+            confirmed = saved.setdefault("volume_receipts", {})
+            prior_confirmed = dict(confirmed)
+            for cid, signature in intent.get("volume_receipts", {}).items():
+                if signature != signatures.get(cid):
+                    continue
+                recorded = sum((Fraction(dec(row[0])) for row in db.execute(
+                    "SELECT quantity FROM cycle_fills WHERE intent_id=? AND client_id=?", (intent["id"], cid))), Fraction(0))
+                if recorded == Fraction(dec(signature[1])):
+                    confirmed[cid] = signature
+            queries = saved.setdefault("volume_queries", {})
+            before_queries = original.get("volume_queries") or {}
+            for cid, incoming in intent.get("volume_queries", {}).items():
+                if cid not in bindings:
+                    continue
+                if confirmed.get(cid) == signatures[cid]:
+                    queries[cid] = {}
+                    continue
+                current = queries.get(cid, {})
+                if current == before_queries.get(cid, {}):
+                    queries[cid] = incoming
+                elif incoming and current.get("identity") == incoming.get("identity"):
+                    # Another worker advanced this checkpoint. Keep its cursor,
+                    # but retain every matching fill observed by either reader.
+                    fills = current.setdefault("fills", {})
+                    for trade_id, fill in incoming.get("fills", {}).items():
+                        if trade_id in fills and fills[trade_id] != fill:
+                            raise TradingError("并发循环补账出现冲突成交明细")
+                        fills[trade_id] = fill
+            if intent.get("volume_error"):
+                if prior_confirmed == (original.get("volume_receipts") or {}):
+                    saved["volume_error"] = intent["volume_error"]
+            else:
+                saved.pop("volume_error", None)
+            db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
+            return False
+
     def create_cycle_intent(self, intent, message):
         """Commit a new pending cycle, its volume index and event before send."""
         if intent.get("kind") != "cycle" or intent.get("status") != "pending":

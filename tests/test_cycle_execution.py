@@ -132,18 +132,21 @@ class CycleExecutionTests(unittest.TestCase):
         self.assertEqual(self.quantities(), (3, 0))
         self.assertEqual(self.f.store.intent("test")["status"], "attention")
 
-    def test_cannot_open_over_preexisting_positions_or_unknown_orders(self):
+    def test_cannot_open_over_preexisting_positions_even_without_order_inventory(self):
         for side in ("LONG", "SHORT"):
             self.f.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "1", "entry": "4400"}
         self.f.broker.save()
         snapshot = self.f.broker.cycle_snapshot(["XAUUSD1"])
+        snapshot.open_orders = None
         with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not send")):
             with self.assertRaisesRegex(TradingError, "空仓"):
                 self.executor.start(self.f.account, snapshot, self.plan("open"), self.progress_now())
-            snapshot = self.f.broker.cycle_snapshot(["XAUUSD1"])
-            snapshot.open_orders = None
-            with self.assertRaisesRegex(TradingError, "挂单"):
-                self.executor.start(self.f.account, snapshot, self.plan("open"), self.progress_now())
+
+    def test_unqueried_external_order_inventory_does_not_block_taker_cycle(self):
+        snapshot = self.f.broker.cycle_snapshot(["XAUUSD1"])
+        snapshot.open_orders = None
+        self.executor.start(self.f.account, snapshot, self.plan("open"), self.progress_now())
+        self.assertEqual(self.quantities(), (2, 2))
 
     def test_hold_minimum_is_enforced_at_execution_boundary(self):
         self.open()
@@ -351,17 +354,16 @@ class CycleLiveBrokerTests(unittest.TestCase):
         self.api.budget = None
         self.live = LiveBroker({}, self.f.market, api=self.api)
 
-    def test_cycle_snapshot_verifies_selected_symbol_open_orders(self):
+    def test_cycle_snapshot_does_not_query_external_order_inventory(self):
         from .test_exchange_hardening import FixtureAPI, account_responses
         responses = account_responses()
+        responses["/fapi/v3/openOrders"] = AssertionError("must not query external orders")
         self.live.api = FixtureAPI(responses)
         verified = self.live.cycle_snapshot(["XAUUSD1"])
-        self.assertEqual(verified.open_orders, [])
+        self.assertIsNone(verified.open_orders)
         calls = [call for call in self.live.api.calls if call[1] == "/fapi/v3/openOrders"]
-        self.assertEqual(calls, [("GET", "/fapi/v3/openOrders", ({"symbol": "XAUUSD1"},), {"signed": True, "weight": 1})])
-        responses["/fapi/v3/openOrders"] = [{"symbol": "CLUSD1"}]
-        with self.assertRaises(TradingError):
-            self.live.cycle_snapshot(["XAUUSD1"])
+        self.assertEqual(calls, [])
+        self.assertIsNone(self.live.cycle_snapshot(["XAUUSD1"]).open_orders)
 
     def test_cycle_leverage_does_not_trust_old_flat_snapshot(self):
         old = self.f.broker.snapshot(["XAUUSD1"])
@@ -372,14 +374,14 @@ class CycleLiveBrokerTests(unittest.TestCase):
         read.assert_called_once_with(["XAUUSD1"], fresh_modes=True)
         self.api.call.assert_not_called()
 
-    def test_cycle_leverage_accepts_2x_after_final_flat_order_check(self):
+    def test_cycle_leverage_accepts_2x_after_final_flat_position_check(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         self.api.call.return_value = {"symbol": "XAUUSD1", "leverage": 2}
         callback = Mock()
         with patch.object(self.live, "cycle_snapshot", return_value=snapshot):
             self.live.set_cycle_leverage("XAUUSD1", 2, before_submit=callback)
         callback.assert_called_once_with(snapshot)
-        self.api.call.assert_called_once_with("POST", "/fapi/v3/leverage", {"symbol": "XAUUSD1", "leverage": "2"}, signed=True)
+        self.api.call.assert_called_once_with("POST", "/fapi/v3/leverage", {"symbol": "XAUUSD1", "leverage": "2"}, signed=True, weight=1)
         with self.assertRaises(TradingError):
             self.live.set_leverage("XAUUSD1", 2)
 

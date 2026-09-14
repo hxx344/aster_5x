@@ -203,8 +203,6 @@ class CycleSingleSnapshotExecutionTests(unittest.TestCase):
     def test_invalid_state_in_the_only_read_blocks_submission(self):
         baseline = self.f.broker.cycle_snapshot(["XAUUSD1"])
         cases = (
-            ({"open_orders": None}, "挂单"),
-            ({"open_orders": [{"symbol": "XAUUSD1"}]}, "挂单"),
             ({"can_trade": False}, "交易权限"),
             ({"hedge_mode": False}, "双向持仓"),
             ({"multi_assets": True}, "单币保证金"),

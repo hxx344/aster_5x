@@ -31,7 +31,7 @@ def account_row(symbol=SYMBOL, side="LONG", *, amount="0", leverage="5", entry="
 
 
 def cycle_account_responses(symbols=(SYMBOL,)):
-    return {MULTI: {"multiAssetsMargin": False}, ORDERS: [],
+    return {MULTI: {"multiAssetsMargin": False},
             ACCOUNT: {"canTrade": True,
                       "assets": [{"asset": "USD1", "crossWalletBalance": "200", "crossUnPnl": "0",
                                   "maintMargin": "5", "availableBalance": "150", "marginAvailable": True}],
@@ -73,20 +73,20 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         market = LocalQuoteMarket() if market is None else market
         return LiveBroker({}, market, api=api), api, market
 
-    def test_official_account_only_needs_three_cold_then_two_steady_gets(self):
+    def test_official_account_only_needs_two_cold_then_one_steady_get(self):
         broker, api, market = self.make_broker()
         first = broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, MULTI, ORDERS])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, MULTI])
         api.calls.clear()
         api.responses[ACCOUNT]["assets"][0]["crossWalletBalance"] = "201"
         second = broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT])
         self.assertEqual(first.equity, dec(200))
         self.assertEqual(second.equity, dec(201))
         self.assertEqual(first.current_leverage_caps, {SYMBOL: (5, dec(1000000))})
         self.assertEqual(first.cycle_cap_cached_at, {})
         self.assertEqual(first.brackets, {})
-        self.assertEqual(first.open_orders, [])
+        self.assertIsNone(first.open_orders)
         self.assertTrue(first.hedge_mode)
         self.assertFalse(first.multi_assets)
         self.assertTrue(all(position.liquidation is None for position in first.positions))
@@ -128,7 +128,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         self.assertEqual(second.available, dec(120))
         self.assertEqual(second.occupied_margin_exact, Fraction(54))
         self.assertEqual({p.symbol for p in second.positions if p.qty}, {"SPCXUSD1"})
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT])
         self.assertEqual(market.public_reads, [])
 
     def test_asset_loss_remains_binding_when_position_and_mark_pnl_are_higher(self):
@@ -152,7 +152,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         broker, api, market = self.make_broker(responses)
         market.assets["OTHERUSD1"] = "USD1"
         result = broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, MULTI, ORDERS, RISK])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, MULTI, RISK])
         self.assertEqual(result.occupied_margin_exact, Fraction(14))
         self.assertEqual(result.unrealized, dec(-30))
         outside_position = next(p for p in result.positions if p.symbol == "OTHERUSD1")
@@ -228,7 +228,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
                 snapshot = broker.cycle_snapshot([SYMBOL])
                 self.assertEqual(snapshot.current_leverage_caps, {SYMBOL: (7, dec(expected))})
                 self.assertEqual(snapshot.brackets, {})
-                self.assertEqual(len(api.calls), 3)
+                self.assertEqual(len(api.calls), 2)
 
     def test_missing_cap_uses_one_validated_tier_read_without_manufacturing_tiers(self):
         responses = cycle_account_responses()
@@ -242,7 +242,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         self.assertEqual([call[1] for call in api.calls].count(BRACKET), 1)
         api.calls.clear()
         broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT])
 
     def test_holding_does_not_need_a_cap_or_tier_table(self):
         responses = cycle_account_responses()
@@ -253,7 +253,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         snapshot = broker.cycle_snapshot([SYMBOL])
         self.assertEqual(snapshot.current_leverage_caps, {})
         self.assertEqual(snapshot.brackets, {})
-        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(len(api.calls), 2)
 
     def test_cached_fallback_cap_keeps_original_ttl_until_final_submit_check(self):
         clock = SimpleNamespace(now=100.0)
@@ -271,7 +271,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
             self.assertEqual(snapshot.cycle_cap_cached_at, {SYMBOL: 100})
             self.assertEqual(snapshot.current_leverage_caps, {SYMBOL: (5, dec(1000000))})
             snapshot.require_fresh()
-            self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS])
+            self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT])
             api.calls.clear()
             clock.now = 105.1
             with self.assertRaises(TradingError):
@@ -286,7 +286,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
                 broker, api, _ = self.make_broker(responses)
                 with self.assertRaises(TradingError):
                     broker.cycle_snapshot([SYMBOL], fresh_modes=True)
-                self.assertEqual(len(api.calls), 3)
+                self.assertEqual(len(api.calls), 2)
                 self.assertIsNone(broker.leverage_snapshot)
                 self.assertEqual(broker.cached_at, {})
 
@@ -360,7 +360,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         api.responses[ACCOUNT]["positions"] = [account_row(side="BOTH")]
         with self.assertRaises(AccountModeError):
             broker.cycle_snapshot([SYMBOL])
-        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, ORDERS])
+        self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT])
 
     def test_unknown_account_read_cannot_send_a_leverage_order(self):
         responses = cycle_account_responses()
@@ -370,20 +370,20 @@ class CycleAccountSnapshotTests(unittest.TestCase):
             broker.set_cycle_leverage(SYMBOL, 6)
         self.assertIsNone(broker.leverage_snapshot)
         self.assertEqual(broker.cached_at, {})
-        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(len(api.calls), 2)
         self.assertTrue(all(call[0] == "GET" for call in api.calls))
 
     def test_weight_estimate_covers_conditional_reads_without_issuing_requests(self):
         clock = SimpleNamespace(now=100.0)
         broker, api, _ = self.make_broker()
         with patch("trading.exchange.time.monotonic", side_effect=lambda: clock.now):
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 44)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 43)
             broker.cycle_snapshot([SYMBOL])
             api.calls.clear()
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 14)
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL], fresh_modes=True), 44)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 13)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL], fresh_modes=True), 43)
             clock.now = 107
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 44)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 43)
             self.assertEqual(api.calls, [])
 
 

@@ -123,6 +123,7 @@ class PublicDepthStream:
         self._stop = threading.Event()
         self._thread = None
         self._connected = False
+        self._update_listener = None
         self._owner = object()
         self._connection = 0
         self._generation = 0
@@ -133,6 +134,20 @@ class PublicDepthStream:
 
     def _ticks(self):
         return time.monotonic() if self._monotonic is None else self._monotonic()
+
+    def set_update_listener(self, listener):
+        """Set an optional synchronized-depth signal, called outside the lock."""
+        if listener is not None and not callable(listener):
+            raise ValueError("Invalid market update listener")
+        with self._lock:
+            self._update_listener = listener
+
+    def _notify_update(self, listener, symbol, received_at, received_monotonic):
+        if listener is not None and not self._stop.is_set():
+            try:
+                listener(symbol, "depth", received_at, received_monotonic)
+            except Exception as exc:
+                _LOG.debug("Public depth update listener failed (%s)", type(exc).__name__)
 
     def _invalidate_locked(self, symbol):
         previous = self._states.get(symbol)
@@ -197,6 +212,7 @@ class PublicDepthStream:
             )
 
     def seed(self, symbol, raw_response, *, token, requested_at):
+        notification = None
         with self._lock:
             if symbol not in self.symbols or not self._connected or self._stop.is_set():
                 return False
@@ -222,12 +238,19 @@ class PublicDepthStream:
                 state.pending.clear()
                 state.pending_levels = 0
                 for update in pending:
+                    previous_last = state.last
                     if not self._apply_locked(state, update):
                         raise ValueError("Depth snapshot cannot bridge buffered updates")
-                return True
+                    if state.valid.is_set() and state.last != previous_last:
+                        notification = (self._update_listener, symbol, update.received_at, update.received_ticks)
             except (KeyError, TypeError, ValueError, OverflowError, TradingError):
                 self._invalidate_locked(symbol)
                 return False
+        # Publish only the final successfully replayed state. Its receive times
+        # belong to the buffered event, so REST seeding cannot freshen a signal.
+        if notification is not None:
+            self._notify_update(*notification)
+        return True
 
     def _bound_levels(self, state):
         # Shrinking a known boundary is conservative; it can never expose an
@@ -316,6 +339,7 @@ class PublicDepthStream:
         if not isinstance(stream, str) or stream not in self._streams:
             return
         symbol = self._streams[stream]
+        notification = None
         with self._lock:
             if not self._connected or self._stop.is_set():
                 return
@@ -340,12 +364,17 @@ class PublicDepthStream:
                 update = _Update(first, last, previous, event_ms, transaction_ms,
                                  _updates(data["b"], self._MAX_UPDATE_LEVELS),
                                  _updates(data["a"], self._MAX_UPDATE_LEVELS), now, ticks)
+                previous_last = state.last
                 if state.seed_id is None:
                     self._buffer_locked(symbol, state, update)
                 elif not self._apply_locked(state, update):
                     self._invalidate_locked(symbol)
+                elif state.valid.is_set() and state.last != previous_last:
+                    notification = (self._update_listener, symbol, now, ticks)
             except (KeyError, TypeError, ValueError, OverflowError, TradingError):
                 self._invalidate_locked(symbol)
+        if notification is not None:
+            self._notify_update(*notification)
 
     def _run(self):
         retry = self._RETRY_INITIAL

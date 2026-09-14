@@ -1,3 +1,5 @@
+import type { CycleExecutionQuality } from './cycle-quality';
+
 export type CycleConfig = {
   enabled: boolean;
   symbol: string;
@@ -32,6 +34,7 @@ export type CycleState = {
   daily_volume?: CycleDailyVolume;
   rolling_volume?: CycleRollingVolume;
   diagnostic?: CycleDiagnostic | null;
+  execution_quality?: CycleExecutionQuality | null;
 };
 
 export type CycleDiagnostic = {

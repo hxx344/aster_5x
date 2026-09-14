@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -331,3 +332,167 @@ class DemoIsolationTests(unittest.TestCase):
         winners = [value for value in results if value is not None]
         self.assertEqual(len(winners), 1)
         self.assertEqual(Store(path).get("runtime_mode"), "demo" if winners[0] else "authenticated")
+
+
+class StoreWALInitializationTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def test_real_competing_writer_delays_wal_but_not_another_database(self):
+        path = (self.root / "locked.sqlite3").resolve()
+        real_connect = sqlite3.connect
+        writer_ready, release, busy_seen = threading.Event(), threading.Event(), threading.Event()
+        attempts, mode_seen = [], []
+
+        def competing_writer():
+            with closing(real_connect(path, timeout=10)) as db:
+                db.execute("BEGIN IMMEDIATE")
+                mode_seen.append(json.loads(db.execute("SELECT data FROM kv WHERE key='runtime_mode'").fetchone()[0]))
+                writer_ready.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("test did not release competing writer")
+                db.rollback()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writer = []
+            class ObservedConnection(sqlite3.Connection):
+                def execute(connection, sql, *args, **kwargs):
+                    if sql == "PRAGMA journal_mode=WAL":
+                        attempts.append(sql)
+                        if not writer:
+                            writer.append(pool.submit(competing_writer))
+                            if not writer_ready.wait(timeout=5):
+                                raise AssertionError("competing writer did not acquire its lock")
+                        try:
+                            return super().execute(sql, *args, **kwargs)
+                        except sqlite3.OperationalError:
+                            busy_seen.set()
+                            raise
+                    return super().execute(sql, *args, **kwargs)
+
+            def connect(database, *args, **kwargs):
+                if Path(database) == path:
+                    kwargs["factory"] = ObservedConnection
+                return real_connect(database, *args, **kwargs)
+
+            with patch("trading.store.sqlite3.connect", side_effect=connect):
+                initialized = pool.submit(Store, path, demo=False)
+                try:
+                    self.assertTrue(busy_seen.wait(timeout=5))
+                    # A lock on one ledger must not serialize unrelated ledgers.
+                    other = Store(self.root / "other.sqlite3", demo=True)
+                    self.assertEqual(other.get("runtime_mode"), "demo")
+                finally:
+                    release.set()
+                store = initialized.result(timeout=5)
+            writer[0].result(timeout=5)
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertEqual(mode_seen, ["authenticated"])
+        with store.connect() as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], 10000)
+        self.assertEqual(store.get("runtime_mode"), "authenticated")
+
+    @staticmethod
+    def fault_connection(failure, attempts, *, once=False, mode=None):
+        class FaultConnection(sqlite3.Connection):
+            def execute(connection, sql, *args, **kwargs):
+                if sql == "PRAGMA journal_mode=WAL":
+                    attempts.append(sql)
+                    if mode is not None:
+                        return SimpleNamespace(fetchone=lambda: (mode,))
+                    if not once or len(attempts) == 1:
+                        raise failure
+                return super().execute(sql, *args, **kwargs)
+        return FaultConnection
+
+    def test_busy_locked_extended_and_python310_lock_messages_can_retry(self):
+        cases = [(5, "database is locked"), (6, "database table is locked"),
+                 (517, "database is locked"), (262, "database table is locked"),
+                 (None, "database is locked"), (None, "database table is locked")]
+        real_connect = sqlite3.connect
+        for index, (code, message) in enumerate(cases):
+            with self.subTest(code=code, message=message):
+                failure = sqlite3.OperationalError(message)
+                if code is not None:
+                    failure.sqlite_errorcode = code
+                attempts = []
+                factory = self.fault_connection(failure, attempts, once=True)
+                with patch("trading.store.sqlite3.connect", side_effect=lambda *a, **kw: real_connect(*a, **kw, factory=factory)), \
+                     patch("trading.store.time.sleep") as sleep:
+                    store = Store(self.root / f"retry-{index}.sqlite3", demo=False)
+                self.assertEqual(len(attempts), 2)
+                sleep.assert_called_once()
+                with store.connect() as db:
+                    self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_persistent_busy_stops_at_one_ten_second_deadline(self):
+        path = self.root / "timeout.sqlite3"
+        real_connect = sqlite3.connect
+        failure = sqlite3.OperationalError("database is locked")
+        failure.sqlite_errorcode = 5
+        attempts = []
+        factory = self.fault_connection(failure, attempts)
+        clock = SimpleNamespace(value=100)
+        sleeps = []
+        def sleep(duration):
+            sleeps.append(duration)
+            clock.value += duration
+        timer = SimpleNamespace(monotonic=lambda: clock.value, sleep=sleep)
+        with patch("trading.store.sqlite3.connect", side_effect=lambda *a, **kw: real_connect(*a, **kw, factory=factory)), \
+             patch("trading.store.time", timer), self.assertRaises(sqlite3.OperationalError) as raised:
+            Store(path, demo=False)
+        self.assertIs(raised.exception, failure)
+        self.assertGreater(len(attempts), 1)
+        self.assertAlmostEqual(sum(sleeps), 10)
+        self.assertAlmostEqual(clock.value, 110)
+        with closing(real_connect(path)) as db:
+            self.assertEqual(json.loads(db.execute("SELECT data FROM kv WHERE key='runtime_mode'").fetchone()[0]), "authenticated")
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        self.assertEqual(Store(path, demo=False).get("runtime_mode"), "authenticated")
+
+    def test_other_operational_errors_are_not_retried_even_with_lock_text(self):
+        real_connect = sqlite3.connect
+        for index, (code, message) in enumerate(((10, "disk I/O error"), (10, "database is locked"),
+                                                (8, "attempt to write a readonly database"),
+                                                (None, "unrecognized operational error"))):
+            with self.subTest(code=code, message=message):
+                failure = sqlite3.OperationalError(message)
+                if code is not None:
+                    failure.sqlite_errorcode = code
+                attempts = []
+                factory = self.fault_connection(failure, attempts)
+                with patch("trading.store.sqlite3.connect", side_effect=lambda *a, **kw: real_connect(*a, **kw, factory=factory)), \
+                     patch("trading.store.time.sleep") as sleep, self.assertRaises(sqlite3.OperationalError) as raised:
+                    Store(self.root / f"error-{index}.sqlite3", demo=False)
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(len(attempts), 1)
+                sleep.assert_not_called()
+
+    def test_unchanged_journal_mode_is_an_error_and_is_not_retried(self):
+        real_connect = sqlite3.connect
+        attempts = []
+        factory = self.fault_connection(None, attempts, mode="delete")
+        with patch("trading.store.sqlite3.connect", side_effect=lambda *a, **kw: real_connect(*a, **kw, factory=factory)), \
+             patch("trading.store.time.sleep") as sleep, self.assertRaisesRegex(sqlite3.OperationalError, "WAL"):
+            Store(self.root / "no-wal.sqlite3", demo=False)
+        self.assertEqual(len(attempts), 1)
+        sleep.assert_not_called()
+
+    def test_mode_rejection_does_not_enter_wal_transition_or_change_legacy_bytes(self):
+        path = self.root / "protected.sqlite3"
+        real_connect = sqlite3.connect
+        with closing(real_connect(path)) as db, db:
+            db.execute("CREATE TABLE kv(key TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            db.execute("INSERT INTO kv VALUES ('runtime_mode',?)", (json.dumps("authenticated"),))
+        original = path.read_bytes()
+        attempts = []
+        factory = self.fault_connection(AssertionError("rejected mode must not try WAL"), attempts)
+        with patch("trading.store.sqlite3.connect", side_effect=lambda *a, **kw: real_connect(*a, **kw, factory=factory)), \
+             patch("trading.store.time.sleep") as sleep, self.assertRaisesRegex(TradingError, "用途与启动模式不符"):
+            Store(path, demo=True)
+        self.assertEqual(attempts, [])
+        sleep.assert_not_called()
+        self.assertEqual(path.read_bytes(), original)

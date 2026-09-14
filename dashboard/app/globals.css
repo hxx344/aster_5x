@@ -1042,6 +1042,207 @@ label input,
   max-height: 510px;
   overflow: auto;
 }
+.cycle-execution-quality {
+  padding: 20px 22px;
+  border-top: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.cycle-quality-heading,
+.cycle-quality-batch {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+}
+.cycle-quality-heading h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.cycle-quality-heading > span,
+.cycle-quality-batch,
+.cycle-quality-recorded,
+.cycle-quality-note,
+.cycle-quality-notice {
+  font-size: 12px;
+  line-height: 1.65;
+}
+.cycle-quality-heading > span,
+.cycle-quality-recorded,
+.cycle-quality-note {
+  color: #93a6b2;
+}
+.cycle-quality-batch {
+  margin: 12px 0 4px;
+}
+.cycle-quality-recorded {
+  margin: 0 0 12px;
+}
+.cycle-quality-recorded time,
+.cycle-quality-value strong,
+.cycle-quality-timings dd,
+.cycle-quality-fields dd {
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.cycle-quality-comparison {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: normal;
+}
+.cycle-quality-comparison caption {
+  text-align: left;
+  font-size: 12px;
+  color: #93a6b2;
+  padding: 0 0 8px;
+}
+.cycle-quality-comparison th,
+.cycle-quality-comparison td {
+  padding: 10px 12px;
+  text-align: left;
+  border-top: 1px solid #2b353d;
+  vertical-align: top;
+}
+.cycle-quality-comparison thead th {
+  color: #93a6b2;
+  font-weight: 400;
+  background: #141b20;
+}
+.cycle-quality-comparison th:first-child {
+  width: 27%;
+}
+.cycle-quality-comparison th:nth-child(2) {
+  width: 45%;
+}
+.cycle-quality-comparison tbody th {
+  font-weight: 500;
+  background: transparent;
+  height: auto !important;
+}
+.cycle-quality-comparison td {
+  height: auto;
+}
+.cycle-quality-mobile-unit {
+  display: none;
+}
+.cycle-quality-note,
+.cycle-quality-notice {
+  margin: 9px 0;
+}
+.cycle-quality-timings {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin: 16px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid #2b353d;
+}
+.cycle-quality-timings dt,
+.cycle-quality-fields dt {
+  color: #93a6b2;
+  font-size: 12px;
+}
+.cycle-quality-timings dd {
+  margin: 7px 0 0;
+  font-size: 16px;
+}
+.cycle-quality-timings dd > span {
+  color: #93a6b2;
+  font-size: 12px;
+}
+.cycle-quality-details > summary {
+  cursor: pointer;
+  color: #b1c9d3;
+  font-size: 13px;
+  width: fit-content;
+  padding: 10px 0;
+}
+.cycle-quality-details > summary:focus-visible {
+  outline: 2px solid #81e4c3;
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+.cycle-quality-detail-body {
+  margin-top: 8px;
+}
+.cycle-quality-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 24px;
+  margin: 0;
+}
+.cycle-quality-fields dd {
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 5px 0 0;
+  white-space: pre-wrap;
+}
+.cycle-quality-stage {
+  border-top: 1px solid #2b353d;
+  margin-top: 16px;
+  padding-top: 14px;
+}
+.cycle-quality-stage h4 {
+  font-size: 13px;
+  font-weight: 500;
+  margin: 0 0 14px;
+}
+@media (max-width: 600px) {
+  .cycle-execution-quality {
+    padding: 18px 16px;
+  }
+  .cycle-quality-comparison thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .cycle-quality-comparison tbody,
+  .cycle-quality-comparison tr,
+  .cycle-quality-comparison th,
+  .cycle-quality-comparison td {
+    display: block;
+    width: 100%;
+  }
+  .cycle-quality-comparison tr {
+    border-top: 1px solid #2b353d;
+    padding: 10px 0;
+  }
+  .cycle-quality-comparison th,
+  .cycle-quality-comparison td {
+    padding: 3px 0;
+    border: 0;
+  }
+  .cycle-quality-comparison th:first-child {
+    width: 100%;
+  }
+  .cycle-quality-mobile-unit {
+    display: inline-block;
+    margin-right: 12px;
+    color: #93a6b2;
+    font-size: 12px;
+  }
+  .cycle-quality-timings,
+  .cycle-quality-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cycle-quality-timings > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .cycle-quality-timings dd {
+    margin: 0;
+  }
+  .cycle-quality-details > summary {
+    min-height: 44px;
+    padding: 12px 0;
+  }
+}
 .event {
   display: flex;
   align-items: flex-start;

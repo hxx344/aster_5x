@@ -150,7 +150,29 @@ class Store:
         # WAL cannot be enabled inside the initialization transaction. A rejected
         # mode or failed migration never reaches these database-level changes.
         with self.connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
+            # A competing initializer can hold a lock after our claim commits.
+            # journal_mode may return BUSY immediately despite busy_timeout, so
+            # bound this transition itself to the same ten-second wait budget.
+            deadline = time.monotonic() + 10
+            db.execute("PRAGMA busy_timeout=0")
+            while True:
+                try:
+                    mode = db.execute("PRAGMA journal_mode=WAL").fetchone()
+                    if not mode or mode[0] != "wal":
+                        raise sqlite3.OperationalError("无法启用 SQLite WAL 日志模式")
+                    break
+                except sqlite3.OperationalError as exc:
+                    code = getattr(exc, "sqlite_errorcode", None)
+                    # SQLite primary BUSY/LOCKED are 5/6; extended codes keep
+                    # their primary code in the low byte. Python 3.10 has no
+                    # sqlite_errorcode, so accept only its exact lock messages.
+                    locked = (code & 255) in (5, 6) if type(code) is int else code is None and str(exc) in (
+                        "database is locked", "database table is locked")
+                    remaining = deadline - time.monotonic()
+                    if not locked or remaining <= 0:
+                        raise
+                    time.sleep(min(0.05, remaining))
+            db.execute("PRAGMA busy_timeout=10000")
             db.execute("PRAGMA optimize")
 
     @contextmanager
@@ -258,6 +280,34 @@ class Store:
             db.execute("INSERT INTO intents VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data",
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
             self._index_cycle_volume(db, intent)
+
+    def record_cycle_execution_quality(self, intent):
+        """Update display metadata only; leave status and volume indexes intact."""
+        quality = intent["execution_quality"]
+        if not isinstance(quality, dict) or quality.get("intent_id") != intent.get("id"):
+            raise TradingError("循环执行观测与批次不一致")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT account_id,data FROM intents WHERE id=?", (intent["id"],)).fetchone()
+            if row is None or row["account_id"] != intent["account_id"]:
+                raise TradingError("循环执行观测不属于此账户")
+            saved = json.loads(row["data"])
+            if saved.get("kind") != "cycle" or any(saved.get(key) != intent.get(key)
+                                                     for key in ("account_id", "symbol", "phase", "quantity")):
+                raise TradingError("循环执行观测与持久批次不一致")
+            if any(quality.get(key) != saved.get(key) for key in ("symbol", "phase", "quantity", "created_at")):
+                raise TradingError("循环执行观测元数据不一致")
+            serialized = json.dumps(quality, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            saved["execution_quality"] = quality
+            db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
+            key = "cycle_execution:" + intent["account_id"]
+            previous = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+            latest = json.loads(previous["data"]) if previous else None
+            # Delayed historical reconciliation must not displace a newer batch.
+            if isinstance(latest, dict) and latest.get("intent_id") != intent["id"] \
+                    and latest.get("created_at", 0) >= quality["created_at"]:
+                return
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, serialized))
 
     @staticmethod
     def _index_cycle_volume(db, intent, row=None):

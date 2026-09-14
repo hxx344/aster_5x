@@ -374,6 +374,15 @@ class MarketData:
         self.depth_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
         self.depth_retry_at = {}
 
+    def set_update_listener(self, listener):
+        """Forward optional market signals while supporting older injected streams."""
+        if listener is not None and not callable(listener):
+            raise ValueError("Invalid market update listener")
+        for stream in (self.stream, self.depth_stream):
+            setter = getattr(stream, "set_update_listener", None)
+            if callable(setter):
+                setter(listener)
+
     def start_stream(self):
         try:
             self.stream.start()

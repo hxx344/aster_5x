@@ -46,6 +46,7 @@ import { Progress } from '@/components/ui/progress';
 import { CyclePanel } from '@/components/cycle-panel';
 import { CycleTradesPanel } from '@/components/cycle-trades-panel';
 import { ExecutionEvents } from '@/components/execution-events';
+import { CycleExecutionQualityPanel } from '@/components/cycle-execution-quality';
 import type { ExecutionEvent } from '@/lib/cycle-events';
 import { OrdinaryConditions } from '@/components/ordinary-conditions';
 import {
@@ -893,6 +894,18 @@ export default function Home() {
                       )}
                     </TabsContent>
                     <TabsContent value="events">
+                      {account ? (
+                        <CycleExecutionQualityPanel
+                          key={`quality:${account.id}`}
+                          accountName={account.name}
+                          quality={account.cycle_state?.execution_quality}
+                          stale={
+                            Boolean(connectionError) ||
+                            !state?.updated_at ||
+                            serverNow - state.updated_at >= 8
+                          }
+                        />
+                      ) : null}
                       <ExecutionEvents key={selected} events={events} />
                     </TabsContent>
                   </Tabs>

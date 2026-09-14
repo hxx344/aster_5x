@@ -8,6 +8,7 @@ from fractions import Fraction
 
 from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
+from .cycle_quality import ObservedBroker, actual, estimate, new_quality, timestamp
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
@@ -18,6 +19,46 @@ SIDES = ("LONG", "SHORT")
 
 
 class CycleExecutor(Executor):
+    def _observe_quality(self, intent):
+        if not intent or intent.get("kind") != "cycle":
+            return
+        try:
+            quality = intent.get("execution_quality")
+            if not isinstance(quality, dict) or quality.get("version") != 1:
+                # Old durable batches have no recoverable clock or quote sample.
+                quality = new_quality(intent)
+            quality.update(actual=actual(intent), updated_at=time.time())
+            intent["execution_quality"] = quality
+            self.store.record_cycle_execution_quality(intent)
+            if self.last_completed_intent and self.last_completed_intent.get("id") == intent["id"]:
+                self.last_completed_intent["execution_quality"] = copy.deepcopy(quality)
+        except Exception:
+            # Telemetry must never mask a trading/reconciliation exception or
+            # strand exposure because a display write failed.
+            pass
+
+    def send(self, intent, orders, *, repair=False):
+        if repair or intent.get("kind") != "cycle":
+            return super().send(intent, orders, repair=repair)
+        observed = None
+        try:
+            quality = intent.get("execution_quality")
+            if not isinstance(quality, dict) or quality.get("version") != 1:
+                quality = intent["execution_quality"] = new_quality(intent)
+            clocks = getattr(self, "_quality_clocks", None)
+            trigger_ticks, final_ticks = clocks[1:] if clocks and clocks[0] == intent["id"] else (None, None)
+            observed = ObservedBroker(self.broker, quality, trigger_ticks, final_ticks)
+        except Exception:
+            pass
+        try:
+            if observed is None:
+                return super().send(intent, orders, repair=repair)
+            # Reuse the original one-call send, validation and persistence logic.
+            # The adapter belongs to this send only; self.broker is never mutated.
+            return Executor(self.store, observed, self.market).send(intent, orders, repair=repair)
+        finally:
+            self._observe_quality(intent)
+
     def _record_volume_fills(self, intent, fills):
         # A single order may span more than the ledger's per-write row limit.
         # Commit bounded chunks; stable trade IDs make an interrupted retry safe.
@@ -162,7 +203,7 @@ class CycleExecutor(Executor):
             raise TradingError("独立循环需要确认所选品种没有未完成挂单")
         return snapshot.pair(symbol)
 
-    def start(self, account, snapshot, plan, progress, before_submit=None):
+    def start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None):
         self.last_snapshot = self.last_completed_intent = None
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
@@ -174,6 +215,12 @@ class CycleExecutor(Executor):
         if plan.phase not in ("open", "close"):
             raise TradingError("独立循环批次阶段无效")
         symbol, qty = plan.symbol, positive(plan.qty)
+        quality, trigger_ticks, final_ticks = None, None, None
+        try:
+            quality = new_quality({"symbol": symbol, "phase": plan.phase, "quantity": wire(qty), "orders": []}, trigger)
+            trigger_ticks = timestamp(trigger.get("received_monotonic")) if isinstance(trigger, dict) else None
+        except Exception:
+            pass
         config = progress.get("config") or account["cycle"]
         self._require_daily_room(account, plan, config)
         if symbol != config["symbol"] or plan.leverage != config["leverage"]:
@@ -207,8 +254,27 @@ class CycleExecutor(Executor):
                 raise TradingError("独立循环尚未达到本轮最短持仓时间")
         book = self.market.book(symbol)
         book.require_fresh()
+        final_observation = None
         if before_submit is not None:
-            before_submit(snapshot)
+            final_observation = before_submit(snapshot)
+        try:
+            if isinstance(final_observation, dict):
+                depth = final_observation.get("depth")
+                checked_at = timestamp(final_observation.get("checked_at"))
+                final_ticks = timestamp(final_observation.get("checked_monotonic"))
+            else:
+                # A cache read only: never invoke market.depth's REST fallback.
+                stream = getattr(self.market, "depth_stream", None)
+                depth = stream.snapshot(symbol) if stream is not None else None
+                checked_at = time.time() if depth is not None else None
+            if quality is not None:
+                quality["final_estimate"] = estimate(wire(qty), depth, checked_at)
+                if quality["final_estimate"]["status"] != "available":
+                    final_ticks = None
+                elif not isinstance(final_observation, dict):
+                    final_ticks = time.monotonic()
+        except Exception:
+            final_ticks = None
         self._ready(snapshot, symbol)
         latest = self.store.account(account["id"])
         if not latest.get("enabled") or not latest.get("cycle", {}).get("enabled"):
@@ -230,10 +296,17 @@ class CycleExecutor(Executor):
                   "repairs": [], "repair_attempts": 0,
                   "order_times": {order["newClientOrderId"]: time.time() for order in orders}}
         intent["progress"]["config"] = copy.deepcopy(config)
+        if quality is not None:
+            quality.update(intent_id=token, created_at=intent["created_at"])
+            intent["execution_quality"] = quality
         self.store.save_intent(intent)
         action = "开仓" if plan.phase == "open" else "平仓"
         self.store.event(account["id"], "cycle", f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
-        self.send(intent, orders)
+        self._quality_clocks = (token, trigger_ticks, final_ticks)
+        try:
+            self.send(intent, orders)
+        finally:
+            self._quality_clocks = None
         return self.reconcile(account, intent)
 
     def set_leverage(self, account, snapshot, progress, before_submit=None):
@@ -288,7 +361,11 @@ class CycleExecutor(Executor):
     def reconcile(self, account, intent=None):
         self.last_snapshot = self.last_completed_intent = None
         with getattr(self.broker, "reconciliation_budget", nullcontext)():
-            return self._reconcile_cycle(account, intent)
+            intent = intent or self.store.intent(account["id"])
+            try:
+                return self._reconcile_cycle(account, intent)
+            finally:
+                self._observe_quality(intent)
 
     def _reconcile_cycle(self, account, intent=None):
         intent = intent or self.store.intent(account["id"])

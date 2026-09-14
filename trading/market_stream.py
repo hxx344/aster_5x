@@ -81,6 +81,7 @@ class PublicQuoteStream:
         self._stop = threading.Event()
         self._thread = None
         self._connected = False
+        self._update_listener = None
         self._bbo = {}
         self._mark = {}
         # Invalid data removes a quote but cannot reset its ordering watermark.
@@ -92,6 +93,20 @@ class PublicQuoteStream:
 
     def _ticks(self):
         return time.monotonic() if self._monotonic is None else self._monotonic()
+
+    def set_update_listener(self, listener):
+        """Set an optional lightweight BBO signal; callbacks run without the lock."""
+        if listener is not None and not callable(listener):
+            raise ValueError("Invalid market update listener")
+        with self._lock:
+            self._update_listener = listener
+
+    def _notify_update(self, listener, symbol, received_at, received_monotonic):
+        if listener is not None and not self._stop.is_set():
+            try:
+                listener(symbol, "bbo", received_at, received_monotonic)
+            except Exception as exc:
+                _LOG.debug("Public quote update listener failed (%s)", type(exc).__name__)
 
     def start(self):
         with self._lock:
@@ -162,6 +177,7 @@ class PublicQuoteStream:
             # Control messages and unrelated events cannot freshen any quote.
             return
         symbol, kind = self._streams[stream]
+        notification = None
         with self._lock:
             if not self._connected or self._stop.is_set():
                 return
@@ -196,6 +212,7 @@ class PublicQuoteStream:
                     expires = ticks + self._MAX_AGE - (now - min(event_ms, transaction_ms) / 1000)
                     cache[symbol] = _BBO(bid, ask, bid_qty, ask_qty, *order, expires)
                     self._bbo_order[symbol] = order
+                    notification = (self._update_listener, symbol, now, ticks)
                 else:
                     price = positive(data["p"])
                     expires = ticks + self._MAX_AGE - (now - event_ms / 1000)
@@ -203,6 +220,8 @@ class PublicQuoteStream:
                     self._mark_order[symbol] = event_ms
             except (KeyError, TypeError, ValueError, TradingError):
                 cache.pop(symbol, None)
+        if notification is not None:
+            self._notify_update(*notification)
 
     def _run(self):
         retry = self._RETRY_INITIAL

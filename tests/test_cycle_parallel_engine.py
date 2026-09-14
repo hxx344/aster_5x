@@ -79,6 +79,10 @@ class CycleParallelEngineTests(TestCase):
         self.assertEqual(self.engine.views["test"]["cycle_state"]["phase"], "waiting_open")
         self.assertIn("价差", self.engine.views["test"]["cycle_state"]["reason"])
         self.assertTrue(self.f.store.account("test")["enabled"])
+        checks = [event for event in self.f.store.events() if event["kind"] == "cycle_check"]
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["cycle_check"]["symbol"], "XAUUSD1")
+        self.assertEqual(checks[0]["cycle_check"]["count"], 1)
 
     def test_completed_ordinary_snapshot_refreshes_missing_flat_cycle_market(self):
         owner = self.f.store.account("test")

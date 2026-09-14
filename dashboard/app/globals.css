@@ -1067,6 +1067,74 @@ label input,
   flex: none;
   margin-top: 9px;
 }
+.event > time {
+  flex: none;
+}
+.event-message,
+.event-check-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.event-check-content {
+  flex: 1;
+}
+.event-check-summary {
+  font-weight: 600;
+  color: #dce6eb;
+}
+.event .event-check-meta,
+.event .event-check-range {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  margin-top: 5px;
+  color: #8598a3;
+  font-size: 12px;
+}
+.event-check-range > span {
+  display: inline-block;
+}
+.event .event-check-range time {
+  font-size: 11px;
+}
+.event-check-details {
+  margin-top: 7px;
+}
+.event-check-details > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: #93b6c4;
+  font-size: 12px;
+  padding: 3px 0;
+}
+.event-check-details > summary:focus-visible {
+  outline: 2px solid #78cdb3;
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+.event-check-detail-body {
+  margin-top: 8px;
+  color: #b3c2ca;
+}
+.event-check-detail-body > p {
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+.event-check-detail-body .cycle-diagnostic {
+  margin: 12px 0 0;
+}
+@media (max-width: 600px) {
+  .event {
+    gap: 8px;
+    padding: 14px 12px;
+  }
+  .event > time {
+    font-size: 11px;
+  }
+  .event-check-range > span {
+    width: 100%;
+  }
+}
 .message,
 .demo-banner {
   padding: 12px 18px;

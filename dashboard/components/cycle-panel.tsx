@@ -24,7 +24,7 @@ import {
 } from '@/lib/cycle';
 import { cycleDailySummary, cycleRollingSummary } from '@/lib/cycle-daily';
 import { CycleCostSummary } from '@/components/cycle-cost-summary';
-import { CycleDiagnostic } from '@/components/cycle-diagnostic';
+import { cycleStateSummary } from '@/lib/cycle-events';
 import { cycleMarginLimit, percentFromMarginLimit } from '@/lib/policy';
 
 type CycleAccount = {
@@ -129,7 +129,7 @@ export function CyclePanel({
       </div>
       <div className="migration-state cycle-state" aria-live="polite">
         <p className="cycle-account-name">当前账户 · {account.name}</p>
-        <p>{view.reason}</p>
+        <p>{cycleStateSummary(state, view.phase, view.reason)}</p>
         {stale ? (
           <p className="amber">
             {connectionError ? '连接异常' : '状态数据已过期'}，以下为最近记录
@@ -141,7 +141,6 @@ export function CyclePanel({
           </p>
         ) : null}
       </div>
-      <CycleDiagnostic diagnostic={state?.diagnostic} />
       <section
         className="cycle-daily-summary"
         aria-labelledby="cycle-daily-heading"

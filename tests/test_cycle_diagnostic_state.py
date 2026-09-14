@@ -53,7 +53,13 @@ class CycleDiagnosticStateTests(TestCase):
         second = self.spread_failure(now + 16)
         self.assertEqual(second["cycle_state"]["diagnostic"]["checked_at"], now + 16)
         self.assertEqual(first["reason"], second["reason"])
-        self.assertEqual(self.f.store.events(), before_events)
+        after_events = self.f.store.events()
+        self.assertEqual(len(after_events), len(before_events))
+        before_check = next(event for event in before_events if event["kind"] == "cycle_check")
+        after_check = next(event for event in after_events if event["kind"] == "cycle_check")
+        self.assertEqual(after_check["id"], before_check["id"])
+        self.assertEqual(after_check["cycle_check"]["count"], before_check["cycle_check"]["count"] + 1)
+        self.assertEqual(after_check["cycle_check"]["diagnostic"], second["cycle_state"]["diagnostic"])
         self.assertTrue(second["enabled"])
 
     def test_successful_open_and_manual_pause_clear_previous_failure_details(self):
@@ -109,6 +115,10 @@ class CycleDiagnosticStateTests(TestCase):
         result = {row["id"]: row for row in response.json()["accounts"]}
         self.assertEqual(result["test"]["cycle_state"]["diagnostic"], first["cycle_state"]["diagnostic"])
         self.assertIsNone(result["second"]["cycle_state"].get("diagnostic"))
+        checks = [event for event in response.json()["events"] if event["kind"] == "cycle_check"]
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["account_id"], "test")
+        self.assertEqual(checks[0]["cycle_check"]["diagnostic"], first["cycle_state"]["diagnostic"])
 
     def test_reached_volume_limit_details_preserve_error_priority_and_both_windows(self):
         self.select(daily_volume_limit="100")

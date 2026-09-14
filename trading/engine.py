@@ -21,7 +21,7 @@ from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
-from .cycle_diagnostics import diagnostic_error, diagnostic_number
+from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
 from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols
 from .models import cycle_margin_limit
 from .lock import ProcessLock
@@ -737,12 +737,23 @@ class Engine:
             self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]))
         return 5
 
+    def record_cycle_check(self, account, exc):
+        diagnostic = getattr(exc, "diagnostic", None)
+        phase = diagnostic.get("phase") if isinstance(diagnostic, dict) else None
+        if phase not in ("open", "close"):
+            progress = self.store.get("cycle:" + account["id"]) or {}
+            phase = "close" if progress.get("opened_at") is not None else "open"
+        self.store.record_cycle_check(account["id"], account["cycle"]["symbol"], phase,
+                                      str(exc), diagnostic=diagnostic)
+
     def cycle_wait(self, account, exc):
         """A local cycle condition must not suppress ordinary work elsewhere."""
         aid, message = account["id"], str(exc)
         with self.lock:
             previous = self.views.get(aid, {}).get("cycle_state", {}).get("reason")
-        if previous != message:
+        if isinstance(exc, CycleConditionError) and not self.store.intent(aid):
+            self.record_cycle_check(account, exc)
+        elif previous != message:
             self.store.event(aid, "wait", message)
         progress = self.store.get("cycle:" + aid) or {}
         phase = ("rolling_limit" if isinstance(exc, RollingVolumeLimitError) else
@@ -989,7 +1000,9 @@ class Engine:
                     log_wait = not isinstance(exc, BudgetWait) or time.monotonic() - self.budget_wait_events.get(account_id, -1e9) >= 60
                     if isinstance(exc, BudgetWait) and old_reason != message and log_wait:
                         self.budget_wait_events[account_id] = time.monotonic()
-                if old_reason != message and log_wait:
+                if cycle_context and isinstance(exc, CycleConditionError) and not self.store.intent(account_id):
+                    self.record_cycle_check(account, exc)
+                elif old_reason != message and log_wait:
                     self.store.event(account_id, "wait" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) else "error", message)
                 status = "waiting" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) else "error"
                 if isinstance(exc, (AccountModeError, CyclePositionError)):

@@ -26,6 +26,33 @@ def dumps(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
+def _cycle_check_metadata(raw):
+    """Unreadable historical metadata is a boundary, never a reason to lose an event."""
+    try:
+        value = json.loads(raw)
+        required = {"symbol", "phase", "count", "first_at", "last_at"}
+        if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"diagnostic"}:
+            return None
+        if value["symbol"] not in SYMBOLS or value["phase"] not in ("open", "close"):
+            return None
+        if type(value["count"]) is not int or value["count"] < 1:
+            return None
+        if any(type(value[key]) not in (int, float) or not math.isfinite(value[key]) or not 0 <= value[key] <= 253402300799
+               for key in ("first_at", "last_at")) or value["first_at"] > value["last_at"]:
+            return None
+        if "diagnostic" in value:
+            diagnostic = value["diagnostic"]
+            if not isinstance(diagnostic, dict) or diagnostic.get("symbol", value["symbol"]) != value["symbol"] \
+                    or diagnostic.get("phase", value["phase"]) != value["phase"]:
+                return None
+        # json.loads accepts non-finite literals by default; these must not leak
+        # through the API or make an invalid record eligible for aggregation.
+        json.dumps(value, allow_nan=False)
+        return value
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+
+
 class Store:
     def __init__(self, path, *, demo=None):
         # All aliases of one database must share its process lock and WAL files.
@@ -53,9 +80,11 @@ class Store:
                     ON intents(account_id) WHERE status NOT IN ('complete','aborted');
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
-                    kind TEXT NOT NULL, message TEXT NOT NULL, created_at REAL NOT NULL
+                    kind TEXT NOT NULL, message TEXT NOT NULL, created_at REAL NOT NULL,
+                    cycle_check TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id,id);
+                CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC,id DESC);
                 CREATE TABLE IF NOT EXISTS outbox (
                     id TEXT PRIMARY KEY, message TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                     due_at REAL NOT NULL, delivered_at REAL, expires_at REAL, capacity_key TEXT
@@ -102,6 +131,9 @@ class Store:
             for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {kind}")
+            event_columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
+            if "cycle_check" not in event_columns:
+                db.execute("ALTER TABLE events ADD COLUMN cycle_check TEXT")
             for row in db.execute("SELECT id,data FROM accounts").fetchall():
                 account = json.loads(row["data"])
                 normalized = self.account_defaults(account)
@@ -451,9 +483,50 @@ class Store:
         with self.connect() as db:
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (account_id, kind, message, time.time()))
 
+    def record_cycle_check(self, account_id, symbol, phase, message, diagnostic=None):
+        """Update only the latest uninterrupted check for this account and stage."""
+        account_identifier(account_id)
+        if not isinstance(symbol, str) or symbol not in SYMBOLS or phase not in ("open", "close"):
+            raise TradingError("循环检查品种或阶段无效")
+        if not isinstance(message, str) or not message:
+            raise TradingError("循环检查消息无效")
+        metadata = {"symbol": symbol, "phase": phase, "count": 1, "first_at": 0, "last_at": 0}
+        if diagnostic is not None:
+            metadata["diagnostic"] = diagnostic
+        try:
+            metadata = _cycle_check_metadata(json.dumps(metadata, ensure_ascii=False, allow_nan=False))
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            metadata = None
+        if metadata is None:
+            raise TradingError("循环检查诊断格式无效")
+        with self.connect() as db:
+            # The database lock, rather than a Store-instance lock alone, keeps
+            # concurrent workers and restarted processes from losing a count.
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            if type(now) not in (int, float) or not math.isfinite(now) or not 0 <= now <= 253402300799:
+                raise TradingError("循环检查时间无效")
+            previous = db.execute("SELECT id,kind,cycle_check FROM events WHERE account_id=? ORDER BY id DESC LIMIT 1",
+                                  (account_id,)).fetchone()
+            last = _cycle_check_metadata(previous["cycle_check"]) if previous and previous["kind"] == "cycle_check" else None
+            metadata.update(first_at=now, last_at=now)
+            if last and last["symbol"] == symbol and last["phase"] == phase and now >= last["last_at"]:
+                metadata.update(count=last["count"] + 1, first_at=last["first_at"])
+                db.execute("UPDATE events SET message=?,created_at=?,cycle_check=? WHERE id=? AND account_id=?",
+                           (message, now, dumps(metadata), previous["id"], account_id))
+            else:
+                db.execute("INSERT INTO events(account_id,kind,message,created_at,cycle_check) VALUES (?,?,?,?,?)",
+                           (account_id, "cycle_check", message, now, dumps(metadata)))
+
     def events(self, limit=100):
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))]
+            rows = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY created_at DESC,id DESC LIMIT ?", (limit,))]
+        for row in rows:
+            raw = row.pop("cycle_check", None)
+            metadata = _cycle_check_metadata(raw) if row["kind"] == "cycle_check" else None
+            if metadata is not None:
+                row["cycle_check"] = metadata
+        return rows
 
     def complete_leverage(self, intent, actual):
         """Persist confirmation and the first-add priority in the same transaction."""

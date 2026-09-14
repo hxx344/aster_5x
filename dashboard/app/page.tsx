@@ -45,6 +45,8 @@ import {
 import { Progress } from '@/components/ui/progress';
 import { CyclePanel } from '@/components/cycle-panel';
 import { CycleTradesPanel } from '@/components/cycle-trades-panel';
+import { ExecutionEvents } from '@/components/execution-events';
+import type { ExecutionEvent } from '@/lib/cycle-events';
 import { OrdinaryConditions } from '@/components/ordinary-conditions';
 import {
   cycleDraft,
@@ -166,19 +168,12 @@ type Market = {
   depth?: DepthQuote;
   depth_error?: string;
 };
-type Event = {
-  id: number;
-  account_id: string;
-  kind: string;
-  message: string;
-  created_at: number;
-};
 type State = {
   demo: boolean;
   ready: boolean;
   accounts: Account[];
   markets: Record<string, Market>;
-  events: Event[];
+  events: ExecutionEvent[];
   updated_at: number;
   notification: { configured: boolean; pending: number; error?: string };
 };
@@ -898,25 +893,7 @@ export default function Home() {
                       )}
                     </TabsContent>
                     <TabsContent value="events">
-                      <div className="event-list">
-                        {events.length ? (
-                          events.slice(0, 50).map((e) => (
-                            <div className="event" key={e.id}>
-                              <time>{clock(e.created_at)}</time>
-                              <i
-                                className={`event-dot ${e.kind === 'error' ? 'danger-bg' : e.kind === 'wait' ? 'amber-bg' : 'mint-bg'}`}
-                              />
-                              <p>{e.message}</p>
-                            </div>
-                          ))
-                        ) : (
-                          <div className="empty-state">
-                            <Activity size={27} />
-                            <h3>暂无执行记录</h3>
-                            <p>开仓、杠杆调整与异常处理都会显示在这里。</p>
-                          </div>
-                        )}
-                      </div>
+                      <ExecutionEvents key={selected} events={events} />
                     </TabsContent>
                   </Tabs>
                 </section>

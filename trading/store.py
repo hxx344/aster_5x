@@ -345,6 +345,35 @@ class Store:
                 "latest_trade_at": row["latest_trade_at"] if row else None,
                 "cumulative_order": "execution_time", "timezone": "UTC"}
 
+    def cycle_rolling_volume(self, account_id, now=None):
+        """Sum every fill in (now - 24h, now], independently of UTC day changes."""
+        account_identifier(account_id)
+        end = time.time() if now is None else now
+        if type(end) not in (int, float) or not 0 <= end <= 253402300799 or not math.isfinite(end):
+            raise TradingError("循环滚动成交统计时间必须为有效时间戳")
+        end = float(end)
+        start = end - 86400
+        volume, estimated = Fraction(0), Fraction(0)
+        count, estimated_count, next_release = 0, 0, None
+        with self.connect() as db:
+            # The account/time range uses idx_cycle_fills_recent. Iterate every
+            # matching fill without a UI limit or lossy SQLite numeric SUM.
+            rows = db.execute("""SELECT notional,time_source,executed_at FROM cycle_fills
+                WHERE account_id=? AND executed_at>? AND executed_at<=? ORDER BY executed_at""",
+                              (account_id, start, end))
+            for row in rows:
+                notional = Fraction(dec(row["notional"]))
+                volume += notional
+                count += 1
+                if next_release is None:
+                    next_release = row["executed_at"] + 86400
+                if row["time_source"] == "legacy_estimated":
+                    estimated += notional
+                    estimated_count += 1
+        return {"window_start": start, "window_end": end, "volume": wire(volume), "trade_count": count,
+                "next_release_at": next_release, "estimated_volume": wire(estimated),
+                "estimated_trade_count": estimated_count}
+
     def cycle_trade_records(self, account_id, limit=100):
         account_identifier(account_id)
         if type(limit) is not int or not 1 <= limit <= 1000:

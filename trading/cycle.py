@@ -27,7 +27,11 @@ class CyclePositionError(TradingError):
 
 
 class DailyVolumeLimitError(TradingError):
-    """A new cycle must wait for the next UTC day's volume allowance."""
+    """A new cycle must wait for sufficient volume allowance."""
+
+
+class RollingVolumeLimitError(DailyVolumeLimitError):
+    """Recent fills must leave the rolling 24-hour window before reopening."""
 
 
 @dataclass(frozen=True)
@@ -140,7 +144,8 @@ def _spread(buy, sell):
     return (buy - sell) * 20000 / (buy + sell)
 
 
-def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None):
+def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None,
+               rolling_remaining=None):
     """Maximize one exact pair, or close precisely the recorded completed pair.
 
     The configured reference amount sweeps each side separately. Its VWAP
@@ -228,6 +233,9 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     available, equity = Fraction(snapshot.available), Fraction(snapshot.equity)
     minimum, maximum = (Fraction(dec(config[key])) for key in ("min_notional", "max_notional"))
     daily_budget = None if daily_remaining is None else Fraction(positive(daily_remaining, True))
+    rolling_budget = None if rolling_remaining is None else Fraction(positive(rolling_remaining, True))
+    budgets = [value for value in (daily_budget, rolling_budget) if value is not None]
+    volume_budget = min(budgets) if budgets else None
     upper = min(maximum_qty, bids.quantity, asks.quantity)
     if config["notional_scope"] == "per_side":
         upper = min(upper, asks.quantity_for(maximum), bids.quantity_for(maximum))
@@ -236,7 +244,7 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
         buy, sell = asks.amount(qty), bids.amount(qty)
         # Reserve both opening fills and their estimated closing fills. A later
         # price move or necessary repair may still consume more actual volume.
-        if quota and daily_budget is not None and 2 * (buy + sell) > daily_budget:
+        if quota and volume_budget is not None and 2 * (buy + sell) > volume_budget:
             return None
         value = max(buy, sell) if config["notional_scope"] == "per_side" else buy + sell
         if value > maximum or _spread(buy, sell) > limit_bp:
@@ -278,8 +286,10 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     qty = search()
     error = minimum_error(qty)
     if error:
-        if daily_budget is not None and not minimum_error(search(quota=False), quota=False):
-            raise DailyVolumeLimitError("今日剩余额度不足以完成下一轮开平仓，等待 UTC 00:00 自动恢复")
+        if volume_budget is not None and not minimum_error(search(quota=False), quota=False):
+            if rolling_budget is not None and (daily_budget is None or rolling_budget < daily_budget):
+                raise RollingVolumeLimitError("滚动 24 小时剩余额度不足以完成下一轮开平仓，等待历史成交移出窗口后自动重试")
+            raise DailyVolumeLimitError("今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度和滚动 24 小时额度均满足后自动恢复")
         raise TradingError(error)
     buy, sell, projected_ratio = resources(qty)
     require_search_time()

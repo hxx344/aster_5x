@@ -1,4 +1,4 @@
-import type { CycleDailyVolume, CycleTrade } from './cycle';
+import type { CycleDailyVolume, CycleRollingVolume, CycleTrade } from './cycle';
 
 // Keep monetary strings exact, including cumulative values above Number's
 // precise range. The server owns aggregation and UTC day assignment.
@@ -123,4 +123,72 @@ export function cycleTradesForDate(
   date: string,
 ): CycleTrade[] {
   return (trades || []).filter((trade) => !date || trade.utc_date === date);
+}
+
+export function cycleRollingSummary(
+  rolling: CycleRollingVolume | undefined,
+  now: number,
+  dataStale = false,
+) {
+  const start = rolling?.window_start;
+  const end = rolling?.window_end;
+  const knownWindow =
+    typeof start === 'number' &&
+    typeof end === 'number' &&
+    cycleUtcDate(start) !== null &&
+    cycleUtcDate(end) !== null &&
+    Math.abs(end - start - 86400) <= 1;
+  const stale =
+    dataStale ||
+    !Number.isFinite(now) ||
+    !knownWindow ||
+    now < end - 1 ||
+    now - end >= 8;
+  const release = rolling?.next_release_at;
+  const knownRelease =
+    typeof release === 'number' && cycleUtcDate(release) !== null;
+  const releasePassed = knownRelease && Number.isFinite(now) && now >= release;
+  const unlimited =
+    typeof rolling?.limit === 'string' && /^0+(?:\.0+)?$/.test(rolling.limit);
+  const notice = !rolling
+    ? '等待首次滚动 24 小时成交统计'
+    : rolling.error
+      ? `滚动成交统计异常：${rolling.error}`
+      : rolling.sync_pending
+        ? '正在核对成交，滚动额度尚未确认'
+        : !knownWindow
+          ? '滚动统计窗口未知或异常，等待刷新'
+          : stale
+            ? '滚动统计已过期，以下为最近记录'
+            : releasePassed
+              ? '下一笔释放时间已到，等待服务更新额度'
+              : '';
+  const estimatedVolume = cycleAmount(rolling?.estimated_volume);
+  return {
+    volume: cycleAmount(rolling?.volume),
+    remaining:
+      unlimited && rolling?.remaining === null
+        ? '不限'
+        : cycleAmount(rolling?.remaining),
+    trades:
+      typeof rolling?.trade_count === 'number' &&
+      Number.isSafeInteger(rolling.trade_count) &&
+      rolling.trade_count >= 0
+        ? String(rolling.trade_count)
+        : '—',
+    windowStart: knownWindow ? cycleUtcTime(start) : '时间未知',
+    windowEnd: knownWindow ? cycleUtcTime(end) : '时间未知',
+    releaseAt: knownRelease
+      ? cycleUtcTime(release)
+      : release === null
+        ? '暂无待释放成交'
+        : '等待服务确认',
+    notice,
+    stale,
+    releasePassed,
+    estimatedVolume,
+    hasEstimates:
+      estimatedVolume !== '—' &&
+      !/^0+(?:\.0+)?$/.test(rolling?.estimated_volume || ''),
+  };
 }

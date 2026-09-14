@@ -6,7 +6,7 @@ import uuid
 from contextlib import nullcontext
 from fractions import Fraction
 
-from .cycle import DailyVolumeLimitError
+from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, dec, floor_step, positive, wire
@@ -26,16 +26,22 @@ class CycleExecutor(Executor):
     def _require_daily_room(self, account, plan, config):
         if plan.phase != "open":
             return
-        if self.store.cycle_volume_backlog(account["id"], limit=1):
+        now = time.time()
+        if self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, now - 86400)):
             raise TradingError("循环成交明细尚未补齐，等待核对后再开新仓")
         # Even unlimited accounts read the ledger: missing accounting cannot be
         # silently treated as zero when the limit is subsequently configured.
-        daily = self.store.cycle_daily_volume(account["id"])
-        used = Fraction(positive(daily["volume"], True))
+        # Both windows share one timestamp, including at a UTC day boundary.
+        daily = self.store.cycle_daily_volume(account["id"], now=now)
+        rolling = self.store.cycle_rolling_volume(account["id"], now=now)
+        used_day = Fraction(positive(daily["volume"], True))
+        used_24h = Fraction(positive(rolling["volume"], True))
         limit = Fraction(positive(config.get("daily_volume_limit", "0"), True))
         roundtrip = 2 * (Fraction(positive(plan.long_notional)) + Fraction(positive(plan.short_notional)))
-        if limit and used + roundtrip > limit:
-            raise DailyVolumeLimitError("今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，等待次日 00:00 UTC 自动恢复")
+        if limit and used_day + roundtrip > limit and used_day >= used_24h:
+            raise DailyVolumeLimitError("今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日与滚动 24 小时额度均满足后自动恢复")
+        if limit and used_24h + roundtrip > limit:
+            raise RollingVolumeLimitError("最近 24 小时交易量余量不足以覆盖本轮预计开仓及平仓，待较早成交移出窗口且两项额度均满足后自动恢复")
 
     def sync_volume(self, account, intent):
         """Idempotently account known fills; missing details never block reductions."""

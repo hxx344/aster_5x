@@ -22,7 +22,7 @@ import {
   type CycleDraft,
   type CycleState,
 } from '@/lib/cycle';
-import { cycleDailySummary } from '@/lib/cycle-daily';
+import { cycleDailySummary, cycleRollingSummary } from '@/lib/cycle-daily';
 
 type CycleAccount = {
   id: string;
@@ -97,8 +97,10 @@ export function CyclePanel({
     setDraft({ ...draft, [key]: value });
   const spread = cycleSpreadView(state, now, stale);
   const daily = cycleDailySummary(state?.daily_volume, now, stale);
-  const dailyWaiting =
-    view.phase === 'daily_limit' || Boolean(state?.daily_volume?.reached);
+  const rolling = cycleRollingSummary(state?.rolling_volume, now, stale);
+  const volumeWaiting =
+    ['daily_limit', 'rolling_limit'].includes(view.phase) ||
+    Boolean(state?.daily_volume?.reached || state?.rolling_volume?.reached);
 
   return (
     <section
@@ -110,7 +112,7 @@ export function CyclePanel({
           <Repeat2 size={17} /> 多空循环
         </h2>
         <span
-          className={`migration-badge ${view.phase === 'attention' || view.phase === 'daily_limit' || stale ? 'amber' : ''}`}
+          className={`migration-badge ${view.phase === 'attention' || volumeWaiting || stale ? 'amber' : ''}`}
         >
           {stale ? '最近记录 · ' : ''}
           {view.label}
@@ -135,7 +137,7 @@ export function CyclePanel({
         aria-labelledby="cycle-daily-heading"
       >
         <h3 id="cycle-daily-heading">
-          每日成交额度 <span>{daily.date} · UTC</span>
+          成交额度 <span>UTC 日统计 · {daily.date}</span>
         </h3>
         <dl className="cycle-daily-grid">
           <div>
@@ -143,7 +145,7 @@ export function CyclePanel({
             <dd>{daily.volume}</dd>
           </div>
           <div>
-            <dt>当日上限 · USD1</dt>
+            <dt>日 / 24h 共用上限 · USD1</dt>
             <dd>{daily.limit}</dd>
           </div>
           <div>
@@ -157,23 +159,53 @@ export function CyclePanel({
         </dl>
         {daily.notice ? <p className="amber">{daily.notice}</p> : null}
         <p>
-          下次额度重置：<time>{daily.resetAt}</time>
+          UTC 日额度重置：<time>{daily.resetAt}</time>
         </p>
+        <h4 className="cycle-rolling-heading">滚动 24 小时统计</h4>
+        <dl className="cycle-daily-grid cycle-rolling-grid">
+          <div>
+            <dt>近 24 小时已成交 · USD1</dt>
+            <dd>{rolling.volume}</dd>
+          </div>
+          <div>
+            <dt>近 24 小时剩余 · USD1</dt>
+            <dd>{rolling.remaining}</dd>
+          </div>
+          <div>
+            <dt>近 24 小时成交笔数</dt>
+            <dd>{rolling.trades}</dd>
+          </div>
+        </dl>
+        {rolling.notice ? <p className="amber">{rolling.notice}</p> : null}
+        <p className="cycle-rolling-window">
+          统计窗口：<time>{rolling.windowStart}</time>
+          <span>至</span>
+          <time>{rolling.windowEnd}</time>
+        </p>
+        <p>
+          下一笔额度释放：<time>{rolling.releaseAt}</time>
+        </p>
+        {rolling.hasEstimates ? (
+          <p className="amber">
+            其中 {rolling.estimatedVolume} USD1 来自旧模拟单的估算成交时间。
+          </p>
+        ) : null}
+        <p>成交满 24 小时后逐笔移出统计；下一笔释放不代表额度已足够恢复。</p>
         {account.cycle?.enabled ? (
           !account.enabled ? (
-            <p>账户已手动暂停，UTC 换日后仍需手动启动。</p>
-          ) : dailyWaiting ? (
+            <p>账户已手动暂停，UTC 换日或滚动额度释放后仍需手动启动。</p>
+          ) : volumeWaiting ? (
             <p className="amber">
               {ownedPosition
                 ? '继续本轮条件平仓，暂停新增。'
-                : '当日额度已满或不足开启下一轮，暂停新增。'}
-              下一 UTC
-              日额度重置后，条件满足时自动恢复；点击暂停可取消自动恢复。
+                : '成交额度已满或不足开启下一轮，暂停新增。'}
+              UTC 日与滚动 24
+              小时额度均足够，且交易条件满足后才自动恢复；点击暂停可取消自动恢复。
             </p>
           ) : (
             <p>
-              达到额度后暂停新增；已有仓位仍按条件平仓。下一 UTC
-              日条件满足后自动恢复。
+              任一额度不足时暂停新增；已有仓位仍按条件平仓。UTC 日与滚动 24
+              小时额度均足够，且交易条件满足后才自动恢复。
             </p>
           )
         ) : null}
@@ -418,7 +450,7 @@ export function CyclePanel({
             天。平仓均确认后自动开始下一轮。
           </p>
           <label htmlFor="cycle-daily-volume">
-            每日成交额度 <span>USD1 · 0 为不限</span>
+            成交额度上限 <span>USD1 · 0 为不限</span>
             <Input
               id="cycle-daily-volume"
               type="number"
@@ -433,9 +465,9 @@ export function CyclePanel({
             />
           </label>
           <p className="muted">
-            按 UTC 日累计全部循环成交。每边 10,000 USD1
-            的一轮多空开仓和平仓，交易量约 40,000
-            USD1；修复成交也计入，手续费不计入。剩余额度不足新一轮时等待下一日，平仓不受额度限制。价格变化或修复可能使实际成交量超过上限。
+            UTC 日与滚动 24 小时分别累计全部循环成交，共用同一个上限。每边
+            10,000 USD1 的一轮多空开仓和平仓，交易量约 40,000
+            USD1；修复成交也计入，手续费不计入。任一剩余额度不足新一轮时等待两项额度均足够，平仓不受额度限制。价格变化或修复可能使实际成交量超过上限。
           </p>
         </fieldset>
         <p className="muted">

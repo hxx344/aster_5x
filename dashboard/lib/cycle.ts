@@ -30,6 +30,7 @@ export type CycleState = {
   spread_bp?: string | null;
   spread_checked_at?: number | null;
   daily_volume?: CycleDailyVolume;
+  rolling_volume?: CycleRollingVolume;
 };
 
 export type CycleDailyVolume = {
@@ -60,6 +61,21 @@ export type CycleTrade = {
   daily_volume: string;
   intent_id: string;
   phase: 'open' | 'close' | 'repair';
+};
+
+export type CycleRollingVolume = {
+  window_start: number;
+  window_end: number;
+  volume: string;
+  trade_count: number;
+  next_release_at: number | null;
+  estimated_volume?: string;
+  estimated_trade_count?: number;
+  limit: string;
+  remaining: string | null;
+  reached: boolean;
+  sync_pending?: boolean;
+  error?: string | null;
 };
 
 export const DEFAULT_CYCLE: CycleConfig = {
@@ -196,8 +212,14 @@ const PHASES: Record<string, { label: string; reason: string }> = {
   },
   closing: { label: '多空平仓中', reason: '正在提交并核对本轮多空平仓' },
   daily_limit: {
-    label: '等待次日额度',
-    reason: '当日额度已用完或不足开启下一轮，下一 UTC 日条件满足后自动恢复新增',
+    label: '等待日额度',
+    reason:
+      '当日额度已用完或不足开启下一轮，需同时满足 UTC 日与滚动 24 小时额度后恢复新增',
+  },
+  rolling_limit: {
+    label: '等待滚动额度',
+    reason:
+      '滚动 24 小时额度已用完或不足开启下一轮，等待成交逐笔移出统计，且 UTC 日额度也足够后恢复新增',
   },
 };
 
@@ -209,13 +231,16 @@ export function cycleStatus(
   let phase =
     state?.phase ||
     (!enabled ? 'disabled' : accountEnabled ? 'waiting_open' : 'paused');
-  if (phase === 'daily_limit' && (!enabled || !accountEnabled)) {
+  if (
+    ['daily_limit', 'rolling_limit'].includes(phase) &&
+    (!enabled || !accountEnabled)
+  ) {
     phase = enabled ? 'paused' : 'disabled';
     return {
       phase,
       label: PHASES[phase].label,
       reason: enabled
-        ? '账户已手动暂停，UTC 换日后仍需手动启动'
+        ? '账户已手动暂停，额度释放后仍需手动启动'
         : PHASES.disabled.reason,
     };
   }

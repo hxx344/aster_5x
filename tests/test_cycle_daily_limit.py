@@ -81,17 +81,26 @@ class DailyQuotaEngineTests(TestCase):
         self.assertLessEqual(dec(state["cycle_state"]["daily_volume"]["volume"]), 1000)
         return progress
 
-    def test_cap_wait_keeps_account_armed_and_restarts_at_utc_midnight(self):
-        self.capped_round()
-        before = deepcopy(self.f.broker.state["orders"])
-        daily = self.f.store.cycle_daily_volume("test")
-        restarted = Engine(self.f.store, market=self.f.market)
-        self.engine = restarted
-        self.engine.brokers["test"] = self.f.broker
-        self.engine.tick_account("test")
-        self.assertEqual(before, self.f.broker.state["orders"])
-        self.assertEqual(self.engine.state()["accounts"][0]["cycle_state"]["phase"], "daily_limit")
+    def test_cap_wait_survives_utc_midnight_until_rolling_allowance_releases(self):
+        now = datetime(2026, 9, 14, 12, tzinfo=timezone.utc).timestamp()
+        with patch("trading.engine.time.time", return_value=now):
+            self.capped_round()
+            before = deepcopy(self.f.broker.state["orders"])
+            daily = self.f.store.cycle_daily_volume("test")
+            self.engine = Engine(self.f.store, market=self.f.market)
+            self.engine.brokers["test"] = self.f.broker
+            self.engine.tick_account("test")
+            self.assertEqual(before, self.f.broker.state["orders"])
+            self.assertEqual(self.engine.state()["accounts"][0]["cycle_state"]["phase"], "daily_limit")
         with patch("trading.engine.time.time", return_value=daily["next_reset_at"] + 1):
+            self.engine.tick_account("test")
+            state = self.engine.state()["accounts"][0]
+            self.assertEqual(state["cycle_state"]["phase"], "rolling_limit")
+            self.assertEqual(state["cycle_state"]["daily_volume"]["volume"], "0")
+            self.assertEqual(state["cycle_state"]["rolling_volume"]["volume"], daily["volume"])
+            self.assertTrue(state["enabled"])
+            self.assertEqual(before, self.f.broker.state["orders"])
+        with patch("trading.engine.time.time", return_value=now + 86400):
             self.run_until_holding()
             current = self.engine.state()["accounts"][0]["cycle_state"]["daily_volume"]
             self.assertNotEqual(current["utc_date"], daily["utc_date"])
@@ -191,11 +200,11 @@ class DailyQuotaEngineTests(TestCase):
             self.engine.tick_account("test")
             self.assertEqual(self.f.store.cycle_daily_volume("test")["trade_count"], 0)
         with patch("trading.engine.time.time", return_value=before + 30):
-            self.run_until_holding()
-            self.assertEqual(self.f.store.cycle_daily_volume("test")["trade_count"], 2)
-            self.expire_hold()
             self.engine.tick_account("test")
-            self.engine.tick_account("test")
+            state = self.engine.state()["accounts"][0]["cycle_state"]
+            self.assertEqual(state["phase"], "rolling_limit")
+            self.assertEqual(state["daily_volume"]["trade_count"], 0)
+            self.assertEqual(state["rolling_volume"]["trade_count"], 4)
             self.assertEqual(self.f.store.cycle_daily_volume("test", now=before)["trade_count"], 4)
             self.assertEqual(self.f.store.cycle_volume_backlog("test", since=0), [])
 

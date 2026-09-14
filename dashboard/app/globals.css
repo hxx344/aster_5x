@@ -685,6 +685,22 @@ label input,
   font-size: 12px;
   line-height: 1.7;
 }
+.cycle-rolling-heading {
+  margin: 16px 0 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 500;
+}
+.cycle-rolling-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+.cycle-rolling-window time {
+  display: block;
+}
+.cycle-rolling-window > span {
+  color: var(--muted-foreground);
+}
 .cycle-date-filter {
   min-width: 190px;
 }

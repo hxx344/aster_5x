@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from fractions import Fraction
 
 from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
+from .cycle_diagnostics import diagnostic_error, diagnostic_number
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
@@ -38,10 +39,29 @@ class CycleExecutor(Executor):
         used_24h = Fraction(positive(rolling["volume"], True))
         limit = Fraction(positive(config.get("daily_volume_limit", "0"), True))
         roundtrip = 2 * (Fraction(positive(plan.long_notional)) + Fraction(positive(plan.short_notional)))
+        def exceeded(code, title, error_type):
+            checks = [{"code": check_code, "label": label, "actual": diagnostic_number(used + roundtrip),
+                       "required": "≤ " + diagnostic_number(limit), "unit": "USD1",
+                       "passed": used + roundtrip <= limit}
+                      for check_code, label, used in (("daily_projected_volume", "UTC 日预计累计成交量", used_day),
+                                                      ("rolling_projected_volume", "近 24 小时预计累计成交量", used_24h))]
+            context = [{"label": label, "value": diagnostic_number(value), "unit": "USD1"}
+                       for label, value in (("本轮预计开平交易量", roundtrip),
+                                            ("UTC 日已用成交量", used_day),
+                                            ("UTC 日剩余额度", max(Fraction(0), limit - used_day)),
+                                            ("近 24 小时已用成交量", used_24h),
+                                            ("近 24 小时剩余额度", max(Fraction(0), limit - used_24h)),
+                                            ("成交量上限", limit))]
+            return diagnostic_error(code, title, symbol=plan.symbol, phase="open", checked_at=now,
+                                    checks=checks, context=context, error_type=error_type)
         if limit and used_day + roundtrip > limit and used_day >= used_24h:
-            raise DailyVolumeLimitError("今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日与滚动 24 小时额度均满足后自动恢复")
+            raise exceeded("execution_daily_volume",
+                           "今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日与滚动 24 小时额度均满足后自动恢复",
+                           DailyVolumeLimitError)
         if limit and used_24h + roundtrip > limit:
-            raise RollingVolumeLimitError("最近 24 小时交易量余量不足以覆盖本轮预计开仓及平仓，待较早成交移出窗口且两项额度均满足后自动恢复")
+            raise exceeded("execution_rolling_volume",
+                           "最近 24 小时交易量余量不足以覆盖本轮预计开仓及平仓，待较早成交移出窗口且两项额度均满足后自动恢复",
+                           RollingVolumeLimitError)
 
     def sync_volume(self, account, intent):
         """Idempotently account known fills; missing details never block reductions."""
@@ -358,11 +378,22 @@ class CycleExecutor(Executor):
             compared = list(notionals.values()) if config["notional_scope"] == "per_side" else [sum(notionals.values())]
             if any(not minimum <= amount <= maximum for amount in compared):
                 full_open = False
-                intent["rollback_reason"] = "实际成交金额超出本轮范围"
+                scope = "每边" if config["notional_scope"] == "per_side" else "多空合计"
+                intent["rollback_reason"] = ("实际成交金额超出本轮范围：多头 " + diagnostic_number(notionals["LONG"])
+                                             + " USD1，空头 " + diagnostic_number(notionals["SHORT"])
+                                             + " USD1，多空合计 " + diagnostic_number(sum(notionals.values()))
+                                             + " USD1；要求" + scope + "金额 " + diagnostic_number(minimum)
+                                             + "–" + diagnostic_number(maximum) + " USD1")
             try:
-                if snapshot.margin_exceeds(cycle_margin_limit(account["policy"])):
+                margin_limit = cycle_margin_limit(account["policy"])
+                if snapshot.margin_exceeds(margin_limit):
                     full_open = False
-                    intent["rollback_reason"] = "成交后实际保证金占用超过账户上限"
+                    occupied, equity = snapshot.occupied_margin_exact, Fraction(snapshot.equity)
+                    intent["rollback_reason"] = ("成交后实际保证金占用超过账户上限：当前 "
+                                                 + diagnostic_number(occupied / equity, 100) + "%，要求 ≤ "
+                                                 + diagnostic_number(margin_limit, 100) + "%（基础上限 + 5 个百分点，最高 100%）；"
+                                                 + "账户总占用 " + diagnostic_number(occupied) + " USD1，总权益 "
+                                                 + diagnostic_number(equity) + " USD1")
             except TradingError:
                 full_open = False
                 intent["rollback_reason"] = "成交后无法确认有效的保证金占用"

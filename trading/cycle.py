@@ -7,6 +7,7 @@ from fractions import Fraction
 import math
 import time
 
+from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
 from .migration import _Sweep, migration_symbols
 from .models import (SYMBOLS, TradingError, cycle_margin_limit, dec, decimal_value, leverage_cap,
                      positive, wire)
@@ -26,7 +27,7 @@ class CyclePositionError(TradingError):
     """Actual holdings no longer match the cycle's exclusive tracked position."""
 
 
-class DailyVolumeLimitError(TradingError):
+class DailyVolumeLimitError(CycleConditionError):
     """A new cycle must wait for sufficient volume allowance."""
 
 
@@ -144,6 +145,119 @@ def _spread(buy, sell):
     return (buy - sell) * 20000 / (buy + sell)
 
 
+def _check(code, label, actual, required, unit, passed):
+    return {"code": code, "label": label, "actual": actual, "required": required,
+            "unit": unit, "passed": passed}
+
+
+def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
+                        maximum_qty, mark, exchange_minimum, cap, fee, margin_limit,
+                        occupied, available, equity, minimum, maximum, limit_bp,
+                        daily_budget, rolling_budget, executable_qty,
+                        error_type=CycleConditionError):
+    """Explain the minimum required order using original inputs, not a search probe.
+
+    This runs only after rejection. Unknown prices stay unknown when the supplied
+    book cannot cover the minimum; no notional-to-quantity extrapolation is used.
+    """
+    number = diagnostic_number
+    base = max(step, minimum_qty, exchange_minimum / mark)
+    base = -(-base // step) * step
+    depth_steps = int(min(bids.quantity, asks.quantity) // step)
+
+    def amount_at(qty):
+        buy, sell = asks.amount(qty), bids.amount(qty)
+        return min(buy, sell) if config["notional_scope"] == "per_side" else buy + sell
+
+    depth_amount = amount_at(depth_steps * step) if depth_steps else Fraction(0)
+    target_known = depth_amount >= minimum
+    target = base
+    if minimum and target_known:
+        low, high = 0, depth_steps
+        while low < high:
+            mid = (low + high) // 2
+            if amount_at(mid * step) >= minimum:
+                high = mid
+            else:
+                low = mid + 1
+        target = max(base, low * step)
+
+    target_text = number(target) if target_known else "≥ " + number(base)
+    checks = [
+        _check("exchange_min_qty", "交易所最小数量", target_text, "≥ " + number(minimum_qty), "",
+               target >= minimum_qty if target_known else None),
+        _check("exchange_min_notional", "交易所最小名义额（按标记价）", number(target * mark) if target_known else None,
+               "≥ " + number(exchange_minimum), "USD1", target * mark >= exchange_minimum if target_known else None),
+        _check("quantity_step", "交易所数量步长", target_text, number(step) + " 的正整数倍", "",
+               target > 0 and target % step == 0 if target_known else None),
+        _check("exchange_max_qty", "交易所最大数量", target_text, "≤ " + number(maximum_qty), "",
+               target <= maximum_qty if target_known else False if base > maximum_qty else None),
+        _check("depth_buy_quantity", "买入侧完整深度数量", number(asks.quantity), "≥ " + number(target), "",
+               asks.quantity >= target if target_known else False if asks.quantity < base else None),
+        _check("depth_sell_quantity", "卖出侧完整深度数量", number(bids.quantity), "≥ " + number(target), "",
+               bids.quantity >= target if target_known else False if bids.quantity < base else None),
+    ]
+    priced = target_known and target <= min(bids.quantity, asks.quantity)
+    buy = sell = gross = cost = added_margin = projected_equity = ratio = reserve = None
+    scope = "每边" if config["notional_scope"] == "per_side" else "多空合计"
+    if priced:
+        buy, sell = asks.amount(target), bids.amount(target)
+        gross = 2 * target * max(mark, asks.last_price(target))
+        cost = ((buy + sell) * fee + max(Fraction(0), buy - target * mark)
+                + max(Fraction(0), target * mark - sell))
+        added_margin = gross / config["leverage"]
+        projected_equity = equity - cost
+        ratio = (occupied + added_margin) / projected_equity if projected_equity > 0 else None
+        reserve = 2 * (buy + sell)
+    maximum_value = (max(buy, sell) if scope == "每边" else buy + sell) if priced else None
+    minimum_value = (min(buy, sell) if scope == "每边" else buy + sell) if priced else None
+    checks.extend([
+        _check("configured_min_notional", f"配置最小金额（{scope}）",
+               number(minimum_value) if priced else number(depth_amount) if not target_known else None,
+               "≥ " + number(minimum), "USD1", minimum_value >= minimum if priced else False if not target_known else None),
+        _check("configured_max_notional", f"配置最大金额（{scope}）", number(maximum_value) if priced else None,
+               "≤ " + number(maximum), "USD1", maximum_value <= maximum if priced else None),
+        _check("order_spread", "最小委托实际深度价差", number(_spread(buy, sell)) if priced else None,
+               "≤ " + number(limit_bp), "bp", _spread(buy, sell) <= limit_bp if priced else None),
+        _check("leverage_cap", f"{config['leverage']}x 档位多空合计名义额", number(gross) if priced else None,
+               "≤ " + number(cap), "USD1", gross <= cap if priced else None),
+        _check("projected_equity", "扣除手续费与不利价差后的权益", number(projected_equity) if priced else None,
+               "> 0", "USD1", projected_equity > 0 if priced else None),
+        _check("available_margin", "可用余额", number(available),
+               "≥ " + number(added_margin + cost) if priced else None, "USD1",
+               available >= added_margin + cost if priced else None),
+        _check("projected_margin_ratio", "全账户预计保证金占比", number(ratio, 100) if ratio is not None else None,
+               "≤ " + number(margin_limit, 100), "%", ratio <= margin_limit if ratio is not None else None),
+    ])
+    for code, label, budget in (("daily_volume", "UTC 日剩余成交额度", daily_budget),
+                                 ("rolling_volume", "滚动 24 小时剩余成交额度", rolling_budget)):
+        if budget is not None:
+            checks.append(_check(code, label, number(budget), "≥ " + number(reserve) if priced else None,
+                                 "USD1", budget >= reserve if priced else None))
+    context = [
+        {"label": "最小要求数量", "value": target_text},
+        {"label": "当前可执行数量", "value": number(executable_qty)},
+        {"label": "标记价格", "value": number(mark), "unit": "USD1"},
+        {"label": "当前全账户保证金", "value": number(occupied), "unit": "USD1"},
+        {"label": "当前权益", "value": number(equity), "unit": "USD1"},
+        {"label": "风控手续费预留率", "value": number(fee, 100), "unit": "%"},
+    ]
+    if priced:
+        context.extend([
+            {"label": "最小要求买入均价", "value": number(buy / target), "unit": "USD1"},
+            {"label": "最小要求卖出均价", "value": number(sell / target), "unit": "USD1"},
+            {"label": "最小要求新增保证金", "value": number(added_margin), "unit": "USD1"},
+            {"label": "预留手续费与不利价差", "value": number(cost), "unit": "USD1"},
+            {"label": "可用余额缺口", "value": number(max(Fraction(0), added_margin + cost - available)), "unit": "USD1"},
+            {"label": "全账户保证金超额", "value": number(max(Fraction(0), occupied + added_margin - margin_limit * projected_equity)), "unit": "USD1"},
+        ])
+    note = ("按满足交易所最小委托及配置最小金额的最低步长数量逐项检查；不代表将按该数量下单。"
+            if priced else "完整深度不足以计算全部最小要求；未取得的价格、费用及风险检查不判定通过。"
+            + ("配置最小金额的当前值为现有双边深度按步长可达金额；最小要求数量仅为交易所要求的下界。" if not target_known else ""))
+    return diagnostic_error("cycle_minimum_order", title, symbol=config["symbol"], phase="open", checked_at=now,
+                            checks=checks, context=context, note=note, error_type=error_type)
+
+
 def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None,
                rolling_remaining=None):
     """Maximize one exact pair, or close precisely the recorded completed pair.
@@ -196,12 +310,28 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
 
     reference = Fraction(dec(config["spread_notional"]))
     limit_bp = Fraction(dec(config["spread_limit_bp"]))
+    diagnostic_phase = "open" if phase == "waiting_open" else "close"
     if min(bids.notional, asks.notional) < reference:
-        raise TradingError("循环价差采样金额的双边完整深度不足")
-    reference_spread = _spread(reference / asks.quantity_for(reference),
-                               reference / bids.quantity_for(reference))
+        raise diagnostic_error("reference_depth", "循环价差采样金额的双边完整深度不足",
+            symbol=rule.symbol, phase=diagnostic_phase, checked_at=now,
+            checks=[_check("reference_buy_depth", "买入侧完整深度金额", diagnostic_number(asks.notional),
+                           "≥ " + diagnostic_number(reference), "USD1", asks.notional >= reference),
+                    _check("reference_sell_depth", "卖出侧完整深度金额", diagnostic_number(bids.notional),
+                           "≥ " + diagnostic_number(reference), "USD1", bids.notional >= reference),
+                    _check("reference_spread", "采样深度价差", None, "≤ " + diagnostic_number(limit_bp), "bp", None)],
+            note="采样深度不足，未外推成交均价或判定价差通过。")
+    reference_buy = reference / asks.quantity_for(reference)
+    reference_sell = reference / bids.quantity_for(reference)
+    reference_spread = _spread(reference_buy, reference_sell)
     if reference_spread > limit_bp:
-        raise TradingError("循环采样深度价差超过配置阈值（bp）")
+        raise diagnostic_error("reference_spread", "循环采样深度价差超过配置阈值（bp）",
+            symbol=rule.symbol, phase=diagnostic_phase, checked_at=now,
+            checks=[_check("reference_spread", "采样深度价差", diagnostic_number(reference_spread),
+                           "≤ " + diagnostic_number(limit_bp), "bp", reference_spread <= limit_bp)],
+            context=[{"label": "采样每边金额", "value": diagnostic_number(reference), "unit": "USD1"},
+                     {"label": "买入均价", "value": diagnostic_number(reference_buy), "unit": "USD1"},
+                     {"label": "卖出均价", "value": diagnostic_number(reference_sell), "unit": "USD1"},
+                     {"label": "价差超出", "value": diagnostic_number(reference_spread - limit_bp), "unit": "bp"}])
     step = Fraction(positive(rule.step))
     minimum_qty, maximum_qty = Fraction(positive(rule.min_qty)), Fraction(positive(rule.max_qty))
     mark = Fraction(positive(book.mark))
@@ -210,12 +340,25 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     if phase != "waiting_open":
         qty = Fraction(tracked["LONG"])
         if qty % step or not minimum_qty <= qty <= maximum_qty:
-            raise TradingError("循环全部平仓数量不满足交易所数量步长或限额")
+            raise diagnostic_error("close_quantity", "循环全部平仓数量不满足交易所数量步长或限额",
+                symbol=rule.symbol, phase="close", checked_at=now,
+                checks=[_check("close_min_qty", "全部平仓数量", diagnostic_number(qty), "≥ " + diagnostic_number(minimum_qty), "", qty >= minimum_qty),
+                        _check("close_max_qty", "全部平仓数量", diagnostic_number(qty), "≤ " + diagnostic_number(maximum_qty), "", qty <= maximum_qty),
+                        _check("close_step", "全部平仓数量步长", diagnostic_number(qty), diagnostic_number(step) + " 的整数倍", "", qty % step == 0)])
         if qty > min(bids.quantity, asks.quantity):
-            raise TradingError("循环全部平仓所需双边深度不足")
+            raise diagnostic_error("close_depth", "循环全部平仓所需双边深度不足", symbol=rule.symbol, phase="close", checked_at=now,
+                checks=[_check("close_buy_depth", "买入侧完整深度数量", diagnostic_number(asks.quantity), "≥ " + diagnostic_number(qty), "", asks.quantity >= qty),
+                        _check("close_sell_depth", "卖出侧完整深度数量", diagnostic_number(bids.quantity), "≥ " + diagnostic_number(qty), "", bids.quantity >= qty)],
+                note="深度不足，未外推全部平仓的成交均价。")
         long_amount, short_amount = bids.amount(qty), asks.amount(qty)
         if _spread(short_amount, long_amount) > limit_bp:
-            raise TradingError("循环实际平仓数量的深度价差超过配置阈值（bp）")
+            raise diagnostic_error("close_spread", "循环实际平仓数量的深度价差超过配置阈值（bp）",
+                symbol=rule.symbol, phase="close", checked_at=now,
+                checks=[_check("close_spread", "全部平仓深度价差", diagnostic_number(_spread(short_amount, long_amount)),
+                               "≤ " + diagnostic_number(limit_bp), "bp", _spread(short_amount, long_amount) <= limit_bp)],
+                context=[{"label": "每边平仓数量", "value": diagnostic_number(qty)},
+                         {"label": "买入均价", "value": diagnostic_number(short_amount / qty), "unit": "USD1"},
+                         {"label": "卖出均价", "value": diagnostic_number(long_amount / qty), "unit": "USD1"}])
         require_search_time()
         return CyclePlan("close", rule.symbol, decimal_value(qty, exact=True), config["leverage"],
                          decimal_value(long_amount, exact=True), decimal_value(short_amount, exact=True),
@@ -286,11 +429,19 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     qty = search()
     error = minimum_error(qty)
     if error:
+        error_type = CycleConditionError
         if volume_budget is not None and not minimum_error(search(quota=False), quota=False):
             if rolling_budget is not None and (daily_budget is None or rolling_budget < daily_budget):
-                raise RollingVolumeLimitError("滚动 24 小时剩余额度不足以完成下一轮开平仓，等待历史成交移出窗口后自动重试")
-            raise DailyVolumeLimitError("今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度和滚动 24 小时额度均满足后自动恢复")
-        raise TradingError(error)
+                error_type = RollingVolumeLimitError
+                error = "滚动 24 小时剩余额度不足以完成下一轮开平仓，等待历史成交移出窗口后自动重试"
+            else:
+                error_type = DailyVolumeLimitError
+                error = "今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度和滚动 24 小时额度均满足后自动恢复"
+        raise _minimum_diagnostic(error, config=config, now=now, bids=bids, asks=asks, step=step,
+            minimum_qty=minimum_qty, maximum_qty=maximum_qty, mark=mark, exchange_minimum=exchange_minimum,
+            cap=cap, fee=fee, margin_limit=margin_limit, occupied=occupied, available=available, equity=equity,
+            minimum=minimum, maximum=maximum, limit_bp=limit_bp, daily_budget=daily_budget,
+            rolling_budget=rolling_budget, executable_qty=qty, error_type=error_type)
     buy, sell, projected_ratio = resources(qty)
     require_search_time()
     return CyclePlan("open", rule.symbol, decimal_value(qty, exact=True), config["leverage"],

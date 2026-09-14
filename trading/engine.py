@@ -21,6 +21,7 @@ from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
+from .cycle_diagnostics import diagnostic_error, diagnostic_number
 from .models import cycle_margin_limit
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
@@ -559,6 +560,9 @@ class Engine:
 
     def cycle_view(self, account, **updates):
         saved = self.store.get("cycle:" + account["id"]) or {}
+        # A fresh state transition or a different unstructured failure must not
+        # leave an older condition's numbers attached to the new reason.
+        updates.setdefault("diagnostic", None)
         self.view(account["id"], cycle_state={**saved, **updates})
 
     def cycle_volume_state(self, account, now=None):
@@ -583,12 +587,25 @@ class Engine:
         daily, rolling = state["daily_volume"], state["rolling_volume"]
         if daily["sync_pending"]:
             raise TradingError("循环成交明细仍在同步，完成 UTC 日及滚动 24 小时累计量核对后再开仓")
+        def quota_error(error_type, title, code):
+            checks = [{"code": key, "label": label, "actual": diagnostic_number(record["volume"]),
+                       "required": "< " + diagnostic_number(record["limit"]), "unit": "USD1",
+                       "passed": not record["reached"]}
+                      for key, label, record in (("utc_volume", "UTC 当日成交量", daily),
+                                                 ("rolling_volume", "滚动 24 小时成交量", rolling))]
+            return diagnostic_error(code, title, symbol=account["cycle"]["symbol"], phase="open",
+                                    checked_at=rolling["window_end"], checks=checks,
+                                    context=[{"label": "UTC 成交日", "value": daily["utc_date"]},
+                                             {"label": "当日剩余额度", "value": daily["remaining"], "unit": "USD1"},
+                                             {"label": "近 24 小时剩余额度", "value": rolling["remaining"], "unit": "USD1"}],
+                                    note="两个窗口都要留足本轮开仓及预计平仓的成交额度；平仓与必要补救继续允许。",
+                                    error_type=error_type)
         if rolling["reached"] and dec(rolling["volume"]) > dec(daily["volume"]):
-            raise RollingVolumeLimitError("已达到滚动 24 小时成交量上限，等待历史成交移出窗口后自动重试")
+            raise quota_error(RollingVolumeLimitError, "已达到滚动 24 小时成交量上限，等待历史成交移出窗口后自动重试", "rolling_volume_limit")
         if daily["reached"]:
-            raise DailyVolumeLimitError("已达到 UTC 每日成交量上限，待日额度和滚动 24 小时额度均满足后自动恢复")
+            raise quota_error(DailyVolumeLimitError, "已达到 UTC 每日成交量上限，待日额度和滚动 24 小时额度均满足后自动恢复", "daily_volume_limit")
         if rolling["reached"]:
-            raise RollingVolumeLimitError("已达到滚动 24 小时成交量上限，等待历史成交移出窗口后自动重试")
+            raise quota_error(RollingVolumeLimitError, "已达到滚动 24 小时成交量上限，等待历史成交移出窗口后自动重试", "rolling_volume_limit")
         return {"daily_remaining": daily["remaining"], "rolling_remaining": rolling["remaining"]}
 
     def cycle_progress(self, account, snapshot):
@@ -934,7 +951,8 @@ class Engine:
                     phase = "rolling_limit" if isinstance(exc, RollingVolumeLimitError) else "daily_limit" if isinstance(exc, DailyVolumeLimitError) else "attention" if status == "attention" else "waiting_close" if progress.get("opened_at") is not None else "waiting_open"
                     quota = self.cycle_volume_state(account)["daily_volume"] if isinstance(exc, DailyVolumeLimitError) else {}
                     self.cycle_view(account, phase=phase, reason=message,
-                                    quota_utc_date=quota.get("utc_date"), quota_remaining=quota.get("effective_remaining"))
+                                    quota_utc_date=quota.get("utc_date"), quota_remaining=quota.get("effective_remaining"),
+                                    diagnostic=getattr(exc, "diagnostic", None))
                 delay = max(10, getattr(exc, "retry_after", 0))
                 with self.lock:
                     self.account_backoff[account_id] = time.monotonic() + delay
@@ -1070,6 +1088,11 @@ class Engine:
             with self.lock:
                 self.wake_accounts.add(account_id)
                 self.accounts_generation += 1
+                current_cycle = self.views.get(account_id, {}).get("cycle_state")
+                if current_cycle is not None:
+                    # Clear the stored view too: a pause followed by resume must
+                    # not resurrect a pre-pause diagnostic before the next tick.
+                    view_updates["cycle_state"] = {**current_cycle, "diagnostic": None}
             self.view(account_id, status="running" if enabled else "attention" if account.get("pause_reason") else "paused",
                       reason="策略运行中" if enabled else account.get("pause_reason") or "策略已暂停", **view_updates)
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")
@@ -1297,7 +1320,7 @@ class Engine:
                 daily, rolling = (cycle_volumes[account["id"]][key] for key in ("daily_volume", "rolling_volume"))
                 # Durable phase/ownership must win after an executor completes.
                 if saved_cycle.get("updated_at", 0) > current_cycle.get("updated_at", 0):
-                    cycle.update(saved_cycle)
+                    cycle.update(saved_cycle, diagnostic=None)
                 active_cycle = pending and pending["kind"] in ("cycle", "cycle_leverage")
                 if active_cycle:
                     cycle.update(phase="attention" if pending["status"] == "attention" else "reconciling",
@@ -1321,10 +1344,12 @@ class Engine:
                         previous_remaining = cycle.get("quota_remaining")
                         if daily["effective_remaining"] is None or (previous_remaining is not None and
                                 dec(daily["effective_remaining"]) > dec(previous_remaining)):
-                            cycle.update(phase="waiting_open", reason="成交额度已释放，等待重新核对开仓条件")
+                            cycle.update(phase="waiting_open", reason="成交额度已释放，等待重新核对开仓条件", diagnostic=None)
                         elif cycle.get("quota_utc_date") != daily["utc_date"]:
                             cycle.update(phase="rolling_limit", reason="UTC 日额度已重置，仍需满足滚动 24 小时开平仓额度")
                     cycle["active_batch"] = None
+                if active_cycle or cycle.get("phase") not in ("waiting_open", "waiting_close", "daily_limit", "rolling_limit"):
+                    cycle["diagnostic"] = None
                 if active_cycle and pending.get("volume_error"):
                     daily = {**daily, "sync_pending": True, "error": pending["volume_error"]}
                     rolling = {**rolling, "sync_pending": True, "error": pending["volume_error"]}

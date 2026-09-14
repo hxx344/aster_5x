@@ -24,6 +24,7 @@ import {
 } from '@/lib/cycle';
 import { cycleDailySummary, cycleRollingSummary } from '@/lib/cycle-daily';
 import { CycleCostSummary } from '@/components/cycle-cost-summary';
+import { CycleDiagnostic } from '@/components/cycle-diagnostic';
 import { cycleMarginLimit, percentFromMarginLimit } from '@/lib/policy';
 
 type CycleAccount = {
@@ -140,6 +141,7 @@ export function CyclePanel({
           </p>
         ) : null}
       </div>
+      <CycleDiagnostic diagnostic={state?.diagnostic} />
       <section
         className="cycle-daily-summary"
         aria-labelledby="cycle-daily-heading"

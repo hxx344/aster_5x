@@ -646,6 +646,94 @@ label input,
 .cycle-buttons > button {
   min-width: 130px;
 }
+.cycle-diagnostic {
+  margin: 0 22px 18px;
+  padding: 14px;
+  border: 1px solid #615338;
+  border-radius: 6px;
+  background: #211f1a;
+  overflow-wrap: anywhere;
+}
+.cycle-diagnostic-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+}
+.cycle-diagnostic-heading h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+}
+.cycle-diagnostic-heading > span,
+.cycle-diagnostic-time {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.cycle-diagnostic-title {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.cycle-diagnostic-time {
+  margin: 0;
+}
+.cycle-diagnostic-time time {
+  display: block;
+}
+.cycle-diagnostic-checks {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.cycle-diagnostic-checks > li {
+  padding: 12px 0;
+  border-top: 1px solid #494333;
+}
+.cycle-diagnostic-check-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+.cycle-diagnostic-check-head strong {
+  font-weight: 500;
+}
+.cycle-diagnostic-check-head > span {
+  flex: none;
+  font-size: 11px;
+}
+.cycle-diagnostic-values {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  margin: 10px 0 0;
+}
+.cycle-diagnostic-values dt {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.cycle-diagnostic-values dd {
+  margin: 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+.cycle-diagnostic-context {
+  padding-top: 12px;
+  border-top: 1px solid #494333;
+}
+.cycle-diagnostic-note {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
 .cycle-daily-summary {
   margin: 0 22px 18px;
   padding: 14px;

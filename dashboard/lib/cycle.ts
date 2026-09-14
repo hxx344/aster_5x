@@ -31,6 +31,25 @@ export type CycleState = {
   spread_checked_at?: number | null;
   daily_volume?: CycleDailyVolume;
   rolling_volume?: CycleRollingVolume;
+  diagnostic?: CycleDiagnostic | null;
+};
+
+export type CycleDiagnostic = {
+  code: string;
+  title: string;
+  checked_at: number;
+  symbol: string;
+  phase: 'open' | 'close';
+  checks: {
+    code: string;
+    label: string;
+    actual: string | null;
+    required: string | null;
+    unit: string;
+    passed: boolean | null;
+  }[];
+  context?: { label: string; value: string; unit?: string }[];
+  note?: string;
 };
 
 export type CycleDailyVolume = {

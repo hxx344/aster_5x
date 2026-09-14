@@ -384,6 +384,33 @@ class Store:
         fields = FILL_FIELDS | {"utc_date", "daily_volume", "intent_id", "phase"}
         return [{key: row[key] for key in fields} for row in rows]
 
+    def cycle_cost_records(self, account_id, now=None, limit=100):
+        """Read complete fill contexts for current totals and displayed trades."""
+        account_identifier(account_id)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise TradingError("循环成本明细条数必须为 1 至 1000 的整数")
+        end = time.time() if now is None else now
+        utc_day(end)
+        end = float(end)
+        fields = sorted(FILL_FIELDS | {"account_id", "intent_id", "phase", "utc_date"})
+        with self.connect() as db:
+            # Select through the account/time index, then seek complete intents.
+            # A counterpart or repair can predate the window or the UI cutoff;
+            # unrelated older intents must not turn this into an account scan.
+            rows = db.execute("""WITH selected_intents AS (
+                SELECT intent_id FROM cycle_fills
+                WHERE account_id=? AND executed_at>? AND executed_at<=?
+                UNION
+                SELECT intent_id FROM (
+                    SELECT intent_id FROM cycle_fills WHERE account_id=?
+                    ORDER BY executed_at DESC,symbol DESC,trade_id DESC LIMIT ?
+                )
+            ) SELECT """ + ",".join(fields) + """ FROM cycle_fills INDEXED BY idx_cycle_fills_order
+                WHERE account_id=? AND intent_id IN (SELECT intent_id FROM selected_intents)
+                ORDER BY executed_at,symbol,trade_id""",
+                              (account_id, end - 86400, end, account_id, limit, account_id))
+            return [dict(row) for row in rows]
+
     def cycle_volume_backlog(self, account_id, limit=100, since=None):
         account_identifier(account_id)
         if type(limit) is not int or not 1 <= limit <= 1000:

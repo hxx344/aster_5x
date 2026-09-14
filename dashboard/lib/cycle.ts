@@ -43,6 +43,29 @@ export type CycleDailyVolume = {
   reached: boolean;
   sync_pending?: boolean;
   error?: string;
+  cost?: CycleWindowCost;
+};
+
+export type CycleWindowCost = {
+  taker_rate: string;
+  taker_rate_percent: string;
+  taker_fee: string | null;
+  spread_cost: string | null;
+  total_cost: string | null;
+  unmatched_notional: string | null;
+  unmatched_fill_count: number | null;
+  complete: boolean;
+  sync_pending?: boolean;
+  error?: string | null;
+};
+
+export type CycleTradeCost = {
+  taker_fee: string;
+  spread_cost: string;
+  total_cost: string;
+  matched_quantity: string;
+  unmatched_quantity: string;
+  cost_complete: boolean;
 };
 
 export type CycleTrade = {
@@ -61,6 +84,7 @@ export type CycleTrade = {
   daily_volume: string;
   intent_id: string;
   phase: 'open' | 'close' | 'repair';
+  cost?: CycleTradeCost;
 };
 
 export type CycleRollingVolume = {
@@ -76,6 +100,7 @@ export type CycleRollingVolume = {
   reached: boolean;
   sync_pending?: boolean;
   error?: string | null;
+  cost?: CycleWindowCost;
 };
 
 export const DEFAULT_CYCLE: CycleConfig = {

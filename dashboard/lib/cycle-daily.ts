@@ -1,4 +1,10 @@
-import type { CycleDailyVolume, CycleRollingVolume, CycleTrade } from './cycle';
+import type {
+  CycleDailyVolume,
+  CycleRollingVolume,
+  CycleTrade,
+  CycleTradeCost,
+  CycleWindowCost,
+} from './cycle';
 
 // Keep monetary strings exact, including cumulative values above Number's
 // precise range. The server owns aggregation and UTC day assignment.
@@ -11,6 +17,93 @@ export function cycleAmount(value: string | null | undefined): string {
     ',',
   );
   return match[2] ? `${whole}.${match[2]}` : whole;
+}
+
+// Spread and total cost can be negative. Keep the unsigned volume formatter
+// strict and never round reporting amounts through Number.
+export function cycleSignedAmount(value: string | null | undefined): string {
+  if (typeof value !== 'string') return '—';
+  const negative = value.startsWith('-');
+  const amount = cycleAmount(negative ? value.slice(1) : value);
+  return amount === '—' ? amount : `${negative ? '-' : ''}${amount}`;
+}
+
+function costAmounts(cost: CycleWindowCost | CycleTradeCost | undefined) {
+  const fee = cycleAmount(cost?.taker_fee);
+  const spread = cycleSignedAmount(cost?.spread_cost);
+  const total = cycleSignedAmount(cost?.total_cost);
+  return { fee, spread, total, known: ![fee, spread, total].includes('—') };
+}
+
+function zeroAmount(value: string | null | undefined) {
+  return typeof value === 'string' && /^0+(?:\.0+)?$/.test(value);
+}
+
+export function cycleCostSummary(
+  cost: CycleWindowCost | undefined,
+  stale = false,
+) {
+  const amounts = costAmounts(cost);
+  const unmatched = cycleAmount(cost?.unmatched_notional);
+  const count = cost?.unmatched_fill_count;
+  const knownCount =
+    typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
+  const complete = Boolean(
+    cost?.complete === true &&
+    amounts.known &&
+    knownCount &&
+    count === 0 &&
+    zeroAmount(cost.unmatched_notional) &&
+    !cost.sync_pending &&
+    !cost.error,
+  );
+  const hasUnmatched =
+    (knownCount && count > 0) ||
+    (unmatched !== '—' && !zeroAmount(cost?.unmatched_notional));
+  const notice = !cost
+    ? '成本尚未提供，等待服务统计'
+    : cost.error
+      ? `成本统计异常：${cost.error}；当前仅为已计部分`
+      : cost.sync_pending
+        ? '成本正在补账，当前仅为已计部分'
+        : !amounts.known
+          ? '成本明细不完整，等待补齐'
+          : hasUnmatched
+            ? '仍有成交待配对，差价尚未完整计入'
+            : !complete
+              ? '成本尚未完整确认，等待成交明细核对'
+              : '';
+  return {
+    ...amounts,
+    complete,
+    notice,
+    staleNotice: stale ? '成本数据待刷新，以下为最近统计' : '',
+    unmatched,
+    unmatchedCount: knownCount ? String(count) : '—',
+    hasUnmatched,
+  };
+}
+
+export function cycleTradeCostView(cost: CycleTradeCost | undefined) {
+  const amounts = costAmounts(cost);
+  const unmatched = cycleAmount(cost?.unmatched_quantity);
+  const matched = cycleAmount(cost?.matched_quantity);
+  const complete = Boolean(
+    cost?.cost_complete === true &&
+    amounts.known &&
+    matched !== '—' &&
+    zeroAmount(cost.unmatched_quantity),
+  );
+  const notice = !cost
+    ? '成本明细未提供'
+    : !amounts.known
+      ? '成本明细不完整'
+      : unmatched !== '—' && !zeroAmount(cost.unmatched_quantity)
+        ? `待配对数量 ${unmatched}，成本未完整`
+        : !complete
+          ? '成本待核对，当前仅为已计部分'
+          : '';
+  return { ...amounts, complete, notice, unmatched, matched };
 }
 
 export function cycleUtcDate(timestamp: number | undefined): string | null {

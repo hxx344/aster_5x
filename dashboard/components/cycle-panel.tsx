@@ -23,6 +23,7 @@ import {
   type CycleState,
 } from '@/lib/cycle';
 import { cycleDailySummary, cycleRollingSummary } from '@/lib/cycle-daily';
+import { CycleCostSummary } from '@/components/cycle-cost-summary';
 
 type CycleAccount = {
   id: string;
@@ -158,6 +159,11 @@ export function CyclePanel({
           </div>
         </dl>
         {daily.notice ? <p className="amber">{daily.notice}</p> : null}
+        <CycleCostSummary
+          label="UTC 当日成本"
+          cost={state?.daily_volume?.cost}
+          stale={stale || daily.rolloverPending}
+        />
         <p>
           UTC 日额度重置：<time>{daily.resetAt}</time>
         </p>
@@ -177,6 +183,11 @@ export function CyclePanel({
           </div>
         </dl>
         {rolling.notice ? <p className="amber">{rolling.notice}</p> : null}
+        <CycleCostSummary
+          label="近 24 小时成本"
+          cost={state?.rolling_volume?.cost}
+          stale={rolling.stale}
+        />
         <p className="cycle-rolling-window">
           统计窗口：<time>{rolling.windowStart}</time>
           <span>至</span>
@@ -191,6 +202,12 @@ export function CyclePanel({
           </p>
         ) : null}
         <p>成交满 24 小时后逐笔移出统计；下一笔释放不代表额度已足够恢复。</p>
+        <p className="cycle-cost-note">
+          手续费按每笔成交金额 × 0.0125%
+          统计。差价按同批买卖成交的先后顺序配对， 用（买入价 − 卖出价）×
+          配对数量计算，在较晚成交时计入对应 UTC 日与 24h
+          窗口一次；负差价会抵减成本。未配对部分只先计手续费。
+        </p>
         {account.cycle?.enabled ? (
           !account.enabled ? (
             <p>账户已手动暂停，UTC 换日或滚动额度释放后仍需手动启动。</p>

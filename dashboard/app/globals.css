@@ -695,6 +695,38 @@ label input,
 .cycle-rolling-grid {
   grid-template-columns: minmax(0, 1fr);
 }
+.cycle-cost-summary {
+  margin: 14px 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.cycle-cost-summary h4 {
+  margin: 0 0 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.cycle-cost-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 11px;
+  margin: 0;
+}
+.cycle-cost-grid dt {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.cycle-cost-grid dd {
+  margin: 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.cycle-cost-total dd {
+  font-weight: 600;
+}
+.cycle-cost-note {
+  color: var(--muted-foreground);
+}
 .cycle-rolling-window time {
   display: block;
 }
@@ -719,7 +751,7 @@ label input,
 }
 .cycle-trade-table {
   width: 100%;
-  min-width: 700px;
+  min-width: 880px;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -755,6 +787,9 @@ label input,
 .cycle-trade-money {
   font-family: var(--font-mono);
   overflow-wrap: anywhere;
+}
+.cycle-trade-cost small {
+  font-family: var(--font-sans);
 }
 .mobile-trade-label {
   display: none;
@@ -802,6 +837,9 @@ label input,
     grid-column: 1 / -1;
   }
   .cycle-trade-table td:nth-child(2) {
+    grid-column: 1 / -1;
+  }
+  .cycle-trade-table .cycle-trade-cost {
     grid-column: 1 / -1;
   }
   .mobile-trade-label {

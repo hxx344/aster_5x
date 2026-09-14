@@ -14,6 +14,7 @@ import type { CycleTrade } from '@/lib/cycle';
 import {
   cycleAmount,
   cycleTradeAction,
+  cycleTradeCostView,
   cycleTradeDates,
   cycleTradeTimeSource,
   cycleTradesForDate,
@@ -86,51 +87,70 @@ export function CycleTradesPanel({ accountName, trades, stale }: Props) {
                 <th>动作 / 品种</th>
                 <th>本笔成交金额 · USD1</th>
                 <th>当日累计 · USD1</th>
+                <th>本笔已计成本 · USD1</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((trade) => (
-                <tr key={`${trade.symbol}:${trade.trade_id}:${trade.order_id}`}>
-                  <td>
-                    <span className="mobile-trade-label" aria-hidden="true">
-                      成交时间 · UTC
-                    </span>
-                    <time>{cycleUtcTime(trade.executed_at)}</time>
-                    <small
-                      className={
-                        trade.time_source === 'legacy_estimated' ? 'amber' : ''
-                      }
-                    >
-                      {cycleTradeTimeSource(trade)}
-                    </small>
-                    {!validCycleUtcDate(trade.utc_date) ? (
-                      <small className="amber">统计日期缺失</small>
-                    ) : null}
-                  </td>
-                  <td>
-                    <span className="mobile-trade-label" aria-hidden="true">
-                      动作 / 品种
-                    </span>
-                    <strong>{trade.symbol || '品种未知'}</strong>
-                    <small>{cycleTradeAction(trade)}</small>
-                  </td>
-                  <td className="cycle-trade-money">
-                    <span className="mobile-trade-label" aria-hidden="true">
-                      本笔成交金额 · USD1
-                    </span>
-                    {cycleAmount(trade.notional)}
-                  </td>
-                  <td className="cycle-trade-money">
-                    <span className="mobile-trade-label" aria-hidden="true">
-                      当日累计 · USD1
-                    </span>
-                    {cycleAmount(trade.daily_volume)}
-                    {typeof trade.daily_volume !== 'string' ? (
-                      <small className="amber">此记录未提供累计值</small>
-                    ) : null}
-                  </td>
-                </tr>
-              ))}
+              {rows.map((trade) => {
+                const cost = cycleTradeCostView(trade.cost);
+                return (
+                  <tr
+                    key={`${trade.symbol}:${trade.trade_id}:${trade.order_id}`}
+                  >
+                    <td>
+                      <span className="mobile-trade-label" aria-hidden="true">
+                        成交时间 · UTC
+                      </span>
+                      <time>{cycleUtcTime(trade.executed_at)}</time>
+                      <small
+                        className={
+                          trade.time_source === 'legacy_estimated'
+                            ? 'amber'
+                            : ''
+                        }
+                      >
+                        {cycleTradeTimeSource(trade)}
+                      </small>
+                      {!validCycleUtcDate(trade.utc_date) ? (
+                        <small className="amber">统计日期缺失</small>
+                      ) : null}
+                    </td>
+                    <td>
+                      <span className="mobile-trade-label" aria-hidden="true">
+                        动作 / 品种
+                      </span>
+                      <strong>{trade.symbol || '品种未知'}</strong>
+                      <small>{cycleTradeAction(trade)}</small>
+                    </td>
+                    <td className="cycle-trade-money">
+                      <span className="mobile-trade-label" aria-hidden="true">
+                        本笔成交金额 · USD1
+                      </span>
+                      {cycleAmount(trade.notional)}
+                    </td>
+                    <td className="cycle-trade-money">
+                      <span className="mobile-trade-label" aria-hidden="true">
+                        当日累计 · USD1
+                      </span>
+                      {cycleAmount(trade.daily_volume)}
+                      {typeof trade.daily_volume !== 'string' ? (
+                        <small className="amber">此记录未提供累计值</small>
+                      ) : null}
+                    </td>
+                    <td className="cycle-trade-money cycle-trade-cost">
+                      <span className="mobile-trade-label" aria-hidden="true">
+                        本笔已计成本 · USD1
+                      </span>
+                      <strong>{cost.total}</strong>
+                      <small>手续费 {cost.fee}</small>
+                      <small>本笔计入差价 {cost.spread}</small>
+                      {cost.notice ? (
+                        <small className="amber">{cost.notice}</small>
+                      ) : null}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </section>
@@ -146,6 +166,8 @@ export function CycleTradesPanel({ accountName, trades, stale }: Props) {
       <p className="cycle-trades-note">
         最多展示最近 100 条；按 UTC
         日期筛选当前已加载记录。当日累计由交易服务按成交顺序记录，包含开仓、平仓和修复成交，不含手续费。旧记录未提供的金额显示“—”。
+        成本中的手续费按成交金额的 0.0125% 计；同批买卖数量按成交先后配对，
+        差价只记在较晚成交一笔，负数抵减成本。未配对成交只先计手续费，成本尚未完整。
       </p>
     </section>
   );

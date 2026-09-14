@@ -20,6 +20,7 @@ from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, Request
 from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
+from .cycle_cost import calculate_cycle_costs
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
@@ -1224,13 +1225,34 @@ class Engine:
 
     def state(self):
         # Database I/O must not hold the view lock shared by all account workers.
+        state_now = time.time()
         saved_accounts = self.store.accounts()
         events = self.store.events()
         pending_notifications = self.store.pending_notifications()
         migration_records = {a["id"]: (self.store.get("migration:" + a["id"]) or {}, self.store.intent(a["id"])) for a in saved_accounts}
         cycle_records = {a["id"]: self.store.get("cycle:" + a["id"]) or {} for a in saved_accounts}
-        cycle_volumes = {a["id"]: self.cycle_volume_state(a) for a in saved_accounts}
+        cycle_volumes = {a["id"]: self.cycle_volume_state(a, now=state_now) for a in saved_accounts}
         cycle_trades = {a["id"]: self.store.cycle_trade_records(a["id"], limit=100) for a in saved_accounts}
+        cycle_costs = {}
+        for account in saved_accounts:
+            aid = account["id"]
+            try:
+                report = calculate_cycle_costs(self.store.cycle_cost_records(aid, now=state_now, limit=100), now=state_now)
+                trade_costs = {(row["symbol"], row["trade_id"]): row for row in report["trades"]}
+                for trade in cycle_trades[aid]:
+                    cost = trade_costs.get((trade["symbol"], trade["trade_id"]))
+                    if cost is not None:
+                        trade["cost"] = {key: value for key, value in cost.items() if key not in ("symbol", "trade_id")}
+                cycle_costs[aid] = report
+            except Exception as exc:
+                # Cost reporting is read-only and must not interrupt the account
+                # controls or turn a missing calculation into a zero-cost claim.
+                LOG.warning("Cycle cost report unavailable (%s)", type(exc).__name__)
+                unavailable = {"taker_rate": "0.000125", "taker_rate_percent": "0.0125",
+                               "taker_fee": None, "spread_cost": None, "total_cost": None,
+                               "unmatched_notional": None, "unmatched_fill_count": None,
+                               "complete": False, "error": "成本统计暂不可用，等待重新读取成交记录"}
+                cycle_costs[aid] = {"daily": dict(unavailable), "rolling": dict(unavailable)}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
@@ -1304,6 +1326,16 @@ class Engine:
                 if active_cycle and pending.get("volume_error"):
                     daily = {**daily, "sync_pending": True, "error": pending["volume_error"]}
                     rolling = {**rolling, "sync_pending": True, "error": pending["volume_error"]}
+                for volume, window in ((daily, "daily"), (rolling, "rolling")):
+                    cost = dict(cycle_costs[account["id"]][window])
+                    # An active batch may contain submitted orders whose fills
+                    # have not reached the ledger yet, even without an error.
+                    sync_pending = bool(volume["sync_pending"] or active_cycle and pending["kind"] == "cycle")
+                    cost["sync_pending"] = sync_pending
+                    if sync_pending:
+                        cost["complete"] = False
+                        cost["error"] = volume.get("error") or cost.get("error")
+                    volume["cost"] = cost
                 cycle["daily_volume"] = daily
                 cycle["rolling_volume"] = rolling
                 if cycle.get("opened_at") is not None:

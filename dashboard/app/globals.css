@@ -599,6 +599,53 @@ label input,
   gap: 12px;
   margin-bottom: 20px;
 }
+.cycle-panel h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cycle-panel fieldset {
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+.cycle-account-name {
+  margin-bottom: 6px;
+  color: var(--foreground);
+  overflow-wrap: anywhere;
+}
+.cycle-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 12px;
+}
+.cycle-fields label {
+  min-width: 0;
+}
+.cycle-fields label > span {
+  float: none;
+}
+.cycle-details dd {
+  font-size: 12px;
+  line-height: 1.65;
+}
+.cycle-details dd small {
+  display: block;
+  color: var(--muted-foreground);
+  font-family: var(--font-sans);
+  font-size: 11px;
+}
+.cycle-details dd small.amber {
+  color: #e6c17f;
+}
+.cycle-buttons {
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.cycle-buttons > button {
+  min-width: 130px;
+}
 .notification-state {
   padding: 0 6px;
   display: flex;

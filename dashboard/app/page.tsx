@@ -43,6 +43,13 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
+import { CyclePanel } from '@/components/cycle-panel';
+import {
+  cycleDraft,
+  type CycleConfig,
+  type CycleDraft,
+  type CycleState,
+} from '@/lib/cycle';
 import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
@@ -99,6 +106,8 @@ type Account = {
   policy: Policy;
   migration?: MigrationConfig;
   migration_state?: MigrationState;
+  cycle?: CycleConfig;
+  cycle_state?: CycleState;
   risk_limits?: { base: string; high_leverage: string; migration?: string };
   snapshot?: {
     equity: string;
@@ -187,6 +196,10 @@ export default function Home() {
   const [migrationDrafts, setMigrationDrafts] = useState<
     Record<string, MigrationDraft>
   >({});
+  const [cycleDrafts, setCycleDrafts] = useState<Record<string, CycleDraft>>(
+    {},
+  );
+  const [serverClock, setServerClock] = useState({ server: 0, local: 0 });
   const [now, setNow] = useState(0);
   const [notice, setNotice] = useState('');
   const operationPending = useRef(false);
@@ -196,6 +209,8 @@ export default function Home() {
     setSelected('');
     setDrafts({});
     setMigrationDrafts({});
+    setCycleDrafts({});
+    setServerClock({ server: 0, local: 0 });
     setAddOpen(false);
     setConnectionError('');
   }, []);
@@ -203,6 +218,7 @@ export default function Home() {
     createStatePoller<State>({
       onState: (next) => {
         setState(next);
+        setServerClock({ server: next.updated_at, local: Date.now() / 1000 });
         setNeedsLogin(false);
         setConnectionError('');
         setSelected((v) =>
@@ -231,6 +247,7 @@ export default function Home() {
     };
   }, [refresh, poller]);
   const account = state?.accounts.find((a) => a.id === selected);
+  const serverNow = serverClock.server + Math.max(0, now - serverClock.local);
   const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
   const marginPercent = percentFromMarginLimit(
     account?.policy.margin_limit ?? '0.5',
@@ -468,7 +485,7 @@ export default function Home() {
                     <Input
                       id="account-id"
                       required
-                      pattern="[a-z0-9_-]{1,32}"
+                      pattern={'[a-z0-9_\\-]{1,32}'}
                       value={newAccount.id}
                       onChange={(e) =>
                         setNewAccount({ ...newAccount, id: e.target.value })
@@ -846,6 +863,33 @@ export default function Home() {
                 </section>
               </div>
               <aside className="secondary-column">
+                {account ? (
+                  <CyclePanel
+                    account={account}
+                    draft={cycleDrafts[account.id] || cycleDraft(account.cycle)}
+                    setDraft={(draft) =>
+                      setCycleDrafts((previous) => ({
+                        ...previous,
+                        [account.id]: draft,
+                      }))
+                    }
+                    clearDraft={() =>
+                      setCycleDrafts((previous) => {
+                        const next = { ...previous };
+                        delete next[account.id];
+                        return next;
+                      })
+                    }
+                    busy={busy}
+                    canStart={Boolean(canStart)}
+                    now={serverNow}
+                    dataTimestamp={state?.updated_at}
+                    connectionError={connectionError}
+                    action={action}
+                    setError={setError}
+                    setNotice={setNotice}
+                  />
+                ) : null}
                 <section className="panel risk-panel">
                   <div className="section-head">
                     <h2>风险约束</h2>
@@ -924,96 +968,98 @@ export default function Home() {
                     三项账户模式必须满足，仅核验，不自动修改。下单前与成交后均检查风险。
                   </div>
                 </section>
-                <section className="panel execution-panel">
-                  <div className="section-head">
-                    <h2>执行条件</h2>
-                    <span className="symbol-tag">{focus}</span>
-                  </div>
-                  <Gate
-                    label={
-                      !minimumLeverageSupported
-                        ? '请先选择受支持的最低开仓杠杆'
-                        : !currentLeverageSupported
-                          ? `当前 ${currentLeverage}x 不支持新增开仓`
-                          : currentLeverage < minimumLeverage
-                            ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
-                            : `${currentLeverage}x 额度超过阈值`
-                    }
-                    pass={
-                      currentLeverageSupported &&
-                      minimumLeverageSupported &&
-                      currentLeverage >= minimumLeverage &&
-                      market?.status === 'ok' &&
-                      Number(market.capacities[currentLeverage]) >
-                        Number(account?.policy.threshold || 10000)
-                    }
-                    value={
-                      currentLeverageSupported && market?.status === 'ok'
-                        ? fmt(market.capacities[currentLeverage], 0)
-                        : '—'
-                    }
-                  />
-                  <Gate
-                    label="BBO 价差 ≤ 万 5"
-                    pass={
-                      !!market?.book && Number(market.book.spread) <= 0.0005
-                    }
-                    value={
-                      market?.book
-                        ? `${fmt(Number(market.book.spread) * 10000)} bp`
-                        : '—'
-                    }
-                  />
-                  <Gate
-                    label={`普通 ${currentLeverage}x 加仓占用率 < ${openingPercent}%`}
-                    pass={!!fresh && ratio < openingLimit}
-                    value={snapshot ? pct(snapshot.ratio) : '—'}
-                  />
-                  <div className="strategy-state">
-                    <i
-                      className={`dot ${account?.enabled ? 'mint-bg' : 'amber-bg'}`}
+                {!account?.cycle?.enabled ? (
+                  <section className="panel execution-panel">
+                    <div className="section-head">
+                      <h2>执行条件</h2>
+                      <span className="symbol-tag">{focus}</span>
+                    </div>
+                    <Gate
+                      label={
+                        !minimumLeverageSupported
+                          ? '请先选择受支持的最低开仓杠杆'
+                          : !currentLeverageSupported
+                            ? `当前 ${currentLeverage}x 不支持新增开仓`
+                            : currentLeverage < minimumLeverage
+                              ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
+                              : `${currentLeverage}x 额度超过阈值`
+                      }
+                      pass={
+                        currentLeverageSupported &&
+                        minimumLeverageSupported &&
+                        currentLeverage >= minimumLeverage &&
+                        market?.status === 'ok' &&
+                        Number(market.capacities[currentLeverage]) >
+                          Number(account?.policy.threshold || 10000)
+                      }
+                      value={
+                        currentLeverageSupported && market?.status === 'ok'
+                          ? fmt(market.capacities[currentLeverage], 0)
+                          : '—'
+                      }
                     />
-                    <span>
-                      {strategy?.reason || account?.reason || '等待接入账户'}
-                    </span>
-                  </div>
-                  <div className="execution-buttons">
-                    <Button
-                      disabled={busy || !canStart}
-                      title="启动前会重新核对账户，满足条件后恢复策略"
-                      onClick={() =>
-                        account &&
-                        void action(`/api/accounts/${account.id}/enable`)
+                    <Gate
+                      label="BBO 价差 ≤ 万 5"
+                      pass={
+                        !!market?.book && Number(market.book.spread) <= 0.0005
                       }
-                    >
-                      <CirclePlay size={16} />
-                      {account?.mode === 'paper' ? '启动模拟' : '启动实盘'}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      disabled={busy || !account?.enabled}
-                      onClick={() =>
-                        account &&
-                        void action(`/api/accounts/${account.id}/pause`)
+                      value={
+                        market?.book
+                          ? `${fmt(Number(market.book.spread) * 10000)} bp`
+                          : '—'
                       }
-                    >
-                      <CirclePause size={16} />
-                      暂停策略
-                    </Button>
-                  </div>
-                  {account?.status === 'attention' && (
-                    <Button
-                      className="reconcile-button"
-                      variant="outline"
-                      disabled={busy}
-                      onClick={() =>
-                        void action(`/api/accounts/${account.id}/retry`)
-                      }
-                    >
-                      核对未完成批次
-                    </Button>
-                  )}
-                </section>
+                    />
+                    <Gate
+                      label={`普通 ${currentLeverage}x 加仓占用率 < ${openingPercent}%`}
+                      pass={!!fresh && ratio < openingLimit}
+                      value={snapshot ? pct(snapshot.ratio) : '—'}
+                    />
+                    <div className="strategy-state">
+                      <i
+                        className={`dot ${account?.enabled ? 'mint-bg' : 'amber-bg'}`}
+                      />
+                      <span>
+                        {strategy?.reason || account?.reason || '等待接入账户'}
+                      </span>
+                    </div>
+                    <div className="execution-buttons">
+                      <Button
+                        disabled={busy || !canStart}
+                        title="启动前会重新核对账户，满足条件后恢复策略"
+                        onClick={() =>
+                          account &&
+                          void action(`/api/accounts/${account.id}/enable`)
+                        }
+                      >
+                        <CirclePlay size={16} />
+                        {account?.mode === 'paper' ? '启动模拟' : '启动实盘'}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        disabled={busy || !account?.enabled}
+                        onClick={() =>
+                          account &&
+                          void action(`/api/accounts/${account.id}/pause`)
+                        }
+                      >
+                        <CirclePause size={16} />
+                        暂停策略
+                      </Button>
+                    </div>
+                    {account?.status === 'attention' && (
+                      <Button
+                        className="reconcile-button"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() =>
+                          void action(`/api/accounts/${account.id}/retry`)
+                        }
+                      >
+                        核对未完成批次
+                      </Button>
+                    )}
+                  </section>
+                ) : null}
                 <section className="panel settings-panel migration-panel">
                   <div className="section-head">
                     <h2>XAU 仓位迁移</h2>
@@ -1177,6 +1223,7 @@ export default function Home() {
                           busy ||
                           !account ||
                           account.enabled ||
+                          !!account.cycle?.enabled ||
                           !!migration?.active_batch
                         }
                         checked={migrationForm.enabled}
@@ -1260,11 +1307,14 @@ export default function Home() {
                     <p className="muted">
                       只在 SPCX / CL 有有效 5x
                       额度、实际杠杆不低于原仓位时迁移，优先选择本批深度价差较小的目标。先开目标多空并确认，再平
-                      XAU。迁移临时上限为基础加 5 个百分点，最高
-                      100%，计入未平 XAU 占用并预留四腿成本；保证金不足时等待。常规批次每边至少 500
-                      USD1，最后尾批可按交易所最小下单规则收尾。
+                      XAU。迁移临时上限为基础加 5 个百分点，最高 100%，计入未平
+                      XAU 占用并预留四腿成本；保证金不足时等待。常规批次每边至少
+                      500 USD1，最后尾批可按交易所最小下单规则收尾。
                     </p>
                     <p className="muted">
+                      {account?.cycle?.enabled
+                        ? '当前使用独立多空循环，请先完成平仓并退出循环，再开启迁移。'
+                        : ''}
                       开关开启后，普通策略暂停新增仓位，迁移完成后也保持暂停。修改前请暂停账户并等待本批核对完成；保存不会启动账户。关闭再开启会建立新一轮迁移。
                     </p>
                     <Button

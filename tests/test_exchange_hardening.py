@@ -397,7 +397,9 @@ class TransportHardeningTests(unittest.TestCase):
 
 
 class RateBudgetHardeningTests(unittest.TestCase):
-    def test_public_capacity_backoff_cannot_poison_worker_schedule(self):
+    @patch("trading.exchange.time.monotonic", return_value=1000.0)
+    def test_public_capacity_backoff_cannot_poison_worker_schedule(self, _clock):
+        # Exact clock values keep (now + 180) - now from rounding above 180.
         for delay in (float("inf"), float("nan"), -1, "invalid"):
             api = Mock()
             api.budget = RateBudget()

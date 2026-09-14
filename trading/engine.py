@@ -17,6 +17,8 @@ import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
+from .cycle import DEFAULT_CYCLE, CyclePositionError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
+from .cycle_execution import CycleExecutor
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
@@ -76,6 +78,9 @@ def validate_account(account):
     minimum_open_leverage(policy)
     account["policy"] = policy
     account["migration"] = validate_migration(account.get("migration", {**DEFAULT_MIGRATION}))
+    account["cycle"] = validate_cycle(account.get("cycle"))
+    if account["cycle"]["enabled"] and account["migration"]["enabled"]:
+        raise TradingError("同一账户不能同时启用多空循环和仓位迁移")
     return account
 
 
@@ -173,6 +178,8 @@ class Engine:
             def cost(account):
                 if not account["enabled"]:
                     return 90
+                if account.get("cycle", {}).get("enabled"):
+                    return 240  # Private reads and two independently reconciled legs.
                 if account.get("migration", {}).get("enabled"):
                     # Depth reads share the WS book; retain private rechecks.
                     return 300
@@ -306,7 +313,7 @@ class Engine:
                 if fresh and account and account["enabled"] and self.live_allowed(account) and account.get("migration", {}).get("enabled"):
                     if symbol in ("SPCXUSD1", "CLUSD1") and capacities.get(5, dec(0)) > 0:
                         levels = (5,)
-                elif fresh and account and account["enabled"] and self.live_allowed(account) and symbol in account["policy"]["symbols"]:
+                elif fresh and account and account["enabled"] and not account.get("cycle", {}).get("enabled") and self.live_allowed(account) and symbol in account["policy"]["symbols"]:
                     positions = [p for p in self.views.get(aid, {}).get("snapshot", {}).get("positions", []) if p["symbol"] == symbol]
                     current = max((p["leverage"] for p in positions), default=0)
                     threshold = dec(account["policy"]["threshold"])
@@ -547,6 +554,110 @@ class Engine:
             self.check_post_fill_occupancy(account, after)
         return 5
 
+    def cycle_view(self, account, **updates):
+        saved = self.store.get("cycle:" + account["id"]) or {}
+        self.view(account["id"], cycle_state={**saved, **updates})
+
+    def cycle_progress(self, account, snapshot):
+        progress = self.store.get("cycle:" + account["id"])
+        validate_cycle_positions(account, snapshot, progress)
+        config = validate_cycle(account.get("cycle"))
+        if progress and progress.get("config") == config:
+            return progress
+        if progress and any(dec(q) for q in progress.get("quantities", {}).values()):
+            raise CyclePositionError("多空循环持仓参数已变化，请核对记录")
+        progress = {"run_id": uuid.uuid4().hex, "phase": "waiting_open", "config": config,
+                    "quantities": {"LONG": "0", "SHORT": "0"}, "opened_at": None,
+                    "close_eligible_at": None, "completed_cycles": (progress or {}).get("completed_cycles", 0),
+                    "updated_at": time.time(), "reason": "等待价差满足开仓条件"}
+        self.store.put("cycle:" + account["id"], progress)
+        return progress
+
+    def tick_cycle_account(self, account, broker, pending):
+        """Run the opt-in cycle without entering the automatic-add path."""
+        aid = account["id"]
+        config = validate_cycle(account.get("cycle"))
+        symbol = pending["symbol"] if pending else config["symbol"]
+        executor = CycleExecutor(self.store, broker, self.market)
+        if pending:
+            if self.live_allowed(account):
+                reason = executor.reconcile(account, pending)
+                remaining = self.store.intent(aid)
+                status = "attention" if remaining and remaining["status"] == "attention" else "reconciling" if remaining else "running" if account["enabled"] else "paused"
+            else:
+                status, reason = "attention", "服务器未启用实盘执行，保留未完成循环批次等待核对"
+            self.view(aid, status=status, reason=reason)
+            self.cycle_view(account, **({"phase": status, "reason": reason} if self.store.intent(aid) else {}))
+            if executor.last_snapshot is not None:
+                self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]), credential_ready=True)
+            return 5
+        if isinstance(broker, LiveBroker):
+            broker.api.budget.require_available(broker.snapshot_weight([symbol]) + 1)
+        snapshot = broker.cycle_snapshot([symbol])
+        self.view(aid, snapshot=snapshot_json(snapshot, [symbol]), credential_ready=True)
+        snapshot.require_modes([symbol])
+        progress = self.cycle_progress(account, snapshot)
+        if not account["enabled"] or self.shutdown.is_set():
+            reason = account.get("pause_reason") or "循环已暂停，已有仓位和持仓计时保留"
+            phase = "attention" if account.get("pause_reason") else "paused"
+            self.view(aid, status=phase, reason=reason)
+            self.cycle_view(account, phase=phase, reason=reason)
+            return 5
+        if not self.live_allowed(account):
+            raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
+        retry_at = progress.get("retry_at") or 0
+        if progress.get("phase") == "waiting_open" and time.time() < retry_at:
+            reason = "上一批开仓未完成，等待冷却后重新检查"
+            self.view(aid, status="waiting", reason=reason)
+            self.cycle_view(account, phase="waiting_open", reason=reason)
+            return max(1, min(30, retry_at - time.time()))
+        if progress.get("opened_at") is not None:
+            eligible = progress["opened_at"] + progress["config"]["hold_seconds"]
+            if time.time() < eligible:
+                reason = "双向持仓中，持仓时间到达后等待价差达标平仓"
+                self.view(aid, status="running", reason=reason)
+                self.cycle_view(account, phase="holding", reason=reason, close_eligible_at=eligible)
+                return max(1, min(5, eligible - time.time()))
+            self.cycle_view(account, phase="waiting_close", close_eligible_at=eligible,
+                            reason="持仓时间已到，等待价差达标平仓")
+        else:
+            self.cycle_view(account, phase="waiting_open", reason="等待价差达标开仓")
+        long, _ = snapshot.pair(symbol)
+        if long.leverage != config["leverage"]:
+            if isinstance(broker, LiveBroker):
+                broker.api.budget.require_available(broker.snapshot_weight([symbol], fresh_modes=True) + 2)
+            def before_leverage(fresh):
+                if self.shutdown.is_set() or not self.live_allowed(account):
+                    raise TradingError("多空循环已停止提交")
+                validate_cycle_positions(account, fresh, progress)
+            reason = executor.set_leverage(account, snapshot, progress, before_submit=before_leverage)
+            self.view(aid, status="reconciling", reason=reason)
+            self.cycle_view(account, phase="reconciling", reason=reason)
+            return 5
+        if isinstance(broker, LiveBroker):
+            broker.api.budget.require_available(self.market.depth_weight([symbol]) +
+                                                broker.snapshot_weight([symbol], fresh_modes=True) + 6)
+        book, depth = self.market.book(symbol), self.market.depth(symbol)
+        plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress)
+
+        def before_submit(fresh):
+            if self.shutdown.is_set() or not self.live_allowed(account):
+                raise TradingError("多空循环已停止提交")
+            current = plan_cycle(account, fresh, self.market.book(symbol), self.market.depth(symbol),
+                                 self.market.rules[symbol], progress)
+            if current.phase != plan.phase or current.qty != plan.qty or current.leverage != plan.leverage:
+                raise TradingError("循环计划因账户或盘口变化需要重新计算")
+
+        reason = executor.start(account, snapshot, plan, progress, before_submit=before_submit)
+        remaining = self.store.intent(aid)
+        status = "attention" if remaining and remaining["status"] == "attention" else "reconciling" if remaining else "running"
+        self.view(aid, status=status, reason=reason)
+        self.cycle_view(account, spread_bp=wire(plan.spread_bp), spread_checked_at=depth.timestamp,
+                        **({"phase": status, "reason": reason} if remaining else {}))
+        if executor.last_snapshot is not None:
+            self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]))
+        return 5
+
     def tick_account(self, account_id):
         with self.account_lock(account_id):
             with self.lock:
@@ -562,6 +673,8 @@ class Engine:
             try:
                 broker = self.broker(account)
                 pending = self.store.intent(account_id)
+                if (pending and pending["kind"] in ("cycle", "cycle_leverage")) or (not pending and account.get("cycle", {}).get("enabled")):
+                    return self.tick_cycle_account(account, broker, pending)
                 symbols = migration_symbols(account)
                 if pending and (pending["kind"] == "migration" or pending.get("purpose") == "migration"):
                     symbols = list(dict.fromkeys([*symbols, *SYMBOLS]))
@@ -750,7 +863,7 @@ class Engine:
                 if old_reason != message and log_wait:
                     self.store.event(account_id, "wait" if isinstance(exc, BudgetWait) else "error", message)
                 status = "waiting" if isinstance(exc, BudgetWait) else "error"
-                if isinstance(exc, AccountModeError):
+                if isinstance(exc, (AccountModeError, CyclePositionError)):
                     self.store.pause_account(account, message)
                     pending = self.store.intent(account_id)
                     if pending:
@@ -762,6 +875,10 @@ class Engine:
                 self.view(account_id, status=status, reason=message, credential_ready=account_id in self.brokers)
                 if account.get("migration", {}).get("enabled") or (pending and pending.get("kind") == "migration"):
                     self.migration_view(account, phase="attention" if status == "attention" else "waiting", reason=message)
+                if account.get("cycle", {}).get("enabled") or (pending and pending.get("kind") in ("cycle", "cycle_leverage")):
+                    progress = self.store.get("cycle:" + account_id) or {}
+                    phase = "attention" if status == "attention" else "waiting_close" if progress.get("opened_at") is not None else "waiting_open"
+                    self.cycle_view(account, phase=phase, reason=message)
                 delay = max(10, getattr(exc, "retry_after", 0))
                 with self.lock:
                     self.account_backoff[account_id] = time.monotonic() + delay
@@ -826,9 +943,12 @@ class Engine:
                 return
             if account["enabled"] or pending:
                 raise TradingError("请先暂停策略并等待当前批次完成")
-            if not isinstance(changes, dict) or not changes or set(changes) - (EDITABLE_POLICY_FIELDS | {"migration"}):
+            progress = self.store.get("cycle:" + account_id) or {}
+            if any(dec(q) for q in progress.get("quantities", {}).values()):
+                raise TradingError("多空循环仍有持仓，请恢复循环并等待平仓完成后修改参数或退出循环模式")
+            if not isinstance(changes, dict) or not changes or set(changes) - (EDITABLE_POLICY_FIELDS | {"migration", "cycle"}):
                 raise TradingError("请选择有效的策略配置字段")
-            policy_changes = {key: value for key, value in changes.items() if key != "migration"}
+            policy_changes = {key: value for key, value in changes.items() if key not in ("migration", "cycle")}
             if any(value is None or (key != "min_open_leverage" and not isinstance(value, str)) for key, value in policy_changes.items()):
                 raise TradingError("策略配置字段类型无效")
             if "migration" in changes:
@@ -839,6 +959,10 @@ class Engine:
                 account["migration"] = validate_migration({**account.get("migration", DEFAULT_MIGRATION), **migration_changes})
                 if account["migration"]["enabled"] and not migration_was_enabled:
                     account["migration_run_id"] = uuid.uuid4().hex
+            if "cycle" in changes:
+                if not isinstance(changes["cycle"], dict) or not changes["cycle"]:
+                    raise TradingError("请提供非空的多空循环配置字段")
+                account["cycle"] = validate_cycle({**account.get("cycle", DEFAULT_CYCLE), **changes["cycle"]})
             account["policy"] = {**account["policy"], **policy_changes}
             validate_account(account)
             if "min_open_leverage" in changes:
@@ -855,18 +979,29 @@ class Engine:
                 raise TradingError("账户不存在")
             view_updates = {}
             if enabled:
-                if account.get("leverage_setting_required"):
+                cycling = account.get("cycle", {}).get("enabled")
+                if account.get("leverage_setting_required") and not cycling:
                     raise TradingError("请先在 5x、10x、20x 中保存最低开仓杠杆设置")
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
-                if not account.get("migration", {}).get("enabled") and dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
+                if not cycling and not account.get("migration", {}).get("enabled") and dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
                     raise TradingError("单批每边上限低于固定最低批次金额 500 USD1，请先修改策略设置")
                 if self.store.intent(account_id):
                     raise TradingError("请先核对未完成批次")
-                symbols = migration_symbols(account)
-                snapshot = self.broker(account).snapshot(symbols, fresh_modes=True)
-                for symbol in symbols:
-                    snapshot.require_ready(symbol)
+                symbols = cycle_symbols(account)
+                broker = self.broker(account)
+                if cycling:
+                    validate_account(account)
+                    snapshot = broker.cycle_snapshot(symbols, fresh_modes=True)
+                    snapshot.require_fresh()
+                    snapshot.require_modes(symbols)
+                    if not snapshot.can_trade or snapshot.open_orders is None or snapshot.open_orders:
+                        raise TradingError("多空循环需要交易权限及已确认无挂单的账户")
+                    self.cycle_progress(account, snapshot)
+                else:
+                    snapshot = broker.snapshot(symbols, fresh_modes=True)
+                    for symbol in symbols:
+                        snapshot.require_ready(symbol)
                 view_updates = {"snapshot": snapshot_json(snapshot, symbols), "credential_ready": True,
                                 "strategies": {symbol: {"phase": "waiting", "reason": "策略已启动，等待下一轮检查"}
                                                for symbol in account["policy"]["symbols"]}}
@@ -889,7 +1024,7 @@ class Engine:
             if not intent:
                 return
             intent["status"] = "pending"
-            if intent["kind"] == "pair":
+            if intent["kind"] in ("pair", "cycle"):
                 intent["repair_attempts"] = 0
             elif intent["kind"] == "migration":
                 intent["repair_attempts"] = 0
@@ -1039,6 +1174,7 @@ class Engine:
         events = self.store.events()
         pending_notifications = self.store.pending_notifications()
         migration_records = {a["id"]: (self.store.get("migration:" + a["id"]) or {}, self.store.intent(a["id"])) for a in saved_accounts}
+        cycle_records = {a["id"]: self.store.get("cycle:" + a["id"]) or {} for a in saved_accounts}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
@@ -1073,6 +1209,31 @@ class Engine:
                     migration.setdefault("reason", "等待迁移检查")
                     migration["active_batch"] = None
                 account["migration_state"] = migration
+                saved_cycle = cycle_records[account["id"]]
+                current_cycle = account.get("cycle_state", {})
+                if current_cycle.get("run_id") != saved_cycle.get("run_id"):
+                    current_cycle = {}
+                cycle = {**saved_cycle, **current_cycle}
+                # Durable phase/ownership must win after an executor completes.
+                if saved_cycle.get("updated_at", 0) > current_cycle.get("updated_at", 0):
+                    cycle.update(saved_cycle)
+                active_cycle = pending and pending["kind"] in ("cycle", "cycle_leverage")
+                if active_cycle:
+                    cycle.update(phase="attention" if pending["status"] == "attention" else "reconciling",
+                                 reason=pending.get("last_error") or account["reason"],
+                                 active_batch={"stage": pending.get("phase", "leverage")})
+                elif not account.get("cycle", {}).get("enabled"):
+                    cycle.update(phase="disabled", reason="多空循环未启用", active_batch=None)
+                elif not account["enabled"]:
+                    cycle.update(phase="attention" if account.get("pause_reason") else "paused",
+                                 reason=account.get("pause_reason") or "循环已暂停，已有仓位和计时保留", active_batch=None)
+                else:
+                    cycle.setdefault("phase", "waiting_open")
+                    cycle.setdefault("reason", "等待多空循环检查")
+                    cycle["active_batch"] = None
+                if cycle.get("opened_at") is not None:
+                    cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
+                account["cycle_state"] = cycle
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
                 "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,

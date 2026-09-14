@@ -13,6 +13,7 @@ import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
 from .migration import DEFAULT_MIGRATION
+from .cycle import DEFAULT_CYCLE
 
 
 CAPACITY_ALERT_MAX_AGE = 8
@@ -133,6 +134,9 @@ class Store:
         migration = account.get("migration")
         normalized = {**account, "migration": {**DEFAULT_MIGRATION, **migration} if isinstance(migration, dict)
                       else {**DEFAULT_MIGRATION} if "migration" not in account else migration}
+        cycle = account.get("cycle")
+        normalized["cycle"] = ({**DEFAULT_CYCLE, **cycle} if isinstance(cycle, dict)
+                               else {**DEFAULT_CYCLE} if "cycle" not in account else cycle)
         policy = account.get("policy")
         if isinstance(policy, dict):
             previous = policy.get("min_open_leverage", MIN_OPEN_LEVERAGE)
@@ -200,6 +204,27 @@ class Store:
             if intent.get("purpose") != "migration":
                 key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
                 db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
+
+    def complete_cycle(self, intent, progress):
+        """Commit cycle ownership/timing and the terminal receipt together once."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
+            if row and row[0] in ("complete", "aborted"):
+                return
+            if row is None:
+                raise TradingError("多空循环批次记录不存在")
+            key = "cycle:" + intent["account_id"]
+            saved = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+            if not saved or json.loads(saved[0]).get("run_id") != progress.get("run_id") or progress.get("run_id") != intent.get("run_id"):
+                raise TradingError("多空循环记录与批次不一致，等待人工核对")
+            status = "aborted" if intent.get("status") == "aborted" else "complete"
+            intent.update(status=status, completed_at=time.time())
+            progress = {**progress, "updated_at": time.time(), "active_batch": None}
+            db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (status, dumps(intent), intent["id"]))
+            db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(progress), key))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
+                       (intent["account_id"], "cycle", progress.get("reason", "多空循环批次已核对"), time.time()))
 
     def complete_migration(self, intent, result, snapshot_remaining):
         """Commit the four-leg ledger and migration totals exactly once."""

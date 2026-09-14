@@ -122,6 +122,26 @@ class MigrationEdit(BaseModel):
         return values
 
 
+class CycleEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    symbol: Literal["XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
+    leverage: StrictInt | None = Field(default=None, ge=1, le=125)
+    spread_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
+    min_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    max_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    notional_scope: Literal["per_side", "gross"] | None = None
+    hold_seconds: StrictInt | None = Field(default=None, ge=1, le=604800)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_present_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的多空循环配置字段")
+        return values
+
+
 class PolicyEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     threshold: str | None = Field(default=None, min_length=1, max_length=40)
@@ -129,6 +149,7 @@ class PolicyEdit(BaseModel):
     margin_limit: str | None = Field(default=None, min_length=1, max_length=128)
     min_open_leverage: StrictInt | None = Field(default=None, ge=5, le=20, json_schema_extra={"enum": list(TIERS)})
     migration: MigrationEdit | None = None
+    cycle: CycleEdit | None = None
 
     @model_validator(mode="before")
     @classmethod

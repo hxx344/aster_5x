@@ -706,6 +706,19 @@ class LiveBroker:
             result[key] = row
         return result
 
+    def cycle_snapshot(self, symbols, fresh_modes=False):
+        """Confirm selected-symbol external orders for the isolated cycle."""
+        snapshot = self.snapshot(symbols, fresh_modes=fresh_modes)
+        orders = []
+        for symbol in symbols:
+            rows = self.api.call("GET", "/fapi/v3/openOrders", {"symbol": symbol}, signed=True)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) or row.get("symbol") != symbol for row in rows):
+                raise TradingError("独立循环未完成挂单响应无效")
+            orders.extend(rows)
+        snapshot.open_orders = orders
+        snapshot.require_fresh()
+        return snapshot
+
     @staticmethod
     def _leverage(value):
         leverage = positive(value)
@@ -740,6 +753,40 @@ class LiveBroker:
                 raise
             except TradingError as exc:
                 raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
+        try:
+            return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
+        except ExchangeError as exc:
+            status_rejected = exc.http_status in LEVERAGE_REJECTION_HTTP_STATUSES and exc.code not in (-1006, -1007)
+            code_rejected = not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES
+            if not isinstance(exc, RequestNotSent) and (status_rejected or code_rejected):
+                raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after),
+                                       http_status=exc.http_status) from None
+            raise
+
+    def set_cycle_leverage(self, symbol, leverage, *, checked_snapshot=None, before_submit=None):
+        """The independent cycle may choose any integer leverage, only while flat."""
+        if type(leverage) is not int or not 1 <= leverage <= 125:
+            raise TradingError("独立循环杠杆必须为 1 至 125 的整数")
+        # Always refresh: an earlier flat read cannot authorize lowering leverage
+        # after an intervening external fill or a newly submitted order.
+        self.leverage_snapshot = None
+        try:
+            snapshot = self.cycle_snapshot([symbol], fresh_modes=True)
+            snapshot.require_modes([symbol])
+            long, short = snapshot.require_ready(symbol)
+            if snapshot.open_orders is None or snapshot.open_orders or long.qty or short.qty:
+                raise TradingError("独立循环仅允许在所选品种确认空仓且没有挂单时设置杠杆")
+            if before_submit is not None:
+                before_submit(snapshot)
+                long, short = snapshot.require_ready(symbol)
+                if snapshot.open_orders is None or snapshot.open_orders or long.qty or short.qty:
+                    raise TradingError("独立循环杠杆提交前必须仍为空仓且没有挂单")
+            if leverage == long.leverage:
+                return {"symbol": symbol, "leverage": leverage}
+        except RequestNotSent:
+            raise
+        except TradingError as exc:
+            raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
         try:
             return self.api.call("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, signed=True)
         except ExchangeError as exc:

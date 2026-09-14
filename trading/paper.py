@@ -88,6 +88,27 @@ class PaperBroker:
         self.state = state
         return {"symbol": symbol, "leverage": leverage}
 
+    def cycle_snapshot(self, symbols, fresh_modes=False):
+        self.reload()
+        return self.snapshot(symbols, fresh_modes=fresh_modes)
+
+    def set_cycle_leverage(self, symbol, leverage, *, checked_snapshot=None, before_submit=None):
+        if type(leverage) is not int or not 1 <= leverage <= 125:
+            raise TradingError("独立循环杠杆必须为 1 至 125 的整数")
+        snapshot = self.cycle_snapshot([symbol], fresh_modes=True)
+        long, short = snapshot.require_ready(symbol)
+        if snapshot.open_orders is None or snapshot.open_orders or long.qty or short.qty:
+            raise TradingError("独立循环仅允许在所选品种确认空仓且没有挂单时设置杠杆")
+        if before_submit is not None:
+            before_submit(snapshot)
+            long, short = snapshot.require_ready(symbol)
+            if snapshot.open_orders is None or snapshot.open_orders or long.qty or short.qty:
+                raise TradingError("独立循环杠杆提交前必须仍为空仓且没有挂单")
+        state = {**self.state, "leverages": {**self.state["leverages"], symbol: leverage}}
+        self.store.put("paper:" + self.account_id, state)
+        self.state = state
+        return {"symbol": symbol, "leverage": leverage}
+
     def submit(self, orders):
         responses = []
         for order in orders:

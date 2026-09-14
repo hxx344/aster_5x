@@ -22,6 +22,7 @@ import {
   type CycleDraft,
   type CycleState,
 } from '@/lib/cycle';
+import { cycleDailySummary } from '@/lib/cycle-daily';
 
 type CycleAccount = {
   id: string;
@@ -95,6 +96,9 @@ export function CyclePanel({
   const field = (key: keyof CycleDraft, value: string | boolean) =>
     setDraft({ ...draft, [key]: value });
   const spread = cycleSpreadView(state, now, stale);
+  const daily = cycleDailySummary(state?.daily_volume, now, stale);
+  const dailyWaiting =
+    view.phase === 'daily_limit' || Boolean(state?.daily_volume?.reached);
 
   return (
     <section
@@ -106,7 +110,7 @@ export function CyclePanel({
           <Repeat2 size={17} /> 多空循环
         </h2>
         <span
-          className={`migration-badge ${view.phase === 'attention' || stale ? 'amber' : ''}`}
+          className={`migration-badge ${view.phase === 'attention' || view.phase === 'daily_limit' || stale ? 'amber' : ''}`}
         >
           {stale ? '最近记录 · ' : ''}
           {view.label}
@@ -126,6 +130,54 @@ export function CyclePanel({
           </p>
         ) : null}
       </div>
+      <section
+        className="cycle-daily-summary"
+        aria-labelledby="cycle-daily-heading"
+      >
+        <h3 id="cycle-daily-heading">
+          每日成交额度 <span>{daily.date} · UTC</span>
+        </h3>
+        <dl className="cycle-daily-grid">
+          <div>
+            <dt>已成交 · USD1</dt>
+            <dd>{daily.volume}</dd>
+          </div>
+          <div>
+            <dt>当日上限 · USD1</dt>
+            <dd>{daily.limit}</dd>
+          </div>
+          <div>
+            <dt>剩余额度 · USD1</dt>
+            <dd>{daily.remaining}</dd>
+          </div>
+          <div>
+            <dt>当日成交笔数</dt>
+            <dd>{daily.trades}</dd>
+          </div>
+        </dl>
+        {daily.notice ? <p className="amber">{daily.notice}</p> : null}
+        <p>
+          下次额度重置：<time>{daily.resetAt}</time>
+        </p>
+        {account.cycle?.enabled ? (
+          !account.enabled ? (
+            <p>账户已手动暂停，UTC 换日后仍需手动启动。</p>
+          ) : dailyWaiting ? (
+            <p className="amber">
+              {ownedPosition
+                ? '继续本轮条件平仓，暂停新增。'
+                : '当日额度已满或不足开启下一轮，暂停新增。'}
+              下一 UTC
+              日额度重置后，条件满足时自动恢复；点击暂停可取消自动恢复。
+            </p>
+          ) : (
+            <p>
+              达到额度后暂停新增；已有仓位仍按条件平仓。下一 UTC
+              日条件满足后自动恢复。
+            </p>
+          )
+        ) : null}
+      </section>
       <dl className="migration-details cycle-details">
         <div>
           <dt>已保存品种 / 固定杠杆</dt>
@@ -364,6 +416,26 @@ export function CyclePanel({
           <p className="muted">
             从多空开仓成交均确认后计时，精确到整数秒，最长 7
             天。平仓均确认后自动开始下一轮。
+          </p>
+          <label htmlFor="cycle-daily-volume">
+            每日成交额度 <span>USD1 · 0 为不限</span>
+            <Input
+              id="cycle-daily-volume"
+              type="number"
+              min="0"
+              max="1000000000000"
+              step="any"
+              required
+              value={draft.daily_volume_limit}
+              onChange={(event) =>
+                field('daily_volume_limit', event.target.value)
+              }
+            />
+          </label>
+          <p className="muted">
+            按 UTC 日累计全部循环成交。每边 10,000 USD1
+            的一轮多空开仓和平仓，交易量约 40,000
+            USD1；修复成交也计入，手续费不计入。剩余额度不足新一轮时等待下一日，平仓不受额度限制。价格变化或修复可能使实际成交量超过上限。
           </p>
         </fieldset>
         <p className="muted">

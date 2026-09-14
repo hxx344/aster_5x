@@ -131,6 +131,7 @@ class CycleEdit(BaseModel):
     spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
     min_notional: str | None = Field(default=None, min_length=1, max_length=40)
     max_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    daily_volume_limit: str | None = Field(default=None, min_length=1, max_length=40)
     notional_scope: Literal["per_side", "gross"] | None = None
     hold_seconds: StrictInt | None = Field(default=None, ge=1, le=604800)
 

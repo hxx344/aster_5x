@@ -8,6 +8,7 @@ export type CycleConfig = {
   max_notional: string;
   notional_scope: 'per_side' | 'gross';
   hold_seconds: number;
+  daily_volume_limit: string;
 };
 
 export type CycleDraft = Omit<CycleConfig, 'leverage' | 'hold_seconds'> & {
@@ -28,6 +29,37 @@ export type CycleState = {
   updated_at?: number;
   spread_bp?: string | null;
   spread_checked_at?: number | null;
+  daily_volume?: CycleDailyVolume;
+};
+
+export type CycleDailyVolume = {
+  utc_date: string;
+  volume: string;
+  trade_count: number;
+  next_reset_at: number;
+  limit: string;
+  remaining: string | null;
+  reached: boolean;
+  sync_pending?: boolean;
+  error?: string;
+};
+
+export type CycleTrade = {
+  trade_id: string;
+  order_id: string;
+  client_id: string;
+  symbol: string;
+  position_side: string;
+  side: string;
+  quantity: string;
+  price: string;
+  notional: string;
+  executed_at: number;
+  time_source: string;
+  utc_date: string;
+  daily_volume: string;
+  intent_id: string;
+  phase: 'open' | 'close' | 'repair';
 };
 
 export const DEFAULT_CYCLE: CycleConfig = {
@@ -40,6 +72,7 @@ export const DEFAULT_CYCLE: CycleConfig = {
   max_notional: '10000',
   notional_scope: 'per_side',
   hold_seconds: 60,
+  daily_volume_limit: '0',
 };
 
 export function cycleDraft(config?: CycleConfig): CycleDraft {
@@ -126,6 +159,11 @@ export function parseCycleDraft(draft: CycleDraft): CycleConfig {
   const bp = amount(draft.spread_limit_bp, '价差上限（bp）', '100');
   const min = amount(draft.min_notional, '名义价值下限', '1000000');
   const max = amount(draft.max_notional, '名义价值上限', '1000000', true);
+  const dailyLimit = amount(
+    draft.daily_volume_limit,
+    '每日成交额度',
+    '1000000000000',
+  );
   if (compare(min, max) > 0) throw new Error('名义价值下限不能大于上限');
   return {
     enabled: draft.enabled,
@@ -137,6 +175,7 @@ export function parseCycleDraft(draft: CycleDraft): CycleConfig {
     max_notional: max.text,
     notional_scope: draft.notional_scope,
     hold_seconds: cycleHoldSeconds(draft.hold_duration, draft.hold_unit),
+    daily_volume_limit: dailyLimit.text,
   };
 }
 
@@ -156,6 +195,10 @@ const PHASES: Record<string, { label: string; reason: string }> = {
     reason: '持仓时间已满足，等待深度价差达标后平仓',
   },
   closing: { label: '多空平仓中', reason: '正在提交并核对本轮多空平仓' },
+  daily_limit: {
+    label: '等待次日额度',
+    reason: '当日额度已用完或不足开启下一轮，下一 UTC 日条件满足后自动恢复新增',
+  },
 };
 
 export function cycleStatus(
@@ -163,9 +206,19 @@ export function cycleStatus(
   enabled: boolean,
   accountEnabled: boolean,
 ) {
-  const phase =
+  let phase =
     state?.phase ||
     (!enabled ? 'disabled' : accountEnabled ? 'waiting_open' : 'paused');
+  if (phase === 'daily_limit' && (!enabled || !accountEnabled)) {
+    phase = enabled ? 'paused' : 'disabled';
+    return {
+      phase,
+      label: PHASES[phase].label,
+      reason: enabled
+        ? '账户已手动暂停，UTC 换日后仍需手动启动'
+        : PHASES.disabled.reason,
+    };
+  }
   const fallback = PHASES[phase] || {
     label: '等待状态',
     reason: '等待更新循环状态',

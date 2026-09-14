@@ -44,11 +44,13 @@ import {
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
 import { CyclePanel } from '@/components/cycle-panel';
+import { CycleTradesPanel } from '@/components/cycle-trades-panel';
 import {
   cycleDraft,
   type CycleConfig,
   type CycleDraft,
   type CycleState,
+  type CycleTrade,
 } from '@/lib/cycle';
 import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
@@ -108,6 +110,7 @@ type Account = {
   migration_state?: MigrationState;
   cycle?: CycleConfig;
   cycle_state?: CycleState;
+  cycle_trades?: CycleTrade[];
   risk_limits?: { base: string; high_leverage: string; migration?: string };
   snapshot?: {
     equity: string;
@@ -861,6 +864,18 @@ export default function Home() {
                     </TabsContent>
                   </Tabs>
                 </section>
+                {account ? (
+                  <CycleTradesPanel
+                    key={account.id}
+                    accountName={account.name}
+                    trades={account.cycle_trades}
+                    stale={
+                      Boolean(connectionError) ||
+                      !state?.updated_at ||
+                      serverNow - state.updated_at >= 8
+                    }
+                  />
+                ) : null}
               </div>
               <aside className="secondary-column">
                 {account ? (

@@ -14,6 +14,8 @@ import uuid
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
+from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, identifier, normalize_fill,
+                           order_bindings, receipt_quantity, sort_key, utc_day, validate_fill_binding)
 
 
 CAPACITY_ALERT_MAX_AGE = 8
@@ -37,6 +39,7 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if demo is not None:
                 self._bind_runtime_mode(db, demo=demo)
+            had_volume_index = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cycle_volume_sync'").fetchone() is not None
             schema = """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id TEXT PRIMARY KEY, data TEXT NOT NULL
@@ -58,6 +61,38 @@ class Store:
                     due_at REAL NOT NULL, delivered_at REAL, expires_at REAL, capacity_key TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(due_at) WHERE delivered_at IS NULL;
+                CREATE TABLE IF NOT EXISTS cycle_fills (
+                    account_id TEXT NOT NULL, symbol TEXT NOT NULL, trade_id TEXT NOT NULL,
+                    order_id TEXT NOT NULL, client_id TEXT NOT NULL, intent_id TEXT NOT NULL,
+                    phase TEXT NOT NULL, position_side TEXT NOT NULL, side TEXT NOT NULL,
+                    quantity TEXT NOT NULL, price TEXT NOT NULL, notional TEXT NOT NULL,
+                    executed_at REAL NOT NULL, time_source TEXT NOT NULL, utc_date TEXT NOT NULL,
+                    daily_volume TEXT NOT NULL, recorded_at REAL NOT NULL, event_id INTEGER,
+                    PRIMARY KEY(account_id,symbol,trade_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_day
+                    ON cycle_fills(account_id,utc_date,executed_at,symbol,trade_id);
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_order
+                    ON cycle_fills(intent_id,client_id);
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_recent
+                    ON cycle_fills(account_id,executed_at DESC,symbol DESC,trade_id DESC);
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_exchange_order
+                    ON cycle_fills(account_id,symbol,order_id,client_id,intent_id);
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_client
+                    ON cycle_fills(account_id,symbol,client_id,order_id,intent_id);
+                CREATE TABLE IF NOT EXISTS cycle_volume_days (
+                    account_id TEXT NOT NULL, utc_date TEXT NOT NULL, volume TEXT NOT NULL,
+                    trade_count INTEGER NOT NULL, estimated_volume TEXT NOT NULL,
+                    estimated_trade_count INTEGER NOT NULL, latest_trade_at REAL,
+                    latest_symbol TEXT, latest_trade_id TEXT, updated_at REAL NOT NULL,
+                    PRIMARY KEY(account_id,utc_date)
+                );
+                CREATE TABLE IF NOT EXISTS cycle_volume_sync (
+                    intent_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at REAL, completed_at REAL, synced_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_cycle_volume_backlog
+                    ON cycle_volume_sync(account_id,synced_at,status,completed_at,created_at);
             """
             for statement in schema.split(";"):
                 if statement.strip():
@@ -72,6 +107,11 @@ class Store:
                 normalized = self.account_defaults(account)
                 if normalized != account:
                     db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(normalized), row["id"]))
+            # One upgrade pass builds the lightweight index. Subsequent account
+            # ticks never deserialize all historical intents to find today's work.
+            if not had_volume_index:
+                for row in db.execute("SELECT id,account_id,status,data FROM intents").fetchall():
+                    self._index_cycle_volume(db, json.loads(row["data"]), row=row)
             placeholders = ",".join("?" for _ in CAPACITY_ALERT_KEYS)
             db.execute(f"""UPDATE outbox SET expires_at=0 WHERE delivered_at IS NULL
                 AND capacity_key IS NOT NULL AND capacity_key NOT IN ({placeholders})""", tuple(CAPACITY_ALERT_KEYS))
@@ -120,7 +160,8 @@ class Store:
                 raise TradingError("账本用途与启动模式不符；演示与正式服务必须使用独立的数据目录")
             return
         if demo:
-            expected = {"accounts", "kv", "intents", "events", "outbox"}
+            expected = {"accounts", "kv", "intents", "events", "outbox", "cycle_fills",
+                        "cycle_volume_days", "cycle_volume_sync"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
             if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -184,6 +225,171 @@ class Store:
         with self.connect() as db:
             db.execute("INSERT INTO intents VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data",
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
+            self._index_cycle_volume(db, intent)
+
+    @staticmethod
+    def _index_cycle_volume(db, intent, row=None):
+        if intent.get("kind") != "cycle":
+            return
+        def timestamp(value):
+            return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+        identity = row if row is not None else intent
+        db.execute("""INSERT INTO cycle_volume_sync(intent_id,account_id,status,created_at,completed_at,synced_at)
+                    VALUES (?,?,?,?,?,NULL) ON CONFLICT(intent_id) DO UPDATE SET
+                    status=excluded.status,created_at=excluded.created_at,completed_at=excluded.completed_at""",
+                   (identity["id"], identity["account_id"], identity["status"],
+                    timestamp(intent.get("created_at")), timestamp(intent.get("completed_at"))))
+
+    @staticmethod
+    def _cycle_ledger_intent(db, intent):
+        if not isinstance(intent, dict):
+            raise TradingError("循环交易量批次无效")
+        intent_id = identifier(intent.get("id"), "循环批次标识")
+        account_id = account_identifier(intent.get("account_id"))
+        row = db.execute("SELECT account_id,status,data FROM intents WHERE id=?", (intent_id,)).fetchone()
+        if row is None or row["account_id"] != account_id:
+            raise TradingError("循环逐笔成交批次不存在或不属于此账户")
+        saved = json.loads(row["data"])
+        if (saved.get("account_id") != account_id or saved.get("id") != intent_id
+                or saved.get("kind") != "cycle" or any(saved.get(key) != intent.get(key) for key in ("kind", "symbol", "run_id"))):
+            raise TradingError("循环逐笔成交与持久批次身份不一致")
+        if db.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone() is None:
+            raise TradingError("循环成交账户不存在")
+        return saved
+
+    def record_cycle_fills(self, intent, fills):
+        """Atomically admit individually verified fills; return the new row count."""
+        if not isinstance(fills, (list, tuple)) or len(fills) > 20000:
+            raise TradingError("循环逐笔成交列表无效或过大")
+        normalized = [normalize_fill(fill) for fill in fills]
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = self._cycle_ledger_intent(db, intent)
+            account_id, intent_id = saved["account_id"], saved["id"]
+            bindings = order_bindings(saved)
+            limits, changed_days = {}, {}
+            for fill in normalized:
+                phase, maximum_quantity = validate_fill_binding(fill, bindings)
+                limits[fill["client_id"]] = maximum_quantity
+                row = {**fill, "account_id": account_id, "intent_id": intent_id, "phase": phase,
+                       "daily_volume": "0", "recorded_at": time.time()}
+                previous = db.execute("SELECT * FROM cycle_fills WHERE account_id=? AND symbol=? AND trade_id=?",
+                                      (account_id, fill["symbol"], fill["trade_id"])).fetchone()
+                if previous is not None:
+                    if any(previous[key] != row[key] for key in FILL_FIELDS | {"intent_id", "phase", "utc_date"}):
+                        raise TradingError("同一循环成交标识对应的价量、时间或委托发生冲突")
+                    continue
+                if db.execute("SELECT 1 FROM cycle_fills WHERE account_id=? AND symbol=? AND order_id=? AND (client_id!=? OR intent_id!=?) LIMIT 1",
+                              (account_id, fill["symbol"], fill["order_id"], fill["client_id"], intent_id)).fetchone():
+                    raise TradingError("同一交易所订单号不能归属不同循环委托")
+                if db.execute("SELECT 1 FROM cycle_fills WHERE account_id=? AND symbol=? AND client_id=? AND (order_id!=? OR intent_id!=?) LIMIT 1",
+                              (account_id, fill["symbol"], fill["client_id"], fill["order_id"], intent_id)).fetchone():
+                    raise TradingError("同一循环委托不能归属不同交易所订单号或批次")
+                event = db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
+                                   (account_id, "cycle_fill", "循环逐笔成交入账", row["recorded_at"]))
+                row["event_id"] = event.lastrowid
+                fields = (*FILL_FIELDS, "account_id", "intent_id", "phase", "utc_date", "daily_volume", "recorded_at", "event_id")
+                db.execute("INSERT INTO cycle_fills(" + ",".join(fields) + ") VALUES (" + ",".join("?" for _ in fields) + ")",
+                           tuple(row[key] for key in fields))
+                changed_days.setdefault(fill["utc_date"], []).append(row)
+            for client_id, maximum_quantity in limits.items():
+                quantity = sum((Fraction(dec(row[0])) for row in db.execute(
+                    "SELECT quantity FROM cycle_fills WHERE intent_id=? AND client_id=?", (intent_id, client_id))), Fraction(0))
+                if quantity > maximum_quantity:
+                    raise TradingError("循环逐笔成交累计数量超过已核实回执")
+            for date, rows in changed_days.items():
+                self._update_cycle_day(db, account_id, date, rows)
+            return sum(len(rows) for rows in changed_days.values())
+
+    @staticmethod
+    def _update_cycle_day(db, account_id, date, new_rows):
+        old = db.execute("SELECT * FROM cycle_volume_days WHERE account_id=? AND utc_date=?", (account_id, date)).fetchone()
+        # Normal in-order fills append in O(new fills); a late execution rebuilds
+        # that day's exact prefixes so every displayed running total stays true.
+        latest = (old["latest_trade_at"], old["latest_symbol"], old["latest_trade_id"]) if old else None
+        append = old is not None and all(sort_key(row) > latest for row in new_rows)
+        rows = sorted(new_rows, key=sort_key) if append or old is None else [dict(row) for row in db.execute(
+            "SELECT * FROM cycle_fills WHERE account_id=? AND utc_date=? ORDER BY executed_at,symbol,trade_id", (account_id, date))]
+        volume = Fraction(dec(old["volume"])) if append else Fraction(0)
+        estimated = Fraction(dec(old["estimated_volume"])) if append else Fraction(0)
+        count = old["trade_count"] if append else 0
+        estimated_count = old["estimated_trade_count"] if append else 0
+        for row in rows:
+            volume += Fraction(dec(row["notional"]))
+            count += 1
+            if row["time_source"] == "legacy_estimated":
+                estimated += Fraction(dec(row["notional"]))
+                estimated_count += 1
+            row["daily_volume"] = wire(volume)
+            db.execute("UPDATE cycle_fills SET daily_volume=? WHERE account_id=? AND symbol=? AND trade_id=?",
+                       (row["daily_volume"], account_id, row["symbol"], row["trade_id"]))
+            db.execute("UPDATE events SET message=? WHERE id=? AND account_id=? AND kind='cycle_fill'",
+                       (event_message(row), row["event_id"], account_id))
+        last = rows[-1]
+        db.execute("""INSERT INTO cycle_volume_days VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(account_id,utc_date) DO UPDATE SET volume=excluded.volume,trade_count=excluded.trade_count,
+                    estimated_volume=excluded.estimated_volume,estimated_trade_count=excluded.estimated_trade_count,
+                    latest_trade_at=excluded.latest_trade_at,latest_symbol=excluded.latest_symbol,
+                    latest_trade_id=excluded.latest_trade_id,updated_at=excluded.updated_at""",
+                   (account_id, date, wire(volume), count, wire(estimated), estimated_count,
+                    last["executed_at"], last["symbol"], last["trade_id"], time.time()))
+
+    def cycle_daily_volume(self, account_id, now=None):
+        account_identifier(account_id)
+        date, _, reset = utc_day(now)
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM cycle_volume_days WHERE account_id=? AND utc_date=?", (account_id, date)).fetchone()
+        return {"utc_date": date, "volume": row["volume"] if row else "0", "trade_count": row["trade_count"] if row else 0,
+                "next_reset_at": reset, "estimated_volume": row["estimated_volume"] if row else "0",
+                "estimated_trade_count": row["estimated_trade_count"] if row else 0,
+                "latest_trade_at": row["latest_trade_at"] if row else None,
+                "cumulative_order": "execution_time", "timezone": "UTC"}
+
+    def cycle_trade_records(self, account_id, limit=100):
+        account_identifier(account_id)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise TradingError("循环成交明细条数必须为 1 至 1000 的整数")
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM cycle_fills WHERE account_id=? ORDER BY executed_at DESC,symbol DESC,trade_id DESC LIMIT ?",
+                              (account_id, limit)).fetchall()
+        fields = FILL_FIELDS | {"utc_date", "daily_volume", "intent_id", "phase"}
+        return [{key: row[key] for key in fields} for row in rows]
+
+    def cycle_volume_backlog(self, account_id, limit=100, since=None):
+        account_identifier(account_id)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise TradingError("循环成交补记批次数必须为 1 至 1000 的整数")
+        if since is None:
+            since = utc_day()[1]
+        else:
+            utc_day(since)
+        with self.connect() as db:
+            rows = db.execute("""SELECT i.data FROM cycle_volume_sync v JOIN intents i ON i.id=v.intent_id
+                WHERE v.account_id=? AND v.synced_at IS NULL AND v.status IN ('complete','aborted')
+                AND i.account_id=v.account_id AND i.status IN ('complete','aborted')
+                AND (v.created_at>=? OR v.completed_at>=? OR v.completed_at IS NULL)
+                ORDER BY COALESCE(v.completed_at,v.created_at,0) DESC,v.intent_id DESC LIMIT ?""",
+                              (account_id, since, since, limit)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def mark_cycle_volume_synced(self, intent_id):
+        identifier(intent_id, "循环批次标识")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,data FROM intents WHERE id=?", (intent_id,)).fetchone()
+            if row is None or row["status"] not in ("complete", "aborted"):
+                raise TradingError("循环批次尚未结束，不能标记成交同步完成")
+            intent = json.loads(row["data"])
+            self._cycle_ledger_intent(db, intent)
+            bindings = order_bindings(intent)
+            for client_id, (order, receipt, _) in bindings.items():
+                expected = receipt_quantity(order, receipt, require_terminal=True)
+                actual = sum((Fraction(dec(row[0])) for row in db.execute(
+                    "SELECT quantity FROM cycle_fills WHERE intent_id=? AND client_id=?", (intent_id, client_id))), Fraction(0))
+                if actual != expected:
+                    raise TradingError("循环逐笔成交尚未全部入账，不能标记同步完成")
+            self._index_cycle_volume(db, intent)
+            db.execute("UPDATE cycle_volume_sync SET synced_at=? WHERE intent_id=?", (time.time(), intent_id))
 
     def event(self, account_id, kind, message):
         with self.connect() as db:
@@ -222,6 +428,7 @@ class Store:
             intent.update(status=status, completed_at=time.time())
             progress = {**progress, "updated_at": time.time(), "active_batch": None}
             db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (status, dumps(intent), intent["id"]))
+            self._index_cycle_volume(db, intent)
             db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(progress), key))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
                        (intent["account_id"], "cycle", progress.get("reason", "多空循环批次已核对"), time.time()))

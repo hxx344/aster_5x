@@ -102,6 +102,16 @@ class RateBudget:
         finally:
             self.priority.reconciliation = previous
 
+    @contextmanager
+    def cycle_accounting(self):
+        """Fill reporting cannot consume the reserved order-repair budget."""
+        previous = getattr(self.priority, "cycle_accounting", False)
+        self.priority.cycle_accounting = True
+        try:
+            yield self
+        finally:
+            self.priority.cycle_accounting = previous
+
     def _refresh(self, now):
         if now >= self.deadline:
             steps = int((now - self.deadline) // 60) + 1
@@ -130,7 +140,8 @@ class RateBudget:
         if now < self.until:
             raise RequestNotSent("接口退避中", retry_after=self.until - now)
         monitoring = getattr(self.priority, "capacity_monitoring", False)
-        critical = getattr(self.priority, "reconciliation", False) and not monitoring
+        critical = (getattr(self.priority, "reconciliation", False) and not monitoring
+                    and not getattr(self.priority, "cycle_accounting", False))
         if monitoring:
             limit = self._ordinary_limit()
         else:
@@ -569,10 +580,15 @@ class LiveBroker:
         self.market = market
         self.cached, self.cached_at = {}, {}
         self.leverage_snapshot = None
+        self.cycle_trade_queries = {}
 
     def reconciliation_budget(self):
         budget = getattr(self.api, "budget", None)
         return budget.reconciliation() if budget is not None else nullcontext()
+
+    def cycle_volume_budget(self):
+        budget = getattr(self.api, "budget", None)
+        return budget.cycle_accounting() if budget is not None else nullcontext()
 
     def cached_call(self, key, path, params=None, ttl=300, weight=1):
         started = time.monotonic()
@@ -796,6 +812,100 @@ class LiveBroker:
                 raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after),
                                        http_status=exc.http_status) from None
             raise
+
+    def cycle_trades(self, order, receipt, created_at, *, checkpoint=None):
+        """Fetch every fill of one verified order, keeping exchange UTC timestamps.
+
+        userTrades has no orderId filter. Its time filters cannot be combined
+        with fromId, so only the initial page uses a bounded time window.
+        """
+        if any(receipt.get(key) != order[key] for key in ("symbol", "positionSide", "side")) \
+                or receipt.get("clientOrderId") != order["newClientOrderId"]:
+            raise TradingError("循环成交查询的订单回执身份不一致")
+        expected = Fraction(positive(receipt.get("executedQty"), True))
+        if expected > Fraction(positive(order["quantity"])):
+            raise TradingError("循环成交查询数量超过委托数量")
+        if not expected:
+            return []
+
+        def integer(value, name):
+            if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isdigit() or len(str(value)) > 40:
+                raise TradingError(f"循环成交{name}无效")
+            return int(value)
+
+        oid = str(integer(receipt.get("orderId"), "订单编号"))
+        cid, symbol = order["newClientOrderId"], order["symbol"]
+        if type(created_at) not in (int, float) or not math.isfinite(created_at) or created_at <= 0:
+            raise TradingError("循环订单创建时间无效，无法核对成交")
+        state = checkpoint if checkpoint is not None else self.cycle_trade_queries.setdefault(cid, {})
+        fingerprint = [oid, wire(expected), symbol, order["positionSide"], order["side"]]
+        if state.get("identity") != fingerprint:
+            # An exchange order timestamp is a tighter lookup anchor than the
+            # local write time, especially after delayed restart recovery.
+            order_ms = integer(receipt["time"], "订单时间") if receipt.get("time") is not None else int(created_at * 1000)
+            end_ms = integer(receipt["updateTime"], "回执时间") if receipt.get("updateTime") is not None else int(time.time() * 1000)
+            begin_ms = max(0, order_ms - 60000)
+            end_ms = max(order_ms, end_ms) + 60000
+            state.clear()
+            state.update(identity=fingerprint, begin_ms=begin_ms, end_ms=end_ms, window_start=begin_ms,
+                         window_end=min(end_ms, begin_ms + 7 * 86400000 - 1), from_id=None, fills={})
+        # Bound one scheduler pass; persisted checkpoints resume pagination on
+        # the next tick without spending the repair reserve on repeated pages.
+        for _ in range(5):
+            cursor = state.get("from_id")
+            params = {"symbol": symbol, "limit": 1000}
+            if cursor is None:
+                params.update(startTime=state["window_start"], endTime=state["window_end"])
+            else:
+                params["fromId"] = cursor
+            rows = self.api.call("GET", "/fapi/v3/userTrades", params, signed=True, weight=5)
+            if not isinstance(rows, list) or len(rows) > 1000:
+                raise TradingError("循环逐笔成交响应无效")
+            ids = []
+            for row in rows:
+                if not isinstance(row, dict) or row.get("symbol") != symbol:
+                    raise TradingError("循环逐笔成交品种不一致")
+                trade_id = integer(row.get("id"), "编号")
+                row_oid = str(integer(row.get("orderId"), "订单编号"))
+                ids.append(trade_id)
+                if cursor is not None and trade_id < cursor:
+                    raise TradingError("循环逐笔成交分页没有前进，等待重新核对")
+                if row_oid != oid:
+                    continue
+                if row.get("side") != order["side"] or row.get("positionSide") != order["positionSide"]:
+                    raise TradingError("循环逐笔成交方向与委托不一致")
+                stamp = integer(row.get("time"), "时间")
+                if not 0 < stamp <= 253402300799999:
+                    raise TradingError("循环逐笔成交时间无效")
+                qty, price = positive(row.get("qty")), positive(row.get("price"))
+                fill = {"trade_id": str(trade_id), "order_id": oid, "client_id": cid, "symbol": symbol,
+                        "position_side": order["positionSide"], "side": order["side"],
+                        "quantity": wire(qty), "price": wire(price), "notional": wire(Fraction(qty) * Fraction(price)),
+                        "executed_at": stamp / 1000, "time_source": "exchange"}
+                previous = state["fills"].get(str(trade_id))
+                if previous is not None and previous != fill:
+                    raise TradingError("同一循环成交编号出现冲突明细")
+                state["fills"][str(trade_id)] = fill
+            matched = sum((Fraction(dec(fill["quantity"])) for fill in state["fills"].values()), Fraction(0))
+            if matched > expected:
+                raise TradingError("逐笔成交合计超过已核实回执数量")
+            if matched == expected:
+                result = sorted(state["fills"].values(), key=lambda fill: (fill["executed_at"], int(fill["trade_id"])))
+                state.clear()
+                return result
+            if len(rows) == 1000:
+                state["from_id"] = max(ids) + 1
+                continue
+            if cursor is None and state["window_end"] < state["end_ms"]:
+                state["window_start"] = state["window_end"] + 1
+                state["window_end"] = min(state["end_ms"], state["window_start"] + 7 * 86400000 - 1)
+                continue
+            # Fills may become visible after order status. Restart the lookup
+            # window next time, retain known fills, and never call a short page 0.
+            state.update(from_id=None, window_start=state["begin_ms"],
+                         window_end=min(state["end_ms"], state["begin_ms"] + 7 * 86400000 - 1))
+            raise TradingError("循环逐笔成交尚未查全，等待补账后再开新仓")
+        raise TradingError("循环逐笔成交正在分页补账，等待后续核对")
 
     def submit(self, orders):
         self.leverage_snapshot = None

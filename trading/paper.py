@@ -1,5 +1,7 @@
 """Deterministic paper broker with persistent balances and order receipts."""
 from dataclasses import asdict
+from fractions import Fraction
+import math
 import time
 
 from .exchange import ExchangeError
@@ -145,6 +147,15 @@ class PaperBroker:
             receipt = {"symbol": symbol, "clientOrderId": cid, "positionSide": side, "side": order["side"],
                        "status": "FILLED" if executed == qty else "EXPIRED", "executedQty": wire(executed),
                        "origQty": wire(qty), "avgPrice": wire(price if executed else 0)}
+            # Fill time and identity are committed with both balance and receipt;
+            # restart recovery must not move a fill into a different UTC day.
+            executed_at = time.time()
+            receipt.update(orderId="paper:" + cid, time=int(executed_at * 1000), updateTime=int(executed_at * 1000),
+                           paperTrades=[{"trade_id": "paper:" + cid + ":0", "order_id": "paper:" + cid,
+                                         "client_id": cid, "symbol": symbol, "position_side": side, "side": order["side"],
+                                         "quantity": wire(executed), "price": wire(price),
+                                         "notional": wire(Fraction(executed) * Fraction(price)),
+                                         "executed_at": executed_at, "time_source": "paper"}] if executed else [])
             state = {**self.state, "wallet": wallet,
                      "positions": {**self.state["positions"], symbol + ":" + side: position},
                      "orders": {**self.state["orders"], cid: receipt}}
@@ -163,6 +174,32 @@ class PaperBroker:
         if client_id not in self.state["orders"]:
             raise PaperOrderAbsent("模拟订单未写入账本", code=-2013)
         return self.state["orders"][client_id]
+
+    def cycle_trades(self, order, receipt, created_at, *, checkpoint=None):
+        if any(receipt.get(key) != order[key] for key in ("symbol", "positionSide", "side")) \
+                or receipt.get("clientOrderId") != order["newClientOrderId"]:
+            raise TradingError("循环模拟成交回执身份不一致")
+        qty = positive(receipt.get("executedQty"), True)
+        if not qty:
+            return []
+        if "paperTrades" in receipt:
+            rows = receipt["paperTrades"]
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise TradingError("模拟逐笔成交账本无效")
+            if sum((Fraction(positive(row.get("quantity"))) for row in rows), Fraction(0)) != Fraction(qty):
+                raise TradingError("模拟逐笔成交数量与回执不一致")
+            return [dict(row) for row in rows]
+        # Historical paper receipts have no execution timestamp. Preserve this
+        # limitation explicitly, with a stable estimate from the original intent.
+        if type(created_at) not in (int, float) or not math.isfinite(created_at) or created_at <= 0:
+            raise TradingError("旧模拟成交缺少可用的时间依据")
+        cid = order["newClientOrderId"]
+        receipt.setdefault("orderId", "paper:" + cid)
+        price = positive(receipt.get("avgPrice"))
+        return [{"trade_id": "legacy:" + cid, "order_id": str(receipt["orderId"]), "client_id": cid,
+                 "symbol": order["symbol"], "position_side": order["positionSide"], "side": order["side"],
+                 "quantity": wire(qty), "price": wire(price), "notional": wire(Fraction(qty) * Fraction(price)),
+                 "executed_at": created_at, "time_source": "legacy_estimated"}]
 
     def reload(self):
         state = self.store.get("paper:" + self.account_id)

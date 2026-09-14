@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .execution import Executor
-from .cycle import DEFAULT_CYCLE, CyclePositionError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
+from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
@@ -558,11 +559,34 @@ class Engine:
         saved = self.store.get("cycle:" + account["id"]) or {}
         self.view(account["id"], cycle_state={**saved, **updates})
 
+    def cycle_daily_state(self, account, now=None):
+        daily = self.store.cycle_daily_volume(account["id"], now=now)
+        limit = dec(validate_cycle(account.get("cycle"))["daily_volume_limit"])
+        used = Fraction(dec(daily["volume"]))
+        remaining = max(Fraction(0), Fraction(limit) - used)
+        backlog = self.store.cycle_volume_backlog(account["id"], limit=1, since=daily["next_reset_at"] - 86400)
+        return {**daily, "limit": wire(limit), "remaining": wire(remaining) if limit else None,
+                "reached": bool(limit and used >= limit), "sync_pending": bool(backlog),
+                "error": backlog[0].get("volume_error") if backlog else None}
+
+    def cycle_open_remaining(self, account):
+        daily = self.cycle_daily_state(account)
+        if daily["sync_pending"]:
+            raise TradingError("循环成交明细仍在同步，完成每日累计量核对后再开仓")
+        if daily["reached"]:
+            raise DailyVolumeLimitError("已达到每日成交量上限，等待 UTC 00:00 自动恢复")
+        return daily["remaining"]
+
     def cycle_progress(self, account, snapshot):
         progress = self.store.get("cycle:" + account["id"])
         validate_cycle_positions(account, snapshot, progress)
         config = validate_cycle(account.get("cycle"))
-        if progress and progress.get("config") == config:
+        if progress and validate_cycle(progress.get("config")) == config:
+            # Defaulted fields added by an upgrade do not invalidate an active
+            # cycle's ownership or restart its holding timer.
+            if progress.get("config") != config:
+                progress["config"] = config
+                self.store.put("cycle:" + account["id"], progress)
             return progress
         if progress and any(dec(q) for q in progress.get("quantities", {}).values()):
             raise CyclePositionError("多空循环持仓参数已变化，请核对记录")
@@ -605,6 +629,19 @@ class Engine:
             return 5
         if not self.live_allowed(account):
             raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
+        # Fill history is read-only. A failed sync blocks only new exposure;
+        # tracked positions must remain eligible for closing and repairs.
+        daily_remaining = None
+        if progress.get("phase") == "waiting_open":
+            backlog = self.store.cycle_volume_backlog(aid, limit=4)
+            # Continue older history in bounded batches after midnight as well.
+            # Only intents which may include today's fills gate today's allowance.
+            if not backlog:
+                backlog = self.store.cycle_volume_backlog(aid, limit=1, since=0)
+            for unsynced in backlog:
+                if not executor.sync_volume(account, unsynced):
+                    break
+            daily_remaining = self.cycle_open_remaining(account)
         retry_at = progress.get("retry_at") or 0
         if progress.get("phase") == "waiting_open" and time.time() < retry_at:
             reason = "上一批开仓未完成，等待冷却后重新检查"
@@ -630,6 +667,7 @@ class Engine:
                 if self.shutdown.is_set() or not self.live_allowed(account):
                     raise TradingError("多空循环已停止提交")
                 validate_cycle_positions(account, fresh, progress)
+                self.cycle_open_remaining(account)
             reason = executor.set_leverage(account, snapshot, progress, before_submit=before_leverage)
             self.view(aid, status="reconciling", reason=reason)
             self.cycle_view(account, phase="reconciling", reason=reason)
@@ -638,13 +676,15 @@ class Engine:
             broker.api.budget.require_available(self.market.depth_weight([symbol]) +
                                                 broker.snapshot_weight([symbol], fresh_modes=True) + 6)
         book, depth = self.market.book(symbol), self.market.depth(symbol)
-        plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress)
+        plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress,
+                          daily_remaining=daily_remaining)
 
         def before_submit(fresh):
             if self.shutdown.is_set() or not self.live_allowed(account):
                 raise TradingError("多空循环已停止提交")
             current = plan_cycle(account, fresh, self.market.book(symbol), self.market.depth(symbol),
-                                 self.market.rules[symbol], progress)
+                                 self.market.rules[symbol], progress,
+                                 daily_remaining=self.cycle_open_remaining(account) if plan.phase == "open" else None)
             if current.phase != plan.phase or current.qty != plan.qty or current.leverage != plan.leverage:
                 raise TradingError("循环计划因账户或盘口变化需要重新计算")
 
@@ -861,8 +901,8 @@ class Engine:
                     if isinstance(exc, BudgetWait) and old_reason != message and log_wait:
                         self.budget_wait_events[account_id] = time.monotonic()
                 if old_reason != message and log_wait:
-                    self.store.event(account_id, "wait" if isinstance(exc, BudgetWait) else "error", message)
-                status = "waiting" if isinstance(exc, BudgetWait) else "error"
+                    self.store.event(account_id, "wait" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) else "error", message)
+                status = "waiting" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) else "error"
                 if isinstance(exc, (AccountModeError, CyclePositionError)):
                     self.store.pause_account(account, message)
                     pending = self.store.intent(account_id)
@@ -877,8 +917,9 @@ class Engine:
                     self.migration_view(account, phase="attention" if status == "attention" else "waiting", reason=message)
                 if account.get("cycle", {}).get("enabled") or (pending and pending.get("kind") in ("cycle", "cycle_leverage")):
                     progress = self.store.get("cycle:" + account_id) or {}
-                    phase = "attention" if status == "attention" else "waiting_close" if progress.get("opened_at") is not None else "waiting_open"
-                    self.cycle_view(account, phase=phase, reason=message)
+                    phase = "daily_limit" if isinstance(exc, DailyVolumeLimitError) else "attention" if status == "attention" else "waiting_close" if progress.get("opened_at") is not None else "waiting_open"
+                    self.cycle_view(account, phase=phase, reason=message,
+                                    quota_utc_date=self.store.cycle_daily_volume(account_id)["utc_date"] if isinstance(exc, DailyVolumeLimitError) else None)
                 delay = max(10, getattr(exc, "retry_after", 0))
                 with self.lock:
                     self.account_backoff[account_id] = time.monotonic() + delay
@@ -1175,6 +1216,8 @@ class Engine:
         pending_notifications = self.store.pending_notifications()
         migration_records = {a["id"]: (self.store.get("migration:" + a["id"]) or {}, self.store.intent(a["id"])) for a in saved_accounts}
         cycle_records = {a["id"]: self.store.get("cycle:" + a["id"]) or {} for a in saved_accounts}
+        cycle_daily = {a["id"]: self.cycle_daily_state(a) for a in saved_accounts}
+        cycle_trades = {a["id"]: self.store.cycle_trade_records(a["id"], limit=100) for a in saved_accounts}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
@@ -1214,6 +1257,7 @@ class Engine:
                 if current_cycle.get("run_id") != saved_cycle.get("run_id"):
                     current_cycle = {}
                 cycle = {**saved_cycle, **current_cycle}
+                daily = cycle_daily[account["id"]]
                 # Durable phase/ownership must win after an executor completes.
                 if saved_cycle.get("updated_at", 0) > current_cycle.get("updated_at", 0):
                     cycle.update(saved_cycle)
@@ -1230,10 +1274,18 @@ class Engine:
                 else:
                     cycle.setdefault("phase", "waiting_open")
                     cycle.setdefault("reason", "等待多空循环检查")
+                    if not cycle.get("opened_at") and daily["reached"]:
+                        cycle.update(phase="daily_limit", reason="已达到每日成交量上限，等待 UTC 00:00 自动恢复")
+                    elif cycle.get("phase") == "daily_limit" and cycle.get("quota_utc_date") != daily["utc_date"]:
+                        cycle.update(phase="waiting_open", reason="UTC 新的一天已开始，等待开仓检查")
                     cycle["active_batch"] = None
+                if active_cycle and pending.get("volume_error"):
+                    daily = {**daily, "sync_pending": True, "error": pending["volume_error"]}
+                cycle["daily_volume"] = daily
                 if cycle.get("opened_at") is not None:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
+                account["cycle_trades"] = cycle_trades[account["id"]]
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
                 "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,

@@ -6,6 +6,7 @@ import uuid
 from contextlib import nullcontext
 from fractions import Fraction
 
+from .cycle import DailyVolumeLimitError
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, dec, floor_step, positive, wire
@@ -16,6 +17,109 @@ SIDES = ("LONG", "SHORT")
 
 
 class CycleExecutor(Executor):
+    def _record_volume_fills(self, intent, fills):
+        # A single order may span more than the ledger's per-write row limit.
+        # Commit bounded chunks; stable trade IDs make an interrupted retry safe.
+        for offset in range(0, len(fills), 1000):
+            self.store.record_cycle_fills(intent, fills[offset:offset + 1000])
+
+    def _require_daily_room(self, account, plan, config):
+        if plan.phase != "open":
+            return
+        if self.store.cycle_volume_backlog(account["id"], limit=1):
+            raise TradingError("循环成交明细尚未补齐，等待核对后再开新仓")
+        # Even unlimited accounts read the ledger: missing accounting cannot be
+        # silently treated as zero when the limit is subsequently configured.
+        daily = self.store.cycle_daily_volume(account["id"])
+        used = Fraction(positive(daily["volume"], True))
+        limit = Fraction(positive(config.get("daily_volume_limit", "0"), True))
+        roundtrip = 2 * (Fraction(positive(plan.long_notional)) + Fraction(positive(plan.short_notional)))
+        if limit and used + roundtrip > limit:
+            raise DailyVolumeLimitError("今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，等待次日 00:00 UTC 自动恢复")
+
+    def sync_volume(self, account, intent):
+        """Idempotently account known fills; missing details never block reductions."""
+        if intent.get("kind") != "cycle":
+            return True
+        if intent.get("account_id") != account["id"]:
+            intent["volume_error"] = "循环成交补账的账户不一致"
+            return False
+        errors = []
+        orders = intent.get("orders", []) + intent.get("repairs", [])
+        with getattr(self.broker, "cycle_volume_budget", nullcontext)():
+            for order in orders:
+                cid = order["newClientOrderId"]
+                receipt = intent.get("receipts", {}).get(cid)
+                if receipt is None:
+                    errors.append("循环订单回执仍待核对")
+                    continue
+                checkpoint = intent.setdefault("volume_queries", {}).setdefault(cid, {})
+                try:
+                    self.validate_receipt(order, receipt)
+                    if isinstance(self.broker, LiveBroker) and (receipt.get("orderId") is None or receipt["status"] not in TERMINAL) \
+                            and dec(receipt["executedQty"]):
+                        fresh = self.broker.query(order["symbol"], cid)
+                        self.validate_receipt(order, fresh)
+                        if dec(fresh["executedQty"]) < dec(receipt["executedQty"]) or (
+                                receipt["status"] in TERMINAL and dec(fresh["executedQty"]) != dec(receipt["executedQty"])):
+                            raise TradingError("循环订单查询成交数量与原回执冲突")
+                        receipt = intent["receipts"][cid] = fresh
+                    signature = [str(receipt.get("orderId", "")), wire(dec(receipt["executedQty"])), receipt["status"]]
+                    if not dec(receipt["executedQty"]):
+                        if receipt["status"] not in TERMINAL:
+                            errors.append("循环订单尚未终结，成交明细仍待核对")
+                        continue
+                    if intent.setdefault("volume_receipts", {}).get(cid) == signature:
+                        if receipt["status"] not in TERMINAL:
+                            errors.append("循环订单尚未终结，继续核对新增成交")
+                        continue
+                    created_at = intent.get("order_times", {}).get(cid, intent["created_at"])
+                    fills = self.broker.cycle_trades(order, receipt, created_at, checkpoint=checkpoint)
+                    # A historical paper adapter may attach its stable synthetic
+                    # orderId here; the ledger validates against the durable copy.
+                    self.store.save_intent(intent)
+                    self._record_volume_fills(intent, fills)
+                    signature = [str(receipt.get("orderId", "")), wire(dec(receipt["executedQty"])), receipt["status"]]
+                    intent["volume_receipts"][cid] = signature
+                    if receipt["status"] not in TERMINAL:
+                        errors.append("循环订单尚未终结，继续核对新增成交")
+                except Exception as exc:
+                    # Valid matching fills from an incomplete page are useful
+                    # accounting evidence even before the whole order is visible.
+                    try:
+                        self.store.save_intent(intent)
+                        partial = list(checkpoint.get("fills", {}).values())
+                        if partial:
+                            self._record_volume_fills(intent, partial)
+                    except Exception as write_error:
+                        errors.append(str(write_error))
+                    errors.append(str(exc))
+            try:
+                if errors:
+                    intent["volume_error"] = "；".join(dict.fromkeys(errors))[:1000]
+                    self.store.save_intent(intent)
+                    return False
+                intent.pop("volume_error", None)
+                self.store.save_intent(intent)
+                if intent.get("status") in ("complete", "aborted"):
+                    self.store.mark_cycle_volume_synced(intent["id"])
+                    intent["volume_synced"] = True
+                return True
+            except Exception as exc:
+                intent["volume_error"] = str(exc)[:1000]
+                try:
+                    self.store.save_intent(intent)
+                except Exception:
+                    pass
+                # Accounting failure is surfaced to the scheduler; never turn it
+                # into an exception that can strand a partially closed position.
+                return False
+
+    def attention(self, account, intent, reason):
+        result = super().attention(account, intent, reason)
+        self.sync_volume(account, intent)
+        return result
+
     def _require_progress(self, account, progress):
         saved = self.store.get("cycle:" + account["id"])
         if not isinstance(progress, dict) or not progress.get("run_id") or not saved or saved.get("run_id") != progress["run_id"]:
@@ -45,6 +149,7 @@ class CycleExecutor(Executor):
             raise TradingError("独立循环批次阶段无效")
         symbol, qty = plan.symbol, positive(plan.qty)
         config = progress.get("config") or account["cycle"]
+        self._require_daily_room(account, plan, config)
         if symbol != config["symbol"] or plan.leverage != config["leverage"]:
             raise TradingError("独立循环计划与本轮配置不一致")
         rule = self.market.rules[symbol]
@@ -82,6 +187,9 @@ class CycleExecutor(Executor):
         latest = self.store.account(account["id"])
         if not latest.get("enabled") or not latest.get("cycle", {}).get("enabled"):
             raise TradingError("独立循环或账户策略已暂停")
+        # Re-read UTC-day usage after the last account/quote callback. This also
+        # handles a midnight boundary during the admission reads.
+        self._require_daily_room(latest, plan, latest["cycle"])
         book.require_fresh()
         token = uuid.uuid4().hex
         orders = [self.order(symbol, side,
@@ -93,7 +201,8 @@ class CycleExecutor(Executor):
                   "phase": plan.phase, "leverage": plan.leverage, "quantity": wire(qty),
                   "status": "pending", "created_at": time.time(), "baseline": baseline,
                   "progress": copy.deepcopy(progress), "orders": orders, "receipts": {},
-                  "repairs": [], "repair_attempts": 0}
+                  "repairs": [], "repair_attempts": 0,
+                  "order_times": {order["newClientOrderId"]: time.time() for order in orders}}
         intent["progress"]["config"] = copy.deepcopy(config)
         self.store.save_intent(intent)
         action = "开仓" if plan.phase == "open" else "平仓"
@@ -160,6 +269,7 @@ class CycleExecutor(Executor):
         if not intent:
             return "没有未完成循环批次"
         if intent.get("status") in ("complete", "aborted"):
+            self.sync_volume(account, intent)
             return "独立循环批次已结束"
         if intent["kind"] == "cycle_leverage":
             return self._reconcile_leverage(account, intent)
@@ -206,6 +316,7 @@ class CycleExecutor(Executor):
                 absent_repair = True
         self.store.save_intent(intent)
         if unresolved:
+            self.sync_volume(account, intent)
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "独立循环订单结果仍不确定，已暂停；请核对未完成批次")
             return "核对独立循环订单回执中，不重复提交"
@@ -297,6 +408,7 @@ class CycleExecutor(Executor):
                                 "CR" + side[0] + uuid.uuid4().hex[:26])
             repairs.append(repair)
         intent["repairs"].extend(repairs)
+        intent.setdefault("order_times", {}).update({order["newClientOrderId"]: time.time() for order in repairs})
         intent.setdefault("repair_batches", {})[batch] = [order["newClientOrderId"] for order in repairs]
         intent["repair_attempts"] += 1
         intent["status"] = "repair"
@@ -329,5 +441,8 @@ class CycleExecutor(Executor):
             intent["status"] = "complete"
         progress = {**progress, "reason": message}
         self.store.complete_cycle(intent, progress)
+        account = self.store.account(intent["account_id"])
+        if intent.get("kind") == "cycle" and account and not self.sync_volume(account, intent):
+            message += "；成交明细待补账，暂停下一轮开仓"
         self.last_snapshot, self.last_completed_intent = snapshot, copy.deepcopy(intent)
         return message

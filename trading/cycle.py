@@ -18,12 +18,16 @@ DEFAULT_CYCLE = {
     "enabled": False, "symbol": "XAUUSD1", "leverage": 2,
     "spread_notional": "10000", "spread_limit_bp": "0.1",
     "min_notional": "0", "max_notional": "10000",
-    "notional_scope": "per_side", "hold_seconds": 60,
+    "notional_scope": "per_side", "hold_seconds": 60, "daily_volume_limit": "0",
 }
 
 
 class CyclePositionError(TradingError):
     """Actual holdings no longer match the cycle's exclusive tracked position."""
+
+
+class DailyVolumeLimitError(TradingError):
+    """A new cycle must wait for the next UTC day's volume allowance."""
 
 
 @dataclass(frozen=True)
@@ -54,7 +58,7 @@ def validate_cycle(config=None):
         raise TradingError("循环持仓时间必须为 1 至 604800 秒的整数")
     if result["notional_scope"] not in ("per_side", "gross"):
         raise TradingError("循环金额口径必须为单边金额或多空合计金额")
-    for key in ("spread_notional", "spread_limit_bp", "min_notional", "max_notional"):
+    for key in ("spread_notional", "spread_limit_bp", "min_notional", "max_notional", "daily_volume_limit"):
         if not isinstance(result[key], str):
             raise TradingError("循环金额及价差必须为十进制字符串")
         result[key] = wire(dec(result[key]))
@@ -65,6 +69,8 @@ def validate_cycle(config=None):
     minimum, maximum = (dec(result[key]) for key in ("min_notional", "max_notional"))
     if not 0 < maximum <= 1000000 or not 0 <= minimum <= maximum:
         raise TradingError("循环金额范围必须满足 0 ≤ 最小金额 ≤ 最大金额 ≤ 1000000，且最大金额大于 0")
+    if not 0 <= dec(result["daily_volume_limit"]) <= 1000000000000:
+        raise TradingError("循环每日成交量上限必须为 0 至 1000000000000 USD1，0 表示不限")
     return result
 
 
@@ -134,7 +140,7 @@ def _spread(buy, sell):
     return (buy - sell) * 20000 / (buy + sell)
 
 
-def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None):
+def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None):
     """Maximize one exact pair, or close precisely the recorded completed pair.
 
     The configured reference amount sweeps each side separately. Its VWAP
@@ -221,12 +227,17 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None):
     occupied = snapshot.occupied_margin_exact
     available, equity = Fraction(snapshot.available), Fraction(snapshot.equity)
     minimum, maximum = (Fraction(dec(config[key])) for key in ("min_notional", "max_notional"))
+    daily_budget = None if daily_remaining is None else Fraction(positive(daily_remaining, True))
     upper = min(maximum_qty, bids.quantity, asks.quantity)
     if config["notional_scope"] == "per_side":
         upper = min(upper, asks.quantity_for(maximum), bids.quantity_for(maximum))
 
-    def resources(qty):
+    def resources(qty, *, quota=True):
         buy, sell = asks.amount(qty), bids.amount(qty)
+        # Reserve both opening fills and their estimated closing fills. A later
+        # price move or necessary repair may still consume more actual volume.
+        if quota and daily_budget is not None and 2 * (buy + sell) > daily_budget:
+            return None
         value = max(buy, sell) if config["notional_scope"] == "per_side" else buy + sell
         if value > maximum or _spread(buy, sell) > limit_bp:
             return None
@@ -246,21 +257,31 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None):
 
     # Sorted books make notional, marginal-price margin, fees and spread
     # nondecreasing in quantity, so a logarithmic exact search is sufficient.
-    low, high = 0, int(upper // step)
-    while low < high:
-        require_search_time()
-        mid = (low + high + 1) // 2
-        if resources(mid * step) is not None:
-            low = mid
-        else:
-            high = mid - 1
-    qty = low * step
-    if not qty or qty < minimum_qty or qty * mark < exchange_minimum:
-        raise TradingError("循环风险、余额或深度不足以满足交易所最小委托")
+    def search(*, quota=True):
+        low, high = 0, int(upper // step)
+        while low < high:
+            require_search_time()
+            mid = (low + high + 1) // 2
+            if resources(mid * step, quota=quota) is not None:
+                low = mid
+            else:
+                high = mid - 1
+        return low * step
+
+    def minimum_error(qty, *, quota=True):
+        if not qty or qty < minimum_qty or qty * mark < exchange_minimum:
+            return "循环风险、余额或深度不足以满足交易所最小委托"
+        buy, sell, _ = resources(qty, quota=quota)
+        amount = min(buy, sell) if config["notional_scope"] == "per_side" else buy + sell
+        return "循环可执行金额低于配置的最小金额" if amount < minimum else None
+
+    qty = search()
+    error = minimum_error(qty)
+    if error:
+        if daily_budget is not None and not minimum_error(search(quota=False), quota=False):
+            raise DailyVolumeLimitError("今日剩余额度不足以完成下一轮开平仓，等待 UTC 00:00 自动恢复")
+        raise TradingError(error)
     buy, sell, projected_ratio = resources(qty)
-    amount = min(buy, sell) if config["notional_scope"] == "per_side" else buy + sell
-    if amount < minimum:
-        raise TradingError("循环可执行金额低于配置的最小金额")
     require_search_time()
     return CyclePlan("open", rule.symbol, decimal_value(qty, exact=True), config["leverage"],
                      decimal_value(buy, exact=True), decimal_value(sell, exact=True),

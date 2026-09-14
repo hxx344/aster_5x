@@ -240,7 +240,10 @@ export function parseCycleDraft(draft: CycleDraft): CycleConfig {
 }
 
 const PHASES: Record<string, { label: string; reason: string }> = {
-  disabled: { label: '未开启', reason: '保存启用设置后，可单独启动本账户循环' },
+  disabled: {
+    label: '未开启',
+    reason: '保存启用设置后，启动账户可运行本品种循环',
+  },
   paused: { label: '已暂停', reason: '已有仓位与持仓计时保留，启动账户后继续' },
   attention: { label: '需要处理', reason: '请核对当前批次，确认成交后再继续' },
   waiting_open: {

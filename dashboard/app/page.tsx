@@ -45,6 +45,7 @@ import {
 import { Progress } from '@/components/ui/progress';
 import { CyclePanel } from '@/components/cycle-panel';
 import { CycleTradesPanel } from '@/components/cycle-trades-panel';
+import { OrdinaryConditions } from '@/components/ordinary-conditions';
 import {
   cycleDraft,
   type CycleConfig,
@@ -54,6 +55,7 @@ import {
 } from '@/lib/cycle';
 import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
+import { ordinaryConditionsView } from '@/lib/ordinary-conditions';
 import {
   ordinaryAddBlock,
   ordinaryCapacityReady,
@@ -153,7 +155,14 @@ type Market = {
   error?: string;
   checked_at: number;
   capacities: Record<string, string>;
-  book?: { bid: string; ask: string; mark: string; spread: string };
+  book?: {
+    bid: string;
+    ask: string;
+    mark: string;
+    spread: string;
+    timestamp?: number;
+  };
+  book_error?: string;
   depth?: DepthQuote;
   depth_error?: string;
 };
@@ -377,14 +386,13 @@ export default function Home() {
   const market = state?.markets[focus];
   const strategy = account?.strategies[focus];
   const focusedOrdinaryBlock = ordinaryAddBlock(account, focus);
-  const currentLeverage =
-    snapshot?.positions.find((p) => p.symbol === focus)?.leverage ||
-    minimumLeverage;
-  const currentLeverageSupported =
-    SUPPORTED_LEVERAGES.includes(currentLeverage);
-  const highLeverage = currentLeverage === 10 || currentLeverage === 20;
-  const openingLimit = highLeverage ? highMarginLimit : marginLimit;
-  const openingPercent = highLeverage ? highMarginPercent : marginPercent;
+  const ordinaryConditions = ordinaryConditionsView(
+    account,
+    market,
+    focus,
+    serverNow,
+    connectionError,
+  );
   const cycleMode = Boolean(account?.cycle?.enabled);
   const upperRiskLimit = cycleMode ? cycleRiskLimit : highMarginLimit;
   const upperRiskPercent = cycleMode ? cycleMarginPercent : highMarginPercent;
@@ -404,8 +412,18 @@ export default function Home() {
     ) || [];
   // Paused accounts poll slowly. The enable endpoint re-reads and validates the
   // account, so an old display snapshot must not prevent requesting a restart.
+  const selectedCycleDraft =
+    cycleDrafts[selected] || cycleDraft(account?.cycle);
+  const cycleSettingsDirty =
+    Boolean(account) &&
+    JSON.stringify(selectedCycleDraft) !==
+      JSON.stringify(cycleDraft(account?.cycle));
   const canStart =
-    account && !account.enabled && state?.ready && !connectionError;
+    account &&
+    !account.enabled &&
+    state?.ready &&
+    !connectionError &&
+    !cycleSettingsDirty;
 
   return (
     <main className="desk">
@@ -919,7 +937,7 @@ export default function Home() {
                 {account ? (
                   <CyclePanel
                     account={account}
-                    draft={cycleDrafts[account.id] || cycleDraft(account.cycle)}
+                    draft={selectedCycleDraft}
                     setDraft={(draft) =>
                       setCycleDrafts((previous) => ({
                         ...previous,
@@ -1036,106 +1054,74 @@ export default function Home() {
                     三项账户模式必须满足，仅核验，不自动修改。下单前与成交后均检查风险。
                   </div>
                 </section>
-                {!account?.cycle?.enabled ? (
-                  <section className="panel execution-panel">
-                    <div className="section-head">
-                      <h2>执行条件</h2>
-                      <span className="symbol-tag">{focus}</span>
-                    </div>
-                    <Gate
-                      label={
-                        focusedOrdinaryBlock
-                          ? ORDINARY_CYCLE_BLOCK_LABEL
-                          : !minimumLeverageSupported
-                            ? '请先选择受支持的最低开仓杠杆'
-                            : !currentLeverageSupported
-                              ? `当前 ${currentLeverage}x 不支持新增开仓`
-                              : currentLeverage < minimumLeverage
-                                ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
-                                : `${currentLeverage}x 额度超过阈值`
-                      }
-                      pass={
-                        currentLeverageSupported &&
-                        minimumLeverageSupported &&
-                        currentLeverage >= minimumLeverage &&
-                        ordinaryCapacityReady(
-                          market?.capacities[currentLeverage],
-                          account?.policy.threshold || '10000',
-                          market?.status === 'ok',
-                          focusedOrdinaryBlock,
-                        )
-                      }
-                      value={
-                        currentLeverageSupported && market?.status === 'ok'
-                          ? fmt(market.capacities[currentLeverage], 0)
-                          : '—'
-                      }
+                <section
+                  className="panel execution-panel"
+                  aria-label="普通加仓条件"
+                >
+                  <div className="section-head">
+                    <h2>普通加仓条件</h2>
+                    <span className="symbol-tag">{focus}</span>
+                  </div>
+                  <OrdinaryConditions
+                    view={ordinaryConditions}
+                    cycleSymbolActive={Boolean(focusedOrdinaryBlock)}
+                  />
+                  <div className="strategy-state">
+                    <i
+                      className={`dot ${account?.enabled && !focusedOrdinaryBlock ? 'mint-bg' : 'amber-bg'}`}
                     />
-                    <Gate
-                      label="BBO 价差 ≤ 万 5"
-                      pass={
-                        !!market?.book && Number(market.book.spread) <= 0.0005
+                    <span>
+                      {focusedOrdinaryBlock ||
+                        strategy?.reason ||
+                        account?.reason ||
+                        '等待接入账户'}
+                    </span>
+                  </div>
+                  <div className="execution-buttons">
+                    <Button
+                      disabled={busy || !canStart}
+                      title={
+                        cycleSettingsDirty
+                          ? '请先保存循环设置'
+                          : '按已保存配置启动本账户，恢复普通加仓和已启用的循环'
                       }
-                      value={
-                        market?.book
-                          ? `${fmt(Number(market.book.spread) * 10000)} bp`
-                          : '—'
+                      onClick={() =>
+                        account &&
+                        void action(`/api/accounts/${account.id}/enable`)
                       }
-                    />
-                    <Gate
-                      label={`普通 ${currentLeverage}x 加仓占用率 < ${openingPercent}%`}
-                      pass={!!fresh && ratio < openingLimit}
-                      value={snapshot ? pct(snapshot.ratio) : '—'}
-                    />
-                    <div className="strategy-state">
-                      <i
-                        className={`dot ${account?.enabled && !focusedOrdinaryBlock ? 'mint-bg' : 'amber-bg'}`}
-                      />
-                      <span>
-                        {focusedOrdinaryBlock ||
-                          strategy?.reason ||
-                          account?.reason ||
-                          '等待接入账户'}
-                      </span>
-                    </div>
-                    <div className="execution-buttons">
-                      <Button
-                        disabled={busy || !canStart}
-                        title="启动前会重新核对账户，满足条件后恢复策略"
-                        onClick={() =>
-                          account &&
-                          void action(`/api/accounts/${account.id}/enable`)
-                        }
-                      >
-                        <CirclePlay size={16} />
-                        {account?.mode === 'paper' ? '启动模拟' : '启动实盘'}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        disabled={busy || !account?.enabled}
-                        onClick={() =>
-                          account &&
-                          void action(`/api/accounts/${account.id}/pause`)
-                        }
-                      >
-                        <CirclePause size={16} />
-                        暂停策略
-                      </Button>
-                    </div>
-                    {account?.status === 'attention' && (
-                      <Button
-                        className="reconcile-button"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() =>
-                          void action(`/api/accounts/${account.id}/retry`)
-                        }
-                      >
-                        核对未完成批次
-                      </Button>
-                    )}
-                  </section>
-                ) : null}
+                    >
+                      <CirclePlay size={16} />
+                      启动账户
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={busy || !account?.enabled}
+                      title="同时暂停本账户普通加仓和循环"
+                      onClick={() =>
+                        account &&
+                        void action(`/api/accounts/${account.id}/pause`)
+                      }
+                    >
+                      <CirclePause size={16} />
+                      暂停账户
+                    </Button>
+                  </div>
+                  <p className="account-controls-note">
+                    账户总开关同时控制本账户普通加仓和循环；按已保存配置运行。
+                  </p>
+                  {account?.status === 'attention' && (
+                    <Button
+                      className="reconcile-button"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() =>
+                        void action(`/api/accounts/${account.id}/retry`)
+                      }
+                    >
+                      核对未完成批次
+                    </Button>
+                  )}
+                </section>
                 <section className="panel settings-panel migration-panel">
                   <div className="section-head">
                     <h2>XAU 仓位迁移</h2>
@@ -1586,24 +1572,5 @@ function Metric({
       <div className={`metric-value ${accent}`}>{value}</div>
       <p>{sub}</p>
     </article>
-  );
-}
-function Gate({
-  label,
-  value,
-  pass,
-}: {
-  label: string;
-  value: string;
-  pass: boolean;
-}) {
-  return (
-    <div className="gate">
-      <span>
-        <i className={`dot ${pass ? 'mint-bg' : 'muted-bg'}`} />
-        {label}
-      </span>
-      <strong>{value}</strong>
-    </div>
   );
 }

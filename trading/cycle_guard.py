@@ -45,3 +45,10 @@ def ordinary_add_blocks(account):
     """Return only protected market entries, using the same selector as execution."""
     enabled, selected = _cycle_selection(account)
     return {selected: _reason(selected)} if enabled else {}
+
+
+def ordinary_add_symbols(account):
+    """Keep ordinary candidates outside this account's selected cycle market."""
+    enabled, selected = _cycle_selection(account)
+    return [symbol for symbol in account["policy"]["symbols"]
+            if not enabled or symbol != selected]

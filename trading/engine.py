@@ -22,7 +22,7 @@ from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, Rol
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
-from .cycle_guard import ordinary_add_blocks
+from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols
 from .models import cycle_margin_limit
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
@@ -183,23 +183,25 @@ class Engine:
             def cost(account):
                 if not account["enabled"]:
                     return 90
-                if account.get("cycle", {}).get("enabled"):
-                    return 240  # Private reads and two independently reconciled legs.
                 if account.get("migration", {}).get("enabled"):
                     # Depth reads share the WS book; retain private rechecks.
                     return 300
+                cycle_cost = 240 if account.get("cycle", {}).get("enabled") else 0
+                markets = ordinary_add_symbols(account)
+                if not markets:
+                    return cycle_cost
                 positions = self.views.get(account["id"], {}).get("snapshot", {}).get("positions", [])
                 minimum = minimum_open_leverage(account["policy"])
-                for symbol in account["policy"]["symbols"]:
+                for symbol in markets:
                     pair = [p for p in positions if p["symbol"] == symbol]
                     if len(pair) != 2:
-                        return 300  # Cold start may perform and confirm an upgrade.
+                        return cycle_cost + 300  # Cold start may confirm an upgrade.
                     leverage = pair[0]["leverage"]
                     caps = self.markets.get(symbol, {}).get("capacities", {})
                     threshold = dec(account["policy"]["threshold"])
                     if any(target > leverage and dec(caps.get(str(target), "0")) > threshold for target in leverage_candidates(minimum)):
-                        return 300
-                return 120
+                        return cycle_cost + 300
+                return cycle_cost + 120
             costs = {a["id"]: cost(a) for a in live}
         period = 60 * sum(costs.values()) / capacity
         return {a["id"]: {
@@ -216,6 +218,11 @@ class Engine:
         if snapshot is not None:
             try:
                 snapshot.require_fresh()
+                # Executors can request fewer markets than the combined worker.
+                # Live responses omit unrequested flat symbols; freshness alone
+                # does not prove this snapshot covers every requested market.
+                for symbol in symbols:
+                    snapshot.pair(symbol)
                 return snapshot
             except TradingError:
                 pass
@@ -318,7 +325,7 @@ class Engine:
                 if fresh and account and account["enabled"] and self.live_allowed(account) and account.get("migration", {}).get("enabled"):
                     if symbol in ("SPCXUSD1", "CLUSD1") and capacities.get(5, dec(0)) > 0:
                         levels = (5,)
-                elif fresh and account and account["enabled"] and not account.get("cycle", {}).get("enabled") and self.live_allowed(account) and symbol in account["policy"]["symbols"]:
+                elif fresh and account and account["enabled"] and self.live_allowed(account) and symbol in ordinary_add_symbols(account):
                     positions = [p for p in self.views.get(aid, {}).get("snapshot", {}).get("positions", []) if p["symbol"] == symbol]
                     current = max((p["leverage"] for p in positions), default=0)
                     threshold = dec(account["policy"]["threshold"])
@@ -630,7 +637,7 @@ class Engine:
         return progress
 
     def tick_cycle_account(self, account, broker, pending):
-        """Run the opt-in cycle without entering the automatic-add path."""
+        """Advance only the selected cycle; the account worker owns other markets."""
         aid = account["id"]
         config = validate_cycle(account.get("cycle"))
         symbol = pending["symbol"] if pending else config["symbol"]
@@ -730,6 +737,22 @@ class Engine:
             self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]))
         return 5
 
+    def cycle_wait(self, account, exc):
+        """A local cycle condition must not suppress ordinary work elsewhere."""
+        aid, message = account["id"], str(exc)
+        with self.lock:
+            previous = self.views.get(aid, {}).get("cycle_state", {}).get("reason")
+        if previous != message:
+            self.store.event(aid, "wait", message)
+        progress = self.store.get("cycle:" + aid) or {}
+        phase = ("rolling_limit" if isinstance(exc, RollingVolumeLimitError) else
+                 "daily_limit" if isinstance(exc, DailyVolumeLimitError) else
+                 "waiting_close" if progress.get("opened_at") is not None else "waiting_open")
+        quota = self.cycle_volume_state(account)["daily_volume"] if isinstance(exc, DailyVolumeLimitError) else {}
+        self.cycle_view(account, phase=phase, reason=message,
+                        quota_utc_date=quota.get("utc_date"), quota_remaining=quota.get("effective_remaining"),
+                        diagnostic=getattr(exc, "diagnostic", None))
+
     def tick_account(self, account_id):
         with self.account_lock(account_id):
             with self.lock:
@@ -742,12 +765,42 @@ class Engine:
             if not account:
                 return 5
             pending = None
+            cycle_context = False
             try:
                 broker = self.broker(account)
                 pending = self.store.intent(account_id)
-                if (pending and pending["kind"] in ("cycle", "cycle_leverage")) or (not pending and account.get("cycle", {}).get("enabled")):
+                cycling = account.get("cycle", {}).get("enabled")
+                ordinary_markets = ordinary_add_symbols(account)
+                if pending and pending["kind"] in ("cycle", "cycle_leverage"):
+                    cycle_context = True
+                    progressed = True
                     return self.tick_cycle_account(account, broker, pending)
+                if not pending and cycling and not self.store.get("post_fill_check:" + account_id):
+                    cycle_context = True
+                    if not ordinary_markets:
+                        return self.tick_cycle_account(account, broker, None)
+                    try:
+                        self.tick_cycle_account(account, broker, None)
+                    except (ExchangeError, AccountModeError, CyclePositionError):
+                        # Shared budget, transport, and account integrity errors
+                        # keep their account-wide stop/backoff behavior.
+                        raise
+                    except TradingError as exc:
+                        if self.store.intent(account_id):
+                            raise
+                        self.cycle_wait(account, exc)
+                    # A cycle may have completed, paused the account, or left an
+                    # uncertain batch. Never reuse its pre-mutation account view.
+                    account = self.store.account(account_id)
+                    if self.store.intent(account_id):
+                        progressed = True
+                        return 5
+                    if not account or not account["enabled"] or self.shutdown.is_set():
+                        return 5
+                    cycle_context = False
                 symbols = migration_symbols(account)
+                if cycling:
+                    symbols = list(dict.fromkeys([*symbols, account["cycle"]["symbol"]]))
                 if pending and (pending["kind"] == "migration" or pending.get("purpose") == "migration"):
                     symbols = list(dict.fromkeys([*symbols, *SYMBOLS]))
                 recovery = bool(pending or self.store.get("post_fill_check:" + account_id))
@@ -808,7 +861,11 @@ class Engine:
                     return self.tick_migration(account, snapshot, broker)
                 policy = account["policy"]
                 minimum = minimum_open_leverage(policy)
-                markets = policy["symbols"]
+                markets = ordinary_add_symbols(account)
+                for symbol, reason in ordinary_add_blocks(account).items():
+                    self.strategy(account_id, symbol, reason, "disabled")
+                if not markets:
+                    return 5
                 start = self.rotation.get(account_id, 0) % len(markets)
                 ordered = markets[start:] + markets[:start]
                 last_reason = "等待交易条件"
@@ -884,7 +941,7 @@ class Engine:
                                 self.strategy(account_id, symbol, last_reason)
                                 continue
                             if isinstance(broker, LiveBroker):
-                                broker.api.budget.require_available(broker.snapshot_weight(markets, fresh_modes=True) + 1)
+                                broker.api.budget.require_available(broker.snapshot_weight(account["policy"]["symbols"], fresh_modes=True) + 1)
                             def validate_upgrade(current):
                                 latest_book = self.market.book(symbol)
                                 latest_book.require_fresh()
@@ -909,11 +966,11 @@ class Engine:
                         progressed, consumed_symbol = True, symbol
                         # A completed pair is followed by an actual account risk check.
                         self.record_batch_outcome(account_id, executor)
-                        after = self.completed_snapshot(executor, broker, markets)
+                        after = self.completed_snapshot(executor, broker, symbols)
                         unresolved = self.store.intent(account_id)
                         phase = ("attention" if unresolved["status"] == "attention" else "reconciling") if unresolved else "filled"
-                        self.view(account_id, snapshot=snapshot_json(after, markets), reason=reason, status=phase if unresolved else "running")
-                        after.require_modes(markets)
+                        self.view(account_id, snapshot=snapshot_json(after, symbols), reason=reason, status=phase if unresolved else "running")
+                        after.require_modes(symbols)
                         self.strategy(account_id, symbol, reason, phase)
                         self.check_post_fill_occupancy(account, after)
                         self.rotation[account_id] = (markets.index(symbol) + 1) % len(markets)
@@ -947,7 +1004,8 @@ class Engine:
                 self.view(account_id, status=status, reason=message, credential_ready=account_id in self.brokers)
                 if account.get("migration", {}).get("enabled") or (pending and pending.get("kind") == "migration"):
                     self.migration_view(account, phase="attention" if status == "attention" else "waiting", reason=message)
-                if account.get("cycle", {}).get("enabled") or (pending and pending.get("kind") in ("cycle", "cycle_leverage")):
+                if cycle_context or (pending and pending.get("kind") in ("cycle", "cycle_leverage")) or (
+                        status == "attention" and account.get("cycle", {}).get("enabled")):
                     progress = self.store.get("cycle:" + account_id) or {}
                     phase = "rolling_limit" if isinstance(exc, RollingVolumeLimitError) else "daily_limit" if isinstance(exc, DailyVolumeLimitError) else "attention" if status == "attention" else "waiting_close" if progress.get("opened_at") is not None else "waiting_open"
                     quota = self.cycle_volume_state(account)["daily_volume"] if isinstance(exc, DailyVolumeLimitError) else {}
@@ -1055,11 +1113,13 @@ class Engine:
             view_updates = {}
             if enabled:
                 cycling = account.get("cycle", {}).get("enabled")
-                if account.get("leverage_setting_required") and not cycling:
+                ordinary_markets = ordinary_add_symbols(account)
+                ordinary_active = bool(ordinary_markets) and not account.get("migration", {}).get("enabled")
+                if account.get("leverage_setting_required") and (not cycling or ordinary_active):
                     raise TradingError("请先在 5x、10x、20x 中保存最低开仓杠杆设置")
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
-                if not cycling and not account.get("migration", {}).get("enabled") and dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
+                if ordinary_active and dec(account["policy"]["order_notional"]) < MIN_BATCH_NOTIONAL:
                     raise TradingError("单批每边上限低于固定最低批次金额 500 USD1，请先修改策略设置")
                 if self.store.intent(account_id):
                     raise TradingError("请先核对未完成批次")
@@ -1073,6 +1133,13 @@ class Engine:
                     if not snapshot.can_trade or snapshot.open_orders is None or snapshot.open_orders:
                         raise TradingError("多空循环需要交易权限及已确认无挂单的账户")
                     self.cycle_progress(account, snapshot)
+                    if ordinary_markets:
+                        symbols = list(dict.fromkeys([*account["policy"]["symbols"], account["cycle"]["symbol"]]))
+                        snapshot = broker.snapshot(symbols, fresh_modes=True)
+                        snapshot.require_modes(symbols)
+                        for symbol in ordinary_markets:
+                            snapshot.require_ready(symbol)
+                        self.cycle_progress(account, snapshot)
                 else:
                     snapshot = broker.snapshot(symbols, fresh_modes=True)
                     for symbol in symbols:

@@ -504,8 +504,9 @@ export function CyclePanel({
           </p>
         </fieldset>
         <p className="muted">
-          多空订单成批提交，成交不保证同一瞬间完成。此模式独立于普通加仓与 XAU
-          迁移；更改设置需先暂停、核对完当前批次并将循环仓位全部平仓。保存不会启动交易。
+          多空订单成批提交，成交不保证同一瞬间完成。循环品种禁止本账户普通加仓，其他已配置品种可同时运行普通加仓。循环与
+          XAU
+          迁移不可同时开启；更改设置需先暂停账户、核对完当前批次并将循环仓位全部平仓。保存不会启动账户。
         </p>
         {ownedPosition ? (
           <p className="muted amber">
@@ -523,22 +524,30 @@ export function CyclePanel({
       </form>
       <div className="execution-buttons cycle-buttons">
         <Button
-          disabled={busy || !canStart || !account.cycle?.enabled || dirty}
-          title={dirty ? '请先保存循环设置' : '按已保存的循环设置启动账户'}
+          disabled={busy || !canStart || dirty}
+          title={
+            dirty
+              ? '请先保存循环设置'
+              : '按已保存配置启动本账户，恢复普通加仓和已启用的循环'
+          }
           onClick={() => void action(`/api/accounts/${account.id}/enable`)}
         >
           <CirclePlay size={16} />
-          {account.mode === 'paper' ? '启动模拟循环' : '启动实盘循环'}
+          启动账户
         </Button>
         <Button
           variant="outline"
-          disabled={busy || !account.enabled || !account.cycle?.enabled}
+          disabled={busy || !account.enabled}
+          title="同时暂停本账户普通加仓和循环"
           onClick={() => void action(`/api/accounts/${account.id}/pause`)}
         >
           <CirclePause size={16} />
-          暂停循环
+          暂停账户
         </Button>
       </div>
+      <p className="account-controls-note">
+        账户总开关同时控制本账户普通加仓和循环；按已保存配置运行。
+      </p>
       {account.cycle?.enabled && account.status === 'attention' ? (
         <Button
           className="reconcile-button"
@@ -546,7 +555,7 @@ export function CyclePanel({
           disabled={busy}
           onClick={() => void action(`/api/accounts/${account.id}/retry`)}
         >
-          核对循环未完成批次
+          核对账户未完成批次
         </Button>
       ) : null}
     </section>

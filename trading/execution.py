@@ -117,6 +117,9 @@ class Executor:
     def leverage(self, account, symbol, old, target, snapshot=None, before_submit=None, *, purpose=None, symbols=None):
         self.last_snapshot = None
         self.last_completed_intent = None
+        blocked = ordinary_add_block_reason(account, symbol)
+        if blocked:
+            raise TradingError(blocked)
         require_supported_leverage(target)
         require_non_decreasing_leverage(old, target)
         # Re-read before creating intent; the selection snapshot may now be stale.
@@ -134,6 +137,12 @@ class Executor:
             return f"当前已为 {old}x，保持杠杆不变"
         if before_submit is not None and not isinstance(self.broker, LiveBroker):
             before_submit(snapshot)
+        latest = self.store.account(account["id"])
+        if latest is None:
+            raise TradingError("账户不存在，禁止普通杠杆调整")
+        blocked = ordinary_add_block_reason(latest, symbol)
+        if blocked:
+            raise TradingError(blocked)
         intent = {"id": uuid.uuid4().hex, "kind": "leverage", "account_id": account["id"], "symbol": symbol,
                   "previous": old, "target": target, "created_at": time.time(), "status": "pending"}
         if purpose is not None:

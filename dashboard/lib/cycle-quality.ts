@@ -29,6 +29,15 @@ export type CycleExecutionQuality = {
     final_check_to_request_ms: number | null;
     request_to_response_ms: number | null;
     request_status: 'returned' | 'failed' | 'not_sent' | 'unknown';
+    pre_submit?: {
+      queue_ms: number | null;
+      initial_account_ms: number | null;
+      planning_ms: number | null;
+      final_account_ms: number | null;
+      final_check_ms: number | null;
+      persist_ms: number | null;
+      other_ms: number | null;
+    };
   };
   actual: {
     status:
@@ -173,6 +182,16 @@ const REQUEST_STATUS: Record<string, string> = {
   unknown: '未记录',
 };
 
+const PRE_SUBMIT_STAGES = [
+  ['queue_ms', '触发→账户任务开始'],
+  ['initial_account_ms', '首轮账户查询'],
+  ['planning_ms', '首轮规划与盘口'],
+  ['final_account_ms', '提交前账户复核'],
+  ['final_check_ms', '最终盘口与风控检查'],
+  ['persist_ms', '订单记录写入'],
+  ['other_ms', '其他本地准备'],
+] as const;
+
 export function cycleExecutionQualityView(
   quality?: CycleExecutionQuality | null,
 ) {
@@ -276,6 +295,17 @@ export function cycleExecutionQualityView(
             : '—',
       },
     ],
+    preSubmit: PRE_SUBMIT_STAGES.map(([key, label]) => {
+      const value = timing?.pre_submit?.[key];
+      return {
+        key,
+        label,
+        value:
+          typeof value === 'number' && Number.isFinite(value) && value >= 0
+            ? String(value)
+            : '—',
+      };
+    }),
     triggerSource:
       triggerSource === 'bbo'
         ? 'WS 最优盘口'

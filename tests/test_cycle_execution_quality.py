@@ -51,7 +51,9 @@ class CycleExecutionQualityTests(unittest.TestCase):
         trigger = {"source": "bbo", "received_at": now - .1, "received_monotonic": 99.9,
                    "checked_at": now, "depth": trigger_depth}
         final = {"depth": final_depth, "checked_at": now, "checked_monotonic": 99.995}
-        with patch("trading.cycle_quality.time.monotonic", side_effect=[100, 100.025]), \
+        with patch("trading.cycle_execution.clock_tick", return_value=None), \
+             patch("trading.cycle_quality.clock_tick", return_value=None), \
+             patch("trading.cycle_quality.time.monotonic", side_effect=[100, 100.025]), \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.start(trigger=trigger, before_submit=lambda snapshot: final)
         self.assertEqual(submit.call_count, 1)
@@ -202,7 +204,9 @@ class CycleExecutionQualityTests(unittest.TestCase):
         with patch.object(broker, "submit", side_effect=AssertionError("never resend")):
             executor.reconcile(self.f.account, historical)
         self.assertEqual(self.quality()["timing"]["request_status"], "unknown")
-        self.assertTrue(all(value is None for key, value in self.quality()["timing"].items() if key != "request_status"))
+        self.assertTrue(all(value is None for key, value in self.quality()["timing"].items()
+                            if key not in ("request_status", "pre_submit")))
+        self.assertTrue(all(value is None for value in self.quality()["timing"]["pre_submit"].values()))
 
     def test_final_estimate_reads_only_local_cache_and_no_extra_receipt_queries(self):
         depth = self.f.market.depth("XAUUSD1")

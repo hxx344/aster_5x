@@ -352,15 +352,15 @@ class CycleLiveBrokerTests(unittest.TestCase):
         self.live = LiveBroker({}, self.f.market, api=self.api)
 
     def test_cycle_snapshot_verifies_selected_symbol_open_orders(self):
-        snapshot = self.f.broker.snapshot(["XAUUSD1"])
-        snapshot.open_orders = None
-        self.api.call.return_value = []
-        with patch.object(self.live, "snapshot", return_value=snapshot):
-            verified = self.live.cycle_snapshot(["XAUUSD1"])
+        from .test_exchange_hardening import FixtureAPI, account_responses
+        responses = account_responses()
+        self.live.api = FixtureAPI(responses)
+        verified = self.live.cycle_snapshot(["XAUUSD1"])
         self.assertEqual(verified.open_orders, [])
-        self.api.call.assert_called_once_with("GET", "/fapi/v3/openOrders", {"symbol": "XAUUSD1"}, signed=True)
-        self.api.call.return_value = [{"symbol": "CLUSD1"}]
-        with patch.object(self.live, "snapshot", return_value=snapshot), self.assertRaises(TradingError):
+        calls = [call for call in self.live.api.calls if call[1] == "/fapi/v3/openOrders"]
+        self.assertEqual(calls, [("GET", "/fapi/v3/openOrders", ({"symbol": "XAUUSD1"},), {"signed": True, "weight": 1})])
+        responses["/fapi/v3/openOrders"] = [{"symbol": "CLUSD1"}]
+        with self.assertRaises(TradingError):
             self.live.cycle_snapshot(["XAUUSD1"])
 
     def test_cycle_leverage_does_not_trust_old_flat_snapshot(self):

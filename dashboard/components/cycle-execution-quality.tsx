@@ -117,6 +117,20 @@ export function CycleExecutionQualityPanel({
                   <dd>{view.triggerReceivedAt}</dd>
                 </div>
               </dl>
+              <section className="cycle-quality-stage">
+                <h4>发单准备耗时</h4>
+                <p className="cycle-quality-note">
+                  各项均发生在请求开始前；旧批次可能未记录。
+                </p>
+                <dl className="cycle-quality-fields">
+                  {view.preSubmit.map((item) => (
+                    <div key={item.key}>
+                      <dt>{item.label}</dt>
+                      <dd>{item.value} ms</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
               {[
                 {
                   key: 'trigger',

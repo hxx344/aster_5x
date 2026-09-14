@@ -8,7 +8,8 @@ from fractions import Fraction
 
 from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
-from .cycle_quality import ObservedBroker, actual, estimate, new_quality, timestamp
+from .cycle_quality import (ObservedBroker, actual, clock_tick, estimate, estimate_from_plan,
+                            new_quality, record_duration, timestamp)
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
@@ -229,7 +230,9 @@ class CycleExecutor(Executor):
         if qty != floor_step(qty, rule.step) or not rule.min_qty <= qty <= rule.max_qty:
             raise TradingError("循环批次数量不符合交易规则")
         selected = self._ready(snapshot, symbol)
+        final_account_started = clock_tick()
         snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+        record_duration(quality, "final_account_ms", final_account_started)
         long, short = self._ready(snapshot, symbol)
         if any(current.qty != previous.qty or current.leverage != previous.leverage
                for current, previous in zip((long, short), selected)):
@@ -256,7 +259,9 @@ class CycleExecutor(Executor):
         book.require_fresh()
         final_observation = None
         if before_submit is not None:
+            final_check_started = clock_tick()
             final_observation = before_submit(snapshot)
+            record_duration(quality, "final_check_ms", final_check_started)
         try:
             if isinstance(final_observation, dict):
                 depth = final_observation.get("depth")
@@ -268,7 +273,10 @@ class CycleExecutor(Executor):
                 depth = stream.snapshot(symbol) if stream is not None else None
                 checked_at = time.time() if depth is not None else None
             if quality is not None:
-                quality["final_estimate"] = estimate(wire(qty), depth, checked_at)
+                quality_plan = final_observation.get("quality_plan") if isinstance(final_observation, dict) else None
+                quality["final_estimate"] = (
+                    estimate_from_plan(wire(qty), quality_plan, depth, checked_at, symbol=symbol, phase=plan.phase)
+                    if quality_plan is not None else estimate(wire(qty), depth, checked_at))
                 if quality["final_estimate"]["status"] != "available":
                     final_ticks = None
                 elif not isinstance(final_observation, dict):
@@ -299,9 +307,10 @@ class CycleExecutor(Executor):
         if quality is not None:
             quality.update(intent_id=token, created_at=intent["created_at"])
             intent["execution_quality"] = quality
-        self.store.save_intent(intent)
         action = "开仓" if plan.phase == "open" else "平仓"
-        self.store.event(account["id"], "cycle", f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
+        persist_started = clock_tick()
+        self.store.create_cycle_intent(intent, f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
+        record_duration(quality, "persist_ms", persist_started)
         self._quality_clocks = (token, trigger_ticks, final_ticks)
         try:
             self.send(intent, orders)

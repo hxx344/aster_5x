@@ -1,6 +1,7 @@
 """Aster V3 EIP-712 API adapter. No automatic retries of signed mutations."""
 import json
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from email.utils import parsedate_to_datetime
 from fractions import Fraction
@@ -111,6 +112,22 @@ class RateBudget:
             yield self
         finally:
             self.priority.cycle_accounting = previous
+
+    def _priority_flags(self):
+        return tuple(getattr(self.priority, name, False) for name in
+                     ("reconciliation", "cycle_accounting", "capacity_monitoring"))
+
+    @contextmanager
+    def _inherit_priority(self, flags):
+        previous = self._priority_flags()
+        names = ("reconciliation", "cycle_accounting", "capacity_monitoring")
+        for name, value in zip(names, flags):
+            setattr(self.priority, name, value)
+        try:
+            yield
+        finally:
+            for name, value in zip(names, previous):
+                setattr(self.priority, name, value)
 
     def _refresh(self, now):
         if now >= self.deadline:
@@ -619,18 +636,27 @@ class LiveBroker:
         return weight
 
     def snapshot(self, symbols, fresh_modes=False):
+        return self._snapshot(symbols, fresh_modes=fresh_modes)
+
+    def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None):
+        """Shared parsing; the ordinary path retains its sequential reads."""
         self.leverage_snapshot = None
-        started = time.time()
+        started = time.time() if started is None else started
+        if read is None:
+            def read(key, path, params=None, *, ttl=None, weight=1):
+                if ttl is not None:
+                    return self.cached_call(key, path, params, ttl=ttl, weight=weight)
+                return self.api.call("GET", path, params, signed=True, weight=weight)
         if fresh_modes:
             self.cached_at.pop("dual", None)
             self.cached_at.pop("multi", None)
-        dual = self.cached_call("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
-        multi = self.cached_call("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
+        dual = read("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
+        multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
         if (not isinstance(dual, dict) or not isinstance(multi, dict)
                 or type(dual.get("dualSidePosition")) is not bool or type(multi.get("multiAssetsMargin")) is not bool):
             raise TradingError("账户持仓或保证金模式响应无效")
-        account = self.api.call("GET", "/fapi/v3/accountWithJoinMargin", signed=True, weight=5)
-        rows = self.api.call("GET", "/fapi/v3/positionRisk", signed=True, weight=5)
+        account = read("account", "/fapi/v3/accountWithJoinMargin", weight=5)
+        rows = read("positions", "/fapi/v3/positionRisk", weight=5)
         if (not isinstance(account, dict) or not isinstance(account.get("assets"), list)
                 or any(not isinstance(a, dict) for a in account["assets"])):
             raise TradingError("账户资产响应无效")
@@ -682,7 +708,7 @@ class LiveBroker:
                 raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
         brackets = {}
         for symbol in symbols:
-            b = self.cached_call("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
+            b = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
             if isinstance(b, list):
                 if any(not isinstance(item, dict) for item in b):
                     raise TradingError("账户风控档位响应无效")
@@ -732,17 +758,100 @@ class LiveBroker:
         return result
 
     def cycle_snapshot(self, symbols, fresh_modes=False):
-        """Confirm selected-symbol external orders for the isolated cycle."""
-        snapshot = self.snapshot(symbols, fresh_modes=fresh_modes)
-        orders = []
-        for symbol in symbols:
-            rows = self.api.call("GET", "/fapi/v3/openOrders", {"symbol": symbol}, signed=True)
-            if not isinstance(rows, list) or any(not isinstance(row, dict) or row.get("symbol") != symbol for row in rows):
-                raise TradingError("独立循环未完成挂单响应无效")
-            orders.extend(rows)
-        snapshot.open_orders = orders
-        snapshot.require_fresh()
-        return snapshot
+        """Join independent cycle GETs before validating one complete snapshot.
+
+        Aster V3 keeps the latest 100 unique nonces per signer, allowing a small
+        out-of-order group; API's nonce lock preserves uniqueness. HTTPX Client
+        supports sharing across threads. Only GETs use this bounded local pool.
+        """
+        symbols = tuple(symbols)
+        self.leverage_snapshot = None
+        started = time.time()
+        if fresh_modes:
+            self.cached_at.pop("dual", None)
+            self.cached_at.pop("multi", None)
+        specs = [("dual", "/fapi/v3/positionSide/dual", None, 15, 30),
+                 ("multi", "/fapi/v3/multiAssetsMargin", None, 15, 30),
+                 ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5),
+                 ("positions", "/fapi/v3/positionRisk", None, None, 5)]
+        specs.extend(("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, 5, 1)
+                     for symbol in dict.fromkeys(symbols))
+        specs.extend(("orders:" + str(index), "/fapi/v3/openOrders", {"symbol": symbol}, None, 1)
+                     for index, symbol in enumerate(symbols))
+        values, fetched, pending = {}, {}, []
+        for key, path, params, ttl, weight in specs:
+            stamp = self.cached_at.get(key, -1e9)
+            if ttl is not None and time.monotonic() - stamp < ttl:
+                values[key] = self.cached[key]
+            else:
+                pending.append((key, path, params, ttl, weight))
+        budget = getattr(self.api, "budget", None)
+        flags = budget._priority_flags() if isinstance(budget, RateBudget) else None
+
+        def fetch(spec):
+            key, path, params, ttl, weight = spec
+            context = budget._inherit_priority(flags) if flags is not None else nullcontext()
+            with context:
+                stamp = time.monotonic()
+                value = self.api.call("GET", path, params, signed=True, weight=weight)
+                return value, stamp
+
+        errors = []
+        # Exiting the pool waits even on failure: no private read can outlive its
+        # account work or overlap the next verification/submit round.
+        with ThreadPoolExecutor(max_workers=min(6, len(pending)), thread_name_prefix="cycle-read") as pool:
+            futures = [(spec, pool.submit(fetch, spec)) for spec in pending]
+            for spec, future in futures:
+                try:
+                    value, stamp = future.result()
+                    values[spec[0]] = value
+                    if spec[3] is not None:
+                        fetched[spec[0]] = (value, stamp)
+                except BaseException as exc:
+                    errors.append(exc)
+        if errors:
+            def priority(exc):
+                if not isinstance(exc, Exception):
+                    return (5, 0)
+                if isinstance(exc, AccountModeError):
+                    return (4, 0)
+                if isinstance(exc, ExchangeError) and not isinstance(exc, RequestNotSent):
+                    try:
+                        delay = float(exc.retry_after)
+                    except (TypeError, ValueError, OverflowError):
+                        delay = 0
+                    return (3, delay if math.isfinite(delay) else 0)
+                return (1 if isinstance(exc, RequestNotSent) else 2, 0)
+            raise max(errors, key=priority)
+
+        def read(key, path, params=None, *, ttl=None, weight=1):
+            # Brackets were formerly inspected after the account reads. Both a
+            # cached value and this round's early response can expire in flight.
+            if key.startswith("bracket:"):
+                stamp = fetched[key][1] if key in fetched else self.cached_at.get(key, -1e9)
+                if time.monotonic() - stamp >= ttl:
+                    value, stamp = fetch((key, path, params, ttl, weight))
+                    values[key], fetched[key] = value, (value, stamp)
+            return values[key]
+
+        try:
+            snapshot = self._snapshot(symbols, fresh_modes=fresh_modes, read=read, started=started)
+            orders = []
+            for index, symbol in enumerate(symbols):
+                rows = values["orders:" + str(index)]
+                if not isinstance(rows, list) or any(not isinstance(row, dict) or row.get("symbol") != symbol for row in rows):
+                    raise TradingError("独立循环未完成挂单响应无效")
+                orders.extend(rows)
+            snapshot.open_orders = orders
+            snapshot.require_fresh()
+            # Failed rounds publish neither partially refreshed caches nor an
+            # authorization token; cache age includes signing and network time.
+            for key, (value, stamp) in fetched.items():
+                self.cached[key], self.cached_at[key] = value, stamp
+            return snapshot
+        except BaseException:
+            self.leverage_snapshot = None
+            raise
 
     @staticmethod
     def _leverage(value):

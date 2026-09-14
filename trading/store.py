@@ -281,6 +281,19 @@ class Store:
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
             self._index_cycle_volume(db, intent)
 
+    def create_cycle_intent(self, intent, message):
+        """Commit a new pending cycle, its volume index and event before send."""
+        if intent.get("kind") != "cycle" or intent.get("status") != "pending":
+            raise TradingError("只能创建新的待提交循环批次")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # This is creation, never an upsert of a previously submitted ID.
+            db.execute("INSERT INTO intents VALUES (?,?,?,?)",
+                       (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
+            self._index_cycle_volume(db, intent)
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
+                       (intent["account_id"], "cycle", message, time.time()))
+
     def record_cycle_execution_quality(self, intent):
         """Update display metadata only; leave status and volume indexes intact."""
         quality = intent["execution_quality"]

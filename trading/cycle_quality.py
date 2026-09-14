@@ -9,9 +9,15 @@ from fractions import Fraction
 import math
 import time
 
-from .cycle import _depth_sweeps
+from .cycle import CYCLE_DEPTH_MAX_AGE, _depth_sweeps
 from .exchange import RequestNotSent
 from .models import positive, wire
+
+
+# Non-overlapping scopes: trigger reception -> worker start; first account
+# snapshot; primary public reads + planning; final account snapshot; final
+# callback; atomic intent/event commit. Other is the measured total's remainder.
+PRE_SUBMIT_FIELDS = ("queue_ms", "initial_account_ms", "planning_ms", "final_account_ms", "final_check_ms", "persist_ms")
 
 
 def timestamp(value):
@@ -45,6 +51,53 @@ def estimate(quantity, depth=None, checked_at=None):
     return result
 
 
+def estimate_from_plan(quantity, plan, depth, checked_at, *, symbol, phase):
+    """Reuse exact final-plan amounts for display without walking depth again."""
+    result = {"status": "unavailable", "sampled_at": None, "checked_at": timestamp(checked_at),
+              "quantity": quantity, "buy_vwap": None, "sell_vwap": None, "spread_bp": None}
+    try:
+        result["sampled_at"] = timestamp(depth.timestamp)
+        if phase not in ("open", "close") or plan.symbol != symbol or plan.phase != phase:
+            return result
+        qty = Fraction(positive(quantity))
+        if Fraction(positive(plan.qty)) != qty:
+            return result
+        checked_at = result["checked_at"] if result["checked_at"] is not None else time.time()
+        depth.require_fresh(checked_at)
+        if not -1 <= depth.age(checked_at) <= CYCLE_DEPTH_MAX_AGE:
+            return result
+        long, short = Fraction(positive(plan.long_notional)), Fraction(positive(plan.short_notional))
+        buy, sell = (long / qty, short / qty) if phase == "open" else (short / qty, long / qty)
+        # plan.spread_bp describes the configured reference amount, which may
+        # differ from this batch's quantity. Derive this spread from its amounts.
+        result.update(status="available", checked_at=checked_at, buy_vwap=number(buy),
+                      sell_vwap=number(sell), spread_bp=number((buy - sell) * 20000 / (buy + sell)))
+    except Exception:
+        pass
+    return result
+
+
+def pre_submit_timing(raw=None):
+    raw = raw if isinstance(raw, dict) else {}
+    return {key: timestamp(raw.get(key)) if key in PRE_SUBMIT_FIELDS[:3] else None
+            for key in (*PRE_SUBMIT_FIELDS, "other_ms")}
+
+
+def clock_tick():
+    """Missing observation clocks must never interrupt a trading operation."""
+    try:
+        return timestamp(time.monotonic())
+    except Exception:
+        return None
+
+
+def record_duration(quality, key, started):
+    try:
+        quality["timing"]["pre_submit"][key] = elapsed(started, clock_tick())
+    except Exception:
+        pass
+
+
 def new_quality(intent, trigger=None):
     trigger = trigger if isinstance(trigger, dict) else {}
     quantity = wire(positive(intent["quantity"]))
@@ -57,7 +110,8 @@ def new_quality(intent, trigger=None):
             "final_estimate": estimate(quantity),
             "timing": {"request_status": "unknown", "request_started_at": None, "response_received_at": None,
                        "trigger_to_request_ms": None, "final_check_to_request_ms": None,
-                       "request_to_response_ms": None},
+                       "request_to_response_ms": None,
+                       "pre_submit": pre_submit_timing(trigger.get("pre_submit"))},
             "actual": actual(intent)}
 
 
@@ -132,6 +186,15 @@ class ObservedBroker:
             timing.update(request_started_at=time.time(), request_status="unknown",
                           trigger_to_request_ms=elapsed(self._trigger_ticks, started),
                           final_check_to_request_ms=elapsed(self._final_ticks, started))
+            sections = timing.get("pre_submit")
+            if isinstance(sections, dict):
+                sections["other_ms"] = None
+                total = timestamp(timing["trigger_to_request_ms"])
+                measured = [timestamp(sections.get(key)) for key in PRE_SUBMIT_FIELDS]
+                if total is not None and all(value is not None for value in measured):
+                    accounted = math.fsum(measured)
+                    if math.isfinite(accounted) and accounted <= total + 0.000001:
+                        sections["other_ms"] = max(0, total - accounted)
         except Exception:
             pass
         try:

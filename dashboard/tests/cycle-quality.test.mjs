@@ -272,3 +272,101 @@ test('old responses, incomplete new responses and account changes never retain a
   assert.equal(cycleExecutionQualityView(undefined), null);
   assert.deepEqual(quality, original);
 });
+
+test('pre-submit measurements remain separate from the existing overlapping total durations', () => {
+  const source = {
+    ...quality,
+    timing: {
+      ...quality.timing,
+      pre_submit: {
+        queue_ms: 3.125,
+        initial_account_ms: 150.01,
+        planning_ms: 0,
+        final_account_ms: 200.02,
+        final_check_ms: 17.3,
+        persist_ms: 2.1,
+        other_ms: 36.445,
+      },
+    },
+  };
+  const original = structuredClone(source);
+  const view = cycleExecutionQualityView(source);
+  assert.deepEqual(
+    view.preSubmit.map((item) => item.label),
+    [
+      '触发→账户任务开始',
+      '首轮账户查询',
+      '首轮规划与盘口',
+      '提交前账户复核',
+      '最终盘口与风控检查',
+      '订单记录写入',
+      '其他本地准备',
+    ],
+  );
+  assert.deepEqual(
+    view.preSubmit.map((item) => item.value),
+    ['3.125', '150.01', '0', '200.02', '17.3', '2.1', '36.445'],
+  );
+  assert.deepEqual(view.timing, cycleExecutionQualityView(quality).timing);
+  assert.deepEqual(source, original);
+});
+
+test('old batches and missing pre-submit fields remain unknown instead of inheriting a total or HTTP duration', () => {
+  for (const pre_submit of [undefined, null, {}, { queue_ms: 0 }]) {
+    const view = cycleExecutionQualityView({
+      ...quality,
+      timing: { ...quality.timing, pre_submit },
+    });
+    assert.equal(view.preSubmit.length, 7);
+    assert.deepEqual(
+      view.preSubmit.map((item) => item.value),
+      [pre_submit?.queue_ms === 0 ? '0' : '—', '—', '—', '—', '—', '—', '—'],
+    );
+    assert.equal(view.timing[2].value, '100.003');
+  }
+});
+
+test('pre-submit fields reject negative, nonfinite and nonnumeric durations independently', () => {
+  const keys = [
+    'queue_ms',
+    'initial_account_ms',
+    'planning_ms',
+    'final_account_ms',
+    'final_check_ms',
+    'persist_ms',
+    'other_ms',
+  ];
+  for (const invalid of [
+    -1,
+    NaN,
+    Infinity,
+    -Infinity,
+    null,
+    undefined,
+    false,
+    '',
+    '0',
+    '17.3',
+  ]) {
+    const pre_submit = Object.fromEntries(keys.map((key) => [key, invalid]));
+    const view = cycleExecutionQualityView({
+      ...quality,
+      timing: { ...quality.timing, pre_submit },
+    });
+    assert.deepEqual(
+      view.preSubmit.map((item) => item.value),
+      keys.map(() => '—'),
+    );
+  }
+  const partial = cycleExecutionQualityView({
+    ...quality,
+    timing: {
+      ...quality.timing,
+      pre_submit: { queue_ms: 4.75, planning_ms: -1, other_ms: 0 },
+    },
+  });
+  assert.deepEqual(
+    partial.preSubmit.map((item) => item.value),
+    ['4.75', '—', '—', '—', '—', '—', '0'],
+  );
+});

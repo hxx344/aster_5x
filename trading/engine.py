@@ -24,6 +24,7 @@ from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
 from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
 from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols
+from .cycle_quality import clock_tick, elapsed as observed_elapsed
 from .cycle_signal import cycle_signal_quote
 from .models import cycle_margin_limit
 from .lock import ProcessLock
@@ -782,7 +783,11 @@ class Engine:
             return 5
         if isinstance(broker, LiveBroker):
             broker.api.budget.require_available(broker.snapshot_weight([symbol]) + 1)
+        initial_read_started = clock_tick() if trigger is not None else None
         snapshot = broker.cycle_snapshot([symbol])
+        if trigger is not None:
+            trigger = {**trigger, "pre_submit": {**trigger.get("pre_submit", {}),
+                "initial_account_ms": observed_elapsed(initial_read_started, clock_tick())}}
         self.view(aid, snapshot=snapshot_json(snapshot, [symbol]), credential_ready=True)
         snapshot.require_modes([symbol])
         progress = self.cycle_progress(account, snapshot)
@@ -840,9 +845,13 @@ class Engine:
         if isinstance(broker, LiveBroker):
             broker.api.budget.require_available(self.market.depth_weight([symbol]) +
                                                 broker.snapshot_weight([symbol], fresh_modes=True) + 6)
+        planning_started = clock_tick() if trigger is not None else None
         book, depth = self.market.book(symbol), self.market.depth(symbol)
         plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress,
                           **allowances)
+        if trigger is not None:
+            trigger = {**trigger, "pre_submit": {**trigger.get("pre_submit", {}),
+                "planning_ms": observed_elapsed(planning_started, clock_tick())}}
 
         def before_submit(fresh):
             if self.shutdown.is_set() or not self.live_allowed(account):
@@ -853,7 +862,8 @@ class Engine:
                                  **(self.cycle_open_allowances(account) if plan.phase == "open" else {}))
             if current.phase != plan.phase or current.qty != plan.qty or current.leverage != plan.leverage:
                 raise TradingError("循环计划因账户或盘口变化需要重新计算")
-            return {"depth": final_depth, "checked_at": time.time(), "checked_monotonic": time.monotonic()}
+            return {"depth": final_depth, "checked_at": time.time(), "checked_monotonic": time.monotonic(),
+                    "quality_plan": current}
 
         reason = executor.start(account, snapshot, plan, progress, before_submit=before_submit,
                                 **({"trigger": trigger} if trigger is not None else {}))
@@ -895,6 +905,7 @@ class Engine:
 
     def tick_account(self, account_id, *, cycle_signal=None):
         with self.account_lock(account_id):
+            worker_started = clock_tick() if cycle_signal is not None else None
             with self.lock:
                 priority = account_id in self.active_priority_accounts
                 priority_signals = self.active_priority_signals.pop(account_id, {})
@@ -911,6 +922,8 @@ class Engine:
                     if (not self.fresh_cycle_signal(cycle_signal)
                             or cycle_signal["symbol"] != account.get("cycle", {}).get("symbol")):
                         return 5
+                    cycle_signal = {**cycle_signal, "pre_submit": {
+                        "queue_ms": observed_elapsed(cycle_signal["received_monotonic"], worker_started)}}
                     try:
                         ready = self.cycle_public_hint(account)
                     except (TradingError, KeyError, ValueError, TypeError, OverflowError):

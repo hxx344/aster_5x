@@ -56,6 +56,7 @@ import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
 import {
+  cycleMarginLimit,
   marginLimitFromPercent,
   migrationMarginLimit,
   migrationToleranceFromPercent,
@@ -111,7 +112,12 @@ type Account = {
   cycle?: CycleConfig;
   cycle_state?: CycleState;
   cycle_trades?: CycleTrade[];
-  risk_limits?: { base: string; high_leverage: string; migration?: string };
+  risk_limits?: {
+    base: string;
+    high_leverage: string;
+    migration?: string;
+    cycle?: string;
+  };
   snapshot?: {
     equity: string;
     maintenance: string;
@@ -267,6 +273,13 @@ export default function Home() {
       account?.risk_limits,
     ),
   );
+  const cycleMarginLimitValue = cycleMarginLimit(account?.risk_limits);
+  const cycleRiskLimit =
+    cycleMarginLimitValue === null ? null : Number(cycleMarginLimitValue);
+  const cycleMarginPercent =
+    cycleMarginLimitValue === null
+      ? null
+      : percentFromMarginLimit(cycleMarginLimitValue);
   const minimumLeverage = account?.policy.min_open_leverage ?? 5;
   const minimumLeverageSupported =
     SUPPORTED_LEVERAGES.includes(minimumLeverage);
@@ -365,8 +378,17 @@ export default function Home() {
   const highLeverage = currentLeverage === 10 || currentLeverage === 20;
   const openingLimit = highLeverage ? highMarginLimit : marginLimit;
   const openingPercent = highLeverage ? highMarginPercent : marginPercent;
+  const cycleMode = Boolean(account?.cycle?.enabled);
+  const upperRiskLimit = cycleMode ? cycleRiskLimit : highMarginLimit;
+  const upperRiskPercent = cycleMode ? cycleMarginPercent : highMarginPercent;
   const riskAccent =
-    ratio > highMarginLimit ? 'danger' : ratio > marginLimit ? 'amber' : 'mint';
+    upperRiskLimit === null
+      ? 'muted'
+      : ratio > upperRiskLimit
+        ? 'danger'
+        : ratio > marginLimit
+          ? 'amber'
+          : 'mint';
   const positions =
     snapshot?.positions.filter((p) => Number(p.qty) !== 0) || [];
   const events =
@@ -914,7 +936,13 @@ export default function Home() {
                     <span className={riskAccent}>
                       {snapshot ? pct(snapshot.ratio) : '—'}
                     </span>
-                    <small>普通 5x ≤ {marginPercent}%</small>
+                    <small>
+                      {cycleMode
+                        ? cycleMarginPercent === null
+                          ? '循环上限待服务确认'
+                          : `循环 ≤ ${cycleMarginPercent}%`
+                        : `普通 5x ≤ ${marginPercent}%`}
+                    </small>
                   </div>
                   <div className="risk-track">
                     <Progress
@@ -926,13 +954,14 @@ export default function Home() {
                       style={{ left: `${marginPercent}%` }}
                       title={`普通 5x 基础上限 ${marginPercent}%`}
                     />
-                    {highMarginLimit > marginLimit && (
-                      <i
-                        className="limit-marker high-limit-marker"
-                        style={{ left: `${highMarginPercent}%` }}
-                        title={`普通 10x / 20x 上限 ${highMarginPercent}%`}
-                      />
-                    )}
+                    {upperRiskLimit !== null &&
+                      upperRiskLimit > marginLimit && (
+                        <i
+                          className="limit-marker high-limit-marker"
+                          style={{ left: `${upperRiskPercent}%` }}
+                          title={`${cycleMode ? '循环全部持仓' : '普通 10x / 20x'}上限 ${upperRiskPercent}%`}
+                        />
+                      )}
                   </div>
                   <div className="scale">
                     <span>0%</span>
@@ -947,6 +976,14 @@ export default function Home() {
                     <p className="risk-bonus">
                       <span>迁移上限 · 含 5x</span>
                       <strong>{migrationMarginPercent}%</strong>
+                    </p>
+                    <p className="risk-bonus">
+                      <span>循环上限 · 全部持仓</span>
+                      <strong>
+                        {cycleMarginPercent === null
+                          ? '待服务确认'
+                          : `${cycleMarginPercent}%`}
+                      </strong>
                     </p>
                     <p>共用额外 5 个百分点，最高 100%。</p>
                     <p>
@@ -1463,8 +1500,8 @@ export default function Home() {
                     </label>
                     <p className="muted">
                       修改前请暂停策略。基础风险约束大于 0%、不超过 100%。普通
-                      5x 新增使用基础上限；普通 10x / 20x 和迁移各档（含
-                      5x）共用额外 5 个百分点，最高
+                      5x 新增使用基础上限；普通 10x / 20x、迁移各档（含
+                      5x）及循环共用额外 5 个百分点，账户全部持仓总占用最高
                       100%。实际下单量还受余额与盘口限制。最低杠杆可设 5x、10x
                       或 20x，调低该值不会降低已有杠杆。
                     </p>

@@ -24,6 +24,7 @@ import {
 } from '@/lib/cycle';
 import { cycleDailySummary, cycleRollingSummary } from '@/lib/cycle-daily';
 import { CycleCostSummary } from '@/components/cycle-cost-summary';
+import { cycleMarginLimit, percentFromMarginLimit } from '@/lib/policy';
 
 type CycleAccount = {
   id: string;
@@ -33,6 +34,7 @@ type CycleAccount = {
   status: string;
   cycle?: CycleConfig;
   cycle_state?: CycleState;
+  risk_limits?: { cycle?: string };
   migration?: { enabled: boolean };
   migration_state?: { active_batch?: object | null };
 };
@@ -99,6 +101,11 @@ export function CyclePanel({
   const spread = cycleSpreadView(state, now, stale);
   const daily = cycleDailySummary(state?.daily_volume, now, stale);
   const rolling = cycleRollingSummary(state?.rolling_volume, now, stale);
+  const marginLimit = cycleMarginLimit(account.risk_limits);
+  const marginLabel =
+    marginLimit === null
+      ? '待服务确认'
+      : `${percentFromMarginLimit(marginLimit)}%`;
   const volumeWaiting =
     ['daily_limit', 'rolling_limit'].includes(view.phase) ||
     Boolean(state?.daily_volume?.reached || state?.rolling_volume?.reached);
@@ -233,6 +240,13 @@ export function CyclePanel({
           <dd>
             {account.cycle?.symbol ?? 'XAUUSD1'} /{' '}
             {account.cycle?.leverage ?? 2}x
+          </dd>
+        </div>
+        <div>
+          <dt>循环保证金上限</dt>
+          <dd>
+            {marginLabel}
+            <small>基础上限 + 5 个百分点，最高 100%；账户全部持仓共用。</small>
           </dd>
         </div>
         <div>
@@ -428,7 +442,7 @@ export function CyclePanel({
             {draft.notional_scope === 'per_side'
               ? '例如上限 10,000：多头和空头分别最多 10,000 USD1，合计最多 20,000 USD1。'
               : '例如上限 10,000：多头与空头名义价值合计最多 10,000 USD1。'}{' '}
-            下单还需满足交易规则、可用保证金与基础风险上限。
+            下单还需满足交易规则、可用保证金及循环保证金上限；该上限由账户全部持仓共用。
           </p>
           <div className="cycle-fields">
             <label htmlFor="cycle-hold">

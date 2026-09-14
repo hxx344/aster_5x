@@ -21,6 +21,7 @@ from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
+from .models import cycle_margin_limit
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
@@ -1257,7 +1258,8 @@ class Engine:
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
                                             "high_leverage": wire(opening_margin_limit(a["policy"], 10)),
-                                            "migration": wire(migration_margin_limit(a["policy"]))},
+                                            "migration": wire(migration_margin_limit(a["policy"])),
+                                            "cycle": wire(cycle_margin_limit(a["policy"]))},
                          **self.views.get(a["id"], {
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]

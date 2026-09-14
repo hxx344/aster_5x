@@ -297,7 +297,7 @@ class CycleExecutionTests(unittest.TestCase):
     def test_post_fill_margin_above_limit_rolls_back(self):
         original = self.f.broker.submit
         def withdrawal(orders):
-            self.f.broker.state["wallet"] = "17000"
+            self.f.broker.state["wallet"] = "15000"
             self.f.broker.save()
             return original(orders)
         with patch.object(self.f.broker, "submit", side_effect=withdrawal) as submit:

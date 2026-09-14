@@ -194,18 +194,18 @@ class CyclePlanningTests(unittest.TestCase):
             with self.assertRaisesRegex(TradingError, "深度已过期"):
                 self.plan()
 
-    def test_all_account_positions_count_toward_margin_and_base_limit_has_no_bonus(self):
+    def test_all_account_positions_share_the_cycle_five_point_margin_bonus(self):
         self.account["cycle"]["leverage"] = 10
         for p in self.snapshot.positions:
             p.leverage = 10
         self.snapshot.equity = dec(10000)
         self.snapshot.positions.append(Position("CLUSD1", "LONG", dec(48), dec(100), dec(100), 1))
         plan = self.plan()
-        self.assertLess(plan.qty, dec(10))
-        self.assertLessEqual(plan.projected_ratio, dec("0.5"))
-        # At +1 quantity step the exact account base cap, with fees, is exceeded.
+        self.assertGreater(plan.qty, dec(10))
+        self.assertLessEqual(plan.projected_ratio, dec("0.55"))
+        # At +1 quantity step the shared account cap, with fees, is exceeded.
         q = Fraction(plan.qty) + Fraction(self.rule.step)
-        self.assertGreater(4800 + 20 * q, Fraction("0.5") * (10000 - Fraction("0.08") * q))
+        self.assertGreater(4800 + 20 * q, Fraction("0.55") * (10000 - Fraction("0.08") * q))
 
     def test_available_cash_includes_margin_and_both_taker_fees(self):
         self.snapshot.available = dec(100)

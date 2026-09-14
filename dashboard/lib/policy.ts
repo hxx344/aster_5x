@@ -37,6 +37,17 @@ export function percentFromMarginLimit(ratio: string): string {
   return shiftDecimal(ratio, 2);
 }
 
+export function cycleMarginLimit(limits?: { cycle?: string }): string | null {
+  // Older services still enforce the base limit. Only a valid dedicated field
+  // confirms that the shared extra allowance is active for cycle trading.
+  if (typeof limits?.cycle !== 'string') return null;
+  try {
+    return marginLimitFromPercent(percentFromMarginLimit(limits.cycle));
+  } catch {
+    return null;
+  }
+}
+
 export function migrationMarginLimit(
   base: string,
   limits?: { migration?: string; high_leverage?: string },

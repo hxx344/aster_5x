@@ -8,7 +8,7 @@ import math
 import time
 
 from .migration import _Sweep, migration_symbols
-from .models import (SYMBOLS, TradingError, dec, decimal_value, leverage_cap,
+from .models import (SYMBOLS, TradingError, cycle_margin_limit, dec, decimal_value, leverage_cap,
                      positive, wire)
 
 
@@ -226,7 +226,7 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
         raise TradingError("循环开仓缺少账户风控档位或手续费率")
     cap = Fraction(positive(leverage_cap(brackets, config["leverage"])))
     fee = Fraction(positive(fee, True))
-    margin_limit = Fraction(positive(account["policy"]["margin_limit"]))
+    margin_limit = Fraction(cycle_margin_limit(account["policy"]))
     if fee > 1 or margin_limit > 1:
         raise TradingError("循环开仓手续费率或账户保证金上限无效")
     occupied = snapshot.occupied_margin_exact

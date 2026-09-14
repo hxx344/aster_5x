@@ -324,6 +324,14 @@ def migration_margin_limit(policy):
     return decimal_value(min(Fraction(1), base + EXTRA_MARGIN_ALLOWANCE), exact=True)
 
 
+def cycle_margin_limit(policy):
+    """Every cycle leverage shares five points above the account base limit."""
+    base = Fraction(positive(policy["margin_limit"]))
+    if base > 1:
+        raise TradingError("循环账户保证金基础上限不得超过 100%")
+    return decimal_value(min(Fraction(1), base + EXTRA_MARGIN_ALLOWANCE), exact=True)
+
+
 def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     """Size both legs against total occupied margin / equity, cash and capacity."""
     long, short = snapshot.require_ready(rules.symbol, now)

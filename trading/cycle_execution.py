@@ -9,7 +9,7 @@ from fractions import Fraction
 from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
-from .models import AccountModeError, TradingError, dec, floor_step, positive, wire
+from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
 
@@ -360,7 +360,7 @@ class CycleExecutor(Executor):
                 full_open = False
                 intent["rollback_reason"] = "实际成交金额超出本轮范围"
             try:
-                if snapshot.margin_exceeds(account["policy"]["margin_limit"]):
+                if snapshot.margin_exceeds(cycle_margin_limit(account["policy"])):
                     full_open = False
                     intent["rollback_reason"] = "成交后实际保证金占用超过账户上限"
             except TradingError:

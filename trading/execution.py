@@ -4,6 +4,7 @@ import uuid
 from contextlib import nullcontext
 from fractions import Fraction
 
+from .cycle_guard import ordinary_add_block_reason
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
@@ -20,6 +21,9 @@ class Executor:
     def open_pair(self, account, snapshot, symbol, plan, book):
         self.last_snapshot = None
         self.last_completed_intent = None
+        blocked = ordinary_add_block_reason(account, symbol)
+        if blocked:
+            raise TradingError(blocked)
         snapshot.require_modes(account["policy"]["symbols"])
         long, short = snapshot.require_ready(symbol)
         minimum = minimum_open_leverage(account["policy"])
@@ -37,6 +41,14 @@ class Executor:
             raise TradingError("已有多空数量差超过 0.1%，等待人工核对")
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
+        # A previously selected account mapping cannot authorize an ordinary
+        # addition after its saved configuration has switched to this cycle.
+        latest = self.store.account(account["id"])
+        if latest is None:
+            raise TradingError("账户不存在，禁止普通新增开仓")
+        blocked = ordinary_add_block_reason(latest, symbol)
+        if blocked:
+            raise TradingError(blocked)
         token = uuid.uuid4().hex
         orders = [self.order(symbol, side, "BUY" if side == "LONG" else "SELL", plan.qty,
                             side[0] + token[:28]) for side in ("LONG", "SHORT")]

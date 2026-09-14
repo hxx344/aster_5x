@@ -22,6 +22,7 @@ from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, Rol
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
+from .cycle_guard import ordinary_add_blocks
 from .models import cycle_margin_limit
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
@@ -1257,6 +1258,7 @@ class Engine:
         cycle_records = {a["id"]: self.store.get("cycle:" + a["id"]) or {} for a in saved_accounts}
         cycle_volumes = {a["id"]: self.cycle_volume_state(a, now=state_now) for a in saved_accounts}
         cycle_trades = {a["id"]: self.store.cycle_trade_records(a["id"], limit=100) for a in saved_accounts}
+        add_blocks = {a["id"]: ordinary_add_blocks(a) for a in saved_accounts}
         cycle_costs = {}
         for account in saved_accounts:
             aid = account["id"]
@@ -1287,6 +1289,10 @@ class Engine:
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             for account in accounts:
+                # This is selected-account policy, not a global market lock.
+                # Recompute from saved configuration so an older view cannot
+                # retain a block after the cycle selection changes.
+                account["ordinary_add_blocks"] = add_blocks[account["id"]]
                 saved, pending = migration_records[account["id"]]
                 if account.get("migration_run_id") and account["migration_run_id"] != saved.get("run_id"):
                     saved = {}

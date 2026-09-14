@@ -54,6 +54,11 @@ import {
 } from '@/lib/cycle';
 import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
+import {
+  ordinaryAddBlock,
+  ordinaryCapacityReady,
+  ORDINARY_CYCLE_BLOCK_LABEL,
+} from '@/lib/ordinary-add';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
 import {
   cycleMarginLimit,
@@ -112,6 +117,7 @@ type Account = {
   cycle?: CycleConfig;
   cycle_state?: CycleState;
   cycle_trades?: CycleTrade[];
+  ordinary_add_blocks?: Record<string, string>;
   risk_limits?: {
     base: string;
     high_leverage: string;
@@ -370,6 +376,7 @@ export default function Home() {
   const ratio = snapshot ? Number(snapshot.ratio ?? 1) : 0;
   const market = state?.markets[focus];
   const strategy = account?.strategies[focus];
+  const focusedOrdinaryBlock = ordinaryAddBlock(account, focus);
   const currentLeverage =
     snapshot?.positions.find((p) => p.symbol === focus)?.leverage ||
     minimumLeverage;
@@ -684,6 +691,7 @@ export default function Home() {
                           const lev = snapshot?.positions.find(
                             (p) => p.symbol === s,
                           )?.leverage;
+                          const ordinaryBlock = ordinaryAddBlock(account, s);
                           return (
                             <TableRow
                               key={s}
@@ -699,11 +707,19 @@ export default function Home() {
                                     {names[s]} {!live && '· 等待数据'}
                                   </span>
                                 </button>
+                                {ordinaryBlock ? (
+                                  <p
+                                    className="ordinary-add-block"
+                                    title={ordinaryBlock}
+                                  >
+                                    {ORDINARY_CYCLE_BLOCK_LABEL}
+                                  </p>
+                                ) : null}
                               </TableCell>
                               {SUPPORTED_LEVERAGES.map((v) => (
                                 <TableCell
                                   key={v}
-                                  className={`number ${live && Number(m.capacities[v]) > Number(account?.policy.threshold || 10000) ? 'mint' : ''}`}
+                                  className={`number ${ordinaryCapacityReady(m?.capacities[v], account?.policy.threshold || '10000', live, ordinaryBlock) ? 'mint' : ''}`}
                                 >
                                   <span className="mobile-cell-label">
                                     {v}x 额度
@@ -1028,21 +1044,26 @@ export default function Home() {
                     </div>
                     <Gate
                       label={
-                        !minimumLeverageSupported
-                          ? '请先选择受支持的最低开仓杠杆'
-                          : !currentLeverageSupported
-                            ? `当前 ${currentLeverage}x 不支持新增开仓`
-                            : currentLeverage < minimumLeverage
-                              ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
-                              : `${currentLeverage}x 额度超过阈值`
+                        focusedOrdinaryBlock
+                          ? ORDINARY_CYCLE_BLOCK_LABEL
+                          : !minimumLeverageSupported
+                            ? '请先选择受支持的最低开仓杠杆'
+                            : !currentLeverageSupported
+                              ? `当前 ${currentLeverage}x 不支持新增开仓`
+                              : currentLeverage < minimumLeverage
+                                ? `当前 ${currentLeverage}x，需先升至至少 ${minimumLeverage}x`
+                                : `${currentLeverage}x 额度超过阈值`
                       }
                       pass={
                         currentLeverageSupported &&
                         minimumLeverageSupported &&
                         currentLeverage >= minimumLeverage &&
-                        market?.status === 'ok' &&
-                        Number(market.capacities[currentLeverage]) >
-                          Number(account?.policy.threshold || 10000)
+                        ordinaryCapacityReady(
+                          market?.capacities[currentLeverage],
+                          account?.policy.threshold || '10000',
+                          market?.status === 'ok',
+                          focusedOrdinaryBlock,
+                        )
                       }
                       value={
                         currentLeverageSupported && market?.status === 'ok'
@@ -1068,10 +1089,13 @@ export default function Home() {
                     />
                     <div className="strategy-state">
                       <i
-                        className={`dot ${account?.enabled ? 'mint-bg' : 'amber-bg'}`}
+                        className={`dot ${account?.enabled && !focusedOrdinaryBlock ? 'mint-bg' : 'amber-bg'}`}
                       />
                       <span>
-                        {strategy?.reason || account?.reason || '等待接入账户'}
+                        {focusedOrdinaryBlock ||
+                          strategy?.reason ||
+                          account?.reason ||
+                          '等待接入账户'}
                       </span>
                     </div>
                     <div className="execution-buttons">

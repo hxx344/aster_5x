@@ -20,7 +20,7 @@ import monitor
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from .depth_stream import PublicDepthStream
 from .market_stream import PublicQuoteStream
-from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 
@@ -638,6 +638,50 @@ class LiveBroker:
     def snapshot(self, symbols, fresh_modes=False):
         return self._snapshot(symbols, fresh_modes=fresh_modes)
 
+    def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
+        """Include conditional risk/flat-mark/tier reads without issuing them."""
+        symbols = tuple(dict.fromkeys(symbols))
+        now = time.monotonic()
+        # Account + selected orders; reserve for one full risk fallback and the
+        # existing two-request flat quote fallback when risk omits a symbol.
+        weight = 5 + len(symbols) + 5 + 2 * len(symbols)
+        if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= 15:
+            weight += 30
+        weight += sum(1 for symbol in symbols if now - self.cached_at.get("bracket:" + symbol, -1e9) + 8 >= 5)
+        return weight
+
+    @staticmethod
+    def _account_asset(account):
+        if (not isinstance(account, dict) or not isinstance(account.get("assets"), list)
+                or any(not isinstance(a, dict) for a in account["assets"])):
+            raise TradingError("账户资产响应无效")
+        assets = [a for a in account["assets"] if a.get("asset") == "USD1"]
+        if not assets:
+            raise TradingError("账户缺少 USD1 保证金资产")
+        if len(assets) != 1:
+            raise TradingError("账户 USD1 保证金资产重复")
+        return assets[0]
+
+    @staticmethod
+    def _account_snapshot(account, asset, positions, symbols, *, hedge, multi, started, brackets=None,
+                          current_caps=None, risk_unrealized=None):
+        wallet = dec(asset["crossWalletBalance"])
+        account_unrealized = Fraction(dec(asset["crossUnPnl"]))
+        # Charge newer losses immediately, without funding additions with an
+        # unconfirmed gain. All USD1 positions contribute, including other markets.
+        position_unrealized = sum((Fraction(p.unrealized) for p in positions), Fraction(0))
+        marked_unrealized = sum((Fraction(p.qty) * (Fraction(p.mark) - Fraction(p.entry)) * (1 if p.side == "LONG" else -1)
+                                 for p in positions), Fraction(0))
+        selected_pnl = min(account_unrealized, position_unrealized, marked_unrealized)
+        if risk_unrealized is not None:
+            selected_pnl = min(selected_pnl, risk_unrealized)
+        unrealized = decimal_value(selected_pnl, exact=True)
+        available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
+        equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
+        return AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
+            unrealized, positions, None, hedge, multi, account.get("canTrade") is True,
+            started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets or {}, current_caps or {})
+
     def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None):
         """Shared parsing; the ordinary path retains its sequential reads."""
         self.leverage_snapshot = None
@@ -657,15 +701,7 @@ class LiveBroker:
             raise TradingError("账户持仓或保证金模式响应无效")
         account = read("account", "/fapi/v3/accountWithJoinMargin", weight=5)
         rows = read("positions", "/fapi/v3/positionRisk", weight=5)
-        if (not isinstance(account, dict) or not isinstance(account.get("assets"), list)
-                or any(not isinstance(a, dict) for a in account["assets"])):
-            raise TradingError("账户资产响应无效")
-        assets = [a for a in account["assets"] if a.get("asset") == "USD1"]
-        if not assets:
-            raise TradingError("账户缺少 USD1 保证金资产")
-        if len(assets) != 1:
-            raise TradingError("账户 USD1 保证金资产重复")
-        asset = assets[0]
+        asset = self._account_asset(account)
         account_positions = self._position_rows(account.get("positions"))
         present = self._position_rows(rows)
         # Some V3 responses omit flat symbols; use authenticated account rows for
@@ -719,22 +755,10 @@ class LiveBroker:
             if not isinstance(b, dict) or b.get("symbol") != symbol:
                 raise TradingError("账户风控档位交易代码不匹配")
             brackets[symbol] = validate_brackets(b["brackets"])
-        wallet = dec(asset["crossWalletBalance"])
-        account_unrealized = Fraction(dec(asset["crossUnPnl"]))
-        # Account balances and position marks are separate reads. Charge newer
-        # losses immediately, but never fund additions with an unconfirmed gain.
-        position_unrealized = sum((Fraction(p.unrealized) for p in positions), Fraction(0))
-        marked_unrealized = sum((Fraction(p.qty) * (Fraction(p.mark) - Fraction(p.entry)) * (1 if p.side == "LONG" else -1)
-                                 for p in positions), Fraction(0))
-        selected_pnl = min(account_unrealized, position_unrealized, marked_unrealized)
-        unrealized = decimal_value(selected_pnl, exact=True)
-        available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
-        equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
         # External orders are not queried; None must not imply a verified empty
         # order book. Fees are a fixed planning estimate, not a fetched fee rate.
-        snapshot = AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
-            unrealized, positions, None, dual.get("dualSidePosition") is True, multi.get("multiAssetsMargin") is True,
-            account.get("canTrade") is True, started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets)
+        snapshot = self._account_snapshot(account, asset, positions, symbols, hedge=dual["dualSidePosition"],
+            multi=multi["multiAssetsMargin"], started=started, brackets=brackets)
         if fresh_modes:
             self.leverage_snapshot = (snapshot, time.monotonic())
         return snapshot
@@ -757,6 +781,124 @@ class LiveBroker:
             result[key] = row
         return result
 
+    def _cycle_local_mark(self, symbol):
+        """Use only local stream state here; live market.book may issue REST."""
+        try:
+            if getattr(self.market, "demo", False) is True:
+                book = self.market.book(symbol)
+            elif callable(getattr(self.market, "_stream_book", None)):
+                book = self.market._stream_book(symbol)
+            else:
+                stream = getattr(self.market, "stream", None)
+                book = stream.book(symbol) if callable(getattr(stream, "book", None)) else None
+            if book is not None:
+                book.require_fresh()
+                return positive(book.mark)
+        except (TradingError, KeyError):
+            pass
+        return None
+
+    def _cycle_positions(self, account, symbols, read):
+        rows = self._position_rows(account.get("positions"))
+        # V3 account returns LONG/SHORT only in hedge mode, including flat legs.
+        # Do not infer a missing leg as flat or manufacture a dual-mode GET cache.
+        if any(side == "BOTH" for _, side in rows):
+            raise AccountModeError("独立循环需要双向持仓模式，账户返回单向持仓信息")
+        for symbol in symbols:
+            if any((symbol, side) not in rows for side in ("LONG", "SHORT")):
+                raise TradingError(f"{symbol} 缺少双向持仓信息")
+        relevant = {key: row for key, row in rows.items() if key[0] in symbols or dec(row["positionAmt"])}
+        leverages = {}
+        for (symbol, side), row in relevant.items():
+            if self.market.assets.get(symbol) != "USD1":
+                raise TradingError("检测到非 USD1 仓位，需要核对风险范围")
+            if type(row.get("isolated")) is not bool:
+                raise TradingError("账户全仓保证金模式响应无效")
+            leverage = self._leverage(row.get("leverage"))
+            if symbol in leverages and leverages[symbol] != leverage:
+                raise TradingError("多空杠杆不一致")
+            leverages[symbol] = leverage
+            positive(row.get("entryPrice"), allow_zero=not dec(row["positionAmt"]))
+            dec(row.get("unrealizedProfit"))
+
+        marks = {symbol: self._cycle_local_mark(symbol) for symbol in dict.fromkeys(key[0] for key in relevant)}
+        risk, risk_unrealized = {}, None
+        if any(mark is None for mark in marks.values()):
+            risk = self._position_rows(read("positions", "/fapi/v3/positionRisk", weight=5))
+            if any(side == "BOTH" for _, side in risk):
+                raise AccountModeError("账户与持仓的双向模式尚未同步")
+            # Once a full risk response is needed, every nonzero row on either
+            # side must agree; a newly filled external position cannot disappear.
+            for key in set(relevant) | {key for key, row in risk.items() if dec(row["positionAmt"])}:
+                account_row, risk_row = rows.get(key), risk.get(key)
+                if risk_row is None and account_row is not None and not dec(account_row["positionAmt"]):
+                    continue  # Risk is allowed to omit flat account rows.
+                if (account_row is None or risk_row is None
+                        or dec(account_row["positionAmt"]) != dec(risk_row["positionAmt"])
+                        or self._leverage(account_row.get("leverage")) != self._leverage(risk_row.get("leverage"))):
+                    raise TradingError("账户余额与持仓快照正在同步，稍后重试")
+                margin_type = risk_row.get("marginType")
+                if (not isinstance(margin_type, str) or margin_type.lower() not in ("cross", "crossed", "isolated")
+                        or account_row.get("isolated") != (margin_type.lower() == "isolated")):
+                    raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
+            risk_unrealized = sum((Fraction(dec(row.get("unRealizedProfit")))
+                                   for key, row in risk.items() if key in relevant), Fraction(0))
+
+        positions = []
+        for key, row in relevant.items():
+            symbol, side = key
+            qty = dec(row["positionAmt"]).copy_abs()
+            risk_row = risk.get(key)
+            mark = marks[symbol]
+            if mark is None and risk_row is not None:
+                mark = positive(risk_row.get("markPrice"))
+            if mark is None:
+                if qty:
+                    raise TradingError("账户持仓缺少有效标记价格")
+                # Only a selected flat symbol omitted by risk reaches the
+                # existing public quote fallback, once for its two flat legs.
+                book = self.market.book(symbol)
+                book.require_fresh()
+                mark = marks[symbol] = positive(book.mark)
+            liquidation = None
+            if risk_row is not None and risk_row.get("liquidationPrice") is not None:
+                liquidation = positive(risk_row["liquidationPrice"], True)
+            positions.append(Position(symbol, side, qty, positive(row["entryPrice"], allow_zero=not qty),
+                mark, leverages[symbol], dec(row["unrealizedProfit"]), liquidation, isolated=row["isolated"]))
+        return positions, rows, leverages, risk_unrealized
+
+    @staticmethod
+    def _cycle_current_caps(symbols, rows, leverages, read):
+        caps = {}
+        for symbol in symbols:
+            pair = [rows[(symbol, side)] for side in ("LONG", "SHORT")]
+            if any(dec(row["positionAmt"]) for row in pair):
+                continue
+            # Validate every reported value, even if the other leg is missing it.
+            reported = [positive(row["maxNotional"], True) for row in pair if "maxNotional" in row]
+            if len(reported) == 2:
+                cap = min(reported)
+            else:
+                data = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
+                if isinstance(data, list):
+                    if any(not isinstance(item, dict) for item in data):
+                        raise TradingError("账户风控档位响应无效")
+                    matches = [item for item in data if item.get("symbol") == symbol]
+                    if len(matches) != 1:
+                        raise TradingError("账户风控档位缺失或重复")
+                    data = matches[0]
+                if not isinstance(data, dict) or data.get("symbol") != symbol:
+                    raise TradingError("账户风控档位交易代码不匹配")
+                try:
+                    if not isinstance(data.get("brackets"), list) or any(not isinstance(tier, dict) for tier in data["brackets"]):
+                        raise TradingError("账户风控档位响应无效")
+                    tiers = validate_brackets(data["brackets"])
+                except (KeyError, TypeError):
+                    raise TradingError("账户风控档位响应无效") from None
+                cap = min([leverage_cap(tiers, leverages[symbol])] + reported)
+            caps[symbol] = (leverages[symbol], cap)
+        return caps
+
     def cycle_snapshot(self, symbols, fresh_modes=False):
         """Join independent cycle GETs before validating one complete snapshot.
 
@@ -764,18 +906,13 @@ class LiveBroker:
         out-of-order group; API's nonce lock preserves uniqueness. HTTPX Client
         supports sharing across threads. Only GETs use this bounded local pool.
         """
-        symbols = tuple(symbols)
+        symbols = tuple(dict.fromkeys(symbols))
         self.leverage_snapshot = None
         started = time.time()
         if fresh_modes:
-            self.cached_at.pop("dual", None)
             self.cached_at.pop("multi", None)
-        specs = [("dual", "/fapi/v3/positionSide/dual", None, 15, 30),
-                 ("multi", "/fapi/v3/multiAssetsMargin", None, 15, 30),
-                 ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5),
-                 ("positions", "/fapi/v3/positionRisk", None, None, 5)]
-        specs.extend(("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, 5, 1)
-                     for symbol in dict.fromkeys(symbols))
+        specs = [("multi", "/fapi/v3/multiAssetsMargin", None, 15, 30),
+                 ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5)]
         specs.extend(("orders:" + str(index), "/fapi/v3/openOrders", {"symbol": symbol}, None, 1)
                      for index, symbol in enumerate(symbols))
         values, fetched, pending = {}, {}, []
@@ -825,17 +962,35 @@ class LiveBroker:
             raise max(errors, key=priority)
 
         def read(key, path, params=None, *, ttl=None, weight=1):
-            # Brackets were formerly inspected after the account reads. Both a
-            # cached value and this round's early response can expire in flight.
-            if key.startswith("bracket:"):
-                stamp = fetched[key][1] if key in fetched else self.cached_at.get(key, -1e9)
-                if time.monotonic() - stamp >= ttl:
-                    value, stamp = fetch((key, path, params, ttl, weight))
-                    values[key], fetched[key] = value, (value, stamp)
+            stamp = fetched[key][1] if key in fetched else self.cached_at.get(key, -1e9)
+            if key not in values and ttl is not None and time.monotonic() - stamp < ttl:
+                values[key] = self.cached[key]
+            if key not in values or (ttl is not None and time.monotonic() - stamp >= ttl):
+                value, stamp = fetch((key, path, params, ttl, weight))
+                values[key] = value
+                if ttl is not None:
+                    fetched[key] = value, stamp
+            if ttl is not None and time.monotonic() - stamp >= ttl:
+                raise TradingError("账户模式或风控档位查询已过期，等待重试")
             return values[key]
 
         try:
-            snapshot = self._snapshot(symbols, fresh_modes=fresh_modes, read=read, started=started)
+            account = values["account"]
+            asset = self._account_asset(account)
+            positions, rows, leverages, risk_unrealized = self._cycle_positions(account, symbols, read)
+            caps = self._cycle_current_caps(symbols, rows, leverages, read)
+            multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
+            if not isinstance(multi, dict) or type(multi.get("multiAssetsMargin")) is not bool:
+                raise TradingError("账户保证金模式响应无效")
+            snapshot = self._account_snapshot(account, asset, positions, symbols, hedge=True,
+                multi=multi["multiAssetsMargin"], started=started, current_caps=caps, risk_unrealized=risk_unrealized)
+            # A fallback tier keeps its original five-second lifetime after it
+            # becomes a current-leverage cap, including the final submit check.
+            snapshot.cycle_cap_cached_at = {
+                symbol: (fetched["bracket:" + symbol][1] if "bracket:" + symbol in fetched
+                         else self.cached_at["bracket:" + symbol])
+                for symbol in caps if "bracket:" + symbol in values
+            }
             orders = []
             for index, symbol in enumerate(symbols):
                 rows = values["orders:" + str(index)]
@@ -844,10 +999,18 @@ class LiveBroker:
                 orders.extend(rows)
             snapshot.open_orders = orders
             snapshot.require_fresh()
+            for key in caps:
+                cache_key = "bracket:" + key
+                if cache_key in values:
+                    stamp = fetched[cache_key][1] if cache_key in fetched else self.cached_at[cache_key]
+                    if time.monotonic() - stamp >= 5:
+                        raise TradingError("账户风控档位查询已过期，等待重试")
             # Failed rounds publish neither partially refreshed caches nor an
             # authorization token; cache age includes signing and network time.
             for key, (value, stamp) in fetched.items():
                 self.cached[key], self.cached_at[key] = value, stamp
+            if fresh_modes:
+                self.leverage_snapshot = (snapshot, time.monotonic())
             return snapshot
         except BaseException:
             self.leverage_snapshot = None

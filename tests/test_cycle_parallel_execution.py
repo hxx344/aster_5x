@@ -212,7 +212,9 @@ class CycleParallelSnapshotTests(TestCase):
         if path == "/fapi/v3/accountWithJoinMargin":
             return {"canTrade": True, "assets": [{"asset": "USD1", "crossWalletBalance": "25000",
                                                    "crossUnPnl": "0", "maintMargin": "0", "availableBalance": "24900"}],
-                    "positions": [{**row, "isolated": row["marginType"] != "cross"} for row in self.rows]}
+                    "positions": [{**{key: row[key] for key in ("symbol", "positionSide", "positionAmt", "entryPrice", "leverage")},
+                                   "unrealizedProfit": row["unRealizedProfit"], "maxNotional": "1000000",
+                                   "isolated": row["marginType"] != "cross"} for row in self.rows]}
         if path == "/fapi/v3/positionRisk":
             return deepcopy(self.rows)
         if path == "/fapi/v3/leverageBracket":
@@ -223,7 +225,9 @@ class CycleParallelSnapshotTests(TestCase):
 
     def test_cycle_snapshot_keeps_other_exposure_but_only_queries_selected_orders(self):
         snapshot = self.live.cycle_snapshot([CYCLE_SYMBOL])
-        self.assertEqual(snapshot.occupied_margin_exact, 100)
+        self.assertEqual(snapshot.occupied_margin_exact,
+                         6 * Fraction(self.f.market.book("SPCXUSD1").mark) / 10
+                         + 8 * Fraction(self.f.market.book("CLUSD1").mark) / 20)
         self.assertEqual({position.symbol for position in snapshot.positions if position.qty}, {"SPCXUSD1", "CLUSD1"})
         self.assertEqual(snapshot.open_orders, [])
         self.assertEqual(tuple(position.qty for position in CycleExecutor._ready(snapshot, CYCLE_SYMBOL)), (0, 0))

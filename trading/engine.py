@@ -98,6 +98,8 @@ def snapshot_json(snapshot, symbols):
     result = asdict(snapshot)
     result.pop("brackets", None)
     result.pop("fees", None)
+    result.pop("current_leverage_caps", None)
+    result.pop("cycle_cap_cached_at", None)
     result["ratio"] = snapshot.ratio if snapshot.equity > 0 else None
     result["margin_ratio"] = snapshot.margin_ratio if snapshot.equity > 0 else None
     result["total_notional"] = snapshot.total_notional
@@ -781,10 +783,30 @@ class Engine:
             if executor.last_snapshot is not None:
                 self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]), credential_ready=True)
             return 5
+        # History synchronization cannot change exchange positions. Complete it
+        # before the single live account read, so a slow backlog cannot age the
+        # snapshot that will authorize this batch.
+        previous = self.store.get("cycle:" + aid)
+        if (account["enabled"] and not self.shutdown.is_set() and self.live_allowed(account)
+                and (not previous or previous.get("phase", "waiting_open") == "waiting_open")):
+            backlog = self.store.cycle_volume_backlog(aid, limit=4, since=max(0, time.time() - 86400))
+            if not backlog:
+                backlog = self.store.cycle_volume_backlog(aid, limit=1, since=0)
+            for unsynced in backlog:
+                if not executor.sync_volume(account, unsynced):
+                    break
+        public_prepare_ms = None
+        if trigger is not None:
+            # The WS prefilter already checked these caches. If a feed failed
+            # meanwhile, finish its possible REST recovery before reading cash.
+            public_prepare_started = clock_tick()
+            self.market.book(symbol)
+            self.market.depth(symbol)
+            public_prepare_ms = observed_elapsed(public_prepare_started, clock_tick())
         if isinstance(broker, LiveBroker):
-            broker.api.budget.require_available(broker.snapshot_weight([symbol]) + 1)
+            broker.api.budget.require_available(broker.cycle_snapshot_weight([symbol], fresh_modes=True))
         initial_read_started = clock_tick() if trigger is not None else None
-        snapshot = broker.cycle_snapshot([symbol])
+        snapshot = executor.prepare_snapshot(account, symbol)
         if trigger is not None:
             trigger = {**trigger, "pre_submit": {**trigger.get("pre_submit", {}),
                 "initial_account_ms": observed_elapsed(initial_read_started, clock_tick())}}
@@ -803,14 +825,6 @@ class Engine:
         # tracked positions must remain eligible for closing and repairs.
         allowances = {}
         if progress.get("phase") == "waiting_open":
-            backlog = self.store.cycle_volume_backlog(aid, limit=4, since=max(0, time.time() - 86400))
-            # Continue older history in bounded batches after midnight as well.
-            # Any intent that may include a recent fill gates new exposure.
-            if not backlog:
-                backlog = self.store.cycle_volume_backlog(aid, limit=1, since=0)
-            for unsynced in backlog:
-                if not executor.sync_volume(account, unsynced):
-                    break
             allowances = self.cycle_open_allowances(account)
         retry_at = progress.get("retry_at") or 0
         if progress.get("phase") == "waiting_open" and time.time() < retry_at:
@@ -832,7 +846,7 @@ class Engine:
         long, _ = snapshot.pair(symbol)
         if long.leverage != config["leverage"]:
             if isinstance(broker, LiveBroker):
-                broker.api.budget.require_available(broker.snapshot_weight([symbol], fresh_modes=True) + 2)
+                broker.api.budget.require_available(broker.cycle_snapshot_weight([symbol], fresh_modes=True) + 1)
             def before_leverage(fresh):
                 if self.shutdown.is_set() or not self.live_allowed(account):
                     raise TradingError("多空循环已停止提交")
@@ -843,15 +857,16 @@ class Engine:
             self.cycle_view(account, phase="reconciling", reason=reason)
             return 5
         if isinstance(broker, LiveBroker):
-            broker.api.budget.require_available(self.market.depth_weight([symbol]) +
-                                                broker.snapshot_weight([symbol], fresh_modes=True) + 6)
+            broker.api.budget.require_available(self.market.depth_weight([symbol]) + 5)
         planning_started = clock_tick() if trigger is not None else None
         book, depth = self.market.book(symbol), self.market.depth(symbol)
         plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress,
                           **allowances)
         if trigger is not None:
+            planning_ms = observed_elapsed(planning_started, clock_tick())
             trigger = {**trigger, "pre_submit": {**trigger.get("pre_submit", {}),
-                "planning_ms": observed_elapsed(planning_started, clock_tick())}}
+                "planning_ms": (planning_ms + public_prepare_ms
+                                if planning_ms is not None and public_prepare_ms is not None else None)}}
 
         def before_submit(fresh):
             if self.shutdown.is_set() or not self.live_allowed(account):
@@ -942,8 +957,8 @@ class Engine:
                         symbol = account["cycle"]["symbol"]
                         # Admit the complete read/check/send path before its first
                         # private read; the broker retains per-request admission.
-                        broker.api.budget.require_available(broker.snapshot_weight([symbol]) +
-                            broker.snapshot_weight([symbol], fresh_modes=True) + self.market.depth_weight([symbol]) + 6)
+                        broker.api.budget.require_available(broker.cycle_snapshot_weight([symbol], fresh_modes=True) +
+                            self.market.depth_weight([symbol]) + 5)
                     return self.tick_cycle_account(account, broker, None, trigger=cycle_signal)
                 if pending and pending["kind"] in ("cycle", "cycle_leverage"):
                     cycle_context = True

@@ -53,6 +53,39 @@ class CyclePlanningTests(unittest.TestCase):
         for p in self.snapshot.positions:
             p.qty = dec(qty)
 
+    def test_account_current_leverage_cap_replaces_tiers_for_a_flat_cycle(self):
+        self.snapshot.brackets = {}
+        self.snapshot.current_leverage_caps = {SYMBOL: (2, dec("1000"))}
+        result = self.plan()
+        self.assertEqual(result.qty, dec("5"))
+        self.assertEqual(result.long_notional + result.short_notional, dec("1000"))
+
+    def test_account_current_cap_is_not_transferred_to_another_leverage(self):
+        self.snapshot.current_leverage_caps = {SYMBOL: (5, dec("1000000"))}
+        with self.assertRaisesRegex(TradingError, "当前杠杆不匹配"):
+            self.plan()
+
+    def test_current_account_cap_takes_precedence_over_a_larger_old_tier(self):
+        self.snapshot.current_leverage_caps = {SYMBOL: (2, dec("1000"))}
+        self.assertEqual(self.plan().qty, dec("5"))
+        self.snapshot.current_leverage_caps[SYMBOL] = (2, dec("2000"))
+        self.assertEqual(self.plan().qty, dec("10"))
+
+    def test_zero_current_cap_blocks_new_exposure_but_does_not_block_closing(self):
+        self.snapshot.current_leverage_caps = {SYMBOL: (2, dec("0"))}
+        with self.assertRaises(TradingError):
+            self.plan()
+        self.hold(qty="5")
+        self.snapshot.brackets = {}
+        result = self.plan()
+        self.assertEqual((result.phase, result.qty), ("close", dec("5")))
+
+    def test_malformed_current_cap_cannot_authorize_a_plan(self):
+        for value in ((), (2,), (True, "1000"), (2, "NaN"), (2, "-1"), "1000"):
+            with self.subTest(value=value), self.assertRaises(TradingError):
+                self.snapshot.current_leverage_caps = {SYMBOL: value}
+                self.plan()
+
     def test_config_defaults_and_exact_normalization(self):
         self.assertEqual(validate_cycle(), DEFAULT_CYCLE)
         config = validate_cycle({"leverage": 1, "hold_seconds": 604800, "spread_limit_bp": "0",

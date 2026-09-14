@@ -364,10 +364,23 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
                          decimal_value(long_amount, exact=True), decimal_value(short_amount, exact=True),
                          decimal_value(reference_spread))
 
-    brackets, fee = snapshot.brackets.get(rule.symbol), snapshot.fees.get(rule.symbol)
-    if not brackets or fee is None:
-        raise TradingError("循环开仓缺少账户风控档位或手续费率")
-    cap = Fraction(positive(leverage_cap(brackets, config["leverage"])))
+    current_cap = snapshot.current_leverage_caps.get(rule.symbol)
+    fee = snapshot.fees.get(rule.symbol)
+    if current_cap is not None:
+        # At this point ownership validation has proved both selected legs flat.
+        # A current-leverage limit cannot authorize a different leverage.
+        if (not isinstance(current_cap, (tuple, list)) or len(current_cap) != 2
+                or type(current_cap[0]) is not int or current_cap[0] != config["leverage"]
+                or any(position.qty for position in pair)):
+            raise TradingError("循环账户额度与空仓状态或当前杠杆不匹配")
+        cap = Fraction(positive(current_cap[1], True))
+    else:
+        brackets = snapshot.brackets.get(rule.symbol)
+        if not brackets:
+            raise TradingError("循环开仓缺少当前杠杆额度")
+        cap = Fraction(positive(leverage_cap(brackets, config["leverage"])))
+    if fee is None:
+        raise TradingError("循环开仓缺少手续费率")
     fee = Fraction(positive(fee, True))
     margin_limit = Fraction(cycle_margin_limit(account["policy"]))
     if fee > 1 or margin_limit > 1:

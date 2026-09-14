@@ -100,12 +100,12 @@ class CycleSignalEngineTests(TestCase):
         signal = self.signal()
         fresh = self.f.market.depth("XAUUSD1")
         wide = replace(fresh, asks=tuple((p + Fraction(1), qty) for p, qty in fresh.asks))
-        # The worker rechecks public data, plans once, then checks again at the
-        # last pre-submit callback after the fresh private account snapshot.
-        with patch.object(self.f.market, "depth", side_effect=[fresh, fresh, wide]) as reads, \
+        # Public hint and stream priming precede the unique private read. The
+        # plan and final callback still check depth afterward.
+        with patch.object(self.f.market, "depth", side_effect=[fresh, fresh, fresh, wide]) as reads, \
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.engine.tick_account("test", cycle_signal=signal)
-        self.assertEqual(reads.call_count, 3)
+        self.assertEqual(reads.call_count, 4)
         submit.assert_not_called()
         self.assertIsNone(self.f.store.intent("test"))
         self.assertEqual(self.f.broker.state["orders"], {})

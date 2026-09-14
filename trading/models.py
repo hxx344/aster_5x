@@ -156,7 +156,7 @@ class Position:
     mark: Decimal
     leverage: int
     unrealized: Decimal = ZERO
-    liquidation: Decimal = ZERO
+    liquidation: Decimal | None = ZERO
     maintenance: Decimal = ZERO
     isolated: bool = False
 
@@ -190,6 +190,11 @@ class AccountSnapshot:
     timestamp: float
     fees: dict[str, Decimal] = field(default_factory=dict)
     brackets: dict[str, list[dict]] = field(default_factory=dict)
+    # Account-reported cap at this exact current leverage, usable for a flat
+    # cycle opening. It is not a tier table for selecting another leverage.
+    current_leverage_caps: dict[str, tuple[int, Decimal]] = field(default_factory=dict)
+    # Conditional tier-derived caps retain the original five-second cache age.
+    cycle_cap_cached_at: dict[str, float] = field(default_factory=dict)
 
     @property
     def total_notional(self):
@@ -239,6 +244,9 @@ class AccountSnapshot:
         age = (time.time() if now is None else now) - self.timestamp
         if not -1 <= age <= max_age:
             raise TradingError("账户快照已过期")
+        for stamp in self.cycle_cap_cached_at.values():
+            if (type(stamp) not in (int, float) or not 0 <= time.monotonic() - stamp < 5):
+                raise TradingError("账户风控档位查询已过期，等待重试")
 
     def require_ready(self, symbol, now=None):
         self.require_fresh(now)

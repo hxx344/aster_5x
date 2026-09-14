@@ -5,6 +5,7 @@ import time
 import uuid
 from contextlib import nullcontext
 from fractions import Fraction
+from time import monotonic
 
 from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
@@ -20,6 +21,25 @@ SIDES = ("LONG", "SHORT")
 
 
 class CycleExecutor(Executor):
+    def prepare_snapshot(self, account, symbol=None):
+        """Read the one account snapshot this executor may admit once."""
+        self._cycle_admission = None
+        account_id = account["id"]
+        symbol = account["cycle"]["symbol"] if symbol is None else symbol
+        started = monotonic()
+        snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+        # Keep the authority local to this executor. Neither a copied snapshot
+        # nor later changes to its wall-clock timestamp can renew admission.
+        self._cycle_admission = (snapshot, account_id, symbol, started)
+        return snapshot
+
+    @staticmethod
+    def _require_admission_fresh(admission):
+        started, now = admission[3], monotonic()
+        if type(started) not in (int, float) or type(now) not in (int, float) \
+                or not math.isfinite(started) or not math.isfinite(now) or not 0 <= now - started <= 8:
+            raise TradingError("循环本轮账户快照已过期，等待重新核对")
+
     def _observe_quality(self, intent):
         if not intent or intent.get("kind") != "cycle":
             return
@@ -39,6 +59,7 @@ class CycleExecutor(Executor):
             pass
 
     def send(self, intent, orders, *, repair=False):
+        self._cycle_admission = None
         if repair or intent.get("kind") != "cycle":
             return super().send(intent, orders, repair=repair)
         observed = None
@@ -205,6 +226,8 @@ class CycleExecutor(Executor):
         return snapshot.pair(symbol)
 
     def start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None):
+        admission = getattr(self, "_cycle_admission", None)
+        self._cycle_admission = None
         self.last_snapshot = self.last_completed_intent = None
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
@@ -229,14 +252,22 @@ class CycleExecutor(Executor):
         rule = self.market.rules[symbol]
         if qty != floor_step(qty, rule.step) or not rule.min_qty <= qty <= rule.max_qty:
             raise TradingError("循环批次数量不符合交易规则")
-        selected = self._ready(snapshot, symbol)
         final_account_started = clock_tick()
-        snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+        prepared = admission is not None and admission[0] is snapshot \
+            and admission[1] == account["id"] and admission[2] == symbol
+        if prepared:
+            self._require_admission_fresh(admission)
+            long, short = self._ready(snapshot, symbol)
+        else:
+            # Preserve the direct-call contract for callers that did not obtain
+            # this exact snapshot through this executor's one-shot preparation.
+            selected = self._ready(snapshot, symbol)
+            snapshot = self.broker.cycle_snapshot([symbol], fresh_modes=True)
+            long, short = self._ready(snapshot, symbol)
+            if any(current.qty != previous.qty or current.leverage != previous.leverage
+                   for current, previous in zip((long, short), selected)):
+                raise TradingError("独立循环规划后的仓位或杠杆已变化，等待重新核对")
         record_duration(quality, "final_account_ms", final_account_started)
-        long, short = self._ready(snapshot, symbol)
-        if any(current.qty != previous.qty or current.leverage != previous.leverage
-               for current, previous in zip((long, short), selected)):
-            raise TradingError("独立循环规划后的仓位或杠杆已变化，等待重新核对")
         if long.leverage != plan.leverage:
             raise TradingError("独立循环实际杠杆与设定不一致")
         baseline = {"LONG": wire(long.qty), "SHORT": wire(short.qty)}
@@ -283,6 +314,8 @@ class CycleExecutor(Executor):
                     final_ticks = time.monotonic()
         except Exception:
             final_ticks = None
+        if prepared:
+            self._require_admission_fresh(admission)
         self._ready(snapshot, symbol)
         latest = self.store.account(account["id"])
         if not latest.get("enabled") or not latest.get("cycle", {}).get("enabled"):
@@ -319,6 +352,7 @@ class CycleExecutor(Executor):
         return self.reconcile(account, intent)
 
     def set_leverage(self, account, snapshot, progress, before_submit=None):
+        self._cycle_admission = None
         self.last_snapshot = self.last_completed_intent = None
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
@@ -368,6 +402,7 @@ class CycleExecutor(Executor):
         return f"正在核对独立循环 {symbol} {long.leverage}x→{target}x 杠杆调整结果"
 
     def reconcile(self, account, intent=None):
+        self._cycle_admission = None
         self.last_snapshot = self.last_completed_intent = None
         with getattr(self.broker, "reconciliation_budget", nullcontext)():
             intent = intent or self.store.intent(account["id"])

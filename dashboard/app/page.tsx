@@ -91,7 +91,7 @@ type Position = {
   notional: string;
   occupied_margin: string;
   unrealized: string;
-  liquidation: string;
+  liquidation: string | null;
 };
 type Policy = {
   threshold: string;

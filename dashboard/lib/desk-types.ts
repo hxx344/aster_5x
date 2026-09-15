@@ -1,0 +1,122 @@
+import type { CycleConfig, CycleState, CycleTrade } from './cycle';
+import type { MigrationConfig, MigrationState } from './migration';
+import type { ExecutionEvent } from './cycle-events';
+import type { AccountCapacity } from './account-capacity';
+import type { DepthQuote } from './depth';
+export type Position = {
+  symbol: string;
+  side: string;
+  qty: string;
+  entry: string;
+  mark: string;
+  leverage: number;
+  notional: string;
+  occupied_margin: string;
+  unrealized: string;
+  liquidation: string | null;
+};
+export type Policy = {
+  threshold: string;
+  order_notional: string;
+  margin_limit: string;
+  min_open_leverage?: number;
+  ordinary_symbol?: string;
+  spread_limit: string;
+  symbols: string[];
+};
+export type PolicyDraft = {
+  threshold: string;
+  order_notional: string;
+  min_open_leverage: string;
+  ordinary_symbol: string;
+};
+export type Account = {
+  id: string;
+  name: string;
+  mode: string;
+  env_prefix: string;
+  enabled: boolean;
+  cycle_recovery_available?: boolean;
+  status: string;
+  reason: string;
+  credential_ready: boolean;
+  policy: Policy;
+  migration?: MigrationConfig;
+  migration_state?: MigrationState;
+  cycle?: CycleConfig;
+  cycle_state?: CycleState;
+  cycle_trades?: CycleTrade[];
+  cycle_trades_revision?: string;
+  ordinary_add_blocks?: Record<string, string>;
+  risk_limits?: {
+    base: string;
+    high_leverage: string;
+    migration?: string;
+    cycle?: string;
+  };
+  snapshot?: {
+    equity: string;
+    maintenance: string;
+    occupied_margin: string;
+    available: string;
+    wallet: string;
+    unrealized: string;
+    ratio: string | null;
+    margin_ratio?: string | null;
+    total_notional?: string;
+    timestamp: number;
+    positions: Position[];
+    mode_checks: { cross: boolean; hedge: boolean; single_asset: boolean };
+    account_capacity?: Record<string, AccountCapacity>;
+  };
+  strategies: Record<
+    string,
+    {
+      reason: string;
+      phase: string;
+      projected_ratio?: string;
+      completed_notional?: string;
+    }
+  >;
+};
+export type Market = {
+  status: string;
+  error?: string;
+  checked_at: number;
+  capacities: Record<string, string>;
+  capacity_checked_at?: Record<string, number>;
+  poll_interval_ms?: number;
+  fast_leverages?: number[];
+  book?: {
+    bid: string;
+    ask: string;
+    mark: string;
+    spread: string;
+    timestamp?: number;
+  };
+  book_error?: string;
+  depth?: DepthQuote;
+  depth_error?: string;
+};
+export type State = {
+  demo: boolean;
+  ready: boolean;
+  accounts: Account[];
+  markets: Record<string, Market>;
+  events: ExecutionEvent[];
+  updated_at: number;
+  notification: { configured: boolean; pending: number; error?: string };
+};
+
+export type DeskAction = (
+  url: string,
+  body?: object,
+  method?: 'POST' | 'PATCH',
+) => Promise<boolean>;
+export type FeatureProps = {
+  account: Account;
+  busy: boolean;
+  action: DeskAction;
+  setError: (message: string) => void;
+  setNotice: (message: string) => void;
+};

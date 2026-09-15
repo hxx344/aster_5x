@@ -1,10 +1,15 @@
 import { percentFromMarginLimit } from '@/lib/policy';
+import { formatNumber } from '@/lib/number-format';
 import type { ordinaryConditionsView } from '@/lib/ordinary-conditions';
 
 type View = ReturnType<typeof ordinaryConditionsView>;
 type Condition = View['spread'];
 
-function amount(value: string | null, unit: 'USD1' | '%' | 'bp') {
+function amount(
+  value: string | null,
+  unit: 'USD1' | '%' | 'bp',
+  compact = true,
+) {
   if (value === null) return '—';
   let shifted: string;
   try {
@@ -19,6 +24,8 @@ function amount(value: string | null, unit: 'USD1' | '%' | 'bp') {
   }
   if (/[eE]/.test(shifted)) return shifted;
   const [whole, fraction] = shifted.split('.');
+  if (compact && fraction && /[1-9]/.test(fraction.slice(4)))
+    return `≈${formatNumber(shifted, 4)}`;
   return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${fraction === undefined ? '' : `.${fraction}`}`;
 }
 
@@ -26,10 +33,12 @@ function Check({
   label,
   value,
   unit,
+  compact = true,
 }: {
   label: string;
   value: Condition;
   unit: 'USD1' | '%' | 'bp';
+  compact?: boolean;
 }) {
   return (
     <div className="ordinary-condition">
@@ -39,10 +48,10 @@ function Check({
       </div>
       <div className="ordinary-condition-value">
         <span>
-          {amount(value.actual, unit)} {unit}
+          {amount(value.actual, unit, compact)} {unit}
         </span>
         <span>
-          要求 {value.operator} {amount(value.required, unit)} {unit}
+          要求 {value.operator} {amount(value.required, unit, compact)} {unit}
         </span>
       </div>
     </div>
@@ -57,7 +66,7 @@ export function OrdinaryConditions({
   cycleSymbolActive: boolean;
 }) {
   return (
-    <div className="ordinary-conditions">
+    <div className="ordinary-conditions compact-conditions">
       <p className="ordinary-conditions-context">
         当前品种持仓杠杆：
         {view.currentLeverage === null
@@ -93,9 +102,31 @@ export function OrdinaryConditions({
           <Check label="当前保证金占用率" value={tier.margin} unit="%" />
         </section>
       ))}
-      <p className="ordinary-conditions-context">
-        保证金条件按账户当前占用率比较各档上限，未估算调整杠杆后的占用。以上结果只反映各项条件，余额、最小批次、持仓平衡等仍在下单前核验。
-      </p>
+      <details className="disclosure ordinary-precision">
+        <summary>精确数值与条件口径</summary>
+        <Check label="BBO 价差" value={view.spread} unit="bp" compact={false} />
+        {view.tiers.map((tier) => (
+          <section key={tier.leverage} className="ordinary-tier">
+            <h3>{tier.leverage}x</h3>
+            <Check
+              label="公开额度"
+              value={tier.capacity}
+              unit="USD1"
+              compact={false}
+            />
+            <Check
+              label="当前保证金占用率"
+              value={tier.margin}
+              unit="%"
+              compact={false}
+            />
+          </section>
+        ))}
+        <p className="ordinary-conditions-context">
+          ≈
+          为显示近似值，条件判断使用精确数值。保证金条件按当前占用率比较，未估算调整杠杆后的占用；余额、最小批次和持仓平衡仍需在下单前核验。
+        </p>
+      </details>
     </div>
   );
 }

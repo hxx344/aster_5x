@@ -71,6 +71,61 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
     def quota(self, value):
         self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": time.time(), "capacities": {"2": value}}
 
+    def test_lower_tier_capacity_never_replaces_unavailable_current_leverage(self):
+        self.f.broker.set_cycle_leverage(SYMBOL, 20)
+        self.engine.view("test", snapshot=snapshot_json(self.f.broker.snapshot([SYMBOL]), [SYMBOL]))
+        owner = self.f.store.account("test")  # Legacy configured leverage is still 2x.
+        with patch.object(self.f.broker, "submit") as submit, \
+             patch.object(self.f.broker, "set_leverage") as ordinary_leverage, \
+             patch.object(self.f.broker, "set_cycle_leverage") as cycle_leverage:
+            for current in ({}, {"20": "0"}, {"20": "3999"}, {"20": "1000000"}):
+                with self.subTest(current=current):
+                    now = time.time()
+                    self.engine.markets[SYMBOL] = {
+                        "status": "ok", "checked_at": now,
+                        "capacities": {"2": "1000000", "5": "1000000", "10": "1000000", **current},
+                        "capacity_checked_at": {"20": now - 2} if current.get("20") == "1000000" else {},
+                    }
+                    with self.assertRaises(TradingError):
+                        self.engine.cycle_public_hint(owner)
+                    self.engine.tick_account("test")
+                    state = self.engine.views["test"]
+                    self.assertEqual(state["status"], "waiting")
+                    self.assertEqual(state["cycle_state"]["diagnostic"]["checks"][0]["label"], "20x 公共剩余额度")
+                    self.assertEqual(self.f.store.get("cycle:test")["phase"], "waiting_open")
+            submit.assert_not_called()
+            ordinary_leverage.assert_not_called()
+            cycle_leverage.assert_not_called()
+        self.assertEqual(self.f.broker.state["leverages"][SYMBOL], 20)
+        self.assertIsNone(self.f.store.intent("test"))
+
+    def test_exact_current_leverage_survives_open_and_close_with_lower_legacy_setting(self):
+        self.f.broker.set_cycle_leverage(SYMBOL, 17)
+        for side, qty in (("LONG", "1"), ("SHORT", "0.5")):
+            self.f.broker.state["positions"][SYMBOL + ":" + side] = {"qty": qty, "entry": "4412"}
+        self.f.broker.save()
+        self.engine.view("test", snapshot=snapshot_json(self.f.broker.snapshot([SYMBOL]), [SYMBOL]))
+        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": time.time(), "capacities": {"17": "4000"}}
+        with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit, \
+             patch.object(self.f.broker, "set_leverage") as ordinary_leverage, \
+             patch.object(self.f.broker, "set_cycle_leverage") as cycle_leverage:
+            self.engine.tick_account("test")
+            progress = self.f.store.get("cycle:test")
+            self.assertEqual(progress["phase"], "holding")
+            self.assertEqual(progress["config"]["leverage"], 17)
+            self.assertEqual(self.f.store.account("test")["cycle"]["leverage"], 2)
+            progress["opened_at"] = time.time() - 61
+            self.f.store.put("cycle:test", progress)
+            self.engine.markets[SYMBOL] = {}
+            self.engine.tick_account("test")
+            self.assertEqual(submit.call_count, 2)
+            ordinary_leverage.assert_not_called()
+            cycle_leverage.assert_not_called()
+        pair = self.f.broker.snapshot([SYMBOL]).pair(SYMBOL)
+        self.assertEqual(tuple(p.leverage for p in pair), (17, 17))
+        self.assertEqual(tuple(p.qty for p in pair), (dec(1), dec("0.5")))
+        self.assertEqual(self.f.store.get("cycle:test")["completed_cycles"], 1)
+
     def test_capacity_is_checked_before_spread_in_worker_and_public_hint(self):
         self.quota("3999")
         owner = self.f.store.account("test")

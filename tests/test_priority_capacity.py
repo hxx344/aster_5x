@@ -32,9 +32,9 @@ class PriorityCapacityFixture(unittest.TestCase):
     def take_priority_tick(self):
         # Reproduce the scheduler's consumption of a signal before dispatch.
         with self.engine.lock:
-            self.engine.priority_accounts.pop("test", None)
-            self.engine.priority_followups.discard("test")
-            self.engine.active_priority_accounts.add("test")
+            self.engine.work("test").take_priority()
+            self.engine.work("test").followup = False
+            self.engine.work("test").active_priority = True
         return self.engine.tick_account("test")
 
 
@@ -43,10 +43,10 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
         self.f.account["policy"]["threshold"] = "20000"
         self.f.store.save_account(self.f.account)
         self.assertEqual(self.publish({5: 500000, 10: 20000, 20: 19999}), 2)
-        self.assertNotIn("test", self.engine.priority_accounts)
+        self.assertFalse(self.engine.work("test").priority)
 
         self.publish({10: "20000.0001", 20: 20000})
-        self.assertIn(SYMBOL, self.engine.priority_accounts["test"])
+        self.assertIn(SYMBOL, self.engine.work("test").priority)
 
     def test_paused_unrelated_and_disallowed_live_accounts_do_not_wake(self):
         paused = {**account("paused"), "enabled": False}
@@ -60,34 +60,34 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
 
         with patch.dict(os.environ, {}, clear=True):
             self.publish({10: 500000, 20: 500000})
-        self.assertEqual(set(self.engine.priority_accounts), {"test"})
+        self.assertEqual(set({aid: work.priority for aid, work in self.engine.account_work.items() if work.priority}), {"test"})
 
     def test_unchanged_availability_does_not_wake_again_but_new_20x_does(self):
         self.publish({10: 500000, 20: 0})
-        self.assertIn("test", self.engine.priority_accounts)
-        self.engine.priority_accounts.pop("test")
+        self.assertTrue(self.engine.work("test").priority)
+        self.engine.work("test").take_priority()
 
         self.publish({10: 499999, 20: 0})
-        self.assertNotIn("test", self.engine.priority_accounts)
+        self.assertFalse(self.engine.work("test").priority)
 
         self.publish({10: 499999, 20: 500000})
-        self.assertIn(SYMBOL, self.engine.priority_accounts["test"])
+        self.assertIn(SYMBOL, self.engine.work("test").priority)
 
     def test_capacity_recovery_after_a_drop_creates_a_new_opportunity(self):
         self.publish({10: 500000, 20: 0})
-        self.engine.priority_accounts.pop("test")
+        self.engine.work("test").take_priority()
         self.publish({10: 0, 20: 0})
-        self.assertNotIn("test", self.engine.priority_accounts)
+        self.assertFalse(self.engine.work("test").priority)
         self.publish({10: 500000, 20: 0})
-        self.assertIn("test", self.engine.priority_accounts)
+        self.assertTrue(self.engine.work("test").priority)
 
     def test_losing_one_available_tier_does_not_create_another_wake(self):
         self.publish({10: 500000, 20: 500000})
-        self.engine.priority_accounts.pop("test")
+        self.engine.work("test").take_priority()
         self.publish({10: 0, 20: 500000})
-        self.assertNotIn("test", self.engine.priority_accounts)
+        self.assertFalse(self.engine.work("test").priority)
         self.publish({10: 500000, 20: 500000})
-        self.assertIn("test", self.engine.priority_accounts)
+        self.assertTrue(self.engine.work("test").priority)
 
     def test_current_high_tier_can_wake_when_new_capacity_is_below_existing_exposure(self):
         self.f.broker.state["leverages"][SYMBOL] = 10
@@ -100,7 +100,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
         # Existing gross exposure exceeds 44,000; 20,000 remaining public
         # capacity still covers this account's next 1,000-per-side batch.
         self.publish({10: 20000, 20: 0})
-        self.assertIn("test", self.engine.priority_accounts)
+        self.assertTrue(self.engine.work("test").priority)
         with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit, \
              patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change:
             self.take_priority_tick()
@@ -117,7 +117,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
         with patch("trading.engine.time.time", side_effect=lambda: clock[0]), \
              patch.object(self.f.market, "capacities", side_effect=slow_capacity):
             self.real_poll_market(SYMBOL)
-            self.assertNotIn("test", self.engine.priority_accounts)
+            self.assertFalse(self.engine.work("test").priority)
             with self.assertRaisesRegex(TradingError, "额度快照"):
                 self.engine.capacities(SYMBOL)
 
@@ -125,7 +125,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
         with patch.object(self.f.market, "book", side_effect=AssertionError("book has its own worker")):
             self.assertEqual(self.publish({10: 500000}), 2)
             self.assertEqual(self.engine.capacities(SYMBOL)[10], dec(500000))
-        self.assertIn("test", self.engine.priority_accounts)
+        self.assertTrue(self.engine.work("test").priority)
 
     def test_a_blocked_book_worker_does_not_delay_capacity_publication(self):
         book = self.f.market.book(SYMBOL)
@@ -143,7 +143,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
             try:
                 self.assertTrue(entered.wait(1))
                 self.assertEqual(self.publish({10: 500000}), 2)
-                self.assertIn("test", self.engine.priority_accounts)
+                self.assertTrue(self.engine.work("test").priority)
                 self.assertEqual(self.engine.capacities(SYMBOL)[10], dec(500000))
                 self.assertTrue(worker.is_alive())
             finally:
@@ -168,7 +168,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
             try:
                 self.assertTrue(entered.wait(1))
                 self.assertEqual(self.publish({10: 500000}), 2)
-                self.assertIn("test", self.engine.priority_accounts)
+                self.assertTrue(self.engine.work("test").priority)
                 self.assertEqual(self.engine.capacities(SYMBOL)[10], dec(500000))
                 self.assertTrue(worker.is_alive())
             finally:
@@ -186,8 +186,8 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
              patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             delay = self.take_priority_tick()
         self.assertEqual(delay, 45)
-        self.assertGreaterEqual(self.engine.account_backoff["test"], started + 45)
-        self.assertIn("test", self.engine.priority_followups)
+        self.assertGreaterEqual(self.engine.work("test").backoff, started + 45)
+        self.assertTrue(self.engine.work("test").followup)
         self.assertIsNone(self.f.store.intent("test"))
         submit.assert_not_called()
 
@@ -198,14 +198,14 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.take_priority_tick()
             change.assert_called_once_with(SYMBOL, 10)
             self.assertEqual(self.f.store.intent("test")["target"], 10)
-            self.assertIn("test", self.engine.priority_followups)
-            self.assertNotIn("test", self.engine.active_priority_accounts)
+            self.assertTrue(self.engine.work("test").followup)
+            self.assertFalse(self.engine.work("test").active_priority)
             submit.assert_not_called()
 
             self.take_priority_tick()
             self.assertIsNone(self.f.store.intent("test"))
             self.assertEqual(self.f.store.get("open_after_leverage:test:" + SYMBOL), 10)
-            self.assertIn("test", self.engine.priority_followups)
+            self.assertTrue(self.engine.work("test").followup)
             submit.assert_not_called()
 
             self.take_priority_tick()
@@ -214,7 +214,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.assertEqual({order["symbol"] for order in submit.call_args.args[0]}, {SYMBOL})
             self.assertIsNone(self.f.store.intent("test"))
             self.assertIsNone(self.f.store.get("open_after_leverage:test:" + SYMBOL))
-            self.assertNotIn("test", self.engine.priority_followups)
+            self.assertFalse(self.engine.work("test").followup)
             self.assertEqual(self.f.broker.state["leverages"][SYMBOL], 10)
 
     def test_20x_is_used_when_10x_capacity_is_unavailable(self):
@@ -236,8 +236,8 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
         with patch("trading.engine.Executor.reconcile", return_value="等待账户确认"):
             self.take_priority_tick()
         self.assertIsNotNone(self.f.store.intent("test"))
-        self.assertIn("test", self.engine.urgent_accounts)
-        self.assertNotIn("test", self.engine.priority_followups)
+        self.assertTrue(self.engine.work("test").urgent)
+        self.assertFalse(self.engine.work("test").followup)
 
     def test_capacity_dropping_after_confirmation_prevents_opening(self):
         self.publish({10: 500000})
@@ -249,7 +249,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.take_priority_tick()
             submit.assert_not_called()
         self.assertEqual(self.f.broker.state["leverages"][SYMBOL], 10)
-        self.assertNotIn("test", self.engine.priority_followups)
+        self.assertFalse(self.engine.work("test").followup)
 
     def test_capacity_lost_during_fresh_account_read_prevents_the_upgrade_write(self):
         self.publish({10: 500000})
@@ -266,7 +266,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.take_priority_tick()
         change.assert_not_called()
         self.assertIsNone(self.f.store.intent("test"))
-        self.assertNotIn("test", self.engine.priority_followups)
+        self.assertFalse(self.engine.work("test").followup)
 
     def test_priority_upgrade_still_respects_a_higher_opening_floor(self):
         self.f.account["policy"]["min_open_leverage"] = 20
@@ -292,7 +292,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
                 return tick(aid)
             finally:
                 with self.engine.lock:
-                    self.engine.active_priority_accounts.discard(aid)
+                    self.engine.work(aid).active_priority = False
 
         with patch.object(self.engine, "scheduling", return_value=timing), \
              patch.object(self.engine, "tick_account", side_effect=worker), \
@@ -311,7 +311,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
         calls = []
 
         def tick(aid):
-            calls.append((time.monotonic(), aid in self.engine.active_priority_accounts))
+            calls.append((time.monotonic(), self.engine.work(aid).active_priority))
             (first if len(calls) == 1 else second).set()
             return 60
 
@@ -396,7 +396,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
             if len(calls) == 1:
                 with self.engine.lock:
                     deadline.append(time.monotonic() + .6)
-                    self.engine.account_backoff[aid] = deadline[0]
+                    self.engine.work(aid).backoff = deadline[0]
                 first.set()
             else:
                 second.set()
@@ -426,7 +426,7 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
                 # this test deadline to exercise expiration in bounded time.
                 with self.engine.lock:
                     retry_deadline.append(time.monotonic() + .35)
-                    self.engine.account_backoff[aid] = retry_deadline[0]
+                    self.engine.work(aid).backoff = retry_deadline[0]
                 denied.set()
                 return delay
             delay = real_tick(aid)

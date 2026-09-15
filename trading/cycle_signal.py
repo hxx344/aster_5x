@@ -4,7 +4,7 @@ import math
 import time
 
 from .cycle import CYCLE_DEPTH_MAX_AGE, _depth_sweeps, _spread, _state
-from .models import TradingError, dec, decimal_value, positive, wire
+from .models import TradingError, dec, positive
 
 
 def cycle_signal_quote(account, progress, book, depth, rule, *, now):
@@ -78,7 +78,4 @@ def cycle_signal_quote(account, progress, book, depth, rule, *, now):
     depth.require_fresh(now)
     if depth.age(now) + max(0, time.monotonic() - started) > CYCLE_DEPTH_MAX_AGE:
         raise TradingError("循环行情预筛期间深度已过期")
-    # The returned quantity is only the hint's public sizing basis; the caller
-    # must never substitute it for plan_cycle's fresh account-aware result.
-    return {"phase": "open" if phase == "waiting_open" else "close",
-            "minimum_quantity": wire(quantity), "reference_spread_bp": wire(decimal_value(spread))}
+    return {"phase": "open" if phase == "waiting_open" else "close"}

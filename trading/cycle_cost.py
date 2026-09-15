@@ -56,7 +56,7 @@ def _summary(rows):
             "complete": unmatched_count == 0}
 
 
-def calculate_cycle_costs(fills, now):
+def calculate_cycle_costs(fills, now, *, symbol=None):
     """Report one account's costs as of now using complete related intents.
 
     BUY/SELL quantities pair FIFO within account, intent and symbol. A match's
@@ -66,6 +66,8 @@ def calculate_cycle_costs(fills, now):
     synchronization responsibility; this function only describes supplied data.
     """
     now = _timestamp(now)
+    if symbol is not None and symbol not in SYMBOLS:
+        raise TradingError("循环成本统计品种无效")
     date, day_start, _ = utc_day(now)
     if not isinstance(fills, (list, tuple)):
         raise TradingError("循环成本成交列表无效")
@@ -103,8 +105,9 @@ def calculate_cycle_costs(fills, now):
                 opposite.popleft()
         if row["remaining"]:
             sides[row["side"]].append(row)
-    daily = {**_summary(row for row in rows if day_start <= row["executed_at"] <= now), "utc_date": date}
-    rolling = {**_summary(row for row in rows if now - 86400 < row["executed_at"] <= now),
+    summary_rows = rows if symbol is None else [row for row in rows if row["symbol"] == symbol]
+    daily = {**_summary(row for row in summary_rows if day_start <= row["executed_at"] <= now), "utc_date": date}
+    rolling = {**_summary(row for row in summary_rows if now - 86400 < row["executed_at"] <= now),
                "window_start": now - 86400, "window_end": now}
     trades = [{"symbol": row["symbol"], "trade_id": row["trade_id"],
                "taker_fee": _wire(row["fee"]), "spread_cost": _wire(row["spread"]),

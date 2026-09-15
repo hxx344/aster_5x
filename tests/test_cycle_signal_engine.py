@@ -12,6 +12,7 @@ from tests.helpers import account
 from tests import test_cycle_parallel_engine as parallel_cases
 from trading.exchange import API, LiveBroker, RateBudget
 from trading.models import dec
+from trading.store import Store
 
 
 class CycleSignalEngineTests(TestCase):
@@ -90,7 +91,7 @@ class CycleSignalEngineTests(TestCase):
             with self.subTest(case=case):
                 if case == "post_fill":
                     self.f.store.put("post_fill_check:test", {"intent_id": "previous"})
-                with patch.object(self.f.store, "intent", return_value={"id": "existing"} if case == "intent" else None), \
+                with patch.object(Store, "intent", return_value={"id": "existing"} if case == "intent" else None), \
                      patch.object(self.engine, "broker", side_effect=AssertionError("wake bypassed recovery")):
                     self.engine.tick_account("test", cycle_signal=signal)
         self.assertEqual(self.f.broker.state["orders"], {})
@@ -109,7 +110,7 @@ class CycleSignalEngineTests(TestCase):
         submit.assert_not_called()
         self.assertIsNone(self.f.store.intent("test"))
         self.assertEqual(self.f.broker.state["orders"], {})
-        self.assertEqual(self.engine.cycle_quote_backoff["test"], self.engine.account_backoff["test"])
+        self.assertEqual(self.engine.work("test").quote_backoff, self.engine.work("test").backoff)
 
     def test_current_depth_rejection_never_reaches_private_reads(self):
         self.start()
@@ -134,7 +135,7 @@ class CycleSignalEngineTests(TestCase):
         submit.assert_not_called()
         self.assertFalse(self.f.store.account("test")["enabled"])
         self.assertEqual(self.engine.views["test"]["cycle_state"]["phase"], "attention")
-        self.assertNotIn("test", self.engine.cycle_quote_backoff)
+        self.assertFalse(self.engine.work("test").quote_backoff)
 
     def test_live_budget_rejects_whole_wake_before_any_http_request(self):
         self.start()
@@ -153,8 +154,8 @@ class CycleSignalEngineTests(TestCase):
             self.engine.tick_account("test", cycle_signal=signal)
         self.assertEqual(seen, [])
         self.assertIn("预算", self.engine.views["test"]["reason"])
-        self.assertGreater(self.engine.account_backoff["test"], time.monotonic())
-        self.assertNotIn("test", self.engine.cycle_quote_backoff)
+        self.assertGreater(self.engine.work("test").backoff, time.monotonic())
+        self.assertFalse(self.engine.work("test").quote_backoff)
 
     def test_quality_state_is_owned_by_saved_account_and_survives_restart(self):
         self.start()

@@ -4,12 +4,18 @@ import { createStatePoller } from '../lib/state-poller.ts';
 
 function deferred() {
   let resolve, reject;
-  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  const promise = new Promise((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
   return { promise, resolve, reject };
 }
 
 function fixture(t) {
-  const calls = [], states = [], errors = [], unauthorized = [];
+  const calls = [],
+    states = [],
+    errors = [],
+    unauthorized = [];
   const poller = createStatePoller({
     request: (_url, options) => {
       const call = { ...deferred(), signal: options.signal };
@@ -150,4 +156,37 @@ test('network failure permits a subsequent refresh', async (t) => {
   await retry;
   assert.deepEqual(f.errors, ['offline']);
   assert.deepEqual(f.states, [{ recovered: true }]);
+});
+
+test('account switch cancels an old history response before it can enter the cache', async () => {
+  const calls = [],
+    states = [];
+  let selected = 'first';
+  const poller = createStatePoller({
+    requestUrl: () => `/api/state?history_account=${selected}`,
+    request: (url, options) => {
+      const call = { ...deferred(), url, signal: options.signal };
+      calls.push(call);
+      return call.promise;
+    },
+    onState: (state) => states.push(state),
+    onError: () => assert.fail('unexpected error'),
+    onUnauthorized: () => assert.fail('unexpected logout'),
+  });
+  try {
+    const old = poller.refresh();
+    selected = 'second';
+    poller.pause();
+    poller.resume();
+    const next = poller.refresh();
+    assert.equal(calls[0].signal.aborted, true);
+    assert.match(calls[1].url, /history_account=second/);
+    calls[1].resolve(Response.json({ account: 'second' }));
+    await next;
+    calls[0].resolve(Response.json({ account: 'first' }));
+    await old;
+    assert.deepEqual(states, [{ account: 'second' }]);
+  } finally {
+    poller.pause();
+  }
 });

@@ -217,7 +217,7 @@ class CycleHotEngineTests(unittest.TestCase):
                     self.broker.refresh_cycle_hot_snapshot.assert_not_called()
                     executor.assert_not_called()
                     backlog.assert_not_called()
-                self.assertGreaterEqual(self.engine.cycle_hot_backoff["test"], started + CYCLE_HOT_POLL_INTERVAL)
+                self.assertGreaterEqual(self.engine.work("test").hot_backoff, started + CYCLE_HOT_POLL_INTERVAL)
                 with self.assertRaises(HotAccountUnavailable):
                     lease.require_fresh()
 
@@ -356,7 +356,7 @@ class CycleHotEngineTests(unittest.TestCase):
                 # Consume the failed future at time 100 before advancing time.
                 harness.ticks = {1: 100, 2: 101, 3: 129.999, 4: 130}[step]
                 if step >= 2:
-                    self.assertEqual(harness.engine.cycle_hot_backoff["test"], 130)
+                    self.assertEqual(harness.engine.work("test").hot_backoff, 130)
                 for _ in range(20):
                     harness.engine.wake_cycle_hot_data("test")
             else:
@@ -414,9 +414,8 @@ class CycleHotEngineTests(unittest.TestCase):
                 harness.emit(101)
                 # This public opportunity was already checked while hot data
                 # was missing. A successful publication must rearm it.
-                harness.engine.cycle_signal_seen["test"] = (SYMBOL, "bbo", 101, harness.engine.accounts_generation)
-                harness.engine.cycle_signal_ready["test"] = (SYMBOL, "open", harness.engine.accounts_generation)
-                harness.engine.cycle_hot_waiting.add("test")
+                harness.engine.work("test").cycle.seen = (SYMBOL, "bbo", 101, harness.engine.accounts_generation)
+                harness.engine.work("test").cycle.opportunity = (SYMBOL, "open", harness.engine.accounts_generation)
                 broker.refresh_cycle_hot_snapshot.return_value = True
                 cache = broker.cycle_cache
                 cache.configure([SYMBOL])
@@ -424,8 +423,8 @@ class CycleHotEngineTests(unittest.TestCase):
                 cache.publish(cache.begin_refresh(), self.f.broker.snapshot([SYMBOL]), time.monotonic())
                 harness.engine.wake_cycle_hot_data("test")
             elif step == 3:
-                self.assertNotIn("test", harness.engine.cycle_hot_waiting)
-                self.assertNotIn("test", harness.engine.wake_accounts)
+                self.assertIsNone(harness.engine.work("test").cycle.seen)
+                self.assertFalse(harness.engine.work("test").wake)
                 harness.ticks = 101.1
             elif step == 4:
                 harness.ticks = 129

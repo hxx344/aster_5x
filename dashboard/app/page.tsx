@@ -59,6 +59,7 @@ import {
   type CycleTrade,
 } from '@/lib/cycle';
 import { createStatePoller } from '@/lib/state-poller';
+import { createStateHistory } from '@/lib/state-history';
 import { accountModeView } from '@/lib/account-modes';
 import {
   accountCapacityView,
@@ -127,6 +128,7 @@ type Account = {
   cycle?: CycleConfig;
   cycle_state?: CycleState;
   cycle_trades?: CycleTrade[];
+  cycle_trades_revision?: string;
   ordinary_add_blocks?: Record<string, string>;
   risk_limits?: {
     base: string;
@@ -208,6 +210,7 @@ const clock = (v?: number) =>
 export default function Home() {
   const [state, setState] = useState<State | null>(null);
   const [selected, setSelected] = useState('');
+  const [history] = useState(() => createStateHistory<CycleTrade>());
   const [focus, setFocus] = useState('XAUUSD1');
   const [error, setError] = useState('');
   const [errorAccountId, setErrorAccountId] = useState('');
@@ -237,6 +240,7 @@ export default function Home() {
     setNeedsLogin(true);
     setState(null);
     setSelected('');
+    history.clear();
     setDrafts({});
     setMigrationDrafts({});
     setCycleDrafts({});
@@ -245,24 +249,28 @@ export default function Home() {
     setConnectionError('');
     setError('');
     setErrorAccountId('');
-  }, []);
+  }, [history]);
   const [poller] = useState(() =>
     createStatePoller<State>({
+      requestUrl: () => history.url(),
       onState: (next) => {
-        setState(next);
+        setState({ ...next, accounts: history.merge(next.accounts) });
         setServerClock({ server: next.updated_at, local: Date.now() / 1000 });
         setNeedsLogin(false);
         setConnectionError('');
-        setSelected((v) =>
-          next.accounts.some((a) => a.id === v)
-            ? v
-            : next.accounts[0]?.id || '',
-        );
+        setSelected(history.selected());
       },
       onUnauthorized: clearSession,
       onError: setConnectionError,
     }),
   );
+  const selectAccount = (id: string) => {
+    history.select(id);
+    setSelected(id);
+    poller.pause();
+    poller.resume();
+    void poller.refresh();
+  };
   const refresh = useCallback(() => poller.refresh(), [poller]);
   useEffect(() => {
     poller.resume();
@@ -498,7 +506,7 @@ export default function Home() {
                 disabled={busy}
                 onValueChange={(v) => {
                   if (!v) return;
-                  setSelected(v);
+                  selectAccount(v);
                   setError('');
                   setNotice('');
                 }}
@@ -533,7 +541,7 @@ export default function Home() {
                     e.preventDefault();
                     if (await action('/api/accounts', newAccount)) {
                       setAddOpen(false);
-                      setSelected(newAccount.id);
+                      selectAccount(newAccount.id);
                       setNewAccount({
                         id: '',
                         name: '',

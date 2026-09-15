@@ -236,7 +236,7 @@ class CycleVolumeTests(unittest.TestCase):
     def test_record_transaction_rolls_back_fill_event_and_total_together(self):
         intent = self.intent()
         with self.store.connect() as db:
-            db.execute("CREATE TRIGGER deny_day BEFORE INSERT ON cycle_volume_days BEGIN SELECT RAISE(ABORT,'test failure'); END")
+            db.execute("CREATE TRIGGER deny_day BEFORE INSERT ON cycle_symbol_volume_days BEGIN SELECT RAISE(ABORT,'test failure'); END")
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.record_cycle_fills(intent, [self.fill(intent)])
         self.assertEqual(self.store.cycle_trade_records("first"), [])
@@ -313,7 +313,7 @@ class CycleVolumeTests(unittest.TestCase):
         intent = self.intent()
         self.store.record_cycle_fills(intent, [self.fill(intent)])
         with self.store.connect() as db:
-            for table in ("accounts", "intents", "events", "cycle_volume_days", "cycle_volume_sync"):
+            for table in ("accounts", "intents", "events", "cycle_symbol_volume_days", "cycle_volume_sync", "cycle_fill_versions"):
                 db.execute("DELETE FROM " + table)
         with self.assertRaisesRegex(TradingError, "用途未确认"):
             Store(self.path, demo=True)

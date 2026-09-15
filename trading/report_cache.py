@@ -4,6 +4,8 @@ import logging
 import threading
 import time
 
+from .ledger_cache import LedgerCache
+
 
 LOG = logging.getLogger("aster.trading")
 REPORT_INTERVAL = 5
@@ -18,13 +20,14 @@ class ReportCache:
         self.worker = None
         self.due = 0
         self.closed = False
+        self.history = LedgerCache()
 
     @staticmethod
     def key(account):
         config = account.get("cycle", {})
         return config.get("symbol"), config.get("daily_volume_limit")
 
-    def read(self, accounts, now):
+    def read(self, accounts, now, *, history_revisions=None):
         with self.lock:
             live_ids = {account["id"] for account in accounts}
             self.entries = {aid: row for aid, row in self.entries.items() if aid in live_ids}
@@ -38,7 +41,14 @@ class ReportCache:
                 data, stamp = entry.get("data"), entry.get("as_of")
                 stale = stamp is None or not 0 <= now - stamp < REPORT_MAX_AGE or now // 86400 != stamp // 86400
                 error = entry.get("error")
-                result[account["id"]] = (deepcopy(data), {
+                selected = data
+                if data is not None and history_revisions is not None:
+                    selected = {key: value for key, value in data.items() if key not in ("trades", "trades_revision")}
+                    if account["id"] in history_revisions:
+                        selected["trades_revision"] = data.get("trades_revision")
+                        if not data.get("trades_revision") or history_revisions[account["id"]] != data["trades_revision"]:
+                            selected["trades"] = data["trades"]
+                result[account["id"]] = (deepcopy(selected), {
                     "as_of": stamp, "max_age_seconds": REPORT_MAX_AGE,
                     "status": ("stale" if stale or error else "ready") if data is not None else ("error" if error else "loading"),
                     "refreshing": bool(running or start), "error": error})

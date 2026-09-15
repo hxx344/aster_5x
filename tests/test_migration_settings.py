@@ -113,8 +113,8 @@ class MigrationSettingsTests(unittest.TestCase):
         self.assertEqual(self.f.store.intent("test"), intent)
         self.assertEqual(self.f.store.get("migration:test"), ledger)
         self.assertEqual(self.engine.views["test"]["status"], "reconciling")
-        self.assertIn("test", self.engine.wake_accounts)
-        self.assertIn("test", self.engine.urgent_accounts)
+        self.assertTrue(self.engine.work("test").wake)
+        self.assertTrue(self.engine.work("test").urgent)
         with patch("trading.engine.MigrationExecutor.reconcile", return_value="继续核对已提交减仓") as reconcile:
             self.engine.tick_account("test")
         reconcile.assert_called_once()

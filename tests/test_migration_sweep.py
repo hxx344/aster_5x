@@ -60,7 +60,7 @@ class MigrationSweepTests(unittest.TestCase):
                             Fraction("1.25") + epsilon, Fraction(4) - epsilon, Fraction(4)],
                 amounts=[Fraction(-1), Fraction(0), first_amount - epsilon,
                          first_amount, first_amount + epsilon, Fraction(1000)])
-            self.assertEqual(_Sweep(levels, bids=bids).levels, [levels[1], levels[3]])
+            self.assertEqual(_Sweep(levels, bids=bids).levels, (levels[1], levels[3]))
 
     def test_full_thousand_level_book_matches_selected_deep_boundaries(self):
         epsilon = Fraction(1, 10**40)

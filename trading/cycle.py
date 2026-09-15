@@ -8,7 +8,7 @@ import math
 import time
 
 from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
-from .migration import _Sweep, migration_symbols
+from .migration import migration_symbols
 from .models import (SYMBOLS, TradingError, cycle_margin_limit, dec, decimal_value, leverage_cap,
                      positive, wire)
 
@@ -166,7 +166,7 @@ def _depth_sweeps(depth, now):
     if not -1 <= depth.age(now) <= CYCLE_DEPTH_MAX_AGE:
         raise TradingError("循环交易深度已过期，等待 3 秒内的新快照")
     try:
-        bids, asks = _Sweep(depth.bids, bids=True), _Sweep(depth.asks, bids=False)
+        bids, asks = depth.sweeps
     except TradingError as exc:
         raise TradingError(str(exc).replace("迁移", "循环交易")) from exc
     if bids.levels[0][0] > asks.levels[0][0]:

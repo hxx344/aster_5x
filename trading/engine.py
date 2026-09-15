@@ -27,6 +27,7 @@ from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic
 from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols, ordinary_selection
 from .cycle_quality import clock_tick, elapsed as observed_elapsed
 from .cycle_signal import cycle_signal_quote
+from .cycle_projection import cycle_overlay, project_cycle_state
 from .cycle_capacity import require_cycle_capacity
 from .models import cycle_margin_limit
 from .lock import ProcessLock
@@ -35,6 +36,7 @@ from .migration_execution import MigrationExecutor
 from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
+from .scheduling import AccountWork
 from .store import dumps
 
 LOG = logging.getLogger("aster.trading")
@@ -153,17 +155,8 @@ class Engine:
         self.markets, self.views, self.rotation = {}, {}, {}
         self.display_snapshots = {}
         self.dashboard_reports = ReportCache(self._load_dashboard_report)
-        self.wake_accounts, self.urgent_accounts = set(), set()
-        self.priority_accounts, self.priority_levels = {}, {}
-        self.priority_followups, self.active_priority_accounts = set(), set()
-        self.active_priority_signals = {}
-        self.account_backoff = {}
-        self.cycle_quote_backoff = {}
-        self.cycle_market_updates, self.cycle_market_order, self.cycle_signal_seen = {}, {}, {}
-        self.cycle_signals, self.cycle_signal_ready, self.cycle_signal_after = {}, {}, {}
-        self.cycle_signal_deferred = set()
-        self.cycle_hot_wakes, self.cycle_hot_waiting = set(), set()
-        self.cycle_hot_backoff = {}
+        self.account_work = {}
+        self.cycle_market_updates, self.cycle_market_order = {}, {}
         self.cycle_recovery_previews = {}
         self.ready = False
         self.error = "正在连接行情服务"
@@ -179,6 +172,13 @@ class Engine:
     def account_lock(self, account_id):
         with self.lock:
             return self.account_locks.setdefault(account_id, threading.RLock())
+
+    def work(self, account_id):
+        with self.lock:
+            state = self.account_work.get(account_id)
+            if state is None:
+                state = self.account_work[account_id] = AccountWork()
+            return state
 
     def view(self, account_id, **updates):
         with self.lock:
@@ -223,14 +223,13 @@ class Engine:
         if self.shutdown.is_set():
             return
         with self.lock:
-            self.cycle_hot_wakes.add(account_id)
+            self.work(account_id).hot_wake = True
         self.scheduler_event.set()
 
     def cycle_hot_ready(self, account_id):
         with self.lock:
-            self.cycle_hot_waiting.discard(account_id)
-            self.cycle_signal_seen.pop(account_id, None)
-            self.cycle_signal_ready.pop(account_id, None)
+            self.work(account_id).cycle.seen = None
+            self.work(account_id).cycle.opportunity = None
         self.scheduler_event.set()
 
     def revoke_cycle_hot_data(self, account_id, reason):
@@ -258,7 +257,7 @@ class Engine:
         if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
             broker.invalidate_cycle_hot_data("本账户未完成批次正在核对")
             with self.lock:
-                self.cycle_hot_backoff[account_id] = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
+                self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
             return CYCLE_HOT_POLL_INTERVAL
         try:
             # A hot refresh spends ordinary quota only. Keep room for one
@@ -278,7 +277,7 @@ class Engine:
             return CYCLE_HOT_POLL_INTERVAL
         except HotAccountUnavailable:
             with self.lock:
-                self.cycle_hot_backoff[account_id] = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
+                self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
             return CYCLE_HOT_POLL_INTERVAL
         except AccountModeError as exc:
             broker.invalidate_cycle_hot_data("账户模式不符合要求", refresh_modes=True)
@@ -297,7 +296,7 @@ class Engine:
             broker.invalidate_cycle_hot_data("账户后台更新暂不可用")
             delay = max(CYCLE_HOT_POLL_INTERVAL, getattr(exc, "retry_after", 0))
             with self.lock:
-                self.cycle_hot_backoff[account_id] = time.monotonic() + delay
+                self.work(account_id).hot_backoff = time.monotonic() + delay
             return delay
 
     def poll_cycle_history(self, account_id):
@@ -364,13 +363,14 @@ class Engine:
         symbol = account.get("cycle", {}).get("symbol")
         if not account.get("enabled") or not account.get("cycle", {}).get("enabled") or symbol not in self.market.rules:
             return None
-        if self.store.intent(account["id"]) or self.store.get("post_fill_check:" + account["id"]):
-            return None
+        with self.store.read_snapshot() as reader:
+            if reader.intent(account["id"]) or reader.get("post_fill_check:" + account["id"]):
+                return None
+            progress = reader.get("cycle:" + account["id"])
         with self.lock:
             state = self.views.get(account["id"], {}).get("cycle_state", {})
             if state.get("phase") in ("attention", "daily_limit", "rolling_limit"):
                 return None
-        progress = self.store.get("cycle:" + account["id"])
         if not progress or progress.get("phase", "waiting_open") == "waiting_open":
             self.require_cycle_open_capacity(account["cycle"], self.cycle_actual_leverage(account))
         if isinstance(self.market, MarketData):
@@ -388,50 +388,54 @@ class Engine:
             updates = self.cycle_market_updates.copy()
             capacity_versions = {symbol: (row.get("status"), row.get("checked_at")) for symbol, row in self.markets.items()}
         live_ids = {account["id"] for account in accounts}
-        self.cycle_signal_deferred.intersection_update(live_ids)
-        for mapping in (self.cycle_signals, self.cycle_signal_seen, self.cycle_signal_ready, self.cycle_signal_after):
-            for aid in set(mapping) - live_ids:
-                mapping.pop(aid, None)
+        with self.lock:
+            for aid, work in self.account_work.items():
+                if aid not in live_ids:
+                    work.cycle.clear_hint()
+                    work.cycle.rearm()
+                    work.cycle.after = 0
         for account in accounts:
             aid = account["id"]
+            work = self.work(aid)
             signal = updates.get(account.get("cycle", {}).get("symbol"))
             if not self.fresh_cycle_signal(signal) or not account.get("enabled") or not account.get("cycle", {}).get("enabled"):
-                self.cycle_signals.pop(aid, None)
-                self.cycle_signal_ready.pop(aid, None)
+                work.cycle.signal = None
+                work.cycle.opportunity = None
                 continue
             # Leave the latest signal unseen until this account's existing work
             # finishes. No signal is ever allowed to create a second worker.
             if "account:" + aid in pending_keys:
                 identity = (signal["symbol"], signal["source"], signal["received_monotonic"], self.accounts_generation, capacity_versions.get(signal["symbol"]))
-                if self.cycle_signal_seen.get(aid) != identity:
-                    self.cycle_signal_deferred.add(aid)
+                if work.cycle.seen != identity:
+                    work.cycle.deferred = True
                 continue
             with self.lock:
-                backoff = self.account_backoff.get(aid, 0)
-                blocked = time.monotonic() < backoff and self.cycle_quote_backoff.get(aid) != backoff
+                backoff = work.backoff
+                blocked = time.monotonic() < backoff and work.quote_backoff != backoff
             if blocked:
-                self.cycle_signals.pop(aid, None)
-                self.cycle_signal_ready.pop(aid, None)
+                work.cycle.signal = None
+                work.cycle.opportunity = None
                 continue
             identity = (signal["symbol"], signal["source"], signal["received_monotonic"], self.accounts_generation, capacity_versions.get(signal["symbol"]))
-            if self.cycle_signal_seen.get(aid) == identity:
+            if work.cycle.seen == identity:
                 continue
-            self.cycle_signal_seen[aid] = identity
+            work.cycle.seen = identity
             try:
                 hint = self.cycle_public_hint(account)
             except (TradingError, KeyError, ValueError, TypeError, OverflowError):
                 hint = None
             if hint is None:
-                self.cycle_signal_ready.pop(aid, None)
-                self.cycle_signals.pop(aid, None)
+                work.cycle.opportunity = None
+                work.cycle.signal = None
                 continue
             opportunity = (signal["symbol"], hint["phase"], self.accounts_generation)
-            if self.cycle_signal_ready.get(aid) != opportunity or aid in self.cycle_signals:
-                self.cycle_signals[aid] = {**signal, **hint}
-            self.cycle_signal_ready[aid] = opportunity
+            if work.cycle.opportunity != opportunity or work.cycle.signal is not None:
+                work.cycle.signal = {**signal, **hint}
+            work.cycle.opportunity = opportunity
         now = time.monotonic()
-        return {aid: signal for aid, signal in self.cycle_signals.items()
-                if self.fresh_cycle_signal(signal) and now >= self.cycle_signal_after.get(aid, 0)}
+        with self.lock:
+            return {aid: work.cycle.signal for aid, work in self.account_work.items()
+                    if self.fresh_cycle_signal(work.cycle.signal) and now >= work.cycle.after}
 
     @staticmethod
     def cycle_waits_for_market(exc):
@@ -531,7 +535,7 @@ class Engine:
         broker = self.brokers.get(account["id"])
         if isinstance(broker, LiveBroker):
             try:
-                return broker.cycle_cache.lease([symbol]).snapshot.pair(symbol)[0].leverage
+                return broker.cycle_cache.current_leverage(symbol)
             except TradingError:
                 return None
         with self.lock:
@@ -566,7 +570,7 @@ class Engine:
                     try:
                         # This lease reads only local background data. It can
                         # detect leverage changes before the next UI publication.
-                        actual = {p.leverage for p in broker.cycle_cache.lease([symbol]).snapshot.pair(symbol)}
+                        actual = {broker.cycle_cache.current_leverage(symbol)}
                     except TradingError:
                         pass
                 leverage = next(iter(actual)) if len(actual) == 1 else None
@@ -673,7 +677,7 @@ class Engine:
         fresh = -1 <= time.time() - checked_at <= 8
         by_id = {a["id"]: a for a in accounts}
         with self.lock:
-            ids = set(by_id) | {aid for aid, market in self.priority_levels if market == symbol}
+            ids = set(by_id) | {aid for aid, work in self.account_work.items() if symbol in work.priority_levels}
             for aid in ids:
                 account = by_id.get(aid)
                 levels = ()
@@ -690,26 +694,24 @@ class Engine:
                     levels = tuple(tier for tier in PRIORITY_TIERS
                                    if (tier > current and capacities.get(tier, dec(0)) > required)
                                    or (tier == current >= minimum and capacities.get(tier, dec(0)) > threshold))
-                key = (aid, symbol)
-                previous = self.priority_levels.get(key, ())
+                work = self.work(aid)
+                previous = work.priority_levels.get(symbol, ())
                 if levels:
-                    self.priority_levels[key] = levels
+                    work.priority_levels[symbol] = levels
                     if set(levels) - set(previous):
-                        self.priority_accounts.setdefault(aid, {})[symbol] = checked_at
-                    elif symbol in self.priority_accounts.get(aid, {}):
+                        self.work(aid).priority[symbol] = checked_at
+                    elif symbol in self.work(aid).priority:
                         # Refresh a queued opportunity while this account is busy/backing off.
-                        self.priority_accounts[aid][symbol] = checked_at
+                        self.work(aid).priority[symbol] = checked_at
                 else:
-                    self.priority_levels.pop(key, None)
-                    self.priority_accounts.get(aid, {}).pop(symbol, None)
-                if not self.priority_accounts.get(aid):
-                    self.priority_accounts.pop(aid, None)
-            if self.priority_accounts:
+                    work.priority_levels.pop(symbol, None)
+                    self.work(aid).priority.pop(symbol, None)
+            if any(work.priority for work in self.account_work.values()):
                 self.scheduler_event.set()
 
     def priority_continuation(self, account_id):
         with self.lock:
-            self.priority_followups.add(account_id)
+            self.work(account_id).followup = True
         self.scheduler_event.set()
 
     @staticmethod
@@ -926,8 +928,7 @@ class Engine:
         saved = self.store.get("cycle:" + account["id"]) or {}
         # A fresh state transition or a different unstructured failure must not
         # leave an older condition's numbers attached to the new reason.
-        updates.setdefault("diagnostic", None)
-        self.view(account["id"], cycle_state={**saved, **updates})
+        self.view(account["id"], cycle_state=cycle_overlay(saved, updates))
 
     def cycle_volume_state(self, account, now=None, *, symbol=None, _store=None):
         store = self.store if _store is None else _store
@@ -1156,8 +1157,8 @@ class Engine:
         with self.account_lock(account_id):
             worker_started = clock_tick() if cycle_signal is not None else None
             with self.lock:
-                priority = account_id in self.active_priority_accounts
-                priority_signals = self.active_priority_signals.pop(account_id, {})
+                priority = self.work(account_id).active_priority
+                priority_signals = self.work(account_id).take_active_signals()
             progressed, consumed_symbol, retry_priority = False, None, False
             if self.shutdown.is_set():
                 return 5
@@ -1411,8 +1412,7 @@ class Engine:
                 # Missing hot data queues background work; it must never cause
                 # an on-demand query or a long account-wide network backoff.
                 with self.lock:
-                    self.cycle_hot_waiting.add(account_id)
-                    self.cycle_signal_ready.pop(account_id, None)
+                    self.work(account_id).cycle.opportunity = None
                 self.wake_cycle_hot_data(account_id)
                 self.view(account_id, status="waiting", reason=str(exc), credential_ready=True)
                 progress = self.store.get("cycle:" + account_id) or {}
@@ -1453,11 +1453,11 @@ class Engine:
                                     diagnostic=getattr(exc, "diagnostic", None))
                 delay = max(10, getattr(exc, "retry_after", 0))
                 with self.lock:
-                    self.account_backoff[account_id] = time.monotonic() + delay
+                    self.work(account_id).backoff = time.monotonic() + delay
                     if cycle_context and self.cycle_waits_for_market(exc):
-                        self.cycle_quote_backoff[account_id] = self.account_backoff[account_id]
+                        self.work(account_id).quote_backoff = self.work(account_id).backoff
                     else:
-                        self.cycle_quote_backoff.pop(account_id, None)
+                        self.work(account_id).quote_backoff = None
                 if priority and isinstance(exc, ExchangeError):
                     retry_priority = True
                     self.priority_continuation(account_id)
@@ -1465,19 +1465,19 @@ class Engine:
             finally:
                 urgent = bool(self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id))
                 with self.lock:
-                    self.active_priority_accounts.discard(account_id)
+                    self.work(account_id).active_priority = False
                     if progressed or retry_priority:
                         # Keep each opportunity through upgrade and confirmation;
                         # consume it after its first batch, retaining the other markets.
                         for symbol in priority_signals:
                             row = self.markets.get(symbol, {})
-                            if (symbol != consumed_symbol and self.priority_levels.get((account_id, symbol))
+                            if (symbol != consumed_symbol and self.work(account_id).priority_levels.get(symbol)
                                 and row.get("status") == "ok" and -1 <= time.time() - row.get("checked_at", 0) <= 8):
-                                self.priority_accounts.setdefault(account_id, {}).setdefault(symbol, row["checked_at"])
+                                self.work(account_id).priority.setdefault(symbol, row["checked_at"])
                     if urgent:
-                        self.urgent_accounts.add(account_id)
+                        self.work(account_id).urgent = True
                     else:
-                        self.urgent_accounts.discard(account_id)
+                        self.work(account_id).urgent = False
 
     def add_account(self, data):
         account = validate_account({**data, "enabled": False, "policy": {**DEFAULT_POLICY}})
@@ -1510,9 +1510,9 @@ class Engine:
                 self.store.save_account(account)
                 self.revoke_cycle_hot_data(account_id, "账户已暂停")
                 with self.lock:
-                    self.wake_accounts.add(account_id)
+                    self.work(account_id).wake = True
                     if pending:
-                        self.urgent_accounts.add(account_id)
+                        self.work(account_id).urgent = True
                     self.accounts_generation += 1
                 reason = "迁移已停止，账户已暂停" + ("；已提交批次继续核对" if pending else "")
                 self.view(account_id, status="reconciling" if pending else "paused", reason=reason)
@@ -1611,7 +1611,7 @@ class Engine:
             self.store.save_account(account)
             self.revoke_cycle_hot_data(account_id, "账户运行状态已更新")
             with self.lock:
-                self.wake_accounts.add(account_id)
+                self.work(account_id).wake = True
                 self.accounts_generation += 1
                 current_cycle = self.views.get(account_id, {}).get("cycle_state")
                 if current_cycle is not None:
@@ -1683,9 +1683,9 @@ class Engine:
             self.revoke_cycle_hot_data(account_id, "人工核对完成，等待手动启动")
             with self.lock:
                 self.accounts_generation += 1
-                self.wake_accounts.add(account_id)
+                self.work(account_id).wake = True
             self.view(account_id, status="paused", reason=reason, snapshot=displayed_snapshot,
-                      credential_ready=True, cycle_state={**progress, "phase": "paused", "diagnostic": None},
+                      credential_ready=True, cycle_state=cycle_overlay(progress, {"phase": "paused"}),
                       strategies={symbol: {"phase": "paused", "reason": "账户已暂停，等待手动启动"}
                                   for symbol in account["policy"]["symbols"]})
 
@@ -1702,8 +1702,8 @@ class Engine:
                 intent["attempts"] = {}
             self.store.save_intent(intent)
             with self.lock:
-                self.urgent_accounts.add(account_id)
-                self.wake_accounts.add(account_id)
+                self.work(account_id).urgent = True
+                self.work(account_id).wake = True
             self.store.event(account_id, "control", "重新核对未完成批次；不重复提交原开仓订单")
 
     def notification_config(self):
@@ -1843,18 +1843,25 @@ class Engine:
         aid = account["id"]
         symbol = validate_cycle(account.get("cycle"))["symbol"]
         volumes = {item: self.cycle_volume_state(account, now=now, symbol=item, _store=store) for item in SYMBOLS}
+        revision = store.cycle_fill_revision(aid)
+        cache_key = aid, symbol
+        cached = self.dashboard_reports.history.read(cache_key, revision, now)
+        if cached is not None:
+            cached["costs"]["rolling"].update(window_start=now - 86400, window_end=now)
+            return {"volumes": volumes, **cached}
         trades = store.cycle_trade_records(aid, limit=100)
+        complete = True
         try:
             fills = store.cycle_cost_records(aid, now=now, limit=100)
-            report = calculate_cycle_costs(fills, now=now)
+            report = calculate_cycle_costs(fills, now=now, symbol=symbol)
             trade_costs = {(row["symbol"], row["trade_id"]): row for row in report["trades"]}
             for trade in trades:
                 cost = trade_costs.get((trade["symbol"], trade["trade_id"]))
                 if cost is not None:
                     trade["cost"] = {key: value for key, value in cost.items() if key not in ("symbol", "trade_id")}
-            selected = [fill for fill in fills if fill["symbol"] == symbol]
-            costs = report if len(selected) == len(fills) else calculate_cycle_costs(selected, now=now)
+            costs = report
         except Exception as exc:
+            complete = False
             # Reporting never turns missing costs into a zero-cost claim.
             LOG.warning("Cycle cost report unavailable (%s)", type(exc).__name__)
             unavailable = {"taker_rate": "0.000125", "taker_rate_percent": "0.0125",
@@ -1862,26 +1869,34 @@ class Engine:
                            "unmatched_notional": None, "unmatched_fill_count": None,
                            "complete": False, "error": "成本统计暂不可用，等待重新读取成交记录"}
             costs = {"daily": dict(unavailable), "rolling": dict(unavailable)}
-        return {"volumes": volumes, "trades": trades, "costs": {key: costs[key] for key in ("daily", "rolling")}}
+        result = {"trades": trades, "trades_revision": hashlib.sha256(dumps(trades).encode()).hexdigest(),
+                  "costs": {key: costs[key] for key in ("daily", "rolling")}}
+        if complete:
+            self.dashboard_reports.history.save(cache_key, revision, now, store.cycle_report_boundary(aid, now), result)
+        return {"volumes": volumes, **result}
 
     def _load_dashboard_report(self, account, now):
         with self.store.read_snapshot() as reader:
             return self._cycle_report(reader, account, now)
 
-    def state(self, *, background_reports=False):
+    def state(self, *, background_reports=False, compact=False, history_account="", history_revision=""):
         # HTTP reads neither wait on the execution writer lock nor calculate
         # history. Synchronous reports remain available to local diagnostics.
         state_now = time.time()
         with self.store.read_snapshot() as reader:
             saved_accounts = reader.accounts()
-            events = reader.events()
+            history_account = next((a["id"] for a in saved_accounts if a["id"] == history_account),
+                                   saved_accounts[0]["id"] if saved_accounts else None)
+            events = reader.events(account_id=history_account if compact else None)
             pending_notifications = reader.pending_notifications()
             migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
             cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
-            cycle_quality = {a["id"]: reader.get("cycle_execution:" + a["id"]) for a in saved_accounts}
+            cycle_quality = {a["id"]: reader.get("cycle_execution:" + a["id"]) for a in saved_accounts
+                             if not compact or a["id"] == history_account}
         cycle_selection = {a["id"]: validate_cycle(a.get("cycle"))["symbol"] for a in saved_accounts}
-        reports = self.dashboard_reports.read(saved_accounts, state_now) if background_reports else {
-            a["id"]: (self._cycle_report(self.store, a, state_now), None) for a in saved_accounts}
+        reports = self.dashboard_reports.read(saved_accounts, state_now,
+            history_revisions={history_account: history_revision} if compact else None) if background_reports else {
+            a["id"]: (self._load_dashboard_report(a, state_now), None) for a in saved_accounts}
         add_blocks = {a["id"]: ordinary_add_blocks(a) for a in saved_accounts}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
@@ -1945,47 +1960,12 @@ class Engine:
                 account["migration_state"] = migration
                 saved_cycle = cycle_records[account["id"]]
                 account["cycle_recovery_available"] = cycle_recovery_available(account, saved_cycle, pending)
-                current_cycle = account.get("cycle_state", {})
-                if current_cycle.get("run_id") != saved_cycle.get("run_id"):
-                    current_cycle = {}
-                cycle = {**saved_cycle, **current_cycle}
                 report, report_status = reports[account["id"]]
                 selected_volumes = report["volumes"][cycle_selection[account["id"]]] if report else {}
                 daily, rolling = (selected_volumes.get(key) for key in ("daily_volume", "rolling_volume"))
-                # Durable phase/ownership must win after an executor completes.
-                if saved_cycle.get("updated_at", 0) > current_cycle.get("updated_at", 0):
-                    cycle.update(saved_cycle, diagnostic=None)
                 active_cycle = pending and pending["kind"] in ("cycle", "cycle_leverage")
-                if active_cycle:
-                    cycle.update(phase="attention" if pending["status"] == "attention" else "reconciling",
-                                 reason=pending.get("last_error") or account["reason"],
-                                 active_batch={"stage": pending.get("phase", "leverage")})
-                elif not account.get("cycle", {}).get("enabled"):
-                    cycle.update(phase="disabled", reason="多空循环未启用", active_batch=None)
-                elif not account["enabled"]:
-                    cycle.update(phase="attention" if account.get("pause_reason") else "paused",
-                                 reason=account.get("pause_reason") or "循环已暂停，已有仓位和计时保留", active_batch=None)
-                else:
-                    cycle.setdefault("phase", "waiting_open")
-                    cycle.setdefault("reason", "等待多空循环检查")
-                    # Background statistics describe their own as-of time; they
-                    # cannot overwrite the current executor phase or diagnostics.
-                    if not background_reports and not cycle.get("opened_at") and rolling["reached"] and dec(rolling["volume"]) > dec(daily["volume"]):
-                        cycle.update(phase="rolling_limit", reason="已达到滚动 24 小时成交量上限，等待历史成交移出窗口")
-                    elif not background_reports and not cycle.get("opened_at") and daily["reached"]:
-                        cycle.update(phase="daily_limit", reason="已达到 UTC 每日成交量上限，待日额度和滚动 24 小时额度均满足后自动恢复")
-                    elif not background_reports and not cycle.get("opened_at") and rolling["reached"]:
-                        cycle.update(phase="rolling_limit", reason="已达到滚动 24 小时成交量上限，等待历史成交移出窗口")
-                    elif not background_reports and cycle.get("phase") in ("daily_limit", "rolling_limit"):
-                        previous_remaining = cycle.get("quota_remaining")
-                        if daily["effective_remaining"] is None or (previous_remaining is not None and
-                                dec(daily["effective_remaining"]) > dec(previous_remaining)):
-                            cycle.update(phase="waiting_open", reason="成交额度已释放，等待重新核对开仓条件", diagnostic=None)
-                        elif cycle.get("quota_utc_date") != daily["utc_date"]:
-                            cycle.update(phase="rolling_limit", reason="UTC 日额度已重置，仍需满足滚动 24 小时开平仓额度")
-                    cycle["active_batch"] = None
-                if active_cycle or cycle.get("phase") not in ("waiting_open", "waiting_close", "daily_limit", "rolling_limit"):
-                    cycle["diagnostic"] = None
+                cycle = project_cycle_state(account, saved_cycle, account.get("cycle_state", {}), pending,
+                                            daily, rolling, background_reports=background_reports)
                 if report and active_cycle and pending.get("volume_error"):
                     daily = {**daily, "sync_pending": True, "error": pending["volume_error"]}
                     rolling = {**rolling, "sync_pending": True, "error": pending["volume_error"]}
@@ -2006,12 +1986,15 @@ class Engine:
                     cycle["volume_by_symbol"] = report["volumes"]
                     cycle["daily_volume"] = daily
                     cycle["rolling_volume"] = rolling
-                    account["cycle_trades"] = report["trades"]
+                    if "trades" in report:
+                        account["cycle_trades"] = report["trades"]
+                    if "trades_revision" in report:
+                        account["cycle_trades_revision"] = report["trades_revision"]
                 else:
                     for key in ("volume_by_symbol", "daily_volume", "rolling_volume"):
                         cycle.pop(key, None)
                     account.pop("cycle_trades", None)
-                cycle["execution_quality"] = cycle_quality[account["id"]]
+                cycle["execution_quality"] = cycle_quality.get(account["id"])
                 if cycle.get("opened_at") is not None:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
@@ -2060,26 +2043,26 @@ class Engine:
                                     if key.startswith("account:"):
                                         failed_aid = key.removeprefix("account:")
                                         with self.lock:
-                                            self.account_backoff[failed_aid] = time.monotonic() + delay
-                                            self.cycle_quote_backoff.pop(failed_aid, None)
+                                            self.work(failed_aid).backoff = time.monotonic() + delay
+                                            self.work(failed_aid).quote_backoff = None
                                     elif key.startswith("cycle-data:"):
                                         with self.lock:
-                                            self.cycle_hot_backoff[key.removeprefix("cycle-data:")] = time.monotonic() + delay
+                                            self.work(key.removeprefix("cycle-data:")).hot_backoff = time.monotonic() + delay
                                 aid = key.removeprefix("account:")
                                 with self.lock:
-                                    urgent = aid in self.urgent_accounts
-                                    self.active_priority_accounts.discard(aid)
-                                    self.active_priority_signals.pop(aid, None)
-                                seen = self.cycle_signal_seen.get(aid)
+                                    work = self.work(aid) if key.startswith("account:") else None
+                                    urgent = bool(work and work.urgent)
+                                    if work is not None:
+                                        work.active_priority = False
+                                        work.take_active_signals()
+                                seen = work.cycle.seen if work else None
                                 with self.lock:
                                     latest_signal = self.cycle_market_updates.get(seen[0]) if seen else None
                                     latest_capacity = self.markets.get(seen[0], {}) if seen else {}
                                 newer_signal = latest_signal and (latest_signal["source"], latest_signal["received_monotonic"]) != seen[1:3]
                                 newer_capacity = seen and len(seen) > 4 and (latest_capacity.get("status"), latest_capacity.get("checked_at")) != seen[4]
-                                if aid in self.cycle_signal_deferred or newer_signal or newer_capacity:
-                                    self.cycle_signal_ready.pop(aid, None)
-                                    self.cycle_signal_seen.pop(aid, None)
-                                    self.cycle_signal_deferred.discard(aid)
+                                if work and (work.cycle.deferred or newer_signal or newer_capacity):
+                                    work.cycle.rearm()
                                 if key in cycle_job_due:
                                     # A fast cycle attempt borrows the existing
                                     # account worker; it never postpones ordinary
@@ -2108,8 +2091,12 @@ class Engine:
                             for aid in set(account_ids) - known_accounts:
                                 if self.store.intent(aid) or self.store.get("post_fill_check:" + aid):
                                     with self.lock:
-                                        self.urgent_accounts.add(aid)
+                                        self.work(aid).urgent = True
                             known_accounts = set(account_ids)
+                            with self.lock:
+                                for aid in set(self.account_work) - known_accounts:
+                                    if "account:" + aid not in pending:
+                                        self.account_work.pop(aid, None)
                             account_generation = generation
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
                         targets = self.cycle_capacity_targets(saved_accounts)
@@ -2129,22 +2116,21 @@ class Engine:
                             schedules = self.scheduling(saved_accounts)
                         cycle_candidates = self.cycle_wake_candidates(saved_accounts, pending)
                         with self.lock:
-                            for aid in list(self.cycle_hot_wakes):
+                            for aid, work in self.account_work.items():
                                 key = "cycle-data:" + aid
-                                if key not in pending and time.monotonic() >= self.cycle_hot_backoff.get(aid, 0):
+                                if work.hot_wake and key not in pending and time.monotonic() >= work.hot_backoff:
                                     due[key] = 0
-                                    self.cycle_hot_wakes.discard(aid)
-                            for aid in list(self.wake_accounts):
+                                    work.hot_wake = False
                                 key = "account:" + aid
-                                if key not in pending:
+                                if work.wake and key not in pending:
                                     due[key] = 0
-                                    self.wake_accounts.discard(aid)
-                            urgent_accounts = self.urgent_accounts.copy()
-                            priority_accounts = self.priority_followups.copy()
-                            for aid, signals in self.priority_accounts.items():
+                                    work.wake = False
+                            urgent_accounts = {aid for aid, work in self.account_work.items() if work.urgent}
+                            priority_accounts = {aid for aid, work in self.account_work.items() if work.followup}
+                            for aid, work in self.account_work.items():
                                 if aid not in urgent_accounts and any(-1 <= time.time() - stamp <= 8
                                        and self.markets.get(symbol, {}).get("status") == "ok"
-                                       for symbol, stamp in signals.items()):
+                                       for symbol, stamp in work.priority.items()):
                                     priority_accounts.add(aid)
                         jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
                         if isinstance(self.market, MarketData):
@@ -2172,12 +2158,12 @@ class Engine:
                             if key not in pending and (cycle_signal or priority or time.monotonic() >= due.get(key, 0)):
                                 if key.startswith("cycle-data:"):
                                     with self.lock:
-                                        if time.monotonic() < self.cycle_hot_backoff.get(key.removeprefix("cycle-data:"), 0):
+                                        if time.monotonic() < self.work(key.removeprefix("cycle-data:")).hot_backoff:
                                             continue
                                 if is_account:
                                     with self.lock:
-                                        backoff = self.account_backoff.get(aid, 0)
-                                        quote_wait = cycle_signal is not None and self.cycle_quote_backoff.get(aid) == backoff
+                                        backoff = self.work(aid).backoff
+                                        quote_wait = cycle_signal is not None and self.work(aid).quote_backoff == backoff
                                         if time.monotonic() < backoff and not quote_wait:
                                             continue
                                 ordinary = is_account and aid in schedules and aid not in urgent_accounts and not priority and cycle_signal is None
@@ -2185,17 +2171,15 @@ class Engine:
                                     continue
                                 if priority:
                                     with self.lock:
-                                        self.active_priority_signals[aid] = self.priority_accounts.pop(aid, {})
-                                        self.priority_followups.discard(aid)
-                                        self.active_priority_accounts.add(aid)
+                                        self.work(aid).start_priority()
                                 if cycle_signal is not None:
                                     cycle_job_due[key] = due.get(key, 0)
-                                    self.cycle_signals.pop(aid, None)
-                                    self.cycle_signal_after[aid] = time.monotonic() + CYCLE_SIGNAL_MIN_INTERVAL
+                                    self.work(aid).cycle.signal = None
+                                    self.work(aid).cycle.after = time.monotonic() + CYCLE_SIGNAL_MIN_INTERVAL
                                     pending[key] = pool.submit(function, *args, cycle_signal=cycle_signal)
                                 else:
                                     if is_account:
-                                        self.cycle_signals.pop(aid, None)
+                                        self.work(aid).cycle.signal = None
                                     if key.startswith("market:"):
                                         market_started[key] = time.monotonic()
                                     pending[key] = pool.submit(function, *args)

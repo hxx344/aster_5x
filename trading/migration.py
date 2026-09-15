@@ -1,12 +1,12 @@
 """Exact, side-effect-free XAU migration sizing from executable depth."""
 from __future__ import annotations
 
-from bisect import bisect_left
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 import time
 
+from .depth import DepthSweep as _Sweep
 from .models import (HEDGE_TOLERANCE, MIN_BATCH_NOTIONAL, SYMBOLS, TIERS, TradingError, dec,
                      decimal_value, hedge_balanced, leverage_cap,
                      migration_margin_limit, minimum_open_leverage, positive, wire)
@@ -81,62 +81,6 @@ def _ceil(value, step):
     return -((-value) // step) * step
 
 
-class _Sweep:
-    """Piecewise exact quantity/notional conversions; no liquidity extrapolation."""
-
-    def __init__(self, levels, *, bids):
-        self.levels = []
-        self._quantities, self._notionals = [], []
-        quantity_sum = notional_sum = Fraction(0)
-        previous = None
-        if not isinstance(levels, (list, tuple)) or not 0 < len(levels) <= 1000:
-            raise TradingError("迁移深度不足或档位无效")
-        for row in levels:
-            if not isinstance(row, (tuple, list)) or len(row) != 2:
-                raise TradingError("迁移深度档位无效")
-            price, quantity = row
-            price = price if isinstance(price, Fraction) else Fraction(positive(price))
-            quantity = quantity if isinstance(quantity, Fraction) else Fraction(positive(quantity, True))
-            if price <= 0 or quantity < 0:
-                raise TradingError("迁移深度价格或数量无效")
-            if previous is not None and (price >= previous if bids else price <= previous):
-                raise TradingError("迁移深度档位顺序无效")
-            previous = price
-            if quantity:
-                self.levels.append((price, quantity))
-                quantity_sum += quantity
-                notional_sum += price * quantity
-                self._quantities.append(quantity_sum)
-                self._notionals.append(notional_sum)
-        if not self.levels:
-            raise TradingError("迁移深度不足")
-        self.quantity, self.notional = quantity_sum, notional_sum
-
-    def amount(self, quantity):
-        if quantity < 0 or quantity > self.quantity:
-            raise TradingError("迁移深度不足以成交全部数量")
-        index = bisect_left(self._quantities, quantity)
-        previous_quantity = self._quantities[index - 1] if index else Fraction(0)
-        previous_notional = self._notionals[index - 1] if index else Fraction(0)
-        return previous_notional + (quantity - previous_quantity) * self.levels[index][0]
-
-    def quantity_for(self, amount):
-        if amount <= 0:
-            return Fraction(0)
-        if amount >= self.notional:
-            return self.quantity
-        index = bisect_left(self._notionals, amount)
-        previous_quantity = self._quantities[index - 1] if index else Fraction(0)
-        previous_notional = self._notionals[index - 1] if index else Fraction(0)
-        return previous_quantity + (amount - previous_notional) / self.levels[index][0]
-
-    def last_price(self, quantity):
-        if quantity > self.quantity:
-            raise TradingError("迁移深度不足以成交全部数量")
-        # An exact level boundary still executes at that level's price.
-        return self.levels[bisect_left(self._quantities, quantity)][0]
-
-
 def _require_depth_fresh(depth, now):
     depth.require_fresh(now)
     if not -1 <= depth.age(now) <= MIGRATION_DEPTH_MAX_AGE:
@@ -145,7 +89,7 @@ def _require_depth_fresh(depth, now):
 
 def _depth(depth, now):
     _require_depth_fresh(depth, now)
-    bids, asks = _Sweep(depth.bids, bids=True), _Sweep(depth.asks, bids=False)
+    bids, asks = depth.sweeps
     if bids.levels[0][0] > asks.levels[0][0]:
         raise TradingError("迁移深度买卖价格交叉")
     return bids, asks

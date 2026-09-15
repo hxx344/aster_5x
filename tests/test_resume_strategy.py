@@ -53,7 +53,7 @@ class ResumeStrategyTests(unittest.TestCase):
         self.assertGreater(account["snapshot"]["timestamp"], self.stale["timestamp"])
         self.assertEqual(account["strategies"], {symbol: {"phase": "waiting", "reason": "策略已启动，等待下一轮检查"}
                                                  for symbol in self.symbols})
-        self.assertIn("test", self.engine.wake_accounts)
+        self.assertTrue(self.engine.work("test").wake)
 
     def test_resume_refreshes_all_configured_strategy_messages_only_after_account_commit(self):
         symbols = ["XAUUSD1", "SPCXUSD1", "CLUSD1"]
@@ -101,7 +101,7 @@ class ResumeStrategyTests(unittest.TestCase):
                     self.engine.enable("test", True)
                 self.assertFalse(self.f.store.account("test")["enabled"])
                 self.assertEqual(self.engine.views["test"], before)
-                self.assertNotIn("test", self.engine.wake_accounts)
+                self.assertFalse(self.engine.work("test").wake)
 
     def test_api_rejects_unfunded_untradable_open_orders_or_stale_current_snapshot(self):
         before = copy.deepcopy(self.engine.views["test"])
@@ -167,7 +167,7 @@ class ResumeStrategyTests(unittest.TestCase):
                 self.engine.enable("test", True)
         self.assertFalse(self.f.store.account("test")["enabled"])
         self.assertEqual(self.engine.views["test"], before)
-        self.assertEqual(self.engine.wake_accounts, set())
+        self.assertEqual({aid for aid, work in self.engine.account_work.items() if work.wake}, set())
         self.assertEqual(self.engine.accounts_generation, 0)
 
     def test_pausing_does_not_require_current_snapshot_or_replace_previous_view(self):

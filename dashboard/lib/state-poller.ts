@@ -3,6 +3,7 @@ type PollerOptions<T> = {
   onUnauthorized: () => void;
   onError: (message: string) => void;
   request?: typeof fetch;
+  requestUrl?: () => string;
   timeoutMs?: number;
 };
 
@@ -11,6 +12,7 @@ export function createStatePoller<T>({
   onUnauthorized,
   onError,
   request = fetch,
+  requestUrl = () => '/api/state',
   timeoutMs = 10000,
 }: PollerOptions<T>) {
   let paused = false;
@@ -43,7 +45,7 @@ export function createStatePoller<T>({
         onError('连接超时，请稍后重试');
       }, timeoutMs);
       try {
-        const response = await request('/api/state', {
+        const response = await request(requestUrl(), {
           cache: 'no-store',
           signal: controller.signal,
         });
@@ -54,7 +56,9 @@ export function createStatePoller<T>({
           return;
         }
         if (!response.ok) {
-          const body = (await response.json().catch(() => ({}))) as { detail?: string };
+          const body = (await response.json().catch(() => ({}))) as {
+            detail?: string;
+          };
           throw new Error(body.detail || '交易服务暂时不可用');
         }
         const next: T = await response.json();

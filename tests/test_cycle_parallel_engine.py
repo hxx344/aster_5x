@@ -142,12 +142,12 @@ class CycleParallelEngineTests(TestCase):
         self.f.store.save_account(other)
         for symbol in ("XAUUSD1", "SPCXUSD1"):
             self.engine.wake_capacity_accounts(symbol, {10: dec(500000)}, time.time(), self.f.store.accounts())
-        self.assertNotIn(("test", "XAUUSD1"), self.engine.priority_levels)
-        self.assertNotIn("XAUUSD1", self.engine.priority_accounts["test"])
-        self.assertIn(("test", "SPCXUSD1"), self.engine.priority_levels)
-        self.assertIn("SPCXUSD1", self.engine.priority_accounts["test"])
-        self.assertIn(("second", "XAUUSD1"), self.engine.priority_levels)
-        self.assertIn("XAUUSD1", self.engine.priority_accounts["second"])
+        self.assertNotIn("XAUUSD1", self.engine.work("test").priority_levels)
+        self.assertNotIn("XAUUSD1", self.engine.work("test").priority)
+        self.assertIn("SPCXUSD1", self.engine.work("test").priority_levels)
+        self.assertIn("SPCXUSD1", self.engine.work("test").priority)
+        self.assertIn("XAUUSD1", self.engine.work("second").priority_levels)
+        self.assertIn("XAUUSD1", self.engine.work("second").priority)
 
     def test_existing_cycle_batch_recovers_before_any_ordinary_work(self):
         owner = self.start()

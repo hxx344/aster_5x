@@ -136,7 +136,7 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
             self.engine.tick_account("test")
         self.assertEqual(self.engine.views["test"]["status"], "waiting")
         self.assertEqual(self.engine.views["test"]["cycle_state"]["diagnostic"]["code"], "cycle_market_capacity")
-        self.assertEqual(self.engine.cycle_quote_backoff["test"], self.engine.account_backoff["test"])
+        self.assertEqual(self.engine.work("test").quote_backoff, self.engine.work("test").backoff)
 
     def test_capacity_recovery_wakes_existing_fresh_quote_without_new_ws_event(self):
         self.quota("0")

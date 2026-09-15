@@ -14,6 +14,7 @@ import uuid
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
+from .ledger_cache import LedgerCache
 from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, identifier, normalize_fill,
                            order_bindings, receipt_quantity, sort_key, utc_day, validate_fill_binding)
 
@@ -59,6 +60,7 @@ class Store:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._rolling_cache = LedgerCache()
         with self.connect() as db:
             # Decide HTTP exposure before touching historical schema or state.
             # Keep the claim and migrations in one rollback-capable transaction;
@@ -110,12 +112,8 @@ class Store:
                     ON cycle_fills(account_id,symbol,order_id,client_id,intent_id);
                 CREATE INDEX IF NOT EXISTS idx_cycle_fills_client
                     ON cycle_fills(account_id,symbol,client_id,order_id,intent_id);
-                CREATE TABLE IF NOT EXISTS cycle_volume_days (
-                    account_id TEXT NOT NULL, utc_date TEXT NOT NULL, volume TEXT NOT NULL,
-                    trade_count INTEGER NOT NULL, estimated_volume TEXT NOT NULL,
-                    estimated_trade_count INTEGER NOT NULL, latest_trade_at REAL,
-                    latest_symbol TEXT, latest_trade_id TEXT, updated_at REAL NOT NULL,
-                    PRIMARY KEY(account_id,utc_date)
+                CREATE TABLE IF NOT EXISTS cycle_fill_versions (
+                    account_id TEXT PRIMARY KEY, revision INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS cycle_symbol_volume_days (
                     account_id TEXT NOT NULL, utc_date TEXT NOT NULL, volume TEXT NOT NULL,
@@ -136,6 +134,16 @@ class Store:
             for statement in schema.split(";"):
                 if statement.strip():
                     db.execute(statement)
+            # A revision changes in the same transaction as its fills, including
+            # backfills and writes from a different process/Store. Rollbacks
+            # cannot publish a new revision. Never infer validity from a TTL.
+            for action, owners in (("INSERT", ("NEW",)), ("DELETE", ("OLD",)), ("UPDATE", ("OLD", "NEW"))):
+                updates = " ".join(
+                    f"INSERT INTO cycle_fill_versions VALUES ({owner}.account_id,1) "
+                    "ON CONFLICT(account_id) DO UPDATE SET revision=revision+1;"
+                    for owner in owners)
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS cycle_fills_revision_{action.lower()} "
+                           f"AFTER {action} ON cycle_fills BEGIN {updates} END")
             # Existing trade notifications keep NULL expiry and remain deliverable.
             columns = {row[1] for row in db.execute("PRAGMA table_info(outbox)")}
             for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT")):
@@ -160,6 +168,9 @@ class Store:
                         "SELECT * FROM cycle_fills WHERE account_id=? AND utc_date=? AND symbol=?",
                         tuple(group))]
                     self._update_cycle_day(db, group["account_id"], group["utc_date"], rows, symbol=group["symbol"])
+            # The all-symbol total is derived from at most three symbol rows.
+            # Its old duplicate aggregate is no longer read or maintained.
+            db.execute("DROP TABLE IF EXISTS cycle_volume_days")
             placeholders = ",".join("?" for _ in CAPACITY_ALERT_KEYS)
             db.execute(f"""UPDATE outbox SET expires_at=0 WHERE delivered_at IS NULL
                 AND capacity_key IS NOT NULL AND capacity_key NOT IN ({placeholders})""", tuple(CAPACITY_ALERT_KEYS))
@@ -215,7 +226,7 @@ class Store:
         try:
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
-            reader = _StoreSnapshot(self.path, db)
+            reader = _StoreSnapshot(self, db)
             yield reader
         finally:
             db.close()
@@ -248,7 +259,7 @@ class Store:
             return
         if demo:
             expected = {"accounts", "kv", "intents", "events", "outbox", "cycle_fills",
-                        "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync"}
+                        "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync", "cycle_fill_versions"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
             if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -496,16 +507,15 @@ class Store:
                 if quantity > maximum_quantity:
                     raise TradingError("循环逐笔成交累计数量超过已核实回执")
             for date, rows in changed_days.items():
-                self._update_cycle_day(db, account_id, date, rows)
                 for symbol in {row["symbol"] for row in rows}:
                     self._update_cycle_day(db, account_id, date, [row for row in rows if row["symbol"] == symbol], symbol=symbol)
             return sum(len(rows) for rows in changed_days.values())
 
     @staticmethod
-    def _update_cycle_day(db, account_id, date, new_rows, *, symbol=None):
-        table = "cycle_volume_days" if symbol is None else "cycle_symbol_volume_days"
-        where = "account_id=? AND utc_date=?" + (" AND symbol=?" if symbol is not None else "")
-        params = (account_id, date) if symbol is None else (account_id, date, symbol)
+    def _update_cycle_day(db, account_id, date, new_rows, *, symbol):
+        table = "cycle_symbol_volume_days"
+        where = "account_id=? AND utc_date=? AND symbol=?"
+        params = (account_id, date, symbol)
         old = db.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchone()
         # Normal in-order fills append in O(new fills); a late execution rebuilds
         # that day's exact prefixes so every displayed running total stays true.
@@ -530,23 +540,30 @@ class Store:
                 db.execute("UPDATE events SET message=? WHERE id=? AND account_id=? AND kind='cycle_fill'",
                            (event_message(row), row["event_id"], account_id))
         last = rows[-1]
-        placeholders = ",".join("?" for _ in range(10 if symbol is None else 11))
-        key = "account_id,utc_date" + (",symbol" if symbol is not None else "")
+        placeholders = ",".join("?" for _ in range(11))
+        key = "account_id,utc_date,symbol"
         db.execute(f"""INSERT INTO {table} VALUES ({placeholders})
                     ON CONFLICT({key}) DO UPDATE SET volume=excluded.volume,trade_count=excluded.trade_count,
                     estimated_volume=excluded.estimated_volume,estimated_trade_count=excluded.estimated_trade_count,
                     latest_trade_at=excluded.latest_trade_at,latest_symbol=excluded.latest_symbol,
                     latest_trade_id=excluded.latest_trade_id,updated_at=excluded.updated_at""",
                    (account_id, date, wire(volume), count, wire(estimated), estimated_count,
-                    last["executed_at"], last["symbol"], last["trade_id"], time.time()) + (() if symbol is None else (symbol,)))
+                    last["executed_at"], last["symbol"], last["trade_id"], time.time(), symbol))
 
     def cycle_daily_volume(self, account_id, now=None, *, symbol=None):
         account_identifier(account_id)
         self._cycle_volume_symbol(symbol)
         date, _, reset = utc_day(now)
         with self.connect() as db:
-            row = db.execute("SELECT * FROM cycle_volume_days WHERE account_id=? AND utc_date=?", (account_id, date)).fetchone() if symbol is None else db.execute(
-                "SELECT * FROM cycle_symbol_volume_days WHERE account_id=? AND utc_date=? AND symbol=?", (account_id, date, symbol)).fetchone()
+            rows = db.execute("SELECT * FROM cycle_symbol_volume_days WHERE account_id=? AND utc_date=?"
+                              + (" AND symbol=?" if symbol is not None else ""),
+                              (account_id, date) + (() if symbol is None else (symbol,))).fetchall()
+        row = None
+        if rows:
+            row = {key: sum(r[key] for r in rows) for key in ("trade_count", "estimated_trade_count")}
+            row.update({key: wire(sum((Fraction(dec(r[key])) for r in rows), Fraction(0)))
+                        for key in ("volume", "estimated_volume")})
+            row["latest_trade_at"] = max(r["latest_trade_at"] for r in rows)
         return {**({"symbol": symbol} if symbol is not None else {}), "utc_date": date, "volume": row["volume"] if row else "0", "trade_count": row["trade_count"] if row else 0,
                 "next_reset_at": reset, "estimated_volume": row["estimated_volume"] if row else "0",
                 "estimated_trade_count": row["estimated_trade_count"] if row else 0,
@@ -570,6 +587,13 @@ class Store:
         volume, estimated = Fraction(0), Fraction(0)
         count, estimated_count, next_release = 0, 0, None
         with self.connect() as db:
+            if not db.in_transaction:
+                db.execute("BEGIN")
+            revision = self._fill_revision(db, account_id)
+            key = account_id, symbol
+            cached = self._rolling_cache.read(key, revision, end)
+            if cached is not None:
+                return {**cached, "window_start": start, "window_end": end}
             # The account/time range uses idx_cycle_fills_recent. Iterate every
             # matching fill without a UI limit or lossy SQLite numeric SUM.
             rows = db.execute("""SELECT notional,time_source,executed_at FROM cycle_fills
@@ -585,9 +609,39 @@ class Store:
                 if row["time_source"] == "legacy_estimated":
                     estimated += notional
                     estimated_count += 1
-        return {**({"symbol": symbol} if symbol is not None else {}), "window_start": start, "window_end": end, "volume": wire(volume), "trade_count": count,
-                "next_release_at": next_release, "estimated_volume": wire(estimated),
-                "estimated_trade_count": estimated_count}
+            future = self._next_fill(db, account_id, end, symbol=symbol)
+        result = {**({"symbol": symbol} if symbol is not None else {}), "window_start": start, "window_end": end, "volume": wire(volume), "trade_count": count,
+                  "next_release_at": next_release, "estimated_volume": wire(estimated),
+                  "estimated_trade_count": estimated_count}
+        self._rolling_cache.save(key, revision, end, min(next_release or math.inf, future or math.inf), result)
+        return result
+
+    @staticmethod
+    def _fill_revision(db, account_id):
+        row = db.execute("SELECT revision FROM cycle_fill_versions WHERE account_id=?", (account_id,)).fetchone()
+        return row[0] if row else 0
+
+    def cycle_fill_revision(self, account_id):
+        account_identifier(account_id)
+        with self.connect() as db:
+            return self._fill_revision(db, account_id)
+
+    @staticmethod
+    def _next_fill(db, account_id, now, *, symbol=None):
+        return db.execute("SELECT MIN(executed_at) FROM cycle_fills WHERE account_id=? AND executed_at>?"
+                          + (" AND symbol=?" if symbol is not None else ""),
+                          (account_id, now) + (() if symbol is None else (symbol,))).fetchone()[0]
+
+    def cycle_report_boundary(self, account_id, now):
+        """Next clock-only change, including future fills already in the ledger."""
+        account_identifier(account_id)
+        _, _, midnight = utc_day(now)
+        with self.connect() as db:
+            future = self._next_fill(db, account_id, now)
+            oldest = db.execute("SELECT MIN(executed_at) FROM cycle_fills "
+                                "WHERE account_id=? AND executed_at>? AND executed_at<=?",
+                                (account_id, now - 86400, now)).fetchone()[0]
+        return min(midnight, future or math.inf, oldest + 86400 if oldest is not None else math.inf)
 
     def cycle_trade_records(self, account_id, limit=100):
         account_identifier(account_id)
@@ -703,9 +757,14 @@ class Store:
                 db.execute("INSERT INTO events(account_id,kind,message,created_at,cycle_check) VALUES (?,?,?,?,?)",
                            (account_id, "cycle_check", message, now, dumps(metadata)))
 
-    def events(self, limit=100):
+    def events(self, limit=100, *, account_id=None):
+        if account_id is not None:
+            account_identifier(account_id)
         with self.connect() as db:
-            rows = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY created_at DESC,id DESC LIMIT ?", (limit,))]
+            rows = [dict(row) for row in db.execute("SELECT * FROM events"
+                    + (" WHERE account_id IN (?, '')" if account_id is not None else "")
+                    + " ORDER BY created_at DESC,id DESC LIMIT ?",
+                    (limit,) if account_id is None else (account_id, limit))]
         for row in rows:
             raw = row.pop("cycle_check", None)
             metadata = _cycle_check_metadata(raw) if row["kind"] == "cycle_check" else None
@@ -1001,8 +1060,9 @@ class Store:
 
 class _StoreSnapshot(Store):
     """Single-threaded reader sharing one read-only transaction."""
-    def __init__(self, path, db):
-        self.path, self.db = path, db
+    def __init__(self, owner, db):
+        self.path, self.db = owner.path, db
+        self._rolling_cache = owner._rolling_cache
 
     @contextmanager
     def connect(self):

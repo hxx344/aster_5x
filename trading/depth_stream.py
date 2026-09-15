@@ -81,6 +81,7 @@ class _DepthState:
     ask_ceiling: Fraction | None = None
     timestamp: float = 0
     monotonic_timestamp: float = 0
+    snapshot: DepthSnapshot | None = None
 
 
 class PublicDepthStream:
@@ -205,11 +206,13 @@ class PublicDepthStream:
             state = self._state_locked(symbol)
             if not state.valid.is_set():
                 return None
-            return DepthSnapshot(
-                tuple(sorted(state.bids.items(), reverse=True)), tuple(sorted(state.asks.items())),
-                state.timestamp, monotonic_timestamp=state.monotonic_timestamp,
-                validity=state.valid.is_set,
-            )
+            if state.snapshot is None:
+                state.snapshot = DepthSnapshot(
+                    tuple(sorted(state.bids.items(), reverse=True)), tuple(sorted(state.asks.items())),
+                    state.timestamp, monotonic_timestamp=state.monotonic_timestamp,
+                    validity=state.valid.is_set,
+                )
+            return state.snapshot
 
     def seed(self, symbol, raw_response, *, token, requested_at):
         notification = None
@@ -304,6 +307,7 @@ class PublicDepthStream:
         state.event_ms, state.transaction_ms = update.event_ms, update.transaction_ms
         state.timestamp = min(update.event_ms / 1000, update.received_at)
         state.monotonic_timestamp = update.received_ticks - max(0, update.received_at - state.timestamp)
+        state.snapshot = None
         state.valid.set()
         return True
 

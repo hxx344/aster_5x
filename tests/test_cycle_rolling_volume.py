@@ -152,7 +152,9 @@ class CycleRollingVolumeTests(TestCase):
         self.assertEqual((result["volume"], result["trade_count"]), ("120100", 1201))
         self.assertEqual(result["next_release_at"], DAY - 200 + 86400)
         selects = [query for query in statements if "FROM cycle_fills" in query]
-        self.assertEqual(len(selects), 1)
+        # One indexed window scan and one index seek for a pre-existing future
+        # fill that can enter the window without another ledger write.
+        self.assertEqual(len(selects), 2)
         with original_connect() as db:
             plan = " ".join(row[3] for row in db.execute("EXPLAIN QUERY PLAN " + selects[0]))
         self.assertIn("SEARCH cycle_fills USING INDEX idx_cycle_fills_recent", plan)

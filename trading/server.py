@@ -14,7 +14,7 @@ from time import monotonic
 from typing import Literal
 
 import anyio
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
@@ -284,8 +284,10 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         return {"ok": True}
 
     @app.get("/api/state", dependencies=[Depends(authenticated)])
-    def state():
-        return engine.state(background_reports=True)
+    def state(compact: bool = False, history_account: str = Query("", max_length=32),
+              history_revision: str = Query("", max_length=64)):
+        return engine.state(background_reports=True, compact=compact,
+                            history_account=history_account, history_revision=history_revision)
 
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
 

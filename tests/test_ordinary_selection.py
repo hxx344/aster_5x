@@ -140,8 +140,8 @@ class OrdinarySelectionTests(TestCase):
         self.select("CLUSD1")
         self.engine.enable("test", True)
         self.publish(enabled=("XAUUSD1", "SPCXUSD1"), tiers=(5, 10, 20))
-        self.engine.active_priority_accounts.add("test")
-        self.engine.active_priority_signals["test"] = {"XAUUSD1": time.time()}
+        self.engine.work("test").active_priority = True
+        self.engine.work("test").active_signals = {"XAUUSD1": time.time()}
         with patch.object(self.f.broker, "submit") as submit, patch.object(self.f.broker, "set_leverage") as leverage:
             self.engine.tick_account("test")
         submit.assert_not_called()
@@ -156,8 +156,8 @@ class OrdinarySelectionTests(TestCase):
         self.f.store.save_account(other)
         for symbol in SYMBOLS:
             self.engine.wake_capacity_accounts(symbol, {10: dec(500000)}, time.time(), self.f.store.accounts())
-        self.assertEqual(set(self.engine.priority_accounts["test"]), {"CLUSD1"})
-        self.assertEqual(set(self.engine.priority_accounts["second"]), set(SYMBOLS))
+        self.assertEqual(set(self.engine.work("test").priority), {"CLUSD1"})
+        self.assertEqual(set(self.engine.work("second").priority), set(SYMBOLS))
 
     def test_executor_rechecks_saved_selection_before_creating_pair_intent(self):
         snapshot, plan, book = self.plan()

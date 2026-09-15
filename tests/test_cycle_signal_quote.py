@@ -20,6 +20,13 @@ class CycleSignalQuoteTests(unittest.TestCase):
         args.update(changes)
         return cycle_signal_quote(**args)
 
+    def assert_minimum_quantity(self, quantity):
+        # Check both sides of the exchange maximum boundary without exporting
+        # private-worker sizing inputs in the public wake signal.
+        exact = dec(quantity)
+        self.assertIsNotNone(self.quote(rule=replace(self.rule, max_qty=exact)))
+        self.assertIsNone(self.quote(rule=replace(self.rule, max_qty=exact - dec("0.000001"))))
+
     def hold(self, qty="1", elapsed=60):
         planning.CyclePlanningTests.hold(self, qty=qty, elapsed=elapsed)
 
@@ -28,8 +35,7 @@ class CycleSignalQuoteTests(unittest.TestCase):
         self.account.update(balance="0", available="0", can_trade=False)
         self.account["cycle"]["daily_volume_limit"] = "1"
         self.progress.update(daily_remaining="0", rolling_remaining="0")
-        self.assertEqual(self.quote(), {"phase": "open", "minimum_quantity": "0.05",
-                                        "reference_spread_bp": "0"})
+        self.assertEqual(self.quote(), {"phase": "open"})
 
     def test_disabled_account_cycle_and_migration_do_not_read_books(self):
         for change in ("account", "cycle", "migration"):
@@ -70,13 +76,13 @@ class CycleSignalQuoteTests(unittest.TestCase):
         self.rule = replace(self.rule, min_qty=dec("2"))
         self.assertIsNone(self.quote())
         self.rule = replace(self.rule, min_qty=dec("1"))
-        self.assertEqual(self.quote()["minimum_quantity"], "1")
+        self.assert_minimum_quantity("1")
 
     def test_exchange_minimum_uses_mark_and_rounds_up_to_a_valid_step(self):
         self.rule = replace(self.rule, step=dec("0.03"), min_qty=dec("0.04"), min_notional=dec("7"))
-        self.assertEqual(self.quote()["minimum_quantity"], "0.09")
+        self.assert_minimum_quantity("0.09")
         self.book = replace(self.book, mark=dec("10"))
-        self.assertEqual(self.quote()["minimum_quantity"], "0.72")
+        self.assert_minimum_quantity("0.72")
         self.rule = replace(self.rule, max_qty=dec("0.71"))
         self.assertIsNone(self.quote())
 
@@ -90,7 +96,7 @@ class CycleSignalQuoteTests(unittest.TestCase):
     def test_per_side_minimum_uses_smaller_leg_and_maximum_uses_larger_leg(self):
         self.account["cycle"].update(min_notional="200", max_notional="200.02", spread_limit_bp="2")
         self.depth = planning.depth(self.now, bids=[("100", "1000")], asks=[("100.01", "1000")])
-        self.assertEqual(self.quote()["minimum_quantity"], "2")
+        self.assert_minimum_quantity("2")
         self.account["cycle"]["max_notional"] = "200.0199999999999999999999999999999999"
         with localcontext() as context:
             context.prec = 6
@@ -98,35 +104,35 @@ class CycleSignalQuoteTests(unittest.TestCase):
 
     def test_gross_scope_minimum_and_maximum_use_sum_of_both_legs(self):
         self.account["cycle"].update(notional_scope="gross", min_notional="200", max_notional="200")
-        self.assertEqual(self.quote()["minimum_quantity"], "1")
+        self.assert_minimum_quantity("1")
         self.account["cycle"].update(min_notional="0", max_notional="9.9999999999999999999999999999")
         self.assertIsNone(self.quote())
         self.account["cycle"]["max_notional"] = "10"
-        self.assertEqual(self.quote()["minimum_quantity"], "0.05")
+        self.assert_minimum_quantity("0.05")
 
     def test_gross_scope_sums_different_leg_amounts_at_exact_boundary(self):
         self.account["cycle"].update(notional_scope="gross", min_notional="200.01",
                                       max_notional="200.01", spread_limit_bp="2")
         self.depth = planning.depth(self.now, bids=[("100", "1000")], asks=[("100.01", "1000")])
-        self.assertEqual(self.quote()["minimum_quantity"], "1")
+        self.assert_minimum_quantity("1")
         self.account["cycle"].update(min_notional="0", max_notional="10.0004999999999999999999999999")
         self.assertIsNone(self.quote())
         self.account["cycle"]["max_notional"] = "10.0005"
-        self.assertEqual(self.quote()["minimum_quantity"], "0.05")
+        self.assert_minimum_quantity("0.05")
 
     def test_configured_minimum_must_fit_after_quantization(self):
         self.rule = replace(self.rule, step=dec("0.03"))
         self.account["cycle"].update(min_notional="100", max_notional="100.99999999999999999")
         self.assertIsNone(self.quote())
         self.account["cycle"]["max_notional"] = "102"
-        self.assertEqual(self.quote()["minimum_quantity"], "1.02")
+        self.assert_minimum_quantity("1.02")
         self.rule = replace(self.rule, max_qty=dec("1.01"))
         self.assertIsNone(self.quote())
 
     def test_exact_decimal_threshold_never_rounds_a_failure_into_success(self):
         self.depth = planning.depth(self.now, bids=[("199999", "10")], asks=[("200001", "10")])
         self.book = replace(self.book, bid=dec("199999"), ask=dec("200001"), mark=dec("200000"))
-        self.assertEqual(self.quote()["reference_spread_bp"], "0.1")
+        self.assertEqual(self.quote(), {"phase": "open"})
         self.account["cycle"]["spread_limit_bp"] = "0.09999999999999999999999999999999999999"
         with localcontext() as context:
             context.prec = 6
@@ -139,16 +145,15 @@ class CycleSignalQuoteTests(unittest.TestCase):
             context.prec = 6
             hint = self.quote()
         self.assertEqual(hint["phase"], "open")
-        self.assertEqual(hint["minimum_quantity"], "0.05")
-        self.assertGreater(dec(hint["reference_spread_bp"]), 0)
-        self.assertLessEqual(dec(hint["reference_spread_bp"]), dec("0.1"))
+        self.account["cycle"]["spread_limit_bp"] = "0"
+        self.assertIsNone(self.quote())
 
     def test_actual_minimum_quantity_spread_has_its_own_exact_threshold(self):
         self.account["cycle"].update(spread_notional="100", spread_limit_bp="1")
         self.rule = replace(self.rule, min_qty=dec("2"))
         self.depth = planning.depth(self.now, bids=[("100", "1"), ("99.99", "100")],
                                     asks=[("100", "1"), ("100.01", "100")])
-        self.assertEqual(self.quote()["reference_spread_bp"], "0")
+        self.assertEqual(self.quote(), {"phase": "open"})
         self.account["cycle"]["spread_limit_bp"] = "0.999999999999999999999999999999"
         with localcontext() as context:
             context.prec = 6
@@ -185,7 +190,7 @@ class CycleSignalQuoteTests(unittest.TestCase):
     def test_holding_uses_frozen_market_threshold_and_time_not_new_open_config(self):
         self.hold()
         self.account["cycle"].update(symbol="CLUSD1", hold_seconds=10000, min_notional="0", max_notional="1")
-        self.assertEqual(self.quote(), {"phase": "close", "minimum_quantity": "1", "reference_spread_bp": "0"})
+        self.assertEqual(self.quote(), {"phase": "close"})
         self.progress["config"]["enabled"] = False
         self.assertIsNone(self.quote())
 
@@ -195,7 +200,7 @@ class CycleSignalQuoteTests(unittest.TestCase):
         for bids, asks in (([("100", "1")], None), (None, [("100", "1")])):
             with self.subTest(bids=bids, asks=asks):
                 self.assertIsNone(self.quote(depth=planning.depth(self.now, bids=bids, asks=asks)))
-        self.assertEqual(self.quote()["minimum_quantity"], "2")
+        self.assert_minimum_quantity("2")
 
     def test_close_rejects_bad_actual_spread_even_when_reference_passes(self):
         self.account["cycle"]["spread_notional"] = "100"

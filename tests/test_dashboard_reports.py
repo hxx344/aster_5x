@@ -27,6 +27,32 @@ class DashboardReportTests(TestCase):
         self.engine.dashboard_reports.worker.join(timeout=5)
         self.assertFalse(self.engine.dashboard_reports.worker.is_alive())
 
+    def test_compact_state_scopes_history_and_omits_unchanged_trades(self):
+        self.f.store.save_account(account("second"))
+        self.f.store.event("test", "info", "first account event")
+        self.f.store.event("second", "info", "second account event")
+        self.f.store.event("", "info", "global event")
+        self.engine.state(background_reports=True)
+        self.finish_report()
+        first = self.engine.state(background_reports=True, compact=True, history_account="test")
+        rows = {a["id"]: a for a in first["accounts"]}
+        self.assertIn("cycle_trades", rows["test"])
+        self.assertNotIn("cycle_trades", rows["second"])
+        self.assertEqual({e["account_id"] for e in first["events"]}, {"test", ""})
+        revision = rows["test"]["cycle_trades_revision"]
+        self.engine.view("test", reason="new live status")
+        second = self.engine.state(background_reports=True, compact=True,
+                                   history_account="test", history_revision=revision)
+        current = next(a for a in second["accounts"] if a["id"] == "test")
+        self.assertEqual(current["reason"], "new live status")
+        self.assertEqual(current["cycle_trades_revision"], revision)
+        self.assertNotIn("cycle_trades", current)
+        switched = self.engine.state(background_reports=True, compact=True, history_account="second")
+        self.assertEqual({e["account_id"] for e in switched["events"]}, {"second", ""})
+        full = self.engine.state(background_reports=True)
+        self.assertTrue(all("cycle_trades" in a for a in full["accounts"]))
+        self.assertEqual({e["account_id"] for e in full["events"]}, {"test", "second", ""})
+
     def test_authenticated_status_does_not_wait_or_queue_when_report_is_blocked(self):
         entered, release = threading.Event(), threading.Event()
         original = self.engine.dashboard_reports.load

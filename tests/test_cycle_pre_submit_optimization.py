@@ -59,8 +59,18 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
              patch.object(self.f.broker, "submit", side_effect=submit) as sent:
             self.start()
         prefix = statements[:statements.index("BROKER_SUBMIT")]
-        self.assertEqual(sum(sql.startswith("BEGIN") for sql in prefix), 1)
-        self.assertEqual(prefix.count("COMMIT"), 1)
+        # Consistent read snapshots may commit too; only the durable write
+        # transaction must combine intent, index and event before the send.
+        writes, transaction = [], []
+        for sql in prefix:
+            if sql.startswith("BEGIN"):
+                transaction = []
+            elif sql == "COMMIT":
+                if transaction:
+                    writes.append(transaction)
+            elif sql.startswith(("INSERT ", "UPDATE ", "DELETE ")):
+                transaction.append(sql)
+        self.assertEqual(len(writes), 1)
         self.assertEqual(sum(sql.startswith("INSERT INTO intents") for sql in prefix), 1)
         self.assertEqual(sum(sql.startswith("INSERT INTO cycle_volume_sync") for sql in prefix), 1)
         self.assertEqual(sum(sql.startswith("INSERT INTO events") for sql in prefix), 1)

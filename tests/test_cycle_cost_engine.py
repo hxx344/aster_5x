@@ -110,12 +110,12 @@ class CycleCostStateTests(TestCase):
         self.engine.enable("test", True)
         self.run_until_holding()
         self.f.store.save_account(account("second"))
-        original = self.f.store.cycle_cost_records
-        def read(aid, **kwargs):
+        original = Store.cycle_cost_records
+        def read(store, aid, **kwargs):
             if aid == "test":
                 raise RuntimeError("cost query failed")
-            return original(aid, **kwargs)
-        with patch.object(self.f.store, "cycle_cost_records", side_effect=read):
+            return original(store, aid, **kwargs)
+        with patch.object(Store, "cycle_cost_records", read):
             self.expire_hold()
             self.engine.tick_account("test")
             self.assertEqual(self.f.store.get("cycle:test")["completed_cycles"], 1)

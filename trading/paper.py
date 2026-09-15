@@ -1,5 +1,4 @@
 """Deterministic paper broker with persistent balances and order receipts."""
-from dataclasses import asdict
 from fractions import Fraction
 import math
 import time

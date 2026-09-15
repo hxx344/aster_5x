@@ -168,16 +168,16 @@ class MigrationRecoveryIntegrationTests(TestCase):
                 self.engine.poll_market(symbol)
         publish("CLUSD1", 0)
         publish(TARGET, 0)
-        self.assertEqual(self.engine.priority_accounts, {})
+        self.assertEqual({aid: work.priority for aid, work in self.engine.account_work.items() if work.priority}, {})
         self.assertEqual(self.f.store.account("test")["policy"]["threshold"], "10000")
         publish(TARGET, 2000)
-        self.assertEqual(set(self.engine.priority_accounts), {"test"})
+        self.assertEqual(set({aid: work.priority for aid, work in self.engine.account_work.items() if work.priority}), {"test"})
         self.assertTrue(self.engine.scheduler_event.is_set())
         # Consume the published opportunity at the scheduler/worker boundary.
         with self.engine.lock:
-            signal = self.engine.priority_accounts.pop("test")
-            self.engine.active_priority_accounts.add("test")
-            self.engine.active_priority_signals["test"] = signal
+            signal = self.engine.work("test").take_priority()
+            self.engine.work("test").active_priority = True
+            self.engine.work("test").active_signals = signal
         with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as writer, \
              patch("trading.engine.Executor.open_pair", side_effect=AssertionError("ordinary entry forbidden")):
             self.engine.tick_account("test")
@@ -187,7 +187,7 @@ class MigrationRecoveryIntegrationTests(TestCase):
             publish(TARGET, 1999)
             publish(TARGET, 2100)
             self.assertEqual(writer.call_count, count)
-        self.assertEqual(self.engine.priority_accounts, {})
+        self.assertEqual({aid: work.priority for aid, work in self.engine.account_work.items() if work.priority}, {})
         self.assertFalse(self.engine.scheduler_event.is_set())
         self.assertEqual(self.f.store.get("migration:test")["completed_batches"], 1)
 

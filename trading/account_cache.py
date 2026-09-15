@@ -232,6 +232,13 @@ class CycleAccountCache:
         return self._notice_locked()
 
     def lease(self, symbols):
+        return self._read(symbols, lambda published: CycleAccountLease(self, published))
+
+    def current_leverage(self, symbol):
+        """Read scheduling metadata without copying a mutable working snapshot."""
+        return self._read([symbol], lambda published: published.snapshot.pair(symbol)[0].leverage)
+
+    def _read(self, symbols, select):
         symbols = self._normalize_symbols(symbols)
         with self._lock:
             if symbols != self._symbols or not symbols:
@@ -242,7 +249,7 @@ class CycleAccountCache:
                 listener = self._expire_locked() if self._published is not None else self._notice_locked()
                 error = exc
             else:
-                return CycleAccountLease(self, self._published)
+                return select(self._published)
         self._notify(listener)
         raise error
 

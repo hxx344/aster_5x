@@ -18,6 +18,7 @@ class DashboardAPITests(unittest.TestCase):
         self.f = Fixture()
         self.addCleanup(self.f.close)
         self.engine = Engine(self.f.store, market=self.f.market)
+        self.addCleanup(self.engine.dashboard_reports.close)
         self.engine.brokers["test"] = self.f.broker
         self.f.account["enabled"] = False
         self.f.store.save_account(self.f.account)

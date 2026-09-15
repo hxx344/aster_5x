@@ -121,7 +121,7 @@ class _Harness:
             raise AssertionError("overlapping workers for one account")
         future = self.on_submit(aid, cycle_signal)
         self.calls.append({"aid": aid, "at": self.ticks, "signal": cycle_signal,
-                           "priority": deepcopy(self.engine.active_priority_signals.get(aid)), "future": future})
+                           "priority": deepcopy(self.engine.work(aid).active_signals), "future": future})
         return future
 
     def run(self, control):
@@ -250,7 +250,7 @@ class CycleWSSchedulerTests(unittest.TestCase):
             elif step == 3:
                 h.emit(101.5, source="depth")
                 held.complete = True
-                self.assertNotIn("test", h.engine.cycle_signal_deferred)
+                self.assertFalse(h.engine.work("test").cycle.deferred)
             elif step == 4:
                 h.ticks = 102
             elif step == 5:
@@ -284,7 +284,7 @@ class CycleWSSchedulerTests(unittest.TestCase):
                 h.ticks = 101.5
                 h.engine.markets[SYMBOL]["checked_at"] = h.wall
                 held.complete = True
-                self.assertNotIn("test", h.engine.cycle_signal_deferred)
+                self.assertFalse(h.engine.work("test").cycle.deferred)
             elif step == 4:
                 h.ticks = 102
             elif step == 5:
@@ -320,9 +320,9 @@ class CycleWSSchedulerTests(unittest.TestCase):
 
                 def control(step):
                     if step == 2:
-                        h.engine.account_backoff["test"] = 110
+                        h.engine.work("test").backoff = 110
                         if tag is not None:
-                            h.engine.cycle_quote_backoff["test"] = tag
+                            h.engine.work("test").quote_backoff = tag
                         h.emit(101)
                     elif step == 3:
                         h.engine.shutdown.set()
@@ -343,8 +343,8 @@ class CycleWSSchedulerTests(unittest.TestCase):
         with self.assertLogs("aster.trading", level="ERROR"):
             h.run(control)
         self.assertEqual(len(h.calls), 1)
-        self.assertEqual(h.engine.account_backoff["test"], 130)
-        self.assertNotIn("test", h.engine.cycle_quote_backoff)
+        self.assertEqual(h.engine.work("test").backoff, 130)
+        self.assertFalse(h.engine.work("test").quote_backoff)
 
     def test_unexpected_fast_future_failure_keeps_backoff_after_public_edge_changes(self):
         h = self.h
@@ -363,15 +363,15 @@ class CycleWSSchedulerTests(unittest.TestCase):
         with self.assertLogs("aster.trading", level="ERROR"):
             h.run(control)
         self.assertEqual(len(h.fast_calls()), 1)
-        self.assertEqual(h.engine.account_backoff["test"], 132)
-        self.assertNotIn("test", h.engine.cycle_quote_backoff)
+        self.assertEqual(h.engine.work("test").backoff, 132)
+        self.assertFalse(h.engine.work("test").quote_backoff)
 
     def test_fast_path_preserves_other_market_priority_signal(self):
         h = self.h
 
         def control(step):
             if step == 2:
-                h.engine.priority_accounts["test"] = {OTHER: h.wall}
+                h.engine.work("test").priority = {OTHER: h.wall}
                 h.engine.markets[OTHER] = {"status": "unknown"}
                 h.emit(101)
             elif step == 3:
@@ -379,8 +379,8 @@ class CycleWSSchedulerTests(unittest.TestCase):
 
         h.run(control)
         self.assertEqual(len(h.fast_calls()), 1)
-        self.assertEqual(h.engine.priority_accounts["test"], {OTHER: WALL})
-        self.assertIsNone(h.fast_calls()[0]["priority"])
+        self.assertEqual(h.engine.work("test").priority, {OTHER: WALL})
+        self.assertFalse(h.fast_calls()[0]["priority"])
 
     def test_live_ordinary_priority_takes_precedence_over_cycle_fast_signal(self):
         h = self.h
@@ -388,7 +388,7 @@ class CycleWSSchedulerTests(unittest.TestCase):
         def control(step):
             if step == 2:
                 h.emit(101)
-                h.engine.priority_accounts["test"] = {OTHER: h.wall}
+                h.engine.work("test").priority = {OTHER: h.wall}
                 h.engine.markets[OTHER] = {"status": "ok", "checked_at": h.wall}
             elif step == 3:
                 h.engine.shutdown.set()
@@ -438,15 +438,15 @@ class CycleWSSchedulerTests(unittest.TestCase):
                 row["cycle"]["min_notional"] = "200"
                 self.f.store.save_account(row)
                 h.engine.accounts_generation += 3
-                h.engine.wake_accounts.add("test")
+                h.engine.work("test").wake = True
                 h.emit(102)
             elif step == 5:
                 h.engine.shutdown.set()
 
         h.run(control)
         self.assertEqual([call["at"] for call in h.fast_calls()], [101, 102])
-        self.assertGreater(dec(h.fast_calls()[1]["signal"]["minimum_quantity"]),
-                           dec(h.fast_calls()[0]["signal"]["minimum_quantity"]))
+        self.assertEqual(h.engine.work("test").cycle.seen[3], h.engine.accounts_generation)
+        self.assertEqual(self.f.store.account("test")["cycle"]["min_notional"], "200")
 
     def test_first_synchronized_depth_can_wake_after_a_newer_bbo_was_unusable(self):
         h = self.h

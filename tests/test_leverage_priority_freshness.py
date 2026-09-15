@@ -42,8 +42,8 @@ class LivePriorityFreshnessTests(unittest.TestCase):
             self.engine.poll_market(SYMBOL)
 
     def priority_tick(self):
-        self.engine.priority_accounts.pop("test", None)
-        self.engine.active_priority_accounts.add("test")
+        self.engine.work("test").take_priority()
+        self.engine.work("test").active_priority = True
         return self.engine.tick_account("test")
 
     def assert_aborted_without_write(self, reason):
@@ -132,8 +132,8 @@ class PriorityOpportunityProgressTests(unittest.TestCase):
         self.f.store.put("open_after_leverage:test:" + SYMBOL, 5)
         with patch.object(self.f.market, "capacities", return_value={5: dec(500000), 10: dec(500000)}):
             self.engine.poll_market(SYMBOL)
-        self.engine.active_priority_signals["test"] = self.engine.priority_accounts.pop("test")
-        self.engine.active_priority_accounts.add("test")
+        self.engine.work("test").active_signals = self.engine.work("test").take_priority()
+        self.engine.work("test").active_priority = True
         with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.engine.tick_account("test")
         submit.assert_not_called()
@@ -181,7 +181,7 @@ class PriorityOpportunityProgressTests(unittest.TestCase):
                 self.assertTrue(finished, f"market opportunities did not finish: calls={len(calls)}, "
                     f"leverages={self.f.broker.state['leverages']}, "
                     f"orders={list(self.f.broker.state['orders'].values())}, "
-                    f"signals={self.engine.priority_accounts}, followups={self.engine.priority_followups}, "
+                    f"signals={{aid: work.priority for aid, work in self.engine.account_work.items() if work.priority}}, followups={{aid for aid, work in self.engine.account_work.items() if work.followup}}, "
                     f"reason={self.engine.views.get('test', {}).get('reason')}")
                 self.assertFalse(excess.is_set(), "priority signals caused repeated private account work")
                 self.assertEqual(len(self.f.broker.state["orders"]), 2 * len(SYMBOLS))
@@ -190,8 +190,8 @@ class PriorityOpportunityProgressTests(unittest.TestCase):
                     real_poll(symbol)
                 self.assertFalse(excess.wait(.3))
                 self.assertEqual(len(calls), before, "unchanged availability restarted completed opportunities")
-                self.assertFalse(self.engine.priority_accounts)
-                self.assertFalse(self.engine.priority_followups)
+                self.assertFalse({aid: work.priority for aid, work in self.engine.account_work.items() if work.priority})
+                self.assertFalse({aid for aid, work in self.engine.account_work.items() if work.followup})
             finally:
                 self.engine.stop()
 

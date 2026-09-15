@@ -110,7 +110,10 @@ class DailyQuotaEngineTests(TestCase):
             self.assertNotEqual(current["utc_date"], daily["utc_date"])
             self.assertEqual(current["trade_count"], 2)
 
+    @patch("trading.engine.time.time", new=lambda: 1789387200.0)
     def test_manual_pause_survives_utc_midnight(self):
+        # Public capacity has a one-second lifetime; freeze the clock while
+        # testing pause/quota transitions independently of machine load.
         self.capped_round()
         self.engine.enable("test", False)
         before = deepcopy(self.f.broker.state["orders"])
@@ -178,6 +181,7 @@ class DailyQuotaEngineTests(TestCase):
         self.assertTrue(self.f.store.account("test")["enabled"])
         self.assertEqual(current["config"]["daily_volume_limit"], "0")
 
+    @patch("trading.engine.time.time", new=lambda: 1789387200.0)
     def test_history_sync_failure_does_not_block_close_but_blocks_next_open(self):
         self.select()
         self.engine.enable("test", True)

@@ -122,6 +122,10 @@ class CycleSignalEngineTests(TestCase):
 
     def test_private_position_integrity_is_still_checked_after_public_hint(self):
         self.start()
+        self.engine.tick_account("test", cycle_signal=self.signal())
+        progress = self.f.store.get("cycle:test")
+        progress["opened_at"] = time.time() - progress["config"]["hold_seconds"] - 1
+        self.f.store.put("cycle:test", progress)
         signal = self.signal()
         self.f.broker.state["positions"]["XAUUSD1:LONG"] = {"qty": "1", "entry": "4412"}
         self.f.broker.save()

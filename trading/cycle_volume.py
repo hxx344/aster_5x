@@ -134,4 +134,4 @@ def event_message(fill):
     direction = "多头" if fill["position_side"] == "LONG" else "空头"
     estimated = "；历史成交时间为估算" if fill["time_source"] == "legacy_estimated" else ""
     return (f"{fill['symbol']} {direction}{phase}成交 {fill['quantity']}，本笔交易量 {fill['notional']} USD1；"
-            f"UTC {fill['utc_date']} 按成交时间累计 {fill['daily_volume']} USD1{estimated}")
+            f"UTC {fill['utc_date']} 该品种按成交时间累计 {fill['daily_volume']} USD1{estimated}")

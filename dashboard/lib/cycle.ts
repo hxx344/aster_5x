@@ -24,6 +24,8 @@ export type CycleState = {
   reason?: string;
   run_id?: string;
   quantities?: Partial<Record<'LONG' | 'SHORT', string>>;
+  baseline?: Partial<Record<'LONG' | 'SHORT', string>>;
+  config?: CycleConfig;
   opened_at?: number;
   close_eligible_at?: number;
   completed_cycles?: number;
@@ -33,6 +35,13 @@ export type CycleState = {
   spread_checked_at?: number | null;
   daily_volume?: CycleDailyVolume;
   rolling_volume?: CycleRollingVolume;
+  volume_by_symbol?: Record<
+    string,
+    {
+      daily_volume: CycleDailyVolume;
+      rolling_volume: CycleRollingVolume;
+    }
+  >;
   diagnostic?: CycleDiagnostic | null;
   execution_quality?: CycleExecutionQuality | null;
 };
@@ -56,6 +65,7 @@ export type CycleDiagnostic = {
 };
 
 export type CycleDailyVolume = {
+  symbol?: string;
   utc_date: string;
   volume: string;
   trade_count: number;
@@ -110,6 +120,7 @@ export type CycleTrade = {
 };
 
 export type CycleRollingVolume = {
+  symbol?: string;
   window_start: number;
   window_end: number;
   volume: string;
@@ -124,6 +135,45 @@ export type CycleRollingVolume = {
   error?: string | null;
   cost?: CycleWindowCost;
 };
+
+export function cycleActualLeverage(
+  snapshot:
+    | {
+        timestamp: number;
+        positions: { symbol: string; side: string; leverage: number }[];
+      }
+    | undefined,
+  symbol: string,
+  now: number,
+  stale = false,
+): number | null {
+  if (
+    !snapshot ||
+    stale ||
+    !Number.isFinite(snapshot.timestamp) ||
+    !Number.isFinite(now) ||
+    now - snapshot.timestamp >= 8 ||
+    now < snapshot.timestamp - 1
+  )
+    return null;
+  const pair = snapshot.positions.filter(
+    (position) => position.symbol === symbol,
+  );
+  if (
+    pair.length !== 2 ||
+    new Set(pair.map((position) => position.side)).size !== 2 ||
+    !pair.every(
+      (position) =>
+        ['LONG', 'SHORT'].includes(position.side) &&
+        Number.isInteger(position.leverage) &&
+        position.leverage >= 1 &&
+        position.leverage <= 125 &&
+        position.leverage === pair[0].leverage,
+    )
+  )
+    return null;
+  return pair[0].leverage;
+}
 
 export const DEFAULT_CYCLE: CycleConfig = {
   enabled: false,

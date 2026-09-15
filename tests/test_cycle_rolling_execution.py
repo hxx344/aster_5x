@@ -80,9 +80,9 @@ class RollingCycleExecutionTests(unittest.TestCase):
              patch.object(self.f.store, "cycle_rolling_volume", wraps=self.f.store.cycle_rolling_volume) as rolling, \
              patch.object(self.f.store, "cycle_volume_backlog", wraps=self.f.store.cycle_volume_backlog) as backlog:
             self.require_room(now)
-        daily.assert_called_once_with("test", now=now)
-        rolling.assert_called_once_with("test", now=now)
-        backlog.assert_called_once_with("test", limit=1, since=now - 86400)
+        daily.assert_called_once_with("test", now=now, symbol=SYMBOL)
+        rolling.assert_called_once_with("test", now=now, symbol=SYMBOL)
+        backlog.assert_called_once_with("test", limit=1, since=now - 86400, symbol=SYMBOL)
 
     def test_daily_limit_remains_a_distinct_error_when_both_windows_exceed(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()

@@ -195,7 +195,10 @@ class CycleSingleSnapshotExecutionTests(unittest.TestCase):
                        lambda snapshot: self.executor.set_leverage(self.f.account, snapshot, self.progress_now())):
             with self.subTest(action=action):
                 snapshot = self.executor.prepare_snapshot(self.f.account)
-                action(snapshot)
+                try:
+                    action(snapshot)
+                except TradingError as exc:
+                    self.assertIn("禁止通过循环修改杠杆", str(exc))
                 calls = self.stop_at_callback(snapshot)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0].kwargs, {"fresh_modes": True})
@@ -216,8 +219,8 @@ class CycleSingleSnapshotExecutionTests(unittest.TestCase):
             self.assertEqual(read.call_count, 1)
             submit.assert_not_called()
             self.assertIsNone(self.f.store.intent("test"))
-        for field, value, message in (("isolated", True, "全仓保证金"), ("qty", dec(1), "空仓"),
-                                      ("leverage", 3, "杠杆与设定不一致")):
+        for field, value, message in (("isolated", True, "全仓保证金"), ("qty", dec(-1), "持仓数量"),
+                                      ("leverage", 3, "计划与本轮配置不一致")):
             snapshot = copy.deepcopy(baseline)
             for position in snapshot.pair("XAUUSD1"):
                 setattr(position, field, value)
@@ -236,7 +239,7 @@ class CycleSingleSnapshotExecutionTests(unittest.TestCase):
         self.f.broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "3"
         self.f.broker.save()
         with patch.object(self.f.broker, "cycle_snapshot", wraps=self.f.broker.cycle_snapshot) as read, \
-             patch.object(self.f.broker, "submit") as submit, self.assertRaisesRegex(TradingError, "禁止处理外部仓位"):
+             patch.object(self.f.broker, "submit") as submit, self.assertRaisesRegex(TradingError, "循环实际多空数量与记录不一致"):
             self.prepared_start("close")
         self.assertEqual(read.call_count, 1)
         submit.assert_not_called()

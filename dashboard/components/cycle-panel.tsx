@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/select';
 import {
   cycleCountdown,
+  cycleActualLeverage,
   cycleDraft,
   cycleHasPosition,
   cycleSpreadView,
@@ -22,7 +23,11 @@ import {
   type CycleDraft,
   type CycleState,
 } from '@/lib/cycle';
-import { cycleDailySummary, cycleRollingSummary } from '@/lib/cycle-daily';
+import {
+  cycleAmount,
+  cycleDailySummary,
+  cycleRollingSummary,
+} from '@/lib/cycle-daily';
 import { CycleCostSummary } from '@/components/cycle-cost-summary';
 import { cycleStateSummary } from '@/lib/cycle-events';
 import { cycleMarginLimit, percentFromMarginLimit } from '@/lib/policy';
@@ -35,6 +40,10 @@ type CycleAccount = {
   status: string;
   cycle?: CycleConfig;
   cycle_state?: CycleState;
+  snapshot?: {
+    timestamp: number;
+    positions: { symbol: string; side: string; leverage: number }[];
+  };
   risk_limits?: { cycle?: string };
   migration?: { enabled: boolean };
   migration_state?: { active_batch?: object | null };
@@ -99,6 +108,18 @@ export function CyclePanel({
     now < dataTimestamp - 1;
   const field = (key: keyof CycleDraft, value: string | boolean) =>
     setDraft({ ...draft, [key]: value });
+  const leverage = cycleActualLeverage(
+    account.snapshot,
+    draft.symbol,
+    now,
+    stale,
+  );
+  const savedLeverage = cycleActualLeverage(
+    account.snapshot,
+    account.cycle?.symbol ?? 'XAUUSD1',
+    now,
+    stale,
+  );
   const spread = cycleSpreadView(state, now, stale);
   const daily = cycleDailySummary(state?.daily_volume, now, stale);
   const rolling = cycleRollingSummary(state?.rolling_volume, now, stale);
@@ -146,7 +167,8 @@ export function CyclePanel({
         aria-labelledby="cycle-daily-heading"
       >
         <h3 id="cycle-daily-heading">
-          成交额度 <span>UTC 日统计 · {daily.date}</span>
+          {account.cycle?.symbol ?? 'XAUUSD1'} 成交额度{' '}
+          <span>UTC 日统计 · {daily.date}</span>
         </h3>
         <dl className="cycle-daily-grid">
           <div>
@@ -229,18 +251,42 @@ export function CyclePanel({
             </p>
           ) : (
             <p>
-              任一额度不足时暂停新增；已有仓位仍按条件平仓。UTC 日与滚动 24
+              任一额度不足时暂停新增；本轮新增量仍按条件减回。UTC 日与滚动 24
               小时额度均足够，且交易条件满足后才自动恢复。
             </p>
           )
         ) : null}
       </section>
+      {state?.volume_by_symbol ? (
+        <section aria-label="各品种循环成交量">
+          <h3>各品种独立统计 · USD1</h3>
+          <dl className="migration-details cycle-details">
+            {Object.entries(state.volume_by_symbol).map(([symbol, volumes]) => (
+              <div key={symbol}>
+                <dt>
+                  {symbol}
+                  {symbol === account.cycle?.symbol ? ' · 当前选择' : ''}
+                </dt>
+                <dd>
+                  UTC 日 {cycleAmount(volumes.daily_volume.volume)}
+                  <small>
+                    近 24 小时 {cycleAmount(volumes.rolling_volume.volume)}
+                  </small>
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <p className="muted">
+            每个品种分别使用成交额度上限，切换品种保留各自历史；每次只运行一个品种。
+          </p>
+        </section>
+      ) : null}
       <dl className="migration-details cycle-details">
         <div>
-          <dt>已保存品种 / 固定杠杆</dt>
+          <dt>已保存品种 / 当前实际杠杆</dt>
           <dd>
             {account.cycle?.symbol ?? 'XAUUSD1'} /{' '}
-            {account.cycle?.leverage ?? 2}x
+            {savedLeverage === null ? '待账户确认' : `${savedLeverage}x`}
           </dd>
         </div>
         <div>
@@ -255,12 +301,18 @@ export function CyclePanel({
           <dd>{state?.completed_cycles ?? 0} 轮</dd>
         </div>
         <div>
-          <dt>本轮多头数量</dt>
+          <dt>本轮新增多头数量</dt>
           <dd>{state?.quantities?.LONG ?? '—'}</dd>
         </div>
         <div>
-          <dt>本轮空头数量</dt>
+          <dt>本轮新增空头数量</dt>
           <dd>{state?.quantities?.SHORT ?? '—'}</dd>
+        </div>
+        <div>
+          <dt>本轮原始多头 / 空头</dt>
+          <dd>
+            {state?.baseline?.LONG ?? '—'} / {state?.baseline?.SHORT ?? '—'}
+          </dd>
         </div>
         <div>
           <dt>最近检测深度价差 · bp</dt>
@@ -347,20 +399,18 @@ export function CyclePanel({
                 </SelectContent>
               </Select>
             </label>
-            <label htmlFor="cycle-leverage">
-              固定杠杆 <span>x</span>
-              <Input
-                id="cycle-leverage"
-                type="number"
-                min="1"
-                max="125"
-                step="1"
-                required
-                value={draft.leverage}
-                onChange={(event) => field('leverage', event.target.value)}
-              />
-            </label>
+            <div>
+              <span>杠杆自动跟随</span>
+              <p>
+                {leverage === null
+                  ? '等待读取所选品种实际杠杆'
+                  : `${leverage}x · 交易所当前杠杆`}
+              </p>
+            </div>
           </div>
+          <p className="muted">
+            可任选一个品种。已有仓位沿用持仓杠杆，空仓沿用交易所当前杠杆；循环不会修改杠杆。先加仓，确认后按持仓时长和价差条件减回本轮新增，核实原始多空数量不变后才开始下一轮。
+          </p>
           <label htmlFor="cycle-depth">
             深度价差参考金额 <span>USD1 / 每边</span>
             <Input
@@ -443,7 +493,7 @@ export function CyclePanel({
             {draft.notional_scope === 'per_side'
               ? '例如上限 10,000：多头和空头分别最多 10,000 USD1，合计最多 20,000 USD1。'
               : '例如上限 10,000：多头与空头名义价值合计最多 10,000 USD1。'}{' '}
-            下单还需满足交易规则、可用保证金及循环保证金上限；该上限由账户全部持仓共用。
+            金额仅指本轮新增量。下单需扣除原仓占用后仍有当前杠杆额度，并满足可用保证金及循环保证金上限。
           </p>
           <div className="cycle-fields">
             <label htmlFor="cycle-hold">
@@ -478,8 +528,8 @@ export function CyclePanel({
             </label>
           </div>
           <p className="muted">
-            从多空开仓成交均确认后计时，精确到整数秒，最长 7
-            天。平仓均确认后自动开始下一轮。
+            从多空加仓成交均确认后计时，精确到整数秒，最长 7
+            天。减回新增量并核实原始数量后自动开始下一轮。
           </p>
           <label htmlFor="cycle-daily-volume">
             成交额度上限 <span>USD1 · 0 为不限</span>
@@ -497,15 +547,16 @@ export function CyclePanel({
             />
           </label>
           <p className="muted">
-            UTC 日与滚动 24 小时分别累计全部循环成交，共用同一个上限。每边
-            10,000 USD1 的一轮多空开仓和平仓，交易量约 40,000
+            每个品种分别累计自己的 UTC 日与滚动 24
+            小时循环成交，各自使用所设上限。每边 10,000 USD1
+            的一轮多空开仓和平仓，交易量约 40,000
             USD1；修复成交也计入，手续费不计入。任一剩余额度不足新一轮时等待两项额度均足够，平仓不受额度限制。价格变化或修复可能使实际成交量超过上限。
           </p>
         </fieldset>
         <p className="muted">
           多空订单成批提交，成交不保证同一瞬间完成。循环品种禁止本账户普通加仓，其他已配置品种可同时运行普通加仓。循环与
           XAU
-          迁移不可同时开启；更改设置需先暂停账户、核对完当前批次并将循环仓位全部平仓。保存不会启动账户。
+          迁移不可同时开启；更改设置需先暂停账户、核对完当前批次并减回本轮新增量。原有仓位可保留，保存不会启动账户。
         </p>
         {ownedPosition ? (
           <p className="muted amber">

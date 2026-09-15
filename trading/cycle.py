@@ -113,19 +113,41 @@ def _state(account, progress):
 
 
 def validate_cycle_positions(account, snapshot, progress=None):
-    """Never adopt an existing position or close quantity outside this run."""
+    """Track only the increment above the frozen original position."""
     config, phase, tracked = _state(account, progress)
     try:
         pair = snapshot.pair(config["symbol"])
     except TradingError as exc:
         raise CyclePositionError("循环多空仓位数据无效：" + str(exc)) from exc
-    if any(position.qty != tracked[side] for side, position in zip(SIDES, pair)):
-        if phase == "waiting_open":
-            raise CyclePositionError("循环品种已有仓位；仅允许从多空均为空仓开始")
+    if phase == "waiting_open":
+        return pair
+    baseline = cycle_baseline(progress)
+    if any(Fraction(position.qty) != Fraction(baseline[side]) + Fraction(tracked[side])
+           for side, position in zip(SIDES, pair)):
         raise CyclePositionError("循环实际多空数量与记录不一致，已停止自动交易，需核对")
     if phase != "waiting_open" and any(position.leverage != config["leverage"] for position in pair):
         raise CyclePositionError("循环持仓期间实际杠杆发生变化，需核对后恢复")
     return pair
+
+
+def cycle_baseline(progress):
+    # Pre-upgrade active cycles started flat; retain their zero baseline solely
+    # for closing/recovery. New openings always persist an explicit baseline.
+    values = (progress or {}).get("baseline", dict.fromkeys(SIDES, "0"))
+    if not isinstance(values, dict) or set(values) != set(SIDES):
+        raise CyclePositionError("循环原始持仓记录无效，需核对后恢复")
+    try:
+        return {side: positive(values[side], True) for side in SIDES}
+    except TradingError as exc:
+        raise CyclePositionError("循环原始持仓记录无效，需核对后恢复") from exc
+
+
+def cycle_config(account, snapshot, progress=None):
+    config, phase, _ = _state(account, progress)
+    if phase == "waiting_open":
+        pair = validate_cycle_positions(account, snapshot, progress)
+        config = {**config, "leverage": pair[0].leverage}
+    return config
 
 
 def _depth_sweeps(depth, now):
@@ -219,7 +241,7 @@ def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
                "≤ " + number(maximum), "USD1", maximum_value <= maximum if priced else None),
         _check("order_spread", "最小委托实际深度价差", number(_spread(buy, sell)) if priced else None,
                "≤ " + number(limit_bp), "bp", _spread(buy, sell) <= limit_bp if priced else None),
-        _check("leverage_cap", f"{config['leverage']}x 档位多空合计名义额", number(gross) if priced else None,
+        _check("leverage_cap", f"{config['leverage']}x 新增多空合计名义额（额度已扣原仓）", number(gross) if priced else None,
                "≤ " + number(cap), "USD1", gross <= cap if priced else None),
         _check("projected_equity", "扣除手续费与不利价差后的权益", number(projected_equity) if priced else None,
                "> 0", "USD1", projected_equity > 0 if priced else None),
@@ -268,6 +290,7 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     reductions remain possible when account equity or opening capacity falls.
     """
     config, phase, tracked = _state(account, progress)
+    config = cycle_config(account, snapshot, progress)
     if not validate_cycle(account.get("cycle"))["enabled"] or not config["enabled"]:
         raise TradingError("独立多空循环未开启")
     if rule.symbol != config["symbol"] or rule.margin_asset != "USD1":
@@ -365,18 +388,19 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     current_cap = snapshot.current_leverage_caps.get(rule.symbol)
     fee = snapshot.fees.get(rule.symbol)
     if current_cap is not None:
-        # At this point ownership validation has proved both selected legs flat.
         # A current-leverage limit cannot authorize a different leverage.
         if (not isinstance(current_cap, (tuple, list)) or len(current_cap) != 2
-                or type(current_cap[0]) is not int or current_cap[0] != config["leverage"]
-                or any(position.qty for position in pair)):
-            raise TradingError("循环账户额度与空仓状态或当前杠杆不匹配")
+                or type(current_cap[0]) is not int or current_cap[0] != config["leverage"]):
+            raise TradingError("循环账户额度与当前杠杆不匹配")
         cap = Fraction(positive(current_cap[1], True))
     else:
         brackets = snapshot.brackets.get(rule.symbol)
         if not brackets:
             raise TradingError("循环开仓缺少当前杠杆额度")
         cap = Fraction(positive(leverage_cap(brackets, config["leverage"])))
+    # maxNotional is a total position ceiling, not additional room. Both held
+    # legs consume it before a new pair can be added.
+    cap = max(Fraction(0), cap - sum((Fraction(p.qty) * max(Fraction(p.mark), mark) for p in pair), Fraction(0)))
     if fee is None:
         raise TradingError("循环开仓缺少手续费率")
     fee = Fraction(positive(fee, True))

@@ -271,8 +271,8 @@ class CycleHotExecutionTests(unittest.TestCase):
             self.executor.start(self.f.account, snapshot, self.plan("open"), self.progress_now())
         with self.assertRaisesRegex(TradingError, "阶段无效"):
             self.executor.start(self.f.account, snapshot, replace(self.plan("open"), phase="wrong"), self.progress_now())
-        self.hot.lease.snapshot.pair("XAUUSD1")[0].qty = dec(1)
-        with self.assertRaisesRegex(TradingError, "空仓"):
+        self.hot.lease.snapshot.pair("XAUUSD1")[0].qty = dec(-1)
+        with self.assertRaisesRegex(TradingError, "持仓数量"):
             self.start_hot()
         self.hot.publish()
         def pause(snapshot):

@@ -1007,30 +1007,35 @@ class LiveBroker:
         caps = {}
         for symbol in symbols:
             pair = [rows[(symbol, side)] for side in ("LONG", "SHORT")]
-            if any(dec(row["positionAmt"]) for row in pair):
-                continue
-            # Validate every reported value, even if the other leg is missing it.
-            reported = [positive(row["maxNotional"], True) for row in pair if "maxNotional" in row]
-            if len(reported) == 2:
-                cap = min(reported)
-            else:
-                data = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
-                if isinstance(data, list):
-                    if any(not isinstance(item, dict) for item in data):
-                        raise TradingError("账户风控档位响应无效")
-                    matches = [item for item in data if item.get("symbol") == symbol]
-                    if len(matches) != 1:
-                        raise TradingError("账户风控档位缺失或重复")
-                    data = matches[0]
-                if not isinstance(data, dict) or data.get("symbol") != symbol:
-                    raise TradingError("账户风控档位交易代码不匹配")
-                try:
-                    if not isinstance(data.get("brackets"), list) or any(not isinstance(tier, dict) for tier in data["brackets"]):
-                        raise TradingError("账户风控档位响应无效")
-                    tiers = validate_brackets(data["brackets"])
-                except (KeyError, TypeError):
-                    raise TradingError("账户风控档位响应无效") from None
-                cap = min([leverage_cap(tiers, leverages[symbol])] + reported)
+            try:
+                # Validate every reported value, even if the other leg is missing it.
+                reported = [positive(row["maxNotional"], True) for row in pair if "maxNotional" in row]
+                if len(reported) == 2:
+                    cap = min(reported)
+                else:
+                    data = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
+                    if isinstance(data, list):
+                        if any(not isinstance(item, dict) for item in data):
+                            raise TradingError("账户风控档位响应无效")
+                        matches = [item for item in data if item.get("symbol") == symbol]
+                        if len(matches) != 1:
+                            raise TradingError("账户风控档位缺失或重复")
+                        data = matches[0]
+                    if not isinstance(data, dict) or data.get("symbol") != symbol:
+                        raise TradingError("账户风控档位交易代码不匹配")
+                    try:
+                        if not isinstance(data.get("brackets"), list) or any(not isinstance(tier, dict) for tier in data["brackets"]):
+                            raise TradingError("账户风控档位响应无效")
+                        tiers = validate_brackets(data["brackets"])
+                    except (KeyError, TypeError):
+                        raise TradingError("账户风控档位响应无效") from None
+                    cap = min([leverage_cap(tiers, leverages[symbol])] + reported)
+            except TradingError:
+                # Missing opening capacity must not strand a held increment.
+                # No cap is published, so planning new exposure still fails.
+                if any(dec(row["positionAmt"]) for row in pair):
+                    continue
+                raise
             caps[symbol] = (leverages[symbol], cap)
         return caps
 

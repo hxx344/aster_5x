@@ -86,7 +86,7 @@ export function CycleTradesPanel({ accountName, trades, stale }: Props) {
                 <th>成交时间 · UTC</th>
                 <th>动作 / 品种</th>
                 <th>本笔成交金额 · USD1</th>
-                <th>当日累计 · USD1</th>
+                <th>该品种当日累计 · USD1</th>
                 <th>本笔已计成本 · USD1</th>
               </tr>
             </thead>
@@ -130,7 +130,7 @@ export function CycleTradesPanel({ accountName, trades, stale }: Props) {
                     </td>
                     <td className="cycle-trade-money">
                       <span className="mobile-trade-label" aria-hidden="true">
-                        当日累计 · USD1
+                        该品种当日累计 · USD1
                       </span>
                       {cycleAmount(trade.daily_volume)}
                       {typeof trade.daily_volume !== 'string' ? (

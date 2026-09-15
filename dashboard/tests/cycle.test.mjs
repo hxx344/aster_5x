@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   DEFAULT_CYCLE,
+  cycleActualLeverage,
   cycleCountdown,
   cycleDraft,
   cycleHasPosition,
@@ -10,6 +11,23 @@ import {
   cycleStatus,
   parseCycleDraft,
 } from '../lib/cycle.ts';
+
+test('cycle leverage comes only from a fresh matching exchange position pair', () => {
+  const snapshot = {
+    timestamp: 100,
+    positions: [
+      { symbol: 'XAUUSD1', side: 'LONG', leverage: 17 },
+      { symbol: 'XAUUSD1', side: 'SHORT', leverage: 17 },
+    ],
+  };
+  assert.equal(cycleActualLeverage(snapshot, 'XAUUSD1', 101), 17);
+  assert.equal(cycleActualLeverage(snapshot, 'CLUSD1', 101), null);
+  assert.equal(cycleActualLeverage(snapshot, 'XAUUSD1', 108), null);
+  assert.equal(cycleActualLeverage(snapshot, 'XAUUSD1', 101, true), null);
+  assert.equal(cycleActualLeverage(undefined, 'XAUUSD1', 101), null);
+  snapshot.positions[1].leverage = 2;
+  assert.equal(cycleActualLeverage(snapshot, 'XAUUSD1', 101), null);
+});
 
 test('requested 2x XAU, 10k depth, 0.1 bp and one minute settings retain their exact units', () => {
   const draft = cycleDraft();

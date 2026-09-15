@@ -189,20 +189,18 @@ class CyclePlanningTests(unittest.TestCase):
         with self.assertRaisesRegex(TradingError, "最小金额"):
             self.plan()
 
-    def test_open_ignores_external_orders_but_requires_selected_flat_position(self):
+    def test_open_accepts_existing_positions_without_treating_them_as_cycle_quantity(self):
         expected = self.plan().qty
         for orders in (None, [{"symbol": "CLUSD1"}]):
             with self.subTest(orders=orders):
                 self.assertEqual(self.plan(snapshot=replace(self.snapshot, open_orders=orders)).qty, expected)
         self.snapshot.positions[0].qty = dec("0.001")
-        with self.assertRaises(CyclePositionError):
-            self.plan()
+        self.assertEqual(self.plan().qty, expected)
 
-    def test_open_requires_exact_leverage_and_usd1_rules(self):
+    def test_open_follows_actual_leverage_and_requires_usd1_rules(self):
         for p in self.snapshot.positions:
             p.leverage = 5
-        with self.assertRaisesRegex(TradingError, "2x"):
-            self.plan()
+        self.assertEqual(self.plan().leverage, 5)
         for rule in (replace(self.rule, margin_asset="USDT"), replace(self.rule, symbol="CLUSD1")):
             with self.subTest(rule=rule), self.assertRaisesRegex(TradingError, "USD1"):
                 self.plan(rule=rule)

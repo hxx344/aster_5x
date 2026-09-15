@@ -132,15 +132,18 @@ class CycleExecutionTests(unittest.TestCase):
         self.assertEqual(self.quantities(), (3, 0))
         self.assertEqual(self.f.store.intent("test")["status"], "attention")
 
-    def test_cannot_open_over_preexisting_positions_even_without_order_inventory(self):
+    def test_existing_positions_are_frozen_and_restored_after_cycle(self):
         for side in ("LONG", "SHORT"):
             self.f.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "1", "entry": "4400"}
         self.f.broker.save()
         snapshot = self.f.broker.cycle_snapshot(["XAUUSD1"])
         snapshot.open_orders = None
-        with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not send")):
-            with self.assertRaisesRegex(TradingError, "空仓"):
-                self.executor.start(self.f.account, snapshot, self.plan("open"), self.progress_now())
+        self.executor.start(self.f.account, snapshot, self.plan("open"), self.progress_now())
+        self.assertEqual(self.quantities(), (3, 3))
+        self.assertEqual(self.progress_now()["baseline"], {"LONG": "1", "SHORT": "1"})
+        self.assertEqual(self.progress_now()["quantities"], {"LONG": "2", "SHORT": "2"})
+        self.close_cycle()
+        self.assertEqual(self.quantities(), (1, 1))
 
     def test_unqueried_external_order_inventory_does_not_block_taker_cycle(self):
         snapshot = self.f.broker.cycle_snapshot(["XAUUSD1"])
@@ -199,19 +202,13 @@ class CycleExecutionTests(unittest.TestCase):
         self.assertEqual(self.quantities(), (0, 0))
         self.assertIsNone(self.f.store.intent("test"))
 
-    def test_cycle_supports_2x_without_changing_old_leverage_restriction(self):
+    def test_cycle_cannot_change_actual_leverage_even_while_flat(self):
         self.f.broker.set_leverage("XAUUSD1", 5)
-        with self.assertRaises(TradingError):
-            self.f.broker.set_leverage("XAUUSD1", 2)
-        original = self.f.broker.set_cycle_leverage
-        def accepted(symbol, leverage, **options):
-            original(symbol, leverage, **options)
-            raise AmbiguousOrder("accepted without response")
-        with patch.object(self.f.broker, "set_cycle_leverage", side_effect=accepted) as mutate:
-            self.executor.set_leverage(self.f.account, self.f.broker.cycle_snapshot(["XAUUSD1"]), self.progress_now())
-            self.executor.reconcile(self.f.account)
-        self.assertEqual(mutate.call_count, 1)
-        self.assertEqual(self.f.broker.cycle_snapshot(["XAUUSD1"]).pair("XAUUSD1")[0].leverage, 2)
+        with patch.object(self.f.broker, "set_cycle_leverage") as mutate:
+            with self.assertRaises(TradingError):
+                self.executor.set_leverage(self.f.account, self.f.broker.cycle_snapshot(["XAUUSD1"]), self.progress_now())
+        mutate.assert_not_called()
+        self.assertEqual(self.f.broker.cycle_snapshot(["XAUUSD1"]).pair("XAUUSD1")[0].leverage, 5)
         self.assertIsNone(self.f.store.intent("test"))
 
     def test_cycle_cannot_lower_leverage_with_position(self):
@@ -248,7 +245,7 @@ class CycleExecutionTests(unittest.TestCase):
         for invalid in (True, float("nan"), float("-inf")):
             progress = self.progress_now()
             progress["opened_at"] = invalid
-            with self.subTest(value=invalid), patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")), self.assertRaisesRegex(TradingError, "持仓时间"):
+            with self.subTest(value=invalid), patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")), self.assertRaises(TradingError):
                 self.executor.start(self.f.account, self.f.broker.cycle_snapshot(["XAUUSD1"]), self.plan("close"), progress)
 
     def test_nonterminal_receipts_never_start_holding_clock(self):
@@ -336,13 +333,11 @@ class CycleExecutionTests(unittest.TestCase):
         with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")), self.assertRaisesRegex(TradingError, "持久记录"):
             self.executor.start(self.f.account, self.f.broker.cycle_snapshot(["XAUUSD1"]), self.plan("open"), progress)
 
-    def test_pause_at_leverage_admission_aborts_durable_intent(self):
-        self.f.broker.set_leverage("XAUUSD1", 5)
-        def pause(fresh):
-            self.f.store.pause_account(self.f.store.account("test"), "test pause")
-        with self.assertRaises(RequestNotSent):
-            self.executor.set_leverage(self.f.account, self.f.broker.cycle_snapshot(["XAUUSD1"]), self.progress_now(), before_submit=pause)
-        self.assertEqual(self.f.broker.cycle_snapshot(["XAUUSD1"]).pair("XAUUSD1")[0].leverage, 5)
+    def test_disabled_leverage_path_never_calls_admission_or_creates_intent(self):
+        callback = Mock()
+        with self.assertRaises(TradingError):
+            self.executor.set_leverage(self.f.account, self.f.broker.cycle_snapshot(["XAUUSD1"]), self.progress_now(), before_submit=callback)
+        callback.assert_not_called()
         self.assertIsNone(self.f.store.intent("test"))
 
 
@@ -396,13 +391,16 @@ class CycleLiveBrokerTests(unittest.TestCase):
         executor = CycleExecutor(self.f.store, self.live, self.f.market)
         with patch.object(self.live, "cycle_snapshot", return_value=snapshot), \
              patch.object(self.live, "set_cycle_leverage", side_effect=AmbiguousOrder("unknown")) as mutate:
-            executor.set_leverage(account, snapshot, progress)
+            # Simulate an already submitted pre-upgrade leverage request.
+            self.f.store.save_intent({"id": "legacy-leverage", "kind": "cycle_leverage", "account_id": "test",
+                "run_id": progress["run_id"], "symbol": "XAUUSD1", "previous": 5, "target": 2,
+                "status": "pending", "created_at": time.time(), "progress": progress})
             executor.reconcile(account)
             pending = self.f.store.intent("test")
             pending["created_at"] -= 130
             self.f.store.save_intent(pending)
             executor.reconcile(account)
-        self.assertEqual(mutate.call_count, 1)
+        mutate.assert_not_called()
         self.assertEqual(self.f.store.intent("test")["status"], "attention")
 
 

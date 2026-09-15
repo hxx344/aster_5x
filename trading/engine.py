@@ -20,7 +20,7 @@ from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
 from .account_cache import HotAccountUnavailable
 from .execution import Executor
-from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, plan_cycle, validate_cycle, validate_cycle_positions
+from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
 from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
@@ -822,13 +822,14 @@ class Engine:
         updates.setdefault("diagnostic", None)
         self.view(account["id"], cycle_state={**saved, **updates})
 
-    def cycle_volume_state(self, account, now=None):
+    def cycle_volume_state(self, account, now=None, *, symbol=None):
+        symbol = validate_cycle(account.get("cycle"))["symbol"] if symbol is None else symbol
         now = time.time() if now is None else now
-        daily = self.store.cycle_daily_volume(account["id"], now=now)
-        rolling = self.store.cycle_rolling_volume(account["id"], now=now)
+        daily = self.store.cycle_daily_volume(account["id"], now=now, symbol=symbol)
+        rolling = self.store.cycle_rolling_volume(account["id"], now=now, symbol=symbol)
         limit = dec(validate_cycle(account.get("cycle"))["daily_volume_limit"])
         # Yesterday's unresolved fills can still consume the rolling allowance.
-        backlog = self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, rolling["window_start"]))
+        backlog = self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, rolling["window_start"]), symbol=symbol)
         def allowance(record):
             used = Fraction(dec(record["volume"]))
             remaining = max(Fraction(0), Fraction(limit) - used)
@@ -870,8 +871,10 @@ class Engine:
     def cycle_progress(self, account, snapshot):
         progress = self.store.get("cycle:" + account["id"])
         validate_cycle_positions(account, snapshot, progress)
-        config = validate_cycle(account.get("cycle"))
-        if progress and validate_cycle(progress.get("config")) == config:
+        config = cycle_config(account, snapshot, progress)
+        requested = validate_cycle(account.get("cycle"))
+        requested["leverage"] = config["leverage"]
+        if progress and validate_cycle(progress.get("config")) == requested:
             # Defaulted fields added by an upgrade do not invalidate an active
             # cycle's ownership or restart its holding timer.
             if progress.get("config") != config:
@@ -939,6 +942,7 @@ class Engine:
         self.view(aid, snapshot=snapshot_json(snapshot, [symbol]), credential_ready=True)
         snapshot.require_modes([symbol])
         progress = self.cycle_progress(account, snapshot)
+        config = progress["config"]
         if not account["enabled"] or self.shutdown.is_set():
             reason = account.get("pause_reason") or "循环已暂停，已有仓位和持仓计时保留"
             phase = "attention" if account.get("pause_reason") else "paused"
@@ -969,19 +973,6 @@ class Engine:
                             reason="持仓时间已到，等待价差达标平仓")
         else:
             self.cycle_view(account, phase="waiting_open", reason="等待价差达标开仓")
-        long, _ = snapshot.pair(symbol)
-        if long.leverage != config["leverage"]:
-            if isinstance(broker, LiveBroker):
-                broker.api.budget.require_available(broker.cycle_snapshot_weight([symbol], fresh_modes=True) + 1)
-            def before_leverage(fresh):
-                if self.shutdown.is_set() or not self.live_allowed(account):
-                    raise TradingError("多空循环已停止提交")
-                validate_cycle_positions(account, fresh, progress)
-                self.cycle_open_allowances(account)
-            reason = executor.set_leverage(account, snapshot, progress, before_submit=before_leverage)
-            self.view(aid, status="reconciling", reason=reason)
-            self.cycle_view(account, phase="reconciling", reason=reason)
-            return 5
         if isinstance(broker, LiveBroker):
             broker.api.budget.require_available(5)
         planning_started = clock_tick() if trigger is not None else None
@@ -1658,20 +1649,25 @@ class Engine:
         migration_records = {a["id"]: (self.store.get("migration:" + a["id"]) or {}, self.store.intent(a["id"])) for a in saved_accounts}
         cycle_records = {a["id"]: self.store.get("cycle:" + a["id"]) or {} for a in saved_accounts}
         cycle_quality = {a["id"]: self.store.get("cycle_execution:" + a["id"]) for a in saved_accounts}
-        cycle_volumes = {a["id"]: self.cycle_volume_state(a, now=state_now) for a in saved_accounts}
+        cycle_selection = {a["id"]: validate_cycle(a.get("cycle"))["symbol"] for a in saved_accounts}
+        symbol_volumes = {a["id"]: {symbol: self.cycle_volume_state(a, now=state_now, symbol=symbol)
+                                     for symbol in SYMBOLS} for a in saved_accounts}
+        cycle_volumes = {a["id"]: symbol_volumes[a["id"]][cycle_selection[a["id"]]] for a in saved_accounts}
         cycle_trades = {a["id"]: self.store.cycle_trade_records(a["id"], limit=100) for a in saved_accounts}
         add_blocks = {a["id"]: ordinary_add_blocks(a) for a in saved_accounts}
         cycle_costs = {}
         for account in saved_accounts:
             aid = account["id"]
             try:
-                report = calculate_cycle_costs(self.store.cycle_cost_records(aid, now=state_now, limit=100), now=state_now)
+                fills = self.store.cycle_cost_records(aid, now=state_now, limit=100)
+                report = calculate_cycle_costs(fills, now=state_now)
                 trade_costs = {(row["symbol"], row["trade_id"]): row for row in report["trades"]}
                 for trade in cycle_trades[aid]:
                     cost = trade_costs.get((trade["symbol"], trade["trade_id"]))
                     if cost is not None:
                         trade["cost"] = {key: value for key, value in cost.items() if key not in ("symbol", "trade_id")}
-                cycle_costs[aid] = report
+                cycle_costs[aid] = calculate_cycle_costs(
+                    [fill for fill in fills if fill["symbol"] == cycle_selection[aid]], now=state_now)
             except Exception as exc:
                 # Cost reporting is read-only and must not interrupt the account
                 # controls or turn a missing calculation into a zero-cost claim.
@@ -1771,6 +1767,7 @@ class Engine:
                         cost["complete"] = False
                         cost["error"] = volume.get("error") or cost.get("error")
                     volume["cost"] = cost
+                cycle["volume_by_symbol"] = symbol_volumes[account["id"]]
                 cycle["daily_volume"] = daily
                 cycle["rolling_volume"] = rolling
                 cycle["execution_quality"] = cycle_quality[account["id"]]

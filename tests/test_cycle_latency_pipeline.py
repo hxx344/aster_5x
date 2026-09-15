@@ -50,7 +50,7 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
         def change_account():
             if changed == "positions":
                 for row in balance["positions"]:
-                    row["positionAmt"] = "0.3"
+                    row["positionAmt"] = "NaN"
             elif changed == "mode":
                 balance["positions"] = [{**balance["positions"][0], "positionSide": "BOTH"}]
             elif changed == "balance":

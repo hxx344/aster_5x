@@ -7,11 +7,12 @@ from contextlib import nullcontext
 from fractions import Fraction
 from time import monotonic
 
-from .cycle import DailyVolumeLimitError, RollingVolumeLimitError
+from .cycle import (DailyVolumeLimitError, RollingVolumeLimitError, cycle_baseline,
+                    cycle_config, validate_cycle, validate_cycle_positions)
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
 from .cycle_quality import (ObservedBroker, actual, clock_tick, estimate, estimate_from_plan,
                             new_quality, record_duration, timestamp)
-from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
+from .exchange import ExchangeError, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
 from .paper import PaperBroker, PaperOrderAbsent
@@ -124,13 +125,13 @@ class CycleExecutor(Executor):
         if plan.phase != "open":
             return
         now = time.time()
-        if self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, now - 86400)):
+        if self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, now - 86400), symbol=plan.symbol):
             raise TradingError("循环成交明细尚未补齐，等待核对后再开新仓")
         # Even unlimited accounts read the ledger: missing accounting cannot be
         # silently treated as zero when the limit is subsequently configured.
         # Both windows share one timestamp, including at a UTC day boundary.
-        daily = self.store.cycle_daily_volume(account["id"], now=now)
-        rolling = self.store.cycle_rolling_volume(account["id"], now=now)
+        daily = self.store.cycle_daily_volume(account["id"], now=now, symbol=plan.symbol)
+        rolling = self.store.cycle_rolling_volume(account["id"], now=now, symbol=plan.symbol)
         used_day = Fraction(positive(daily["volume"], True))
         used_24h = Fraction(positive(rolling["volume"], True))
         limit = Fraction(positive(config.get("daily_volume_limit", "0"), True))
@@ -254,7 +255,7 @@ class CycleExecutor(Executor):
 
     def _require_progress(self, account, progress):
         saved = self.store.get("cycle:" + account["id"])
-        if not isinstance(progress, dict) or not progress.get("run_id") or not saved or saved.get("run_id") != progress["run_id"]:
+        if not isinstance(progress, dict) or not progress.get("run_id") or not saved or saved != progress:
             raise TradingError("独立循环进度与持久记录不一致，等待核对")
 
     @staticmethod
@@ -287,7 +288,7 @@ class CycleExecutor(Executor):
             trigger_ticks = timestamp(trigger.get("received_monotonic")) if isinstance(trigger, dict) else None
         except Exception:
             pass
-        config = progress.get("config") or account["cycle"]
+        config = cycle_config(account, snapshot, progress)
         self._require_daily_room(account, plan, config)
         if symbol != config["symbol"] or plan.leverage != config["leverage"]:
             raise TradingError("独立循环计划与本轮配置不一致")
@@ -316,20 +317,20 @@ class CycleExecutor(Executor):
                    for current, previous in zip((long, short), selected)):
                 raise TradingError("独立循环规划后的仓位或杠杆已变化，等待重新核对")
         record_duration(quality, "final_account_ms", final_account_started)
+        validate_cycle_positions(account, snapshot, progress)
         if long.leverage != plan.leverage:
             raise TradingError("独立循环实际杠杆与设定不一致")
         baseline = {"LONG": wire(long.qty), "SHORT": wire(short.qty)}
         if plan.phase == "open":
-            if progress.get("phase", "waiting_open") != "waiting_open" or long.qty or short.qty:
-                raise TradingError("独立循环开仓前必须确认所选品种空仓")
+            if progress.get("phase", "waiting_open") != "waiting_open":
+                raise TradingError("循环加仓前必须完成上一轮核对")
             if any(dec(progress.get("quantities", {}).get(side, "0")) for side in SIDES):
                 raise TradingError("独立循环仍有未核对的本轮持仓")
             snapshot.ratio
         else:
             if progress.get("phase") not in ("holding", "waiting_close"):
                 raise TradingError("独立循环当前阶段不能平仓")
-            if any(dec(progress.get("quantities", {}).get(side, "0")) != dec(baseline[side])
-                   or dec(baseline[side]) != qty for side in SIDES):
+            if any(dec(progress.get("quantities", {}).get(side, "0")) != qty for side in SIDES):
                 raise TradingError("独立循环实际持仓与本轮记录不一致，禁止处理外部仓位")
             opened_at = progress.get("opened_at")
             if type(opened_at) not in (int, float) or not math.isfinite(opened_at) or time.time() - opened_at < config["hold_seconds"]:
@@ -368,6 +369,11 @@ class CycleExecutor(Executor):
         latest = self.store.account(account["id"])
         if not latest.get("enabled") or not latest.get("cycle", {}).get("enabled"):
             raise TradingError("独立循环或账户策略已暂停")
+        selected_config = validate_cycle(latest["cycle"])
+        selected_config["leverage"] = config["leverage"]
+        if plan.phase == "open" and selected_config != config:
+            raise TradingError("循环所选品种或参数已变化，等待重新核对")
+        self._require_progress(account, progress)
         # Re-read UTC-day usage after the last account/quote callback. This also
         # handles a midnight boundary during the admission reads.
         self._require_daily_room(latest, plan, latest["cycle"])
@@ -385,10 +391,12 @@ class CycleExecutor(Executor):
                   "repairs": [], "repair_attempts": 0,
                   "order_times": {order["newClientOrderId"]: time.time() for order in orders}}
         intent["progress"]["config"] = copy.deepcopy(config)
+        if plan.phase == "open":
+            intent["progress"]["baseline"] = copy.deepcopy(baseline)
         if quality is not None:
             quality.update(intent_id=token, created_at=intent["created_at"])
             intent["execution_quality"] = quality
-        action = "开仓" if plan.phase == "open" else "平仓"
+        action = "加仓" if plan.phase == "open" else "减回本轮新增"
         persist_started = clock_tick()
         if isinstance(self.broker, LiveBroker):
             self._cycle_submit_guard = (token, lambda: self._require_admission_fresh(admission))
@@ -405,53 +413,7 @@ class CycleExecutor(Executor):
     def set_leverage(self, account, snapshot, progress, before_submit=None):
         self._cycle_admission = None
         self._cycle_submit_guard = None
-        self.last_snapshot = self.last_completed_intent = None
-        if self.store.intent(account["id"]):
-            raise TradingError("已有批次正在执行")
-        self._require_progress(account, progress)
-        saved_account = self.store.account(account["id"])
-        if not account.get("enabled") or not account.get("cycle", {}).get("enabled") or not saved_account \
-                or not saved_account.get("enabled") or not saved_account.get("cycle", {}).get("enabled"):
-            raise TradingError("独立循环或账户策略未启动")
-        config = progress.get("config") or account["cycle"]
-        symbol, target = config["symbol"], config["leverage"]
-        if type(target) is not int or not 1 <= target <= 125:
-            raise TradingError("独立循环杠杆必须为 1 至 125 的整数")
-        long, short = self._ready(snapshot, symbol)
-        if long.qty or short.qty or any(dec(progress.get("quantities", {}).get(side, "0")) for side in SIDES):
-            raise TradingError("独立循环只在所选品种确认空仓时调整杠杆")
-        if target == long.leverage:
-            return f"独立循环当前已为 {target}x"
-        intent = {"id": uuid.uuid4().hex, "kind": "cycle_leverage", "account_id": account["id"],
-                  "run_id": progress["run_id"],
-                  "symbol": symbol, "previous": long.leverage, "target": target,
-                  "status": "pending", "created_at": time.time(), "progress": copy.deepcopy(progress)}
-        self.store.save_intent(intent)
-        def check_leverage_submit(fresh):
-            current = self.store.account(account["id"])
-            if not current or not current.get("enabled") or not current.get("cycle", {}).get("enabled"):
-                raise RequestNotSent("独立循环或账户策略已暂停")
-            selected = self._ready(fresh, symbol)
-            if any(position.qty for position in selected):
-                raise RequestNotSent("独立循环杠杆提交前发现外部仓位")
-            if before_submit is not None:
-                before_submit(fresh)
-            current = self.store.account(account["id"])
-            if not current or not current.get("enabled") or not current.get("cycle", {}).get("enabled"):
-                raise RequestNotSent("独立循环或账户策略已暂停")
-        try:
-            response = self.broker.set_cycle_leverage(symbol, target, checked_snapshot=snapshot, before_submit=check_leverage_submit)
-            if not isinstance(response, dict) or response.get("symbol") != symbol or LiveBroker._leverage(response.get("leverage")) != target:
-                raise TradingError("独立循环杠杆调整回执无效，等待实际账户确认")
-            intent["change_response"] = {"symbol": symbol, "leverage": target}
-        except (RequestNotSent, LeverageRejected) as exc:
-            intent.update(status="aborted", last_error=str(exc))
-            self.store.complete_cycle(intent, intent["progress"])
-            raise
-        except TradingError as exc:
-            intent.update(last_error=str(exc), submission_error=str(exc))
-        self.store.save_intent(intent)
-        return f"正在核对独立循环 {symbol} {long.leverage}x→{target}x 杠杆调整结果"
+        raise TradingError("循环杠杆自动沿用当前持仓，禁止通过循环修改杠杆")
 
     def reconcile(self, account, intent=None):
         self._cycle_admission = None
@@ -536,11 +498,20 @@ class CycleExecutor(Executor):
         for order in intent["repairs"]:
             repaired[order["positionSide"]] += Fraction(dec(intent["receipts"][order["newClientOrderId"]]["executedQty"]))
         opening = intent["phase"] == "open"
+        try:
+            floor = {side: Fraction(value) for side, value in cycle_baseline(intent["progress"]).items()}
+            tracked = {side: Fraction(dec(intent["progress"].get("quantities", {}).get(side, "0"))) for side in SIDES}
+            if any(Fraction(dec(intent["baseline"][side])) != floor[side] + (0 if opening else tracked[side])
+                   for side in SIDES):
+                raise TradingError("循环批次起始仓位与原始持仓记录不一致")
+        except TradingError as exc:
+            return self.attention(account, intent, str(exc))
         expected = {side: Fraction(dec(intent["baseline"][side])) + (original[side] if opening else -original[side]) - repaired[side]
                     for side in SIDES}
         actual = {"LONG": Fraction(long.qty), "SHORT": Fraction(short.qty)}
-        if any(expected[side] < 0 or actual[side] != expected[side] for side in SIDES):
+        if any(expected[side] < floor[side] or actual[side] != expected[side] for side in SIDES):
             return self.attention(account, intent, "独立循环持仓变化与回执不一致，禁止处理外部仓位；已暂停并等待核对")
+        remaining = {side: actual[side] - floor[side] for side in SIDES}
         full_open = opening and not intent["repairs"] and all(original[side] == Fraction(dec(intent["quantity"])) for side in SIDES)
         if full_open:
             config = intent["progress"]["config"]
@@ -577,10 +548,10 @@ class CycleExecutor(Executor):
             except TradingError as exc:
                 return self.attention(account, intent, str(exc))
             progress = copy.deepcopy(intent["progress"])
-            progress.update(phase="holding", quantities={side: wire(actual[side]) for side in SIDES}, opened_at=time.time(),
+            progress.update(phase="holding", quantities={side: wire(remaining[side]) for side in SIDES}, opened_at=time.time(),
                             failure_count=0, retry_at=0, close_eligible_at=None)
-            return self._finish(intent, progress, snapshot, "独立循环双向开仓已核实，开始计算持仓时间")
-        if not any(actual.values()):
+            return self._finish(intent, progress, snapshot, "循环双向加仓已核实，原始持仓已记录，开始计算持仓时间")
+        if not any(remaining.values()):
             progress = copy.deepcopy(intent["progress"])
             progress.update(phase="waiting_open", quantities=dict.fromkeys(SIDES, "0"), opened_at=None, close_eligible_at=None)
             if opening:
@@ -591,8 +562,8 @@ class CycleExecutor(Executor):
                 progress["completed_cycles"] = progress.get("completed_cycles", 0) + 1
             intent["status"] = "aborted" if opening else "complete"
             return self._finish(intent, progress, snapshot,
-                                f"独立循环{intent.get('rollback_reason', '开仓未完整成交')}，已核实空仓，{delay} 秒后重试" if opening
-                                else "独立循环多空已全部平仓，本轮完成")
+                                f"独立循环{intent.get('rollback_reason', '加仓未完整成交')}，已恢复原始持仓，{delay} 秒后重试" if opening
+                                else "循环新增多空已全部减回，已核实原始持仓数量及杠杆不变，本轮完成")
         # A partial opening is discarded entirely. Never buy/sell extra quantity
         # to repair an imbalance, and never touch a preexisting user position.
         try:
@@ -610,9 +581,9 @@ class CycleExecutor(Executor):
         batch = uuid.uuid4().hex
         repairs = []
         for side in SIDES:
-            if not actual[side]:
+            if not remaining[side]:
                 continue
-            qty = floor_step(min(actual[side], Fraction(rule.max_qty), Fraction(book.bid_qty if side == "LONG" else book.ask_qty)), rule.step)
+            qty = floor_step(min(remaining[side], Fraction(rule.max_qty), Fraction(book.bid_qty if side == "LONG" else book.ask_qty)), rule.step)
             if qty < rule.min_qty:
                 return self.attention(account, intent, "独立循环剩余数量或盘口不足以安全减仓，已暂停并等待核对")
             repair = self.order(intent["symbol"], side, "SELL" if side == "LONG" else "BUY", qty,

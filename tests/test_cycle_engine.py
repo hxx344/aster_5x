@@ -45,9 +45,9 @@ class CycleEngineTests(TestCase):
         progress["opened_at"] = time.time() - progress["config"]["hold_seconds"] - 1
         self.f.store.put("cycle:test", progress)
 
-    def test_2x_open_hold_close_and_repeat_survives_engine_restart(self):
+    def test_actual_leverage_open_hold_close_and_repeat_survives_engine_restart(self):
         progress = self.start_holding()
-        self.assertEqual([p.leverage for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")], [2, 2])
+        self.assertEqual([p.leverage for p in self.f.broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")], [5, 5])
         self.assertGreater(dec(progress["quantities"]["LONG"]), 0)
         self.assertEqual(progress["quantities"]["LONG"], progress["quantities"]["SHORT"])
         before = deepcopy(self.f.broker.state["orders"])
@@ -114,14 +114,13 @@ class CycleEngineTests(TestCase):
         self.engine.tick_account("test")
         self.assertEqual(self.f.store.get("cycle:test")["completed_cycles"], 1)
 
-    def test_external_positions_are_never_adopted_or_closed(self):
+    def test_existing_positions_are_allowed_and_enable_does_not_trade(self):
         self.select()
         for side in ("LONG", "SHORT"):
             self.f.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "1", "entry": "4412"}
         self.f.store.put("paper:test", self.f.broker.state)
-        with self.assertRaisesRegex(TradingError, "已有仓位"):
-            self.engine.enable("test", True)
-        self.assertFalse(self.f.store.account("test")["enabled"])
+        self.engine.enable("test", True)
+        self.assertTrue(self.f.store.account("test")["enabled"])
         self.assertEqual(self.f.broker.state["orders"], {})
 
     def test_external_quantity_change_during_hold_pauses_without_orders(self):

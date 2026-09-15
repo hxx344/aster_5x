@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from trading.exchange import AccountModeError, LiveBroker, RequestNotSent
+from trading.exchange import AccountModeError, ExchangeError, LiveBroker, RequestNotSent
 from trading.engine import snapshot_json
 from trading.models import Book, TradingError, dec
 from trading.paper import DemoMarket, PAPER_BRACKETS
@@ -141,7 +141,7 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         self.assertEqual(result.unrealized, dec(-12))
         self.assertEqual(result.equity, dec(188))
         self.assertEqual(result.available, dec(150))
-        self.assertEqual(result.current_leverage_caps, {})
+        self.assertEqual(result.current_leverage_caps, {SYMBOL: (5, dec("1000000"))})
 
     def test_unsubscribed_position_adds_one_risk_read_without_public_rest(self):
         responses = cycle_account_responses()
@@ -249,11 +249,12 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         for row in responses[ACCOUNT]["positions"]:
             row.update(positionAmt="1", entryPrice="100")
             del row["maxNotional"]
+        responses[BRACKET] = ExchangeError("capacity unavailable")
         broker, api, _ = self.make_broker(responses)
         snapshot = broker.cycle_snapshot([SYMBOL])
         self.assertEqual(snapshot.current_leverage_caps, {})
         self.assertEqual(snapshot.brackets, {})
-        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(len(api.calls), 3)
 
     def test_cached_fallback_cap_keeps_original_ttl_until_final_submit_check(self):
         clock = SimpleNamespace(now=100.0)

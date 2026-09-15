@@ -190,8 +190,8 @@ class AccountSnapshot:
     timestamp: float
     fees: dict[str, Decimal] = field(default_factory=dict)
     brackets: dict[str, list[dict]] = field(default_factory=dict)
-    # Account-reported cap at this exact current leverage, usable for a flat
-    # cycle opening. It is not a tier table for selecting another leverage.
+    # Account-reported total cap at this exact current leverage. Cycle additions
+    # must subtract existing gross exposure before consuming the remaining room. It is not a tier table for selecting another leverage.
     current_leverage_caps: dict[str, tuple[int, Decimal]] = field(default_factory=dict)
     # Conditional tier-derived caps retain the original five-second cache age.
     cycle_cap_cached_at: dict[str, float] = field(default_factory=dict)

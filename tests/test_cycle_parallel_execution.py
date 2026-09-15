@@ -133,13 +133,13 @@ class CycleParallelExecutionTests(TestCase):
         self.open_ordinary("SPCXUSD1")
         self.assertGreater(dec(self.ordinary_positions()["SPCXUSD1:LONG"]["qty"]), 0)
 
-    def test_selected_market_untracked_position_is_still_rejected(self):
+    def test_selected_market_original_position_does_not_change_other_markets(self):
         self.open_ordinary("SPCXUSD1")
         ordinary_positions = self.ordinary_positions()
         self.f.broker.state["positions"][CYCLE_SYMBOL + ":LONG"] = {"qty": "1", "entry": "4412"}
         self.f.broker.save()
-        with self.assertRaisesRegex(CyclePositionError, "循环品种已有仓位"):
-            validate_cycle_positions(self.f.account, self.f.broker.cycle_snapshot([CYCLE_SYMBOL]), self.progress_now())
+        pair = validate_cycle_positions(self.f.account, self.f.broker.cycle_snapshot([CYCLE_SYMBOL]), self.progress_now())
+        self.assertEqual(pair[0].qty, 1)
         self.assertEqual(self.ordinary_positions(), ordinary_positions)
 
     def test_ordinary_upgrades_cannot_change_selected_cycle_leverage(self):
@@ -233,12 +233,12 @@ class CycleParallelSnapshotTests(TestCase):
         order_reads = [call for call in self.api.call.call_args_list if call.args[1] == "/fapi/v3/openOrders"]
         self.assertEqual(order_reads, [])
 
-    def test_selected_external_position_still_blocks_cycle_with_other_markets_present(self):
+    def test_selected_original_position_is_available_with_other_markets_present(self):
         self.rows[0].update(positionAmt="1", entryPrice="100")
         snapshot = self.live.cycle_snapshot([CYCLE_SYMBOL])
         self.assertIsNone(snapshot.open_orders)
-        with self.assertRaises(CyclePositionError):
-            validate_cycle_positions(self.f.account, snapshot)
+        pair = validate_cycle_positions(self.f.account, snapshot)
+        self.assertEqual(pair[0].qty, 1)
 
     def test_other_active_isolated_position_still_blocks_account_mode_check(self):
         self.rows[2]["marginType"] = "isolated"

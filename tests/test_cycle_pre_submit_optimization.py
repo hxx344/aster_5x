@@ -52,7 +52,7 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
                 self.assertIsNone(indexed["synced_at"])
                 events = db.execute("SELECT account_id,kind,message FROM events").fetchall()
                 self.assertEqual([tuple(event) for event in events],
-                                 [("test", "cycle", "XAUUSD1 独立循环同时开仓多空，每边 2，2x")])
+                                 [("test", "cycle", "XAUUSD1 独立循环同时加仓多空，每边 2，2x")])
                 self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 2)
             return original(orders)
         with patch.object(self.f.store, "connect", side_effect=observed_connection), \
@@ -122,7 +122,7 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
             indexed = db.execute("SELECT status FROM cycle_volume_sync WHERE intent_id=?", (pending["id"],)).fetchone()
             self.assertEqual(intent["status"], indexed["status"])
             self.assertIn(intent["status"], ("complete", "aborted"))
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE message LIKE '%同时开仓%'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE message LIKE '%同时加仓%'").fetchone()[0], 1)
 
     def test_creation_rejects_an_existing_id_without_updating_it(self):
         with patch.object(self.executor, "send", side_effect=RuntimeError("before send")), self.assertRaises(RuntimeError):

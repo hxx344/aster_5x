@@ -225,7 +225,8 @@ class EngineHardeningTests(unittest.TestCase):
             return [self.f.account]
 
         with patch.object(self.f.store, "accounts", side_effect=read_accounts):
-            self.engine.state()
+            state = self.engine.state()
+        self.assertEqual(state["accounts"][0]["cycle_state"]["daily_volume"]["symbol"], "XAUUSD1")
 
     def test_shutdown_skips_queued_account_network_and_reconciliation(self):
         self.engine.shutdown.set()

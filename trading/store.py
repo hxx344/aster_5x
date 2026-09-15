@@ -67,6 +67,7 @@ class Store:
             if demo is not None:
                 self._bind_runtime_mode(db, demo=demo)
             had_volume_index = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cycle_volume_sync'").fetchone() is not None
+            had_symbol_volume = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cycle_symbol_volume_days'").fetchone() is not None
             schema = """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id TEXT PRIMARY KEY, data TEXT NOT NULL
@@ -116,6 +117,15 @@ class Store:
                     latest_symbol TEXT, latest_trade_id TEXT, updated_at REAL NOT NULL,
                     PRIMARY KEY(account_id,utc_date)
                 );
+                CREATE TABLE IF NOT EXISTS cycle_symbol_volume_days (
+                    account_id TEXT NOT NULL, utc_date TEXT NOT NULL, volume TEXT NOT NULL,
+                    trade_count INTEGER NOT NULL, estimated_volume TEXT NOT NULL,
+                    estimated_trade_count INTEGER NOT NULL, latest_trade_at REAL,
+                    latest_symbol TEXT, latest_trade_id TEXT, updated_at REAL NOT NULL,
+                    symbol TEXT NOT NULL, PRIMARY KEY(account_id,utc_date,symbol)
+                );
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_symbol_time
+                    ON cycle_fills(account_id,symbol,executed_at,trade_id);
                 CREATE TABLE IF NOT EXISTS cycle_volume_sync (
                     intent_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, status TEXT NOT NULL,
                     created_at REAL, completed_at REAL, synced_at REAL
@@ -144,6 +154,12 @@ class Store:
             if not had_volume_index:
                 for row in db.execute("SELECT id,account_id,status,data FROM intents").fetchall():
                     self._index_cycle_volume(db, json.loads(row["data"]), row=row)
+            if not had_symbol_volume:
+                for group in db.execute("SELECT DISTINCT account_id,utc_date,symbol FROM cycle_fills").fetchall():
+                    rows = [dict(row) for row in db.execute(
+                        "SELECT * FROM cycle_fills WHERE account_id=? AND utc_date=? AND symbol=?",
+                        tuple(group))]
+                    self._update_cycle_day(db, group["account_id"], group["utc_date"], rows, symbol=group["symbol"])
             placeholders = ",".join("?" for _ in CAPACITY_ALERT_KEYS)
             db.execute(f"""UPDATE outbox SET expires_at=0 WHERE delivered_at IS NULL
                 AND capacity_key IS NOT NULL AND capacity_key NOT IN ({placeholders})""", tuple(CAPACITY_ALERT_KEYS))
@@ -215,7 +231,7 @@ class Store:
             return
         if demo:
             expected = {"accounts", "kv", "intents", "events", "outbox", "cycle_fills",
-                        "cycle_volume_days", "cycle_volume_sync"}
+                        "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
             if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -464,17 +480,22 @@ class Store:
                     raise TradingError("循环逐笔成交累计数量超过已核实回执")
             for date, rows in changed_days.items():
                 self._update_cycle_day(db, account_id, date, rows)
+                for symbol in {row["symbol"] for row in rows}:
+                    self._update_cycle_day(db, account_id, date, [row for row in rows if row["symbol"] == symbol], symbol=symbol)
             return sum(len(rows) for rows in changed_days.values())
 
     @staticmethod
-    def _update_cycle_day(db, account_id, date, new_rows):
-        old = db.execute("SELECT * FROM cycle_volume_days WHERE account_id=? AND utc_date=?", (account_id, date)).fetchone()
+    def _update_cycle_day(db, account_id, date, new_rows, *, symbol=None):
+        table = "cycle_volume_days" if symbol is None else "cycle_symbol_volume_days"
+        where = "account_id=? AND utc_date=?" + (" AND symbol=?" if symbol is not None else "")
+        params = (account_id, date) if symbol is None else (account_id, date, symbol)
+        old = db.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchone()
         # Normal in-order fills append in O(new fills); a late execution rebuilds
         # that day's exact prefixes so every displayed running total stays true.
         latest = (old["latest_trade_at"], old["latest_symbol"], old["latest_trade_id"]) if old else None
         append = old is not None and all(sort_key(row) > latest for row in new_rows)
         rows = sorted(new_rows, key=sort_key) if append or old is None else [dict(row) for row in db.execute(
-            "SELECT * FROM cycle_fills WHERE account_id=? AND utc_date=? ORDER BY executed_at,symbol,trade_id", (account_id, date))]
+            f"SELECT * FROM cycle_fills WHERE {where} ORDER BY executed_at,symbol,trade_id", params)]
         volume = Fraction(dec(old["volume"])) if append else Fraction(0)
         estimated = Fraction(dec(old["estimated_volume"])) if append else Fraction(0)
         count = old["trade_count"] if append else 0
@@ -485,34 +506,45 @@ class Store:
             if row["time_source"] == "legacy_estimated":
                 estimated += Fraction(dec(row["notional"]))
                 estimated_count += 1
-            row["daily_volume"] = wire(volume)
-            db.execute("UPDATE cycle_fills SET daily_volume=? WHERE account_id=? AND symbol=? AND trade_id=?",
-                       (row["daily_volume"], account_id, row["symbol"], row["trade_id"]))
-            db.execute("UPDATE events SET message=? WHERE id=? AND account_id=? AND kind='cycle_fill'",
-                       (event_message(row), row["event_id"], account_id))
+            if symbol is not None:
+                row["daily_volume"] = wire(volume)
+                db.execute("UPDATE cycle_fills SET daily_volume=? WHERE account_id=? AND symbol=? AND trade_id=?",
+                           (row["daily_volume"], account_id, row["symbol"], row["trade_id"]))
+                db.execute("UPDATE events SET message=? WHERE id=? AND account_id=? AND kind='cycle_fill'",
+                           (event_message(row), row["event_id"], account_id))
         last = rows[-1]
-        db.execute("""INSERT INTO cycle_volume_days VALUES (?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(account_id,utc_date) DO UPDATE SET volume=excluded.volume,trade_count=excluded.trade_count,
+        placeholders = ",".join("?" for _ in range(10 if symbol is None else 11))
+        key = "account_id,utc_date" + (",symbol" if symbol is not None else "")
+        db.execute(f"""INSERT INTO {table} VALUES ({placeholders})
+                    ON CONFLICT({key}) DO UPDATE SET volume=excluded.volume,trade_count=excluded.trade_count,
                     estimated_volume=excluded.estimated_volume,estimated_trade_count=excluded.estimated_trade_count,
                     latest_trade_at=excluded.latest_trade_at,latest_symbol=excluded.latest_symbol,
                     latest_trade_id=excluded.latest_trade_id,updated_at=excluded.updated_at""",
                    (account_id, date, wire(volume), count, wire(estimated), estimated_count,
-                    last["executed_at"], last["symbol"], last["trade_id"], time.time()))
+                    last["executed_at"], last["symbol"], last["trade_id"], time.time()) + (() if symbol is None else (symbol,)))
 
-    def cycle_daily_volume(self, account_id, now=None):
+    def cycle_daily_volume(self, account_id, now=None, *, symbol=None):
         account_identifier(account_id)
+        self._cycle_volume_symbol(symbol)
         date, _, reset = utc_day(now)
         with self.connect() as db:
-            row = db.execute("SELECT * FROM cycle_volume_days WHERE account_id=? AND utc_date=?", (account_id, date)).fetchone()
-        return {"utc_date": date, "volume": row["volume"] if row else "0", "trade_count": row["trade_count"] if row else 0,
+            row = db.execute("SELECT * FROM cycle_volume_days WHERE account_id=? AND utc_date=?", (account_id, date)).fetchone() if symbol is None else db.execute(
+                "SELECT * FROM cycle_symbol_volume_days WHERE account_id=? AND utc_date=? AND symbol=?", (account_id, date, symbol)).fetchone()
+        return {**({"symbol": symbol} if symbol is not None else {}), "utc_date": date, "volume": row["volume"] if row else "0", "trade_count": row["trade_count"] if row else 0,
                 "next_reset_at": reset, "estimated_volume": row["estimated_volume"] if row else "0",
                 "estimated_trade_count": row["estimated_trade_count"] if row else 0,
                 "latest_trade_at": row["latest_trade_at"] if row else None,
                 "cumulative_order": "execution_time", "timezone": "UTC"}
 
-    def cycle_rolling_volume(self, account_id, now=None):
+    @staticmethod
+    def _cycle_volume_symbol(symbol):
+        if symbol is not None and (not isinstance(symbol, str) or symbol not in SYMBOLS):
+            raise TradingError("循环成交统计品种无效")
+
+    def cycle_rolling_volume(self, account_id, now=None, *, symbol=None):
         """Sum every fill in (now - 24h, now], independently of UTC day changes."""
         account_identifier(account_id)
+        self._cycle_volume_symbol(symbol)
         end = time.time() if now is None else now
         if type(end) not in (int, float) or not 0 <= end <= 253402300799 or not math.isfinite(end):
             raise TradingError("循环滚动成交统计时间必须为有效时间戳")
@@ -524,8 +556,9 @@ class Store:
             # The account/time range uses idx_cycle_fills_recent. Iterate every
             # matching fill without a UI limit or lossy SQLite numeric SUM.
             rows = db.execute("""SELECT notional,time_source,executed_at FROM cycle_fills
-                WHERE account_id=? AND executed_at>? AND executed_at<=? ORDER BY executed_at""",
-                              (account_id, start, end))
+                WHERE account_id=? AND executed_at>? AND executed_at<=?"""
+                + (" AND symbol=?" if symbol is not None else "") + " ORDER BY executed_at",
+                (account_id, start, end) + (() if symbol is None else (symbol,)))
             for row in rows:
                 notional = Fraction(dec(row["notional"]))
                 volume += notional
@@ -535,7 +568,7 @@ class Store:
                 if row["time_source"] == "legacy_estimated":
                     estimated += notional
                     estimated_count += 1
-        return {"window_start": start, "window_end": end, "volume": wire(volume), "trade_count": count,
+        return {**({"symbol": symbol} if symbol is not None else {}), "window_start": start, "window_end": end, "volume": wire(volume), "trade_count": count,
                 "next_release_at": next_release, "estimated_volume": wire(estimated),
                 "estimated_trade_count": estimated_count}
 
@@ -576,8 +609,9 @@ class Store:
                               (account_id, end - 86400, end, account_id, limit, account_id))
             return [dict(row) for row in rows]
 
-    def cycle_volume_backlog(self, account_id, limit=100, since=None):
+    def cycle_volume_backlog(self, account_id, limit=100, since=None, *, symbol=None):
         account_identifier(account_id)
+        self._cycle_volume_symbol(symbol)
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise TradingError("循环成交补记批次数必须为 1 至 1000 的整数")
         if since is None:
@@ -589,8 +623,9 @@ class Store:
                 WHERE v.account_id=? AND v.synced_at IS NULL AND v.status IN ('complete','aborted')
                 AND i.account_id=v.account_id AND i.status IN ('complete','aborted')
                 AND (v.created_at>=? OR v.completed_at>=? OR v.completed_at IS NULL)
-                ORDER BY COALESCE(v.completed_at,v.created_at,0) DESC,v.intent_id DESC LIMIT ?""",
-                              (account_id, since, since, limit)).fetchall()
+                """ + (" AND json_extract(i.data,'$.symbol')=?" if symbol is not None else "")
+                + " ORDER BY COALESCE(v.completed_at,v.created_at,0) DESC,v.intent_id DESC LIMIT ?",
+                (account_id, since, since) + (() if symbol is None else (symbol,)) + (limit,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def mark_cycle_volume_synced(self, intent_id):

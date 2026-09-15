@@ -319,7 +319,8 @@ class EngineHardeningTests(unittest.TestCase):
             notified.set()
             return .01
 
-        with patch.object(self.engine, "tick_account", side_effect=blocked_account), \
+        with patch("trading.engine.CAPACITY_POLL_INTERVAL", .01), \
+             patch.object(self.engine, "tick_account", side_effect=blocked_account), \
              patch.object(self.engine, "poll_market", side_effect=market), \
              patch.object(self.engine, "notify", side_effect=notify), \
              patch.object(self.f.store, "accounts", wraps=self.f.store.accounts) as list_accounts:

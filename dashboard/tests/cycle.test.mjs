@@ -7,10 +7,52 @@ import {
   cycleDraft,
   cycleHasPosition,
   cycleHoldSeconds,
+  cycleRecoveryReason,
   cycleSpreadView,
   cycleStatus,
   parseCycleDraft,
 } from '../lib/cycle.ts';
+
+test('mismatch review stays visible when recovery is blocked or the server flag is missing', () => {
+  const reason = '循环实际多空数量与记录不一致，已停止自动交易，需核对';
+  const account = { id: 'one', cycle: { enabled: true }, reason };
+  assert.equal(cycleRecoveryReason(account), reason);
+  assert.equal(
+    cycleRecoveryReason({ ...account, cycle_recovery_available: false }),
+    reason,
+  );
+  assert.equal(
+    cycleRecoveryReason({ ...account, reason: '', cycle_state: { reason } }),
+    reason,
+  );
+  assert.ok(
+    cycleRecoveryReason({
+      ...account,
+      reason: '',
+      cycle_recovery_available: true,
+    }),
+  );
+  assert.equal(cycleRecoveryReason({ ...account, reason: '策略已暂停' }), null);
+  assert.equal(
+    cycleRecoveryReason({ ...account, cycle: { enabled: false } }),
+    null,
+  );
+  assert.equal(cycleRecoveryReason(undefined), null);
+});
+
+test('startup mismatch errors show the review entry only for the account that failed', () => {
+  const account = { id: 'one', cycle: { enabled: true }, reason: '策略已暂停' };
+  const error = {
+    accountId: 'one',
+    message: '循环实际多空数量与记录不一致，已停止自动交易，需核对',
+  };
+  assert.equal(cycleRecoveryReason(account, error), error.message);
+  assert.equal(cycleRecoveryReason({ ...account, id: 'two' }, error), null);
+  assert.equal(
+    cycleRecoveryReason(account, { ...error, message: '无法读取交易所持仓' }),
+    null,
+  );
+});
 
 test('cycle leverage comes only from a fresh matching exchange position pair', () => {
   const snapshot = {

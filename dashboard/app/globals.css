@@ -1584,9 +1584,8 @@ label input,
 }
 .cycle-recovery-message {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 12px;
 }
 .cycle-recovery-dialog {

@@ -72,6 +72,8 @@ export function CycleRecovery({
           signal: controller.signal,
         },
       );
+      if (response.status === 404)
+        throw new Error('服务器未提供核对入口，请更新并重启后端服务后重试');
       const data = (await response.json()) as Review & { detail?: string };
       if (!response.ok) throw new Error(data.detail || '读取失败，请重新核对');
       if (!controller.signal.aborted) setReview(data as Review);

@@ -47,6 +47,30 @@ export type CycleState = {
   execution_quality?: CycleExecutionQuality | null;
 };
 
+export function cycleRecoveryReason(
+  account:
+    | {
+        id: string;
+        reason?: string;
+        cycle?: { enabled: boolean };
+        cycle_state?: { reason?: string };
+        cycle_recovery_available?: boolean;
+      }
+    | undefined,
+  operationError?: { accountId: string; message: string },
+): string | null {
+  if (!account?.cycle?.enabled) return null;
+  const mismatch = '循环实际多空数量与记录不一致';
+  const reason = [
+    account.reason,
+    account.cycle_state?.reason,
+    operationError?.accountId === account.id ? operationError.message : '',
+  ].find((value) => value?.startsWith(mismatch));
+  // Keep the review entry visible even when a server guard blocks recovery.
+  // The preview endpoint checks eligibility and explains what needs attention.
+  return reason || (account.cycle_recovery_available ? mismatch : null);
+}
+
 export type CycleDiagnostic = {
   code: string;
   title: string;

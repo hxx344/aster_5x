@@ -1546,6 +1546,17 @@ class Engine:
                 self.accounts_generation += 1
             self.store.event(account_id, "config", "策略设置已更新")
 
+    def _cycle_start_progress(self, account, snapshot):
+        try:
+            return self.cycle_progress(account, snapshot)
+        except CyclePositionError as exc:
+            # Startup failures must remain actionable after the HTTP error or
+            # page is dismissed, just like mismatches found by the worker.
+            self.store.pause_account(account, str(exc))
+            self.view(account["id"], status="attention", reason=str(exc))
+            self.cycle_view(account, phase="attention", reason=str(exc), diagnostic=None)
+            raise
+
     def enable(self, account_id, enabled):
         with self.account_lock(account_id):
             account = self.store.account(account_id)
@@ -1573,14 +1584,14 @@ class Engine:
                     snapshot.require_modes(symbols)
                     if not snapshot.can_trade:
                         raise TradingError("多空循环需要账户交易权限")
-                    self.cycle_progress(account, snapshot)
+                    self._cycle_start_progress(account, snapshot)
                     if ordinary_markets:
                         symbols = list(dict.fromkeys([*account["policy"]["symbols"], account["cycle"]["symbol"]]))
                         snapshot = broker.snapshot(symbols, fresh_modes=True)
                         snapshot.require_modes(symbols)
                         for symbol in ordinary_markets:
                             snapshot.require_ready(symbol)
-                        self.cycle_progress(account, snapshot)
+                        self._cycle_start_progress(account, snapshot)
                 else:
                     snapshot = broker.snapshot(symbols, fresh_modes=True)
                     for symbol in symbols:

@@ -90,6 +90,22 @@ class CycleRecoveryTests(TestCase):
         self.assertEqual(self.f.store.get("cycle:test")["baseline"], {"LONG": "0", "SHORT": "0"})
         self.engine.enable("test", True)
 
+    def test_failed_start_publishes_durable_mismatch_pause_for_recovery(self):
+        paused = {**self.before_account}
+        paused.pop("pause_reason")
+        self.f.store.save_account(paused)
+        self.engine.view("test", status="paused", reason="策略已暂停")
+        with self.assertRaisesRegex(TradingError, "循环实际多空数量与记录不一致"):
+            self.engine.enable("test", True)
+        self.assertEqual(self.f.store.account("test").get("pause_reason"), CYCLE_POSITION_MISMATCH)
+        view = self.engine.state()["accounts"][0]
+        self.assertEqual(view["status"], "attention")
+        self.assertTrue(view["cycle_recovery_available"])
+        self.assertEqual(self.f.store.get("cycle:test"), self.before_progress)
+        self.assertEqual(self.f.broker.state["orders"], self.before_orders)
+        self.confirm(self.preview())
+        self.assertFalse(self.f.store.account("test")["enabled"])
+
     def test_changed_quantity_or_leverage_requires_a_new_review(self):
         for change in ("quantity", "leverage"):
             with self.subTest(change=change):

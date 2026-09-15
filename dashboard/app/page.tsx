@@ -52,6 +52,7 @@ import type { ExecutionEvent } from '@/lib/cycle-events';
 import { OrdinaryConditions } from '@/components/ordinary-conditions';
 import {
   cycleDraft,
+  cycleRecoveryReason,
   type CycleConfig,
   type CycleDraft,
   type CycleState,
@@ -209,6 +210,7 @@ export default function Home() {
   const [selected, setSelected] = useState('');
   const [focus, setFocus] = useState('XAUUSD1');
   const [error, setError] = useState('');
+  const [errorAccountId, setErrorAccountId] = useState('');
   const [connectionError, setConnectionError] = useState('');
   const [needsLogin, setNeedsLogin] = useState(false);
   const [password, setPassword] = useState('');
@@ -241,6 +243,8 @@ export default function Home() {
     setServerClock({ server: 0, local: 0 });
     setAddOpen(false);
     setConnectionError('');
+    setError('');
+    setErrorAccountId('');
   }, []);
   const [poller] = useState(() =>
     createStatePoller<State>({
@@ -275,6 +279,16 @@ export default function Home() {
     };
   }, [refresh, poller]);
   const account = state?.accounts.find((a) => a.id === selected);
+  const recoveryReason = cycleRecoveryReason(account, {
+    accountId: errorAccountId,
+    message: error,
+  });
+  const accountMessage =
+    recoveryReason ||
+    (account && ['error', 'attention'].includes(account.status)
+      ? account.reason
+      : '');
+  const separateError = error === accountMessage ? '' : error;
   const serverNow = serverClock.server + Math.max(0, now - serverClock.local);
   const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
   const marginPercent = percentFromMarginLimit(
@@ -338,6 +352,7 @@ export default function Home() {
     let resumePolling = true;
     setBusy(true);
     setError('');
+    setErrorAccountId(selected);
     setNotice('');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
@@ -480,7 +495,13 @@ export default function Home() {
             {account && (
               <Select
                 value={selected}
-                onValueChange={(v) => v && setSelected(v)}
+                disabled={busy}
+                onValueChange={(v) => {
+                  if (!v) return;
+                  setSelected(v);
+                  setError('');
+                  setNotice('');
+                }}
               >
                 <SelectTrigger className="account-select" aria-label="选择账户">
                   <Wallet size={16} />
@@ -589,17 +610,17 @@ export default function Home() {
             </Dialog>
           </div>
         </div>
-        {(error || connectionError || notice) && (
+        {(separateError || connectionError || notice) && (
           <output
-            className={`message ${error || connectionError ? 'message-error' : ''}`}
+            className={`message ${separateError || connectionError ? 'message-error' : ''}`}
           >
-            {error || connectionError || notice}
+            {separateError || connectionError || notice}
           </output>
         )}
-        {account && ['error', 'attention'].includes(account.status) && (
+        {account && accountMessage && (
           <div className="message message-error cycle-recovery-message">
-            <output>{account.reason}</output>
-            {account.cycle_recovery_available ? (
+            <output>{accountMessage}</output>
+            {recoveryReason ? (
               <CycleRecovery
                 key={account.id}
                 accountId={account.id}

@@ -23,6 +23,7 @@ from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIG
 from .depth_stream import PublicDepthStream
 from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
+from .request_timing import transport_stage
 from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
@@ -43,6 +44,10 @@ class AmbiguousOrder(ExchangeError):
 
 class RequestNotSent(ExchangeError):
     """A local admission check failed before any HTTP request was sent."""
+
+
+class SnapshotSuperseded(TradingError):
+    """An account event or write invalidated a read-only preparation."""
 
 
 class PublicBracketsUnavailable(ExchangeError):
@@ -314,15 +319,18 @@ class API:
         return data
 
     def call(self, method, path, params=None, signed=False, weight=1):
-        ticket = self.budget.reserve(weight, track=True)
+        with transport_stage("budget_ms"):
+            ticket = self.budget.reserve(weight, track=True)
         try:
-            params = self.signed_parameters(params or {}) if signed else (params or {})
+            with transport_stage("signing_ms"):
+                params = self.signed_parameters(params or {}) if signed else (params or {})
+                content = urlencode(params) if method != "GET" else None
             is_write = signed and method != "GET"
             try:
-                response = self.http.request(method, BASE + path,
-                    params=params if method == "GET" else None,
-                    content=urlencode(params) if method != "GET" else None,
-                    headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "AsterAccountDesk/1.0"})
+                with transport_stage("http_ms"):
+                    response = self.http.request(method, BASE + path,
+                        params=params if method == "GET" else None, content=content,
+                        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "AsterAccountDesk/1.0"})
             except httpx.HTTPError:
                 error = AmbiguousOrder if is_write else ExchangeError
                 raise error("请求结果未知，需核对订单" if is_write else "Aster 网络连接失败") from None
@@ -347,7 +355,8 @@ class API:
         if (response.status_code >= 500 or response.status_code == 408) and is_write:
             raise AmbiguousOrder("Aster 未确认请求结果，需核对订单", http_status=response.status_code)
         try:
-            data = response.json()
+            with transport_stage("response_decode_ms"):
+                data = response.json()
         except ValueError:
             error = AmbiguousOrder if is_write else ExchangeError
             raise error("Aster 返回无法识别的响应", retry_after=gateway_delay, http_status=response.status_code) from None
@@ -709,6 +718,9 @@ class LiveBroker:
         self.market = market
         self.cached, self.cached_at = {}, {}
         self._snapshot_lock = threading.RLock()
+        self._ordinary_read_lock = threading.Lock()
+        self._cycle_read_lock = threading.Lock()
+        self._snapshot_generation = 0
         self._cycle_lifecycle_lock = threading.Lock()
         self._cycle_stream_callback_lock = threading.RLock()
         self._cycle_stream_token = None
@@ -758,41 +770,45 @@ class LiveBroker:
                 self._cycle_account_event(kind)
 
     def invalidate_cycle_hot_data(self, reason, *, refresh_modes=False):
+        self._invalidate_snapshot_reads(refresh_modes=refresh_modes)
         self.cycle_cache.invalidate(reason, refresh_modes=refresh_modes)
 
+    def _invalidate_snapshot_reads(self, *, refresh_modes=False):
+        with self._snapshot_lock:
+            self._snapshot_generation += 1
+            self.leverage_snapshot = None
+            if refresh_modes:
+                self.cached_at.pop("dual", None)
+                self.cached_at.pop("multi", None)
+
     def _cycle_account_event(self, kind):
-        self.cycle_cache.invalidate("账户事件：" + str(kind),
+        self.invalidate_cycle_hot_data("账户事件：" + str(kind),
             refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
 
     def _cycle_write(self, method, path, params, *, weight=1, refresh_modes=False):
         # No snapshot HTTP lock: in-flight background results are revoked by
         # generation instead of making a ready order wait for another request.
-        self.leverage_snapshot = None
-        self.cycle_cache.invalidate("账户写入开始", refresh_modes=refresh_modes)
+        self.invalidate_cycle_hot_data("账户写入开始", refresh_modes=refresh_modes)
         try:
             return self.api.call(method, path, params, signed=True, weight=weight)
         finally:
             # A refresh that started during this write must also be discarded.
-            self.leverage_snapshot = None
-            self.cycle_cache.invalidate("账户写入结束", refresh_modes=refresh_modes)
+            self.invalidate_cycle_hot_data("账户写入结束", refresh_modes=refresh_modes)
 
     def refresh_cycle_hot_snapshot(self):
         """Only the background scheduler calls this network refresh."""
         ticket = self.cycle_cache.begin_refresh()
         started = time.monotonic()
         try:
-            # Ordinary and cycle parsers share small mode/tier caches. Their
-            # network reads serialize here, but leases and writes never take it.
-            with self._snapshot_lock:
-                try:
-                    snapshot = self.cycle_snapshot(ticket.symbols, fresh_modes=ticket.refresh_modes)
-                    valid_until = self.cached_at["multi"] + 15
-                finally:
-                    # Background maintenance never grants a leverage-write token.
-                    self.leverage_snapshot = None
+            snapshot = self.cycle_snapshot(ticket.symbols, fresh_modes=ticket.refresh_modes,
+                                           authorize_leverage=False)
+            valid_until = snapshot.cycle_mode_valid_until
             snapshot.require_modes(ticket.symbols)
             return self.cycle_cache.publish(ticket, snapshot, started,
                 valid_until_monotonic=valid_until)
+        except SnapshotSuperseded as exc:
+            self.cycle_cache.fail(ticket, exc)
+            return False
         except BaseException as exc:
             self.cycle_cache.fail(ticket, exc)
             raise
@@ -825,11 +841,17 @@ class LiveBroker:
     def cached_call(self, key, path, params=None, ttl=300, weight=1):
         with self._snapshot_lock:
             started = time.monotonic()
-            if started - self.cached_at.get(key, -1e9) >= ttl:
-                self.cached[key] = self.api.call("GET", path, params, signed=True, weight=weight)
-                # Network time counts towards cache age; slow reads must not renew it.
-                self.cached_at[key] = started
-            return self.cached[key]
+            if started - self.cached_at.get(key, -1e9) < ttl:
+                return self.cached[key]
+            generation = self._snapshot_generation
+        value = self.api.call("GET", path, params, signed=True, weight=weight)
+        with self._snapshot_lock:
+            if generation != self._snapshot_generation:
+                raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
+            # Slow reads cannot overwrite a newer result or renew its lifetime.
+            if started >= self.cached_at.get(key, -1e9):
+                self.cached[key], self.cached_at[key] = value, started
+        return value
 
     def snapshot_weight(self, symbols, *, fresh_modes=False):
         with self._snapshot_lock:
@@ -847,7 +869,7 @@ class LiveBroker:
         return weight
 
     def snapshot(self, symbols, fresh_modes=False):
-        with self._snapshot_lock:
+        with self._ordinary_read_lock:
             return self._snapshot(symbols, fresh_modes=fresh_modes)
 
     def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
@@ -900,7 +922,9 @@ class LiveBroker:
 
     def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None):
         """Shared parsing; the ordinary path retains its sequential reads."""
-        self.leverage_snapshot = None
+        with self._snapshot_lock:
+            generation = self._snapshot_generation
+            self.leverage_snapshot = None
         started = time.time() if started is None else started
         if read is None:
             def read(key, path, params=None, *, ttl=None, weight=1):
@@ -908,8 +932,9 @@ class LiveBroker:
                     return self.cached_call(key, path, params, ttl=ttl, weight=weight)
                 return self.api.call("GET", path, params, signed=True, weight=weight)
         if fresh_modes:
-            self.cached_at.pop("dual", None)
-            self.cached_at.pop("multi", None)
+            with self._snapshot_lock:
+                self.cached_at.pop("dual", None)
+                self.cached_at.pop("multi", None)
         dual = read("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
         multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
         if (not isinstance(dual, dict) or not isinstance(multi, dict)
@@ -975,9 +1000,20 @@ class LiveBroker:
         # order book. Fees are a fixed planning estimate, not a fetched fee rate.
         snapshot = self._account_snapshot(account, asset, positions, symbols, hedge=dual["dualSidePosition"],
             multi=multi["multiAssetsMargin"], started=started, brackets=brackets)
-        if fresh_modes:
-            self.leverage_snapshot = (snapshot, time.monotonic())
+        with self._snapshot_lock:
+            if generation != self._snapshot_generation:
+                raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
+            snapshot.account_read_generation = generation
+            if fresh_modes:
+                self.leverage_snapshot = (snapshot, time.monotonic())
         return snapshot
+
+    def require_snapshot_current(self, snapshot):
+        """A prepared ordinary read cannot cross an account write or event."""
+        with self._snapshot_lock:
+            if getattr(snapshot, "account_read_generation", None) != self._snapshot_generation:
+                raise TradingError("账户预读结果已失效，等待新快照")
+        snapshot.require_fresh()
 
     @staticmethod
     def _position_rows(rows):
@@ -1120,11 +1156,11 @@ class LiveBroker:
             caps[symbol] = (leverages[symbol], cap)
         return caps
 
-    def cycle_snapshot(self, symbols, fresh_modes=False):
-        with self._snapshot_lock:
-            return self._cycle_snapshot(symbols, fresh_modes=fresh_modes)
+    def cycle_snapshot(self, symbols, fresh_modes=False, *, authorize_leverage=True):
+        with self._cycle_read_lock:
+            return self._cycle_snapshot(symbols, fresh_modes=fresh_modes, authorize_leverage=authorize_leverage)
 
-    def _cycle_snapshot(self, symbols, fresh_modes=False):
+    def _cycle_snapshot(self, symbols, fresh_modes=False, *, authorize_leverage=True):
         """Join independent cycle GETs before validating one complete snapshot.
 
         Aster V3 keeps the latest 100 unique nonces per signer, allowing a small
@@ -1132,17 +1168,23 @@ class LiveBroker:
         supports sharing across threads. Only GETs use this bounded local pool.
         """
         symbols = tuple(dict.fromkeys(symbols))
-        self.leverage_snapshot = None
+        with self._snapshot_lock:
+            generation = self._snapshot_generation
+            if authorize_leverage:
+                self.leverage_snapshot = None
+            cached, cached_at = dict(self.cached), dict(self.cached_at)
+            if fresh_modes:
+                self.cached_at.pop("multi", None)
         started = time.time()
         if fresh_modes:
-            self.cached_at.pop("multi", None)
+            cached_at.pop("multi", None)
         specs = [("multi", "/fapi/v3/multiAssetsMargin", None, 15, 30),
                  ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5)]
         values, fetched, pending = {}, {}, []
         for key, path, params, ttl, weight in specs:
-            stamp = self.cached_at.get(key, -1e9)
+            stamp = cached_at.get(key, -1e9)
             if ttl is not None and time.monotonic() - stamp < ttl:
-                values[key] = self.cached[key]
+                values[key] = cached[key]
             else:
                 pending.append((key, path, params, ttl, weight))
         budget = getattr(self.api, "budget", None)
@@ -1185,9 +1227,9 @@ class LiveBroker:
             raise max(errors, key=priority)
 
         def read(key, path, params=None, *, ttl=None, weight=1):
-            stamp = fetched[key][1] if key in fetched else self.cached_at.get(key, -1e9)
+            stamp = fetched[key][1] if key in fetched else cached_at.get(key, -1e9)
             if key not in values and ttl is not None and time.monotonic() - stamp < ttl:
-                values[key] = self.cached[key]
+                values[key] = cached[key]
             if key not in values or (ttl is not None and time.monotonic() - stamp >= ttl):
                 value, stamp = fetch((key, path, params, ttl, weight))
                 values[key] = value
@@ -1211,25 +1253,32 @@ class LiveBroker:
             # becomes a current-leverage cap, including the final submit check.
             snapshot.cycle_cap_cached_at = {
                 symbol: (fetched["bracket:" + symbol][1] if "bracket:" + symbol in fetched
-                         else self.cached_at["bracket:" + symbol])
+                         else cached_at["bracket:" + symbol])
                 for symbol in caps if "bracket:" + symbol in values
             }
             snapshot.require_fresh()
             for key in caps:
                 cache_key = "bracket:" + key
                 if cache_key in values:
-                    stamp = fetched[cache_key][1] if cache_key in fetched else self.cached_at[cache_key]
+                    stamp = fetched[cache_key][1] if cache_key in fetched else cached_at[cache_key]
                     if time.monotonic() - stamp >= 5:
                         raise TradingError("账户风控档位查询已过期，等待重试")
             # Failed rounds publish neither partially refreshed caches nor an
             # authorization token; cache age includes signing and network time.
-            for key, (value, stamp) in fetched.items():
-                self.cached[key], self.cached_at[key] = value, stamp
-            if fresh_modes:
-                self.leverage_snapshot = (snapshot, time.monotonic())
+            snapshot.cycle_mode_valid_until = (fetched["multi"][1] if "multi" in fetched else cached_at["multi"]) + 15
+            with self._snapshot_lock:
+                if generation != self._snapshot_generation:
+                    raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
+                for key, (value, stamp) in fetched.items():
+                    if stamp >= self.cached_at.get(key, -1e9):
+                        self.cached[key], self.cached_at[key] = value, stamp
+                if fresh_modes and authorize_leverage:
+                    self.leverage_snapshot = (snapshot, time.monotonic())
             return snapshot
         except BaseException:
-            self.leverage_snapshot = None
+            if authorize_leverage:
+                with self._snapshot_lock:
+                    self.leverage_snapshot = None
             raise
 
     @staticmethod

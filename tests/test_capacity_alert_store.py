@@ -16,6 +16,29 @@ IDENTITY = "a" * 64
 
 
 class CapacityAlertStoreTests(unittest.TestCase):
+    def test_batch_gates_commit_together_and_failure_rolls_back_prior_tiers(self):
+        def record(alerts, tier, value="11000"):
+            return alerts.observe_capacity_alert("XAUUSD1", tier, value, threshold="10000",
+                cooldown=300, identity=IDENTITY, checked_at=self.now)
+        with self.assertRaises(TradingError):
+            with self.store.capacity_alert_batch() as alerts:
+                self.assertTrue(record(alerts, 5))
+                record(alerts, 10, "invalid")
+        self.assertIsNone(self.gate())
+        self.assertEqual(self.all_rows(), [])
+        with self.store.capacity_alert_batch() as alerts:
+            for tier in TIERS:
+                self.assertTrue(record(alerts, tier))
+        self.assertEqual(self.store.pending_notifications(), 3)
+        in_flight = self.store.due_notifications()[0]
+        with self.store.capacity_alert_batch() as alerts:
+            for tier in TIERS:
+                record(alerts, tier, "9000")
+        self.store.notification_result(in_flight, True)
+        for tier in TIERS:
+            self.assertFalse(self.gate(leverage=tier)["notified"])
+            self.assertEqual(self.gate(leverage=tier)["fall_generation"], 1)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

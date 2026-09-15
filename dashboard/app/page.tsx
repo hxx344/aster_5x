@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { formatNumber } from '@/lib/number-format';
 import {
   Activity,
   ArrowDownLeft,
@@ -195,13 +196,7 @@ const names: Record<string, string> = {
   SPCXUSD1: 'SpaceX',
   CLUSD1: '原油',
 };
-const fmt = (v?: string | number | null, digits = 2) =>
-  v == null
-    ? '—'
-    : Number(v).toLocaleString('en-US', {
-        maximumFractionDigits: digits,
-        minimumFractionDigits: digits,
-      });
+const fmt = formatNumber;
 const pct = (v?: string | number | null) =>
   v == null ? '—' : `${fmt(Number(v) * 100)}%`;
 const clock = (v?: number) =>

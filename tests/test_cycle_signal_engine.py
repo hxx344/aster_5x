@@ -57,6 +57,8 @@ class CycleSignalEngineTests(TestCase):
                 "received_at": time.time(), "received_monotonic": time.monotonic()})
         progress["opened_at"] = time.time() - progress["config"]["hold_seconds"] - 1
         self.f.store.put("cycle:test", progress)
+        # Advancing the simulated hold also passes the last-send interval.
+        self.engine.work("test").cycle.after = time.monotonic() - 1
         self.engine.tick_account("test", cycle_signal=self.signal())
         self.assertEqual(tuple(p.qty for p in self.pair("XAUUSD1")), (0, 0))
         self.assertEqual(self.f.store.get("cycle:test")["completed_cycles"], 1)
@@ -127,6 +129,7 @@ class CycleSignalEngineTests(TestCase):
         progress = self.f.store.get("cycle:test")
         progress["opened_at"] = time.time() - progress["config"]["hold_seconds"] - 1
         self.f.store.put("cycle:test", progress)
+        self.engine.work("test").cycle.after = time.monotonic() - 1
         signal = self.signal()
         self.f.broker.state["positions"]["XAUUSD1:LONG"] = {"qty": "1", "entry": "4412"}
         self.f.broker.save()

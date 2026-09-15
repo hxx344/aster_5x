@@ -16,6 +16,7 @@ from .exchange import ExchangeError, LiveBroker, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
 from .paper import PaperBroker, PaperOrderAbsent
+from .request_timing import observe_database, transport_stage
 
 
 SIDES = ("LONG", "SHORT")
@@ -31,9 +32,10 @@ class _GuardedCycleBroker:
 
     def submit(self, orders):
         try:
-            if self.validate is None:
-                raise TradingError("循环账户热快照尚未授权，等待后台更新")
-            self.validate()
+            with transport_stage("guard_ms"):
+                if self.validate is None:
+                    raise TradingError("循环账户热快照尚未授权，等待后台更新")
+                self.validate()
         except Exception as exc:
             raise RequestNotSent(str(exc)) from exc
         return self.broker.submit(orders)
@@ -113,6 +115,7 @@ class CycleExecutor(Executor):
             # A failed observation setup must still use the live admission guard.
             return Executor(self.store, observed or broker, self.market).send(intent, orders, repair=repair)
         finally:
+            self.last_send_attempted = observed.send_attempted if observed is not None else True
             self._observe_quality(intent)
 
     def _record_volume_fills(self, intent, fills):
@@ -268,6 +271,12 @@ class CycleExecutor(Executor):
         return snapshot.pair(symbol)
 
     def start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None, before_send=None):
+        with self.store.connection_scope(), observe_database() as database_timing:
+            return self._start(account, snapshot, plan, progress, before_submit,
+                               trigger=trigger, before_send=before_send, database_timing=database_timing)
+
+    def _start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None, before_send=None, database_timing=None):
+        self.last_send_attempted = False
         admission = getattr(self, "_cycle_admission", None)
         self._cycle_admission = None
         self._cycle_submit_guard = None
@@ -285,6 +294,7 @@ class CycleExecutor(Executor):
         quality, trigger_ticks, final_ticks = None, None, None
         try:
             quality = new_quality({"symbol": symbol, "phase": plan.phase, "quantity": wire(qty), "orders": []}, trigger)
+            quality["timing"]["database"] = database_timing
             trigger_ticks = timestamp(trigger.get("received_monotonic")) if isinstance(trigger, dict) else None
         except Exception:
             pass

@@ -24,6 +24,19 @@ def fill(trade_id, side, quantity="1", price="100", executed_at=DAY + 1,
 
 
 class CycleCostTests(TestCase):
+    def test_visible_detail_filter_keeps_all_fifo_counterparts_and_summaries(self):
+        rows = [fill("buy", "BUY", "2", "101", DAY - 1),
+                fill("sell", "SELL", "1", "100", DAY + 1),
+                fill("later", "SELL", "1", "102", DAY + 2)]
+        full = self.calculate(rows)
+        selected = calculate_cycle_costs(rows, DAY + 100, trade_keys={("XAUUSD1", "sell")})
+        self.assertEqual(selected["daily"], full["daily"])
+        self.assertEqual(selected["rolling"], full["rolling"])
+        self.assertEqual(selected["trades"], [full["trades"][1]])
+        with self.assertRaises(TradingError):
+            calculate_cycle_costs([*rows, {**rows[0], "price": "99"}], DAY + 100,
+                                  trade_keys={("XAUUSD1", "sell")})
+
     def calculate(self, fills, now=DAY + 100):
         return calculate_cycle_costs(fills, now)
 

@@ -49,6 +49,38 @@ const quality = {
   },
 };
 
+test('transport stages preserve measured zero and distinguish missing or invalid stages', () => {
+  const view = cycleExecutionQualityView({
+    ...quality,
+    timing: {
+      ...quality.timing,
+      database: { lock_wait_ms: 0, connection_ms: 1.2, connections: 1 },
+      transport: {
+        guard_ms: 0,
+        budget_ms: 2,
+        signing_ms: -1,
+        http_ms: 30,
+        before_http_ms: 2.5,
+        response_decode_ms: Number.NaN,
+      },
+    },
+  });
+  assert.deepEqual(
+    view.database.map((item) => item.value),
+    ['0', '1.2'],
+  );
+  assert.deepEqual(
+    view.transport.map((item) => item.value),
+    ['0', '2', '—', '30', '—'],
+  );
+  assert.equal(view.beforeHttp, '2.5');
+  assert.ok(
+    cycleExecutionQualityView(quality).transport.every(
+      (item) => item.value === '—',
+    ),
+  );
+});
+
 test('same-quantity comparison preserves server precision and favorable negative actual spread', () => {
   const view = cycleExecutionQualityView(quality);
   assert.equal(view.quantity, '2.5');

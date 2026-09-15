@@ -15,6 +15,7 @@ from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positi
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
+from .request_timing import database_clock, database_duration
 from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, identifier, normalize_fill,
                            order_bindings, receipt_quantity, sort_key, utc_day, validate_fill_binding)
 
@@ -60,6 +61,7 @@ class Store:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._connection_local = threading.local()
         self._rolling_cache = LedgerCache()
         with self.connect() as db:
             # Decide HTTP exposure before touching historical schema or state.
@@ -88,6 +90,7 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id,id);
                 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_account_created ON events(account_id,created_at DESC,id DESC);
                 CREATE TABLE IF NOT EXISTS outbox (
                     id TEXT PRIMARY KEY, message TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                     due_at REAL NOT NULL, delivered_at REAL, expires_at REAL, capacity_key TEXT
@@ -124,6 +127,8 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_cycle_fills_symbol_time
                     ON cycle_fills(account_id,symbol,executed_at,trade_id);
+                CREATE INDEX IF NOT EXISTS idx_cycle_fills_symbol_day
+                    ON cycle_fills(account_id,utc_date,symbol,executed_at,trade_id);
                 CREATE TABLE IF NOT EXISTS cycle_volume_sync (
                     intent_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, status TEXT NOT NULL,
                     created_at REAL, completed_at REAL, synced_at REAL
@@ -139,9 +144,11 @@ class Store:
             # cannot publish a new revision. Never infer validity from a TTL.
             for action, owners in (("INSERT", ("NEW",)), ("DELETE", ("OLD",)), ("UPDATE", ("OLD", "NEW"))):
                 updates = " ".join(
-                    f"INSERT INTO cycle_fill_versions VALUES ({owner}.account_id,1) "
+                    f"INSERT INTO cycle_fill_versions SELECT {owner}.account_id,1 WHERE "
+                    + ("NEW.account_id!=OLD.account_id " if action == "UPDATE" and owner == "NEW" else "1 ") +
                     "ON CONFLICT(account_id) DO UPDATE SET revision=revision+1;"
                     for owner in owners)
+                db.execute(f"DROP TRIGGER IF EXISTS cycle_fills_revision_{action.lower()}")
                 db.execute(f"CREATE TRIGGER IF NOT EXISTS cycle_fills_revision_{action.lower()} "
                            f"AFTER {action} ON cycle_fills BEGIN {updates} END")
             # Existing trade notifications keep NULL expiry and remain deliverable.
@@ -203,16 +210,49 @@ class Store:
             db.execute("PRAGMA optimize")
 
     @contextmanager
+    def connection_scope(self):
+        """Reuse a thread's handle, never its transactions or the writer lock."""
+        if getattr(self._connection_local, "scoped", False):
+            yield
+            return
+        self._connection_local.scoped = True
+        try:
+            yield
+        finally:
+            db = getattr(self._connection_local, "db", None)
+            self._connection_local.db = None
+            self._connection_local.scoped = False
+            if db is not None:
+                db.close()
+
+    @contextmanager
     def connect(self):
+        waiting = database_clock()
         with self.lock:
-            db = sqlite3.connect(self.path, timeout=10)
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA synchronous=FULL")
+            database_duration("lock_wait_ms", waiting)
+            db = getattr(self._connection_local, "db", None)
+            scoped = getattr(self._connection_local, "scoped", False)
+            if db is None:
+                started = database_clock()
+                db = sqlite3.connect(self.path, timeout=10)
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA synchronous=FULL")
+                database_duration("connection_ms", started)
+                if scoped:
+                    self._connection_local.db = db
             try:
                 with db:
                     yield db
             finally:
-                db.close()
+                if not scoped:
+                    db.close()
+
+    @contextmanager
+    def capacity_alert_batch(self):
+        """Commit a symbol's independent notification gates together."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            yield _StoreSnapshot(self, db)
 
     @contextmanager
     def read_snapshot(self):
@@ -517,24 +557,32 @@ class Store:
         where = "account_id=? AND utc_date=? AND symbol=?"
         params = (account_id, date, symbol)
         old = db.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchone()
-        # Normal in-order fills append in O(new fills); a late execution rebuilds
-        # that day's exact prefixes so every displayed running total stays true.
+        # The preceding persisted prefix seeds a late fill's affected suffix.
+        # Aggregate counts only change by the newly admitted rows.
         latest = (old["latest_trade_at"], old["latest_symbol"], old["latest_trade_id"]) if old else None
         append = old is not None and all(sort_key(row) > latest for row in new_rows)
-        rows = sorted(new_rows, key=sort_key) if append or old is None else [dict(row) for row in db.execute(
-            f"SELECT * FROM cycle_fills WHERE {where} ORDER BY executed_at,symbol,trade_id", params)]
+        rows = sorted(new_rows, key=sort_key)
         volume = Fraction(dec(old["volume"])) if append else Fraction(0)
-        estimated = Fraction(dec(old["estimated_volume"])) if append else Fraction(0)
-        count = old["trade_count"] if append else 0
-        estimated_count = old["estimated_trade_count"] if append else 0
-        for row in rows:
-            volume += Fraction(dec(row["notional"]))
-            count += 1
+        if old is not None and not append:
+            first = rows[0]["executed_at"], rows[0]["trade_id"]
+            previous = db.execute(f"SELECT daily_volume FROM cycle_fills WHERE {where} "
+                "AND (executed_at,trade_id)<(?,?) ORDER BY executed_at DESC,trade_id DESC LIMIT 1",
+                (*params, *first)).fetchone()
+            volume = Fraction(dec(previous[0])) if previous else Fraction(0)
+            rows = [dict(row) for row in db.execute(f"SELECT * FROM cycle_fills WHERE {where} "
+                "AND (executed_at,trade_id)>=(?,?) ORDER BY executed_at,trade_id", (*params, *first))]
+        estimated = Fraction(dec(old["estimated_volume"])) if old else Fraction(0)
+        count = (old["trade_count"] if old else 0) + len(new_rows)
+        estimated_count = old["estimated_trade_count"] if old else 0
+        for row in new_rows:
             if row["time_source"] == "legacy_estimated":
                 estimated += Fraction(dec(row["notional"]))
                 estimated_count += 1
-            if symbol is not None:
-                row["daily_volume"] = wire(volume)
+        for row in rows:
+            volume += Fraction(dec(row["notional"]))
+            running = wire(volume)
+            if row["daily_volume"] != running:
+                row["daily_volume"] = running
                 db.execute("UPDATE cycle_fills SET daily_volume=? WHERE account_id=? AND symbol=? AND trade_id=?",
                            (row["daily_volume"], account_id, row["symbol"], row["trade_id"]))
                 db.execute("UPDATE events SET message=? WHERE id=? AND account_id=? AND kind='cycle_fill'",
@@ -958,7 +1006,8 @@ class Store:
         queued = False
         with self.connect() as db:
             # Serialize read-modify-write across separate Store instances/processes.
-            db.execute("BEGIN IMMEDIATE")
+            if not db.in_transaction:
+                db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
             gate = json.loads(row[0]) if row else None
             if not gate or gate.get("identity") != identity:

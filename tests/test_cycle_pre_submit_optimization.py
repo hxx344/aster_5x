@@ -76,6 +76,10 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
         self.assertEqual(sum(sql.startswith("INSERT INTO events") for sql in prefix), 1)
         self.assertEqual(sent.call_count, 1)
         self.assertEqual(self.quality()["actual"]["status"], "filled")
+        database = self.quality()["timing"]["database"]
+        self.assertEqual(database["connections"], 1)
+        self.assertGreaterEqual(database["connection_ms"], 0)
+        self.assertGreaterEqual(database["lock_wait_ms"], 0)
 
     def test_index_or_event_failure_rolls_back_the_whole_batch_and_never_sends(self):
         for table in ("cycle_volume_sync", "events"):

@@ -3,6 +3,16 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class OrdinaryRead:
+    account: dict
+    symbols: tuple
+    broker: object
+    future: object
+    priority: bool
+    signals: dict
+
+
+@dataclass
 class CycleWake:
     seen: tuple | None = None
     opportunity: tuple | None = None
@@ -32,6 +42,7 @@ class AccountWork:
     cycle: CycleWake = field(default_factory=CycleWake)
     hot_wake: bool = False
     hot_backoff: float = 0
+    ordinary_read: OrdinaryRead | None = None
 
     def take_priority(self):
         signals, self.priority = self.priority, {}

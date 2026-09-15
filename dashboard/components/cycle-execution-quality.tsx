@@ -131,6 +131,25 @@ export function CycleExecutionQualityPanel({
                   ))}
                 </dl>
               </section>
+              <section className="cycle-quality-stage">
+                <h4>数据库与提交调用分解</h4>
+                <p className="cycle-quality-note">
+                  数据库耗时从执行器开始计至提交调用，已包含在上方准备耗时中。HTTP
+                  调用包含连接处理和网络往返；失败调用也记录耗时，未记录的阶段显示“—”。
+                </p>
+                <dl className="cycle-quality-fields">
+                  {[
+                    ...view.database,
+                    { label: '提交调用 → HTTP 开始', value: view.beforeHttp },
+                    ...view.transport,
+                  ].map((item) => (
+                    <div key={item.label}>
+                      <dt>{item.label}</dt>
+                      <dd>{item.value} ms</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
               {[
                 {
                   key: 'trigger',

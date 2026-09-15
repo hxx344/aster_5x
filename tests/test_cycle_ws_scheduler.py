@@ -10,6 +10,7 @@ from trading.depth import DepthSnapshot
 from trading.engine import Engine
 from trading.exchange import MarketData
 from trading.models import Book, dec
+from trading.scheduling import OrdinaryRead
 
 
 SYMBOL = "XAUUSD1"
@@ -143,6 +144,46 @@ class _Harness:
 
 
 class CycleWSSchedulerTests(unittest.TestCase):
+    def test_sent_attempt_retains_one_second_cooldown(self):
+        h = self.h
+        def submit(aid, signal):
+            if signal is not None:
+                h.engine.work(aid).cycle.after = h.ticks + 1
+            return _Future()
+        h.on_submit = submit
+        def control(step):
+            if step == 2:
+                h.emit(101)
+            elif step == 3:
+                h.emit(101.15)
+            elif step == 4:
+                h.emit(101.8)
+            elif step == 5:
+                h.ticks = 102
+            elif step == 6:
+                h.engine.shutdown.set()
+        h.run(control)
+        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 102])
+        self.assertEqual(h.fast_calls()[1]["signal"]["received_monotonic"], 101.8)
+
+    def test_completed_ordinary_read_resumes_without_a_second_scheduling_gap(self):
+        h = self.h
+        def control(step):
+            if step == 2:
+                work = h.engine.work("test")
+                work.ordinary_read = OrdinaryRead({}, (), None, _Future(), False, {})
+                work.wake = True
+                h.emit(101)
+            elif step == 3:
+                h.engine.work("test").ordinary_read = None
+                h.ticks = 101.1
+            elif step == 4:
+                h.ticks = 131.1
+            elif step == 5:
+                h.engine.shutdown.set()
+        h.run(control)
+        self.assertEqual([(call["at"], call["signal"] is not None) for call in h.calls],
+                         [(100, False), (101, False), (131.1, False)])
     def setUp(self):
         self.f = Fixture()
         self.addCleanup(self.f.close)
@@ -224,20 +265,20 @@ class CycleWSSchedulerTests(unittest.TestCase):
             if step == 2:
                 h.emit(101)
             elif step == 3:
-                h.emit(101.1)
+                h.emit(101.01)
             elif step == 4:
                 held.complete = True
-                h.ticks = 101.2
+                h.ticks = 101.02
             elif step == 5:
-                h.emit(101.5, source="depth")
+                h.emit(101.05, source="depth")
             elif step == 6:
-                h.ticks = 102
+                h.ticks = 101.1
             elif step == 7:
                 h.engine.shutdown.set()
 
         h.run(control)
-        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 102])
-        self.assertEqual(h.fast_calls()[1]["signal"]["received_monotonic"], 101.5)
+        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 101.1])
+        self.assertEqual(h.fast_calls()[1]["signal"]["received_monotonic"], 101.05)
 
     def test_update_followed_by_immediate_completion_is_not_lost_between_loops(self):
         h = self.h
@@ -257,7 +298,7 @@ class CycleWSSchedulerTests(unittest.TestCase):
                 h.engine.shutdown.set()
 
         h.run(control)
-        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 102])
+        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 101.5])
         self.assertEqual(h.fast_calls()[1]["signal"]["received_monotonic"], 101.5)
 
     def test_continuous_fast_updates_cannot_postpone_the_ordinary_due_time(self):
@@ -290,7 +331,7 @@ class CycleWSSchedulerTests(unittest.TestCase):
             elif step == 5:
                 h.engine.shutdown.set()
         h.run(control)
-        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 102])
+        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 101.5])
 
     def test_expired_update_received_while_busy_is_not_executed_after_completion(self):
         h = self.h

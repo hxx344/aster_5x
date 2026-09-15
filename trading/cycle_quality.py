@@ -12,6 +12,7 @@ import time
 from .cycle import CYCLE_DEPTH_MAX_AGE, _depth_sweeps
 from .exchange import RequestNotSent
 from .models import positive, wire
+from .request_timing import freeze_database, observe_transport
 
 
 # Non-overlapping scopes: trigger reception -> worker start; first account
@@ -174,11 +175,13 @@ class ObservedBroker:
     def __init__(self, broker, quality, trigger_ticks=None, final_ticks=None):
         self._broker, self._quality = broker, quality
         self._trigger_ticks, self._final_ticks = trigger_ticks, final_ticks
+        self.send_attempted = False
 
     def __getattr__(self, name):
         return getattr(self._broker, name)
 
     def submit(self, orders):
+        freeze_database()
         started = None
         try:
             started = time.monotonic()
@@ -198,14 +201,25 @@ class ObservedBroker:
         except Exception:
             pass
         try:
-            result = self._broker.submit(orders)
+            transport = {}
+            with observe_transport(transport):
+                try:
+                    result = self._broker.submit(orders)
+                finally:
+                    if transport:
+                        try:
+                            self._quality["timing"]["transport"] = transport
+                        except Exception:
+                            pass
         except Exception as exc:
+            self.send_attempted = not isinstance(exc, RequestNotSent)
             try:
                 self._quality["timing"]["request_status"] = "not_sent" if isinstance(exc, RequestNotSent) else "failed"
             except Exception:
                 pass
             raise
         else:
+            self.send_attempted = True
             try:
                 finished = time.monotonic()
                 self._quality["timing"].update(request_status="returned", response_received_at=time.time(),

@@ -18,6 +18,28 @@ DAY = datetime(2026, 9, 14, tzinfo=timezone.utc).timestamp()
 
 
 class CycleVolumeTests(unittest.TestCase):
+    def test_late_fill_updates_only_affected_prefixes_and_counts_each_revision_once(self):
+        intent = self.intent(quantity="30", filled="30")
+        self.store.record_cycle_fills(intent, [self.fill(intent, f"trade-{i:02}", executed_at=DAY + i)
+                                                for i in range(20)])
+        with self.store.connect() as db:
+            db.execute("CREATE TABLE changed_trade_ids(id TEXT)")
+            db.execute("CREATE TRIGGER audit_prefix AFTER UPDATE OF daily_volume ON cycle_fills "
+                       "BEGIN INSERT INTO changed_trade_ids VALUES (NEW.trade_id); END")
+        revision = self.store.cycle_fill_revision("first")
+        self.store.record_cycle_fills(intent, [self.fill(intent, "late", executed_at=DAY + 18.5)])
+        with self.store.connect() as db:
+            changed = {row[0] for row in db.execute("SELECT id FROM changed_trade_ids")}
+            self.assertEqual(changed, {"late", "trade-19"})
+            self.assertEqual(db.execute("SELECT daily_volume FROM cycle_fills WHERE trade_id='late'").fetchone()[0], "2000")
+        self.assertEqual(self.store.cycle_fill_revision("first"), revision + 3)
+        daily = self.store.cycle_daily_volume("first", DAY)
+        self.assertEqual((daily["volume"], daily["trade_count"]), ("2100", 21))
+        with self.store.connect() as db:
+            db.execute("UPDATE cycle_fills SET account_id='second' WHERE trade_id='late'")
+        self.assertEqual(self.store.cycle_fill_revision("first"), revision + 4)
+        self.assertEqual(self.store.cycle_fill_revision("second"), 1)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

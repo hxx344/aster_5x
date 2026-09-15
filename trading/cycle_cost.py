@@ -56,7 +56,7 @@ def _summary(rows):
             "complete": unmatched_count == 0}
 
 
-def calculate_cycle_costs(fills, now, *, symbol=None):
+def calculate_cycle_costs(fills, now, *, symbol=None, trade_keys=None):
     """Report one account's costs as of now using complete related intents.
 
     BUY/SELL quantities pair FIFO within account, intent and symbol. A match's
@@ -66,6 +66,7 @@ def calculate_cycle_costs(fills, now, *, symbol=None):
     synchronization responsibility; this function only describes supplied data.
     """
     now = _timestamp(now)
+    trade_keys = None if trade_keys is None else frozenset(trade_keys)
     if symbol is not None and symbol not in SYMBOLS:
         raise TradingError("循环成本统计品种无效")
     date, day_start, _ = utc_day(now)
@@ -113,5 +114,6 @@ def calculate_cycle_costs(fills, now, *, symbol=None):
                "taker_fee": _wire(row["fee"]), "spread_cost": _wire(row["spread"]),
                "total_cost": _wire(row["fee"] + row["spread"]),
                "matched_quantity": _wire(row["matched"]), "unmatched_quantity": _wire(row["remaining"]),
-               "cost_complete": not row["remaining"]} for row in rows]
+               "cost_complete": not row["remaining"]} for row in rows
+              if trade_keys is None or (row["symbol"], row["trade_id"]) in trade_keys]
     return {"daily": daily, "rolling": rolling, "trades": trades}

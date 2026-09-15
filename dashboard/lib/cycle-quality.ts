@@ -29,6 +29,21 @@ export type CycleExecutionQuality = {
     final_check_to_request_ms: number | null;
     request_to_response_ms: number | null;
     request_status: 'returned' | 'failed' | 'not_sent' | 'unknown';
+    database?: {
+      lock_wait_ms: number | null;
+      connection_ms: number | null;
+      connections: number;
+    };
+    transport?: {
+      guard_ms?: number | null;
+      budget_ms?: number | null;
+      signing_ms?: number | null;
+      before_http_ms?: number | null;
+      http_ms?: number | null;
+      response_decode_ms?: number | null;
+      http_started_at?: number | null;
+      http_finished_at?: number | null;
+    };
     pre_submit?: {
       queue_ms: number | null;
       initial_account_ms: number | null;
@@ -306,6 +321,28 @@ export function cycleExecutionQualityView(
             : '—',
       };
     }),
+    database: [
+      ['lock_wait_ms', '等待账本访问锁'],
+      ['connection_ms', '建立数据库连接'],
+    ].map(([key, label]) => {
+      const value = timing?.database?.[key as 'lock_wait_ms' | 'connection_ms'];
+      return { label, value: observedDuration(value) };
+    }),
+    transport: [
+      ['guard_ms', '发单前本地校验'],
+      ['budget_ms', '请求额度检查'],
+      ['signing_ms', '签名与请求编码'],
+      ['http_ms', 'HTTP 调用（含连接处理）'],
+      ['response_decode_ms', '解析响应'],
+    ].map(([key, label]) => ({
+      label,
+      value: observedDuration(
+        timing?.transport?.[
+          key as keyof NonNullable<CycleExecutionQuality['timing']['transport']>
+        ],
+      ),
+    })),
+    beforeHttp: observedDuration(timing?.transport?.before_http_ms),
     triggerSource:
       triggerSource === 'bbo'
         ? 'WS 最优盘口'
@@ -322,4 +359,10 @@ export function cycleExecutionQualityView(
         : '—',
     requestStatus: mappedText(REQUEST_STATUS, timing?.request_status, '未记录'),
   };
+}
+
+function observedDuration(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? String(value)
+    : '—';
 }

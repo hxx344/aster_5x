@@ -205,7 +205,7 @@ class CycleExecutionQualityTests(unittest.TestCase):
             executor.reconcile(self.f.account, historical)
         self.assertEqual(self.quality()["timing"]["request_status"], "unknown")
         self.assertTrue(all(value is None for key, value in self.quality()["timing"].items()
-                            if key not in ("request_status", "pre_submit")))
+                            if key not in ("request_status", "pre_submit", "database")))
         self.assertTrue(all(value is None for value in self.quality()["timing"]["pre_submit"].values()))
 
     def test_final_estimate_reads_only_local_cache_and_no_extra_receipt_queries(self):

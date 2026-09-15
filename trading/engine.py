@@ -17,7 +17,7 @@ import uuid
 
 import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
-from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RequestNotSent, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
+from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import HotAccountUnavailable
 from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, _state as cycle_record_state, cycle_baseline, cycle_recovery_available, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
@@ -36,13 +36,14 @@ from .migration_execution import MigrationExecutor
 from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
-from .scheduling import AccountWork
+from .scheduling import AccountWork, OrdinaryRead
 from .store import dumps
 
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
 CYCLE_SIGNAL_MAX_AGE = 3
-CYCLE_SIGNAL_MIN_INTERVAL = 1
+CYCLE_SIGNAL_MIN_INTERVAL = .1
+CYCLE_SENT_MIN_INTERVAL = 1
 CYCLE_HOT_POLL_INTERVAL = 2
 ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
@@ -144,6 +145,7 @@ class Engine:
         self.shutdown = threading.Event()
         self.scheduler_event = threading.Event()
         self.thread = None
+        self._ordinary_pool = None
         self.process_lock = ProcessLock(store.path.with_suffix(".lock"))
         self.lock = threading.RLock()
         self.lifecycle_lock = threading.Lock()
@@ -1114,9 +1116,15 @@ class Engine:
             return {"depth": final_depth, "checked_at": time.time(), "checked_monotonic": time.monotonic(),
                     "quality_plan": current}
 
-        reason = executor.start(account, snapshot, plan, progress, before_submit=before_submit,
-                                before_send=(lambda: self.require_cycle_open_capacity(config, plan.leverage, minimum_notional=capacity_notional)) if plan.phase == "open" else None,
-                                **({"trigger": trigger} if trigger is not None else {}))
+        attempt_started = time.monotonic()
+        try:
+            reason = executor.start(account, snapshot, plan, progress, before_submit=before_submit,
+                                    before_send=(lambda: self.require_cycle_open_capacity(config, plan.leverage, minimum_notional=capacity_notional)) if plan.phase == "open" else None,
+                                    **({"trigger": trigger} if trigger is not None else {}))
+        finally:
+            if getattr(executor, "last_send_attempted", False):
+                with self.lock:
+                    self.work(aid).cycle.after = max(self.work(aid).cycle.after, attempt_started + CYCLE_SENT_MIN_INTERVAL)
         remaining = self.store.intent(aid)
         status = "attention" if remaining and remaining["status"] == "attention" else "reconciling" if remaining else "running"
         self.view(aid, status=status, reason=reason)
@@ -1154,6 +1162,56 @@ class Engine:
                         diagnostic=getattr(exc, "diagnostic", None))
 
     def tick_account(self, account_id, *, cycle_signal=None):
+        with self.store.connection_scope():
+            return self._tick_account(account_id, cycle_signal=cycle_signal)
+
+    def ordinary_snapshot_ready(self, account_id):
+        with self.lock:
+            read = self.work(account_id).ordinary_read
+            return read is not None and read.future.done()
+
+    def prepare_ordinary_snapshot(self, account, broker, symbols, *, priority=False, signals=None):
+        """Yield the execution worker while ordinary read-only REST is pending."""
+        aid, symbols = account["id"], tuple(symbols)
+        with self.lock:
+            read = self.work(aid).ordinary_read
+        if read is not None:
+            if not read.future.done():
+                return None
+            with self.lock:
+                self.work(aid).ordinary_read = None
+                # This continuation took an ordinary turn instead of a quote
+                # wake. Keep a still-fresh cycle opportunity eligible afterward.
+                self.work(aid).cycle.rearm()
+            # Transport and rate-limit errors retain normal account backoff.
+            try:
+                snapshot = read.future.result()
+            except SnapshotSuperseded:
+                snapshot = None
+            if snapshot is not None and (read.account, read.symbols, read.broker) == (account, symbols, broker):
+                try:
+                    broker.require_snapshot_current(snapshot)
+                    return snapshot
+                except TradingError:
+                    pass
+
+        def fetch():
+            if self.shutdown.is_set():
+                return None
+            broker.api.budget.require_available(broker.snapshot_weight(symbols))
+            return broker.snapshot(symbols)
+
+        future = self._ordinary_pool.submit(fetch)
+        with self.lock:
+            self.work(aid).ordinary_read = OrdinaryRead(account, symbols, broker, future, priority, signals or {})
+        def ready(_):
+            with self.lock:
+                self.work(aid).wake = True
+            self.scheduler_event.set()
+        future.add_done_callback(ready)
+        return None
+
+    def _tick_account(self, account_id, *, cycle_signal=None):
         with self.account_lock(account_id):
             worker_started = clock_tick() if cycle_signal is not None else None
             with self.lock:
@@ -1187,6 +1245,18 @@ class Engine:
                 broker = self.broker(account)
                 pending = self.store.intent(account_id)
                 cycling = account.get("cycle", {}).get("enabled")
+                with self.lock:
+                    read = self.work(account_id).ordinary_read
+                    if read is not None:
+                        if not cycling or not account["enabled"] or pending or read.account != account:
+                            # A running GET cannot be cancelled. Retain ownership
+                            # until it finishes so repeated account writes cannot
+                            # accumulate readers behind the same account lock.
+                            if read.future.cancel() or read.future.done():
+                                self.work(account_id).ordinary_read = None
+                        elif cycle_signal is None and read.future.done():
+                            priority = priority or read.priority
+                            priority_signals = {**read.signals, **priority_signals}
                 ordinary_markets = ordinary_add_symbols(account)
                 if cycle_signal is not None:
                     if pending or self.store.get("post_fill_check:" + account_id):
@@ -1201,7 +1271,7 @@ class Engine:
                     cycle_context = True
                     progressed = True
                     return self.tick_cycle_account(account, broker, pending)
-                if not pending and cycling and not self.store.get("post_fill_check:" + account_id):
+                if not pending and cycling and not self.ordinary_snapshot_ready(account_id) and not self.store.get("post_fill_check:" + account_id):
                     cycle_context = True
                     if not ordinary_markets:
                         return self.tick_cycle_account(account, broker, None)
@@ -1231,9 +1301,14 @@ class Engine:
                     symbols = list(dict.fromkeys([*symbols, *SYMBOLS]))
                 recovery = bool(pending or self.store.get("post_fill_check:" + account_id))
                 with self.recovery_budget(broker) if recovery else nullcontext():
-                    if isinstance(broker, LiveBroker) and not recovery:
-                        broker.api.budget.require_available(broker.snapshot_weight(symbols))
-                    snapshot = broker.snapshot(symbols)
+                    if isinstance(broker, LiveBroker) and account["enabled"] and cycling and not recovery and self._ordinary_pool is not None:
+                        snapshot = self.prepare_ordinary_snapshot(account, broker, symbols, priority=priority, signals=priority_signals)
+                        if snapshot is None:
+                            return 5
+                    else:
+                        if isinstance(broker, LiveBroker) and not recovery:
+                            broker.api.budget.require_available(broker.snapshot_weight(symbols))
+                        snapshot = broker.snapshot(symbols)
                 self.view(account_id, snapshot=snapshot_json(snapshot, symbols), credential_ready=True)
                 snapshot.require_modes(symbols)
                 if self.shutdown.is_set():
@@ -1770,17 +1845,17 @@ class Engine:
                     with self.lock:
                         self.capacity_notification_errors.pop(symbol, None)
                 return
-            for leverage in TIERS:
-                if leverage not in capacities:
-                    if not self.invalidate_capacity_alerts(symbol, leverage):
-                        return
-                    continue
-                self.store.observe_capacity_alert(symbol, leverage, capacities[leverage],
-                    threshold=market_policy["threshold"], cooldown=policy["cooldown"],
-                    identity=market_policy["identity"], checked_at=checked_at,
-                    account_labels=[f"{name}（{aid}，> {threshold:,.2f} USD1）"
-                                    for aid, name, threshold in market_policy["accounts"]
-                                    if dec(capacities[leverage]) > threshold])
+            with self.store.capacity_alert_batch() as alerts:
+                for leverage in TIERS:
+                    if leverage not in capacities:
+                        alerts.invalidate_capacity_alert(symbol, leverage)
+                        continue
+                    alerts.observe_capacity_alert(symbol, leverage, capacities[leverage],
+                        threshold=market_policy["threshold"], cooldown=policy["cooldown"],
+                        identity=market_policy["identity"], checked_at=checked_at,
+                        account_labels=[f"{name}（{aid}，> {threshold:,.2f} USD1）"
+                                        for aid, name, threshold in market_policy["accounts"]
+                                        if dec(capacities[leverage]) > threshold])
             with self.lock:
                 self.capacity_notification_errors.pop(symbol, None)
         except (TradingError, monitor.MonitorError, ValueError, TypeError, OSError):
@@ -1853,7 +1928,8 @@ class Engine:
         complete = True
         try:
             fills = store.cycle_cost_records(aid, now=now, limit=100)
-            report = calculate_cycle_costs(fills, now=now, symbol=symbol)
+            report = calculate_cycle_costs(fills, now=now, symbol=symbol,
+                trade_keys={(row["symbol"], row["trade_id"]) for row in trades})
             trade_costs = {(row["symbol"], row["trade_id"]): row for row in report["trades"]}
             for trade in trades:
                 cost = trade_costs.get((trade["symbol"], trade["trade_id"]))
@@ -2019,7 +2095,8 @@ class Engine:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=3 * MAX_ACCOUNTS + 4 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=4 * MAX_ACCOUNTS + 4 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+                self._ordinary_pool = pool
                 try:
                     while not self.shutdown.is_set():
                         self.scheduler_event.clear()
@@ -2149,10 +2226,11 @@ class Engine:
                             aid = key.removeprefix("account:")
                             priority = is_account and aid in priority_accounts
                             cycle_signal = cycle_candidates.get(aid) if is_account and aid not in urgent_accounts else None
+                            ordinary_resume = is_account and self.ordinary_snapshot_ready(aid)
                             # Due ordinary work retains its turn and can itself
                             # progress the cycle, so continuous quotes cannot
                             # monopolize this account's shared execution slot.
-                            ordinary_due = time.monotonic() >= due.get(key, 0) and time.monotonic() >= next_ordinary_start
+                            ordinary_due = ordinary_resume or time.monotonic() >= due.get(key, 0) and time.monotonic() >= next_ordinary_start
                             if priority or ordinary_due:
                                 cycle_signal = None
                             if key not in pending and (cycle_signal or priority or time.monotonic() >= due.get(key, 0)):
@@ -2167,7 +2245,7 @@ class Engine:
                                         if time.monotonic() < backoff and not quote_wait:
                                             continue
                                 ordinary = is_account and aid in schedules and aid not in urgent_accounts and not priority and cycle_signal is None
-                                if ordinary and time.monotonic() < next_ordinary_start:
+                                if ordinary and not ordinary_resume and time.monotonic() < next_ordinary_start:
                                     continue
                                 if priority:
                                     with self.lock:
@@ -2183,7 +2261,7 @@ class Engine:
                                     if key.startswith("market:"):
                                         market_started[key] = time.monotonic()
                                     pending[key] = pool.submit(function, *args)
-                                if ordinary or priority and aid in schedules and aid not in urgent_accounts:
+                                if not ordinary_resume and (ordinary or priority and aid in schedules and aid not in urgent_accounts):
                                     next_ordinary_start = max(next_ordinary_start, time.monotonic() + schedules[aid]["gap"])
                         self.scheduler_event.wait(.02 if targets else .1)
                 finally:
@@ -2200,6 +2278,7 @@ class Engine:
                 self.error = "交易调度异常停止，请检查服务后重启"
             LOG.error("Scheduler stopped unexpectedly")
         finally:
+            self._ordinary_pool = None
             self.shutdown.set()
             self.scheduler_event.set()
             with self.lock:

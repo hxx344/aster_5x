@@ -60,6 +60,45 @@ class CycleLocalMarketTests(unittest.TestCase):
 
 
 class CycleHotBrokerTests(unittest.TestCase):
+    def test_background_refresh_finishes_while_ordinary_mode_read_is_blocked(self):
+        broker, api, _ = self.make_broker()
+        self.warm(broker)
+        entered, release = threading.Event(), threading.Event()
+        original = api.call
+        def call(method, path, *args, **kwargs):
+            if path == "/fapi/v3/positionSide/dual":
+                entered.set()
+                self.assertTrue(release.wait(3))
+                raise RequestNotSent("ordinary read stopped")
+            return original(method, path, *args, **kwargs)
+        api.call = call
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ordinary = pool.submit(broker.snapshot, [SYMBOL])
+            self.assertTrue(entered.wait(1))
+            try:
+                self.assertTrue(pool.submit(broker.refresh_cycle_hot_snapshot).result(timeout=1))
+                broker.cycle_hot_snapshot([SYMBOL]).require_fresh()
+            finally:
+                release.set()
+            with self.assertRaises(RequestNotSent):
+                ordinary.result(timeout=2)
+
+    def test_background_refresh_does_not_replace_or_revoke_ordinary_leverage_authority(self):
+        broker, api, _ = self.make_broker()
+        self.warm(broker)
+        api.responses["/fapi/v3/positionSide/dual"] = {"dualSidePosition": True}
+        api.responses[RISK] = [risk_row(row) for row in api.responses[ACCOUNT]["positions"]]
+        api.responses[BRACKET] = {"symbol": SYMBOL, "brackets": PAPER_BRACKETS}
+        snapshot = broker.snapshot([SYMBOL], fresh_modes=True)
+        authority = broker.leverage_snapshot
+        self.assertIs(authority[0], snapshot)
+        self.assertTrue(broker.refresh_cycle_hot_snapshot())
+        self.assertIs(broker.leverage_snapshot, authority)
+        broker._cycle_account_event("ACCOUNT_UPDATE")
+        self.assertIsNone(broker.leverage_snapshot)
+        with self.assertRaises(TradingError):
+            broker.require_snapshot_current(snapshot)
+
     def make_broker(self, *, holding=False):
         responses = cycle_account_responses()
         if holding:

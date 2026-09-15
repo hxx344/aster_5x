@@ -26,6 +26,8 @@ from .user_stream import PrivateAccountStream
 from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
+PUBLIC_BRACKETS_REFRESH_INTERVAL = 60
+PUBLIC_BRACKETS_MAX_AGE = 300
 
 
 class ExchangeError(TradingError):
@@ -41,6 +43,10 @@ class AmbiguousOrder(ExchangeError):
 
 class RequestNotSent(ExchangeError):
     """A local admission check failed before any HTTP request was sent."""
+
+
+class PublicBracketsUnavailable(ExchangeError):
+    """The background public risk table is not usable yet."""
 
 
 class LeverageRejected(ExchangeError):
@@ -393,6 +399,9 @@ class MarketData:
         self.book_guard = threading.Lock()
         self.depth_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
         self.depth_retry_at = {}
+        self.public_brackets = {}
+        self.public_bracket_guard = threading.Lock()
+        self.public_bracket_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
 
     def set_update_listener(self, listener):
         """Forward optional market signals while supporting older injected streams."""
@@ -609,15 +618,78 @@ class MarketData:
         DepthSnapshot.from_response(data, requested_at=requested_at)
         return data
 
-    def capacities(self, symbol, leverages):
+    def _public_json(self, path, symbol, *, brackets=False):
+        # Reuse the public client's connections; no account signature or data.
         with self.api.budget.capacity_monitoring():
-            self.api.budget.reserve(2)
+            ticket = self.api.budget.reserve(1, track=True)
         try:
-            result = monitor.sample({"symbol": symbol, "leverages": sorted(set(leverages)), "timeout_seconds": 8})
-            return {v: positive(row["value"], True) for v, row in result.items() if not isinstance(row, Exception)}
+            try:
+                response = self.api.http.request("POST" if brackets else "GET", monitor.BASE + path,
+                    params=None if brackets else {"symbol": symbol},
+                    json={"symbol": symbol} if brackets else None,
+                    headers={"Accept": "application/json", "Cache-Control": "no-cache",
+                             "User-Agent": "AsterAccountDesk/1.0"})
+            except httpx.HTTPError:
+                raise ExchangeError("公共额度网络连接失败") from None
+            self.api.budget.observe(response.headers, ticket=ticket)
+            if response.status_code in (403, 418, 429):
+                delay = {403: 30, 418: 86400, 429: 180}[response.status_code]
+                try:
+                    supplied = float(response.headers.get("Retry-After", "0"))
+                    if math.isfinite(supplied):
+                        delay = max(delay, supplied)
+                except ValueError:
+                    pass
+                self.api.budget.block(delay)
+                raise ExchangeError("公共额度接口限流", retry_after=delay)
+            if not response.is_success:
+                raise ExchangeError(f"公共额度 HTTP {response.status_code}")
+            try:
+                return json.loads(response.content, parse_float=monitor.Decimal)
+            except ValueError:
+                raise ExchangeError("公共额度响应格式异常") from None
+        finally:
+            self.api.budget.finish(ticket)
+
+    def refresh_public_brackets(self, symbol):
+        """Background-only refresh; failed reads never renew the last valid data."""
+        with self.public_bracket_locks[symbol]:
+            started = time.monotonic()
+            payload = self._public_json(monitor.BRACKETS_PATH, symbol, brackets=True)
+            try:
+                caps = {tier: positive(monitor.extract_bracket_cap(payload, symbol, tier), True)
+                        for tier in monitor.SUPPORTED_LEVERAGES}
+            except monitor.MonitorError as exc:
+                raise ExchangeError(str(exc)) from None
+            if time.monotonic() - started >= PUBLIC_BRACKETS_MAX_AGE:
+                raise ExchangeError("公共风控档位更新耗时过长")
+            with self.public_bracket_guard:
+                self.public_brackets[symbol] = (started, caps)
+
+    def capacities(self, symbol, leverages):
+        with self.public_bracket_guard:
+            cached = self.public_brackets.get(symbol)
+        if cached is None or not 0 <= time.monotonic() - cached[0] < PUBLIC_BRACKETS_MAX_AGE:
+            raise PublicBracketsUnavailable("公共风控档位尚未就绪或已过期，等待后台更新")
+        data = self._public_json(monitor.OI_PATH, symbol)
+        try:
+            oi = monitor.unwrap(data)
+            if oi.get("symbol") != symbol:
+                raise monitor.MonitorError("Aster returned a different symbol")
+            mapping = oi.get("leverageOiRemainingMap")
+            if not isinstance(mapping, dict):
+                raise monitor.MonitorError("Requested leverage tier missing")
+            result = {}
+            for tier in set(leverages):
+                try:
+                    result[tier] = min(positive(monitor.number(mapping.get(str(tier))), True), cached[1][tier])
+                except (monitor.MonitorError, KeyError):
+                    continue  # Missing is unavailable, never a substituted tier or zero.
         except monitor.MonitorError as exc:
-            delay = self.api.budget.block(exc.retry_after) if exc.retry_after else 0
-            raise ExchangeError(str(exc), retry_after=delay) from None
+            raise ExchangeError(str(exc)) from None
+        if not 0 <= time.monotonic() - cached[0] < PUBLIC_BRACKETS_MAX_AGE:
+            raise PublicBracketsUnavailable("公共风控档位已过期，等待后台更新")
+        return result
 
 
 class LiveBroker:

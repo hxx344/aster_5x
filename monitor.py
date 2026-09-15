@@ -99,6 +99,11 @@ def extract_capacity(oi_payload, brackets_payload, symbol, leverage):
     if not isinstance(mapping, dict) or str(leverage) not in mapping:
         raise MonitorError("Requested leverage tier missing")
     remaining = number(mapping[str(leverage)])
+    cap = extract_bracket_cap(brackets_payload, symbol, leverage)
+    return min(remaining, cap), remaining, cap
+
+
+def extract_bracket_cap(brackets_payload, symbol, leverage):
     brackets = unwrap(brackets_payload).get("brackets")
     if not isinstance(brackets, list):
         raise MonitorError("Risk brackets missing")
@@ -119,7 +124,7 @@ def extract_capacity(oi_payload, brackets_payload, symbol, leverage):
     if len(matches) != 1:
         raise MonitorError("Requested leverage bracket missing or ambiguous")
     cap = number(matches[0].get("bracketNotionalCap"))
-    return min(remaining, cap), remaining, cap
+    return cap
 
 
 def load_config():

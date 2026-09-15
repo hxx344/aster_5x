@@ -58,6 +58,10 @@ import {
 } from '@/lib/cycle';
 import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
+import {
+  accountCapacityView,
+  type AccountCapacity,
+} from '@/lib/account-capacity';
 import { ordinaryConditionsView } from '@/lib/ordinary-conditions';
 import { ordinaryAddBlock, ordinaryCapacityReady } from '@/lib/ordinary-add';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
@@ -140,6 +144,7 @@ type Account = {
     timestamp: number;
     positions: Position[];
     mode_checks: { cross: boolean; hedge: boolean; single_asset: boolean };
+    account_capacity?: Record<string, AccountCapacity>;
   };
   strategies: Record<
     string,
@@ -156,6 +161,9 @@ type Market = {
   error?: string;
   checked_at: number;
   capacities: Record<string, string>;
+  capacity_checked_at?: Record<string, number>;
+  poll_interval_ms?: number;
+  fast_leverages?: number[];
   book?: {
     bid: string;
     ask: string;
@@ -667,7 +675,7 @@ export default function Home() {
                   <div className="section-head">
                     <div>
                       <h2>市场额度</h2>
-                      <p>公开剩余额度 · USD1</p>
+                      <p>市场额度与账户当前杠杆余量 · USD1</p>
                     </div>
                     <span className="small-note">
                       额度 &gt; {fmt(account?.policy.threshold || 10000, 0)}{' '}
@@ -687,7 +695,9 @@ export default function Home() {
                               {v}x
                             </TableHead>
                           ))}
-                          <TableHead className="number">当前杠杆</TableHead>
+                          <TableHead className="number">
+                            当前杠杆 / 账户余量
+                          </TableHead>
                           {DEPTH_NOTIONALS.map((amount) => (
                             <TableHead key={amount} className="number">
                               {amount / 10000} 万 USD1
@@ -700,11 +710,21 @@ export default function Home() {
                         {symbols.map((s) => {
                           const m = state?.markets[s];
                           const live =
-                            m?.status === 'ok' && now - m.checked_at < 20;
+                            !connectionError &&
+                            m?.status === 'ok' &&
+                            now - m.checked_at >= -1 &&
+                            now - m.checked_at <= 8;
                           const lev = snapshot?.positions.find(
                             (p) => p.symbol === s,
                           )?.leverage;
                           const ordinaryBlock = ordinaryAddBlock(account, s);
+                          const room = snapshot?.account_capacity?.[s];
+                          const roomView = accountCapacityView(
+                            room,
+                            lev,
+                            now,
+                            !!connectionError,
+                          );
                           return (
                             <TableRow
                               key={s}
@@ -718,6 +738,9 @@ export default function Home() {
                                   <strong>{s}</strong>
                                   <span>
                                     {names[s]} {!live && '· 等待数据'}
+                                    {live &&
+                                      m?.poll_interval_ms === 200 &&
+                                      ` · ${m.fast_leverages?.join('/') || ''}x · 200 ms`}
                                   </span>
                                 </button>
                                 {ordinaryBlock ? (
@@ -729,18 +752,26 @@ export default function Home() {
                                   </p>
                                 ) : null}
                               </TableCell>
-                              {SUPPORTED_LEVERAGES.map((v) => (
-                                <TableCell
-                                  key={v}
-                                  className={`number ${ordinaryCapacityReady(m?.capacities[v], account?.policy.threshold || '10000', live, ordinaryBlock) ? 'mint' : ''}`}
-                                >
-                                  <span className="mobile-cell-label">
-                                    {v}x 额度
-                                  </span>
-                                  {live ? fmt(m.capacities[v], 0) : '—'}
-                                </TableCell>
-                              ))}
-                              <TableCell className="number">
+                              {SUPPORTED_LEVERAGES.map((v) => {
+                                const stamp =
+                                  m?.capacity_checked_at?.[v] ??
+                                  m?.checked_at ??
+                                  0;
+                                const tierLive =
+                                  live && now - stamp >= -1 && now - stamp <= 8;
+                                return (
+                                  <TableCell
+                                    key={v}
+                                    className={`number ${ordinaryCapacityReady(m?.capacities[v], account?.policy.threshold || '10000', tierLive, ordinaryBlock) ? 'mint' : ''}`}
+                                  >
+                                    <span className="mobile-cell-label">
+                                      {v}x 额度
+                                    </span>
+                                    {tierLive ? fmt(m?.capacities[v], 0) : '—'}
+                                  </TableCell>
+                                );
+                              })}
+                              <TableCell className="number account-capacity-cell">
                                 <span className="mobile-cell-label">
                                   当前杠杆
                                 </span>
@@ -749,6 +780,21 @@ export default function Home() {
                                 ) : (
                                   '—'
                                 )}
+                                <div
+                                  className="account-capacity"
+                                  title={
+                                    roomView.ready && room
+                                      ? `${room.leverage}x 账户上限 ${fmt(room.cap, 0)} − 多空合计持仓 ${fmt(room.occupied, 0)}；同步于 ${clock(room.checked_at)}`
+                                      : roomView.detail
+                                  }
+                                >
+                                  <span>
+                                    {roomView.ready
+                                      ? fmt(room?.remaining, 0)
+                                      : '—'}
+                                  </span>
+                                  <small>{roomView.detail}</small>
+                                </div>
                               </TableCell>
                               {DEPTH_NOTIONALS.map((amount) => {
                                 const quote = depthQuoteView(
@@ -786,6 +832,9 @@ export default function Home() {
                     <span>1 bp = 万分之一</span>
                   </div>
                   <p className="depth-method">
+                    账户余量 = 当前杠杆账户上限 −
+                    多空合计持仓；可开金额还受市场额度、余额与保证金限制。
+                    <br />
                     深度价差按买入、卖出每边各 1 万 / 5 万 USD1
                     的成交均价计算，不含手续费。 每 10 秒采样，超过 15
                     秒标记过期；买卖盘各最多 1,000 档，1 bp = 万分之一。

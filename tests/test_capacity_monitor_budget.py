@@ -2,6 +2,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import threading
+import time
+import httpx
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -14,20 +16,20 @@ from trading.models import dec
 class CapacityMonitorBudgetTests(unittest.TestCase):
     def test_execution_leaves_monitor_headroom_and_reports_its_actual_limit(self):
         budget = RateBudget(capacity_reserve=CAPACITY_MONITOR_RESERVE)
-        budget.require_available(1320)
+        budget.require_available(1407)
         self.assertEqual(budget.weight, 0)
-        budget.reserve(1320)
+        budget.reserve(1407)
         for check in (budget.require_available, budget.reserve):
-            with self.assertRaisesRegex(BudgetWait, "1320/1320"):
+            with self.assertRaisesRegex(BudgetWait, "1407/1407"):
                 check(1)
         state = budget.snapshot()
         self.assertEqual((state["ordinary_limit"], state["execution_limit"], state["capacity_reserve"]),
-                         (1500, 1320, 180))
-        self.assertEqual((state["remaining"], state["ordinary_remaining"]), (480, 0))
+                         (1500, 1407, 93))
+        self.assertEqual((state["remaining"], state["ordinary_remaining"]), (393, 0))
         self.assertGreater(state["retry_after"], 0)
         with budget.capacity_monitoring():
-            budget.require_available(180)
-            budget.reserve(180)
+            budget.require_available(93)
+            budget.reserve(93)
         self.assertEqual(budget.weight, 1500)
 
     def test_monitoring_cannot_spend_reconciliation_quota(self):
@@ -160,22 +162,24 @@ class CapacityMonitorBudgetTests(unittest.TestCase):
 
     def test_capacity_sample_can_use_headroom_and_does_not_keep_priority_context(self):
         budget = RateBudget(capacity_reserve=360)
-        market = MarketData(SimpleNamespace(budget=budget))
         budget.reserve(1140)
 
-        def sample(config):
-            self.assertEqual(config, {"symbol": "XAUUSD1", "leverages": [10, 20], "timeout_seconds": 8})
+        def sample(request):
+            self.assertEqual(dict(request.url.params), {"symbol": "XAUUSD1"})
             with self.assertRaises(BudgetWait):
                 budget.reserve(1)
-            return {10: {"value": "20"}, 20: {"value": "30"}}
+            return httpx.Response(200, json={"success": True, "code": "000000", "data": {
+                "symbol": "XAUUSD1", "leverageOiRemainingMap": {"10": "20", "20": "30"}}})
 
-        with patch("trading.exchange.monitor.sample", side_effect=sample) as sampler:
-            self.assertEqual(market.capacities("XAUUSD1", [20, 10, 20]), {10: dec(20), 20: dec(30)})
-            sampler.assert_called_once()
-        self.assertEqual(budget.weight, 1142)
+        client = httpx.Client(transport=httpx.MockTransport(sample))
+        self.addCleanup(client.close)
+        market = MarketData(SimpleNamespace(budget=budget, http=client))
+        market.public_brackets["XAUUSD1"] = (time.monotonic(), {10: dec(100), 20: dec(100)})
+        self.assertEqual(market.capacities("XAUUSD1", [20, 10, 20]), {10: dec(20), 20: dec(30)})
+        self.assertEqual(budget.weight, 1141)
         with budget.capacity_monitoring():
-            budget.reserve(358)
-        with patch("trading.exchange.monitor.sample") as sampler:
+            budget.reserve(359)
+        with patch.object(client, "request") as sampler:
             with self.assertRaises(BudgetWait):
                 market.capacities("XAUUSD1", [10, 20])
             sampler.assert_not_called()

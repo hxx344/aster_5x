@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from tests.helpers import Fixture
 from tests.test_cycle_ws_scheduler import _Future, _Harness
-from trading.account_cache import HotAccountUnavailable
+from trading.account_cache import CycleAccountCache, HotAccountUnavailable
 from trading.cycle import DEFAULT_CYCLE
 from trading.engine import CYCLE_HOT_POLL_INTERVAL, Engine
 from trading.exchange import ExchangeError, LiveBroker
@@ -53,6 +53,7 @@ class CycleHotEngineTests(unittest.TestCase):
         self.f.store.save_account(row)
         harness.engine.live_allowed = Mock(return_value=True)
         broker = Mock(spec=LiveBroker)
+        broker.cycle_cache = CycleAccountCache()
         broker.api = SimpleNamespace(budget=None, call=Mock(side_effect=AssertionError("scheduler made HTTP")))
         broker.refresh_cycle_hot_snapshot.return_value = False
         harness.engine.brokers["test"] = broker

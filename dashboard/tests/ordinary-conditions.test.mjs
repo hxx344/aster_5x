@@ -35,6 +35,15 @@ function fixture() {
 const view = ({ account, market }, time = now, error = '') =>
   ordinaryConditionsView(account, market, 'XAUUSD1', time, error);
 
+test('a fast current-tier sample cannot renew other leverage timestamps', () => {
+  const source = fixture();
+  source.market.capacity_checked_at = { 5: now - 9, 10: now, 20: now - 9 };
+  assert.deepEqual(
+    view(source).tiers.map((tier) => tier.capacity.state),
+    ['stale', 'unmet', 'stale'],
+  );
+});
+
 test('cycle 2x leaves all three ordinary conditions visible without turning restrictions into condition failures', () => {
   const result = view(fixture());
   assert.equal(result.currentLeverage, 2);

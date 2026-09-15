@@ -103,6 +103,7 @@ class LivePriorityFreshnessTests(unittest.TestCase):
                 wall[0] += 9
                 # The independent public feed stays fresh while the quote blocks.
                 self.engine.markets[SYMBOL]["checked_at"] = wall[0]
+                self.engine.markets[SYMBOL]["capacity_checked_at"]["10"] = wall[0]
             return book(symbol)
 
         with patch("trading.exchange.time.time", side_effect=lambda: wall[0]), \

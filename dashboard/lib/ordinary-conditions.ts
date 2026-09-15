@@ -16,6 +16,7 @@ type OrdinaryAccount = {
 type OrdinaryMarket = {
   status?: string;
   checked_at?: number;
+  capacity_checked_at?: Record<string, number>;
   capacities?: Record<string, string>;
   book?: { spread?: string; timestamp?: number };
   book_error?: string;
@@ -113,10 +114,6 @@ export function ordinaryConditionsView(
     8,
     Boolean(connectionError),
   );
-  const capacityState =
-    market?.status === 'ok'
-      ? freshness(market.checked_at, now, 8, Boolean(connectionError))
-      : 'unknown';
   const bookState = market?.book_error
     ? 'unknown'
     : freshness(market?.book?.timestamp, now, 3, Boolean(connectionError));
@@ -174,7 +171,14 @@ export function ordinaryConditionsView(
         decimal(market?.capacities?.[leverage]),
         threshold,
         '>',
-        capacityState,
+        market?.status === 'ok'
+          ? freshness(
+              market.capacity_checked_at?.[leverage] ?? market.checked_at,
+              now,
+              8,
+              Boolean(connectionError),
+            )
+          : 'unknown',
       ),
       margin: condition(
         ratio,

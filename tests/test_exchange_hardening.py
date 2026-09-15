@@ -405,8 +405,10 @@ class RateBudgetHardeningTests(unittest.TestCase):
         for delay in (float("inf"), float("nan"), -1, "invalid"):
             api = Mock()
             api.budget = RateBudget()
+            api.http.request.return_value = httpx.Response(429, headers={"Retry-After": str(delay)})
             market = MarketData(api)
-            with self.subTest(delay=delay), patch("monitor.sample", side_effect=monitor.MonitorError("HTTP 429", delay)):
+            market.public_brackets["XAUUSD1"] = (1000, {5: dec(100), 10: dec(100), 20: dec(100)})
+            with self.subTest(delay=delay):
                 with self.assertRaises(ExchangeError) as caught:
                     market.capacities("XAUUSD1", [5, 10, 20])
                 self.assertEqual(caught.exception.retry_after, 180)

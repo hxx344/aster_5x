@@ -17,7 +17,7 @@ import uuid
 
 import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
-from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RequestNotSent, credentials_for
+from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RequestNotSent, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import HotAccountUnavailable
 from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
@@ -31,7 +31,7 @@ from .models import cycle_margin_limit
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
-from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
+from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .store import dumps
 
@@ -42,7 +42,8 @@ CYCLE_SIGNAL_MIN_INTERVAL = 1
 CYCLE_HOT_POLL_INTERVAL = 2
 ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
-CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * 2 * 60 // CAPACITY_POLL_INTERVAL
+CYCLE_CAPACITY_POLL_INTERVAL = .2
+CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * (60 // CAPACITY_POLL_INTERVAL + 1)
 PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_RESYNC_INTERVAL
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
@@ -110,6 +111,25 @@ def snapshot_json(snapshot, symbols):
     result["positions"] = [{**row, "notional": p.notional, "occupied_margin": p.occupied_margin}
                            for row, p in zip(result["positions"], snapshot.positions)]
     result["mode_checks"] = snapshot.mode_checks(symbols)
+    result["account_capacity"] = {}
+    for symbol in symbols:
+        try:
+            long, short = snapshot.pair(symbol)
+            leverage = long.leverage
+            current = snapshot.current_leverage_caps.get(symbol)
+            if current is not None and current[0] == leverage:
+                cap = positive(current[1], True)
+            else:
+                cap = leverage_cap(snapshot.brackets.get(symbol, []), leverage)
+            gross = long.notional + short.notional
+            result["account_capacity"][symbol] = {"leverage": leverage, "cap": cap,
+                "occupied": gross, "remaining": max(dec(0), cap - gross),
+                "checked_at": snapshot.timestamp,
+                "expires_at": min(snapshot.timestamp + 8, time.time() + max(0,
+                    5 - (time.monotonic() - snapshot.cycle_cap_cached_at[symbol])))
+                    if symbol in snapshot.cycle_cap_cached_at else snapshot.timestamp + 8}
+        except (TradingError, KeyError, ValueError, TypeError):
+            continue
     return json.loads(dumps(result))
 
 
@@ -144,6 +164,8 @@ class Engine:
         self.error = "正在连接行情服务"
         self.notification_error = None
         self.capacity_notification_errors = {}
+        self.capacity_targets, self.capacity_accounts = {}, []
+        self.capacity_full_checked = {}
         if demo and not store.accounts():
             account = {"id": "demo", "name": "示例子账户", "mode": "paper", "env_prefix": "ASTER_DEMO", "enabled": False, "policy": {**DEFAULT_POLICY}}
             store.save_account(account)
@@ -427,7 +449,8 @@ class Engine:
         budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else {"ordinary_limit": 1500}
         # Reserve the capacity feed and ordinary quote fallback. Use cold
         # round costs; no private position or balance cache crosses a mutation.
-        capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE)
+        extra_capacity = len(self.capacity_targets) * (round(60 / CYCLE_CAPACITY_POLL_INTERVAL) - 60 // CAPACITY_POLL_INTERVAL)
+        capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE - extra_capacity)
         with self.lock:
             def cost(account):
                 if not account["enabled"]:
@@ -495,31 +518,82 @@ class Engine:
         self.store.put(key, {"failures": count, "until": time.time() + delay})
         self.store.event(account_id, "waiting", f"{intent['symbol']} 本批无新增仓位，新开单等待 {delay} 秒；继续核对已有订单")
 
+    def cycle_capacity_targets(self, accounts):
+        targets = {}
+        with self.lock:
+            for account in accounts:
+                config = account.get("cycle", {})
+                symbol = config.get("symbol")
+                if not account["enabled"] or not config.get("enabled") or symbol not in SYMBOLS or not self.live_allowed(account):
+                    continue
+                view_snapshot = self.views.get(account["id"], {}).get("snapshot", {})
+                positions = view_snapshot.get("positions", [])
+                pair = [p for p in positions if p["symbol"] == symbol]
+                actual = {p["leverage"] for p in pair}
+                if not -1 <= time.time() - view_snapshot.get("timestamp", time.time()) <= 8:
+                    actual = set()
+                broker = self.brokers.get(account["id"])
+                if isinstance(broker, LiveBroker):
+                    try:
+                        # This lease reads only local background data. It can
+                        # detect leverage changes before the next UI publication.
+                        actual = {p.leverage for p in broker.cycle_cache.lease([symbol]).snapshot.pair(symbol)}
+                    except TradingError:
+                        pass
+                leverage = next(iter(actual)) if len(actual) == 1 else None
+                if leverage in TIERS:
+                    targets.setdefault(symbol, set()).add(leverage)
+        return targets
+
+    def poll_public_brackets(self, symbol):
+        if self.shutdown.is_set():
+            return PUBLIC_BRACKETS_REFRESH_INTERVAL
+        try:
+            self.market.refresh_public_brackets(symbol)
+            return PUBLIC_BRACKETS_REFRESH_INTERVAL
+        except (TradingError, KeyError, ValueError, TypeError) as exc:
+            return max(10, getattr(exc, "retry_after", 0))
+
     def poll_market(self, symbol):
         if self.shutdown.is_set():
             return CAPACITY_POLL_INTERVAL
         try:
-            accounts = self.store.accounts()
-            tiers = set(TIERS)
+            with self.lock:
+                targets = self.capacity_targets.get(symbol, set()).copy()
+                accounts = self.capacity_accounts.copy() if targets else None
+            if accounts is None:
+                accounts = self.store.accounts()
+            interval = CYCLE_CAPACITY_POLL_INTERVAL if targets else CAPACITY_POLL_INTERVAL
+            full = time.monotonic() - self.capacity_full_checked.get(symbol, -math.inf) >= CAPACITY_POLL_INTERVAL
+            tiers = set(TIERS) if full or not targets else targets
             # Network latency is part of the capacity snapshot's age.
             checked_at = time.time()
             capacities = {tier: value for tier, value in self.market.capacities(symbol, tiers).items() if tier in TIERS}
-            row = {"status": "ok", "capacities": {str(k): wire(v) for k, v in capacities.items()},
-                   "checked_at": checked_at}
             with self.lock:
                 previous = self.markets.get(symbol, {})
+                values = {k: v for k, v in previous.get("capacities", {}).items() if int(k) not in tiers}
+                stamps = {k: v for k, v in previous.get("capacity_checked_at", {}).items() if int(k) not in tiers}
+                values.update({str(k): wire(v) for k, v in capacities.items()})
+                stamps.update({str(k): checked_at for k in capacities})
+                row = {"status": "ok", "capacities": values, "capacity_checked_at": stamps,
+                       "checked_at": checked_at, "poll_interval_ms": round(interval * 1000),
+                       "fast_leverages": sorted(targets)}
                 self.markets[symbol] = {**previous, **json.loads(dumps(row))}
                 self.markets[symbol].pop("error", None)
             # Wake execution before notification storage or quote I/O can delay it.
-            self.wake_capacity_accounts(symbol, capacities, checked_at, accounts)
-            self.observe_capacity_alerts(symbol, capacities, checked_at)
-            return CAPACITY_POLL_INTERVAL
+            if full or not targets:
+                self.wake_capacity_accounts(symbol, capacities, checked_at, accounts)
+                self.observe_capacity_alerts(symbol, capacities, checked_at)
+                self.capacity_full_checked[symbol] = time.monotonic()
+            return interval
         except (TradingError, KeyError, ValueError, TypeError) as exc:
             self.invalidate_capacity_alerts(symbol)
             with self.lock:
                 previous = self.markets.get(symbol, {})
                 self.markets[symbol] = {**previous, "status": "error", "error": str(exc) if isinstance(exc, TradingError) else "行情数据格式异常"}
             self.wake_capacity_accounts(symbol, {}, time.time(), [])
+            if isinstance(exc, PublicBracketsUnavailable):
+                return CAPACITY_POLL_INTERVAL
             return max(10, getattr(exc, "retry_after", 0))
 
     def poll_book(self, symbol):
@@ -620,7 +694,8 @@ class Engine:
             row = self.markets.get(symbol, {}).copy()
         if row.get("status") != "ok" or not -1 <= time.time() - row.get("checked_at", 0) <= 8:
             raise TradingError("市场额度快照过期或查询失败")
-        capacities = {int(k): dec(v) for k, v in row["capacities"].items()}
+        capacities = {int(k): dec(v) for k, v in row["capacities"].items()
+                      if -1 <= time.time() - row.get("capacity_checked_at", {}).get(k, row["checked_at"]) <= 8}
         return capacities
 
     def check_post_fill_occupancy(self, account, snapshot):
@@ -1782,6 +1857,7 @@ class Engine:
 
     def run(self):
         pending, due = {}, {}
+        market_started, market_backoff = {}, {}
         cycle_job_due = {}
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
@@ -1795,7 +1871,7 @@ class Engine:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=3 * MAX_ACCOUNTS + 3 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=3 * MAX_ACCOUNTS + 4 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 try:
                     while not self.shutdown.is_set():
                         self.scheduler_event.clear()
@@ -1842,17 +1918,26 @@ class Engine:
                                     # account worker; it never postpones ordinary
                                     # work or consumes another market's wakeup.
                                     due[key] = cycle_job_due.pop(key)
+                                elif key.startswith("market:") and delay <= CAPACITY_POLL_INTERVAL:
+                                    # 200 ms between starts, with one request in
+                                    # flight per symbol and no catch-up bursts.
+                                    if key.removeprefix("market:") not in self.capacity_targets:
+                                        delay = CAPACITY_POLL_INTERVAL
+                                    due[key] = max(time.monotonic(), market_started[key] + delay)
+                                    market_backoff.pop(key, None)
                                 else:
                                     if key.startswith("account:") and aid in schedules and not urgent:
                                         delay = max(delay, schedules[aid]["interval"])
                                     due[key] = time.monotonic() + delay
+                                    if key.startswith("market:"):
+                                        market_backoff[key] = due[key]
                                 del pending[key]
                         with self.lock:
                             generation = self.accounts_generation
-                        if generation != account_generation or time.monotonic() >= accounts_due:
+                        refresh_schedules = generation != account_generation or time.monotonic() >= accounts_due
+                        if refresh_schedules:
                             saved_accounts = self.store.accounts()
                             account_ids = [a["id"] for a in saved_accounts]
-                            schedules = self.scheduling(saved_accounts)
                             for aid in set(account_ids) - known_accounts:
                                 if self.store.intent(aid) or self.store.get("post_fill_check:" + aid):
                                     with self.lock:
@@ -1860,6 +1945,21 @@ class Engine:
                             known_accounts = set(account_ids)
                             account_generation = generation
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
+                        targets = self.cycle_capacity_targets(saved_accounts)
+                        with self.lock:
+                            old_targets = self.capacity_targets
+                            self.capacity_targets, self.capacity_accounts = targets, saved_accounts
+                        if isinstance(self.market, MarketData):
+                            reserve = CAPACITY_MONITOR_RESERVE + len(targets) * (
+                                round(60 / CYCLE_CAPACITY_POLL_INTERVAL) - 60 // CAPACITY_POLL_INTERVAL)
+                            self.market.api.budget.configure_capacity_reserve(reserve)
+                        for symbol in targets.keys() | old_targets.keys():
+                            if targets.get(symbol) != old_targets.get(symbol):
+                                key = "market:" + symbol
+                                interval = CYCLE_CAPACITY_POLL_INTERVAL if symbol in targets else CAPACITY_POLL_INTERVAL
+                                due[key] = max(market_backoff.get(key, 0), market_started.get(key, 0) + interval)
+                        if refresh_schedules or targets != old_targets:
+                            schedules = self.scheduling(saved_accounts)
                         cycle_candidates = self.cycle_wake_candidates(saved_accounts, pending)
                         with self.lock:
                             for aid in list(self.cycle_hot_wakes):
@@ -1880,6 +1980,8 @@ class Engine:
                                        for symbol, stamp in signals.items()):
                                     priority_accounts.add(aid)
                         jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
+                        if isinstance(self.market, MarketData):
+                            jobs.update({"brackets:" + s: (self.poll_public_brackets, s) for s in SYMBOLS})
                         jobs.update({"book:" + s: (self.poll_book, s) for s in SYMBOLS})
                         jobs.update({"depth:" + s: (self.poll_depth, s) for s in SYMBOLS})
                         jobs["notify"] = (self.notify,)
@@ -1927,10 +2029,12 @@ class Engine:
                                 else:
                                     if is_account:
                                         self.cycle_signals.pop(aid, None)
+                                    if key.startswith("market:"):
+                                        market_started[key] = time.monotonic()
                                     pending[key] = pool.submit(function, *args)
                                 if ordinary or priority and aid in schedules and aid not in urgent_accounts:
                                     next_ordinary_start = max(next_ordinary_start, time.monotonic() + schedules[aid]["gap"])
-                        self.scheduler_event.wait(.1)
+                        self.scheduler_event.wait(.02 if targets else .1)
                 finally:
                     # Fail health checks as soon as scheduling ends, before waiting
                     # for in-flight workers and closing their shared clients.

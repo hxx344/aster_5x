@@ -59,11 +59,7 @@ import {
 import { createStatePoller } from '@/lib/state-poller';
 import { accountModeView } from '@/lib/account-modes';
 import { ordinaryConditionsView } from '@/lib/ordinary-conditions';
-import {
-  ordinaryAddBlock,
-  ordinaryCapacityReady,
-  ORDINARY_CYCLE_BLOCK_LABEL,
-} from '@/lib/ordinary-add';
+import { ordinaryAddBlock, ordinaryCapacityReady } from '@/lib/ordinary-add';
 import { DEPTH_NOTIONALS, depthQuoteView, type DepthQuote } from '@/lib/depth';
 import {
   cycleMarginLimit,
@@ -98,6 +94,7 @@ type Policy = {
   order_notional: string;
   margin_limit: string;
   min_open_leverage?: number;
+  ordinary_symbol?: string;
   spread_limit: string;
   symbols: string[];
 };
@@ -106,6 +103,7 @@ type PolicyDraft = {
   order_notional: string;
   margin_percent: string;
   min_open_leverage: string;
+  ordinary_symbol: string;
 };
 type Account = {
   id: string;
@@ -299,6 +297,7 @@ export default function Home() {
     order_notional: account?.policy.order_notional || '1000',
     margin_percent: marginPercent,
     min_open_leverage: minimumLeverageSupported ? String(minimumLeverage) : '',
+    ordinary_symbol: account?.policy.ordinary_symbol ?? 'all',
   };
   const setForm = (value: typeof form) =>
     setDrafts((previous) => ({ ...previous, [selected]: value }));
@@ -726,7 +725,7 @@ export default function Home() {
                                     className="ordinary-add-block"
                                     title={ordinaryBlock}
                                   >
-                                    {ORDINARY_CYCLE_BLOCK_LABEL}
+                                    {ordinaryBlock}
                                   </p>
                                 ) : null}
                               </TableCell>
@@ -1054,7 +1053,9 @@ export default function Home() {
                   </div>
                   <OrdinaryConditions
                     view={ordinaryConditions}
-                    cycleSymbolActive={Boolean(focusedOrdinaryBlock)}
+                    cycleSymbolActive={Boolean(
+                      account?.cycle?.enabled && account.cycle.symbol === focus,
+                    )}
                   />
                   <div className="strategy-state">
                     <i
@@ -1395,6 +1396,7 @@ export default function Home() {
                       if (!account) return;
                       try {
                         const policy = {
+                          ordinary_symbol: form.ordinary_symbol,
                           threshold: form.threshold,
                           order_notional: form.order_notional,
                           margin_limit: marginLimitFromPercent(
@@ -1424,6 +1426,41 @@ export default function Home() {
                       }
                     }}
                   >
+                    <label htmlFor="ordinary-symbol">
+                      有额度开仓交易对
+                      <Select
+                        required
+                        disabled={busy || !account || account.enabled}
+                        value={form.ordinary_symbol}
+                        onValueChange={(value) =>
+                          value && setForm({ ...form, ordinary_symbol: value })
+                        }
+                      >
+                        <SelectTrigger
+                          id="ordinary-symbol"
+                          className="full-width"
+                        >
+                          <SelectValue>
+                            {form.ordinary_symbol === 'all'
+                              ? '全部交易对'
+                              : `仅 ${form.ordinary_symbol}`}
+                          </SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">全部交易对</SelectItem>
+                          {(account?.policy.symbols ?? symbols).map(
+                            (symbol) => (
+                              <SelectItem key={symbol} value={symbol}>
+                                仅 {symbol}
+                              </SelectItem>
+                            ),
+                          )}
+                        </SelectContent>
+                      </Select>
+                      <span>
+                        指定后，普通开仓与升杠杆仅操作所选交易对。循环与迁移按各自设置执行。
+                      </span>
+                    </label>
                     <label htmlFor="threshold">
                       额度阈值 <span>USD1</span>
                       <Input

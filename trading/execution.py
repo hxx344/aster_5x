@@ -4,7 +4,7 @@ import uuid
 from contextlib import nullcontext
 from fractions import Fraction
 
-from .cycle_guard import ordinary_add_block_reason
+from .cycle_guard import cycle_add_block_reason, ordinary_add_block_reason
 from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
@@ -42,7 +42,7 @@ class Executor:
         if self.store.intent(account["id"]):
             raise TradingError("已有批次正在执行")
         # A previously selected account mapping cannot authorize an ordinary
-        # addition after its saved configuration has switched to this cycle.
+        # addition after its saved market selection or cycle ownership changes.
         latest = self.store.account(account["id"])
         if latest is None:
             raise TradingError("账户不存在，禁止普通新增开仓")
@@ -117,7 +117,8 @@ class Executor:
     def leverage(self, account, symbol, old, target, snapshot=None, before_submit=None, *, purpose=None, symbols=None):
         self.last_snapshot = None
         self.last_completed_intent = None
-        blocked = ordinary_add_block_reason(account, symbol)
+        guard = cycle_add_block_reason if purpose == "migration" else ordinary_add_block_reason
+        blocked = guard(account, symbol)
         if blocked:
             raise TradingError(blocked)
         require_supported_leverage(target)
@@ -140,7 +141,7 @@ class Executor:
         latest = self.store.account(account["id"])
         if latest is None:
             raise TradingError("账户不存在，禁止普通杠杆调整")
-        blocked = ordinary_add_block_reason(latest, symbol)
+        blocked = guard(latest, symbol)
         if blocked:
             raise TradingError(blocked)
         intent = {"id": uuid.uuid4().hex, "kind": "leverage", "account_id": account["id"], "symbol": symbol,

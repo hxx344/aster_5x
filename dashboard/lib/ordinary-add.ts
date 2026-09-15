@@ -1,4 +1,5 @@
 type OrdinaryAddAccount = {
+  policy?: { ordinary_symbol?: string };
   ordinary_add_blocks?: Record<string, string>;
   cycle?: { enabled: boolean; symbol: string };
 };
@@ -12,6 +13,10 @@ export function ordinaryAddBlock(
 ): string | null {
   const reported = account?.ordinary_add_blocks?.[symbol];
   if (typeof reported === 'string' && reported.trim()) return reported;
+  const selected = account?.policy?.ordinary_symbol ?? 'all';
+  if (selected !== 'all' && selected !== symbol) {
+    return `本账户有额度开仓仅限 ${selected}，禁止 ${symbol} 普通加仓`;
+  }
   // Older services already route this account exclusively through cycle mode.
   // Pausing the account does not turn off its saved cycle configuration.
   return account?.cycle?.enabled && account.cycle.symbol === symbol

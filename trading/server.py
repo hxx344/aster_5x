@@ -145,6 +145,7 @@ class CycleEdit(BaseModel):
 
 class PolicyEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+    ordinary_symbol: Literal["all", "XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
     threshold: str | None = Field(default=None, min_length=1, max_length=40)
     order_notional: str | None = Field(default=None, min_length=1, max_length=40)
     margin_limit: str | None = Field(default=None, min_length=1, max_length=128)

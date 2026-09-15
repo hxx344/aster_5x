@@ -24,7 +24,7 @@ from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, Rol
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
 from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
-from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols
+from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols, ordinary_selection
 from .cycle_quality import clock_tick, elapsed as observed_elapsed
 from .cycle_signal import cycle_signal_quote
 from .models import cycle_margin_limit
@@ -46,8 +46,8 @@ CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * 2 * 60 // CAPACITY_POLL_INTERVAL
 PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_RESYNC_INTERVAL
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
-                  "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE}
-EDITABLE_POLICY_FIELDS = {"threshold", "order_notional", "margin_limit", "min_open_leverage"}
+                  "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE, "ordinary_symbol": "all"}
+EDITABLE_POLICY_FIELDS = {"threshold", "order_notional", "margin_limit", "min_open_leverage", "ordinary_symbol"}
 
 
 @dataclass
@@ -74,7 +74,7 @@ def validate_account(account):
     policy = account.get("policy", {})
     if not isinstance(policy, dict):
         raise TradingError("策略配置字段不完整")
-    policy = {"min_open_leverage": MIN_OPEN_LEVERAGE, **policy}
+    policy = {"min_open_leverage": MIN_OPEN_LEVERAGE, "ordinary_symbol": "all", **policy}
     if set(policy) != set(DEFAULT_POLICY):
         raise TradingError("策略配置字段不完整")
     if not isinstance(policy["symbols"], list) or not policy["symbols"] or any(s not in SYMBOLS for s in policy["symbols"]) or len(set(policy["symbols"])) != len(policy["symbols"]):
@@ -89,6 +89,7 @@ def validate_account(account):
         raise TradingError("价差上限不得超过万 5")
     minimum_open_leverage(policy)
     account["policy"] = policy
+    ordinary_selection(account)
     account["migration"] = validate_migration(account.get("migration", {**DEFAULT_MIGRATION}))
     account["cycle"] = validate_cycle(account.get("cycle"))
     if account["cycle"]["enabled"] and account["migration"]["enabled"]:

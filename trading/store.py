@@ -234,6 +234,8 @@ class Store:
                                else {**DEFAULT_CYCLE} if "cycle" not in account else cycle)
         policy = account.get("policy")
         if isinstance(policy, dict):
+            policy = {"ordinary_symbol": "all", **policy}
+            normalized["policy"] = policy
             previous = policy.get("min_open_leverage", MIN_OPEN_LEVERAGE)
             if type(previous) is int and 1 <= previous <= 125:
                 minimum = next((tier for tier in TIERS if tier >= previous), TIERS[-1])

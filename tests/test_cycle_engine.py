@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from tests.helpers import Fixture, account
+from tests.helpers import Fixture, account, seed_cycle_capacity
 from trading.cycle import DEFAULT_CYCLE
 from trading.engine import Engine
 from trading.models import TradingError, dec
@@ -23,10 +23,12 @@ class CycleEngineTests(TestCase):
         saved.update(enabled=False)
         self.f.store.save_account(saved)
         self.engine = Engine(self.f.store, market=self.f.market)
+        seed_cycle_capacity(self.engine)
         self.engine.brokers["test"] = self.f.broker
 
     def select(self, **changes):
         self.engine.configure("test", {"cycle": {"enabled": True, **changes}})
+        seed_cycle_capacity(self.engine)
 
     def start_holding(self):
         self.select()
@@ -56,6 +58,7 @@ class CycleEngineTests(TestCase):
         self.assertEqual(self.engine.state()["accounts"][0]["cycle_state"]["phase"], "holding")
         reopened = Store(self.f.store.path)
         self.engine = Engine(reopened, market=self.f.market)
+        seed_cycle_capacity(self.engine)
         self.expire_hold()
         for _ in range(4):
             self.engine.tick_account("test")
@@ -93,6 +96,7 @@ class CycleEngineTests(TestCase):
         progress["retry_at"] = None
         self.f.store.put("cycle:test", progress)
         restarted = Engine(self.f.store, market=self.f.market)
+        seed_cycle_capacity(restarted)
         for _ in range(5):
             restarted.tick_account("test")
             if self.f.store.get("cycle:test")["phase"] == "holding":
@@ -142,6 +146,7 @@ class CycleEngineTests(TestCase):
         self.engine.configure("second", {"cycle": {"enabled": True, "symbol": "SPCXUSD1", "leverage": 3,
                                                   "spread_limit_bp": "1", "max_notional": "2000", "hold_seconds": 120}})
         self.engine.enable("second", True)
+        seed_cycle_capacity(self.engine)
         for _ in range(5):
             self.engine.tick_account("second")
             if self.f.store.get("cycle:second")["phase"] == "holding":

@@ -27,8 +27,8 @@ class CycleParallelEngineTests(TestCase):
         for symbol in SYMBOLS:
             self.engine.markets[symbol] = {
                 "status": "ok", "checked_at": time.time(),
-                "capacities": {str(tier): str((available or {}).get(symbol, {}).get(tier, 0))
-                               for tier in (5, 10, 20)},
+                "capacities": {"2": "1000000", **{str(tier): str((available or {}).get(symbol, {}).get(tier, 0))
+                               for tier in (5, 10, 20)}},
             }
 
     def start(self, **changes):
@@ -36,6 +36,8 @@ class CycleParallelEngineTests(TestCase):
                                                    "spread_notional": "1000", **changes}})
         self.f.broker.set_cycle_leverage("XAUUSD1", 2)
         self.engine.enable("test", True)
+        self.engine.view("test", snapshot={"timestamp": time.time(), "positions": [
+            {"symbol": "XAUUSD1", "leverage": 2}]})
         return self.f.store.account("test")
 
     def holding(self):

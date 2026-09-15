@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from tests import test_cycle_engine as engine_cases
-from tests.helpers import account
+from tests.helpers import account, seed_cycle_capacity
 from trading.cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from trading.models import TradingError
 from trading.server import create_app
@@ -25,6 +25,7 @@ class CycleDiagnosticStateTests(TestCase):
         self.engine.enable("test", True)
 
     def spread_failure(self, now):
+        seed_cycle_capacity(self.engine, now=now)
         original = self.f.market.depth
         def wide(symbol):
             depth = original(symbol)

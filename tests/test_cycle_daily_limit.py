@@ -11,6 +11,7 @@ from tests import test_cycle_engine as engine_cases, test_cycle_planning as plan
 from trading.cycle import DailyVolumeLimitError, validate_cycle
 from trading.engine import Engine
 from trading.models import TradingError, dec
+from tests.helpers import seed_cycle_capacity
 
 
 class DailyQuotaPlanningTests(TestCase):
@@ -58,6 +59,7 @@ class DailyQuotaEngineTests(TestCase):
     expire_hold = engine_cases.CycleEngineTests.expire_hold
 
     def run_until_holding(self):
+        seed_cycle_capacity(self.engine)
         for _ in range(5):
             self.engine.tick_account("test")
             progress = self.f.store.get("cycle:test")
@@ -89,10 +91,12 @@ class DailyQuotaEngineTests(TestCase):
             daily = self.f.store.cycle_daily_volume("test")
             self.engine = Engine(self.f.store, market=self.f.market)
             self.engine.brokers["test"] = self.f.broker
+            seed_cycle_capacity(self.engine)
             self.engine.tick_account("test")
             self.assertEqual(before, self.f.broker.state["orders"])
             self.assertEqual(self.engine.state()["accounts"][0]["cycle_state"]["phase"], "daily_limit")
         with patch("trading.engine.time.time", return_value=daily["next_reset_at"] + 1):
+            seed_cycle_capacity(self.engine)
             self.engine.tick_account("test")
             state = self.engine.state()["accounts"][0]
             self.assertEqual(state["cycle_state"]["phase"], "rolling_limit")
@@ -200,6 +204,7 @@ class DailyQuotaEngineTests(TestCase):
             self.engine.tick_account("test")
             self.assertEqual(self.f.store.cycle_daily_volume("test")["trade_count"], 0)
         with patch("trading.engine.time.time", return_value=before + 30):
+            seed_cycle_capacity(self.engine)
             self.engine.tick_account("test")
             state = self.engine.state()["accounts"][0]["cycle_state"]
             self.assertEqual(state["phase"], "rolling_limit")

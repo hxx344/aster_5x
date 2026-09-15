@@ -19,6 +19,7 @@ DEFAULT_CYCLE = {
     "enabled": False, "symbol": "XAUUSD1", "leverage": 2,
     "spread_notional": "10000", "spread_limit_bp": "0.1",
     "min_notional": "0", "max_notional": "10000",
+    "capacity_multiplier": "1",
     "notional_scope": "per_side", "hold_seconds": 60, "daily_volume_limit": "0",
 }
 
@@ -45,6 +46,7 @@ class CyclePlan:
     short_notional: Decimal
     spread_bp: Decimal
     projected_ratio: Decimal | None = None
+    capacity_notional: Decimal | None = None
 
 
 def validate_cycle(config=None):
@@ -63,7 +65,7 @@ def validate_cycle(config=None):
         raise TradingError("循环持仓时间必须为 1 至 604800 秒的整数")
     if result["notional_scope"] not in ("per_side", "gross"):
         raise TradingError("循环金额口径必须为单边金额或多空合计金额")
-    for key in ("spread_notional", "spread_limit_bp", "min_notional", "max_notional", "daily_volume_limit"):
+    for key in ("spread_notional", "spread_limit_bp", "min_notional", "max_notional", "daily_volume_limit", "capacity_multiplier"):
         if not isinstance(result[key], str):
             raise TradingError("循环金额及价差必须为十进制字符串")
         result[key] = wire(dec(result[key]))
@@ -76,6 +78,8 @@ def validate_cycle(config=None):
         raise TradingError("循环金额范围必须满足 0 ≤ 最小金额 ≤ 最大金额 ≤ 1000000，且最大金额大于 0")
     if not 0 <= dec(result["daily_volume_limit"]) <= 1000000000000:
         raise TradingError("循环每日成交量上限必须为 0 至 1000000000000 USD1，0 表示不限")
+    if not 1 <= dec(result["capacity_multiplier"]) <= 100:
+        raise TradingError("循环额度倍数必须为 1 至 100，可使用小数")
     return result
 
 
@@ -281,7 +285,7 @@ def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
 
 
 def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None,
-               rolling_remaining=None):
+               rolling_remaining=None, market_capacity=None):
     """Maximize one exact pair, or close precisely the recorded completed pair.
 
     The configured reference amount sweeps each side separately. Its VWAP
@@ -401,6 +405,8 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     # maxNotional is a total position ceiling, not additional room. Both held
     # legs consume it before a new pair can be added.
     cap = max(Fraction(0), cap - sum((Fraction(p.qty) * max(Fraction(p.mark), mark) for p in pair), Fraction(0)))
+    if market_capacity is not None:
+        cap = min(cap, Fraction(positive(market_capacity, True)))
     if fee is None:
         raise TradingError("循环开仓缺少手续费率")
     fee = Fraction(positive(fee, True))
@@ -481,4 +487,5 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     require_search_time()
     return CyclePlan("open", rule.symbol, decimal_value(qty, exact=True), config["leverage"],
                      decimal_value(buy, exact=True), decimal_value(sell, exact=True),
-                     decimal_value(reference_spread), decimal_value(projected_ratio))
+                     decimal_value(reference_spread), decimal_value(projected_ratio),
+                     decimal_value(2 * qty * max(mark, asks.last_price(qty)), exact=True))

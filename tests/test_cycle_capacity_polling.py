@@ -75,6 +75,12 @@ class PublicCapacityCacheTests(unittest.TestCase):
         with self.assertRaises(ExchangeError):
             self.market.capacities(SYMBOL, [10])
 
+    def test_cycle_uses_exact_nonordinary_leverage_when_both_public_sources_have_it(self):
+        self.market.refresh_public_brackets(SYMBOL)
+        self.remaining["data"]["leverageOiRemainingMap"]["2"] = "1500"
+        self.assertEqual(self.market.capacities(SYMBOL, [2]), {2: dec(1000)})
+        self.assertEqual(self.market.capacities(SYMBOL, [3]), {})
+
     def test_rate_limit_blocks_all_channels_and_keeps_original_cache_age(self):
         self.market.refresh_public_brackets(SYMBOL)
         self.failure = httpx.Response(429, headers={"Retry-After": "240"})

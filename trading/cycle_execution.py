@@ -95,7 +95,7 @@ class CycleExecutor(Executor):
         if repair or intent.get("kind") != "cycle":
             return super().send(intent, orders, repair=repair)
         broker = self.broker
-        if isinstance(broker, LiveBroker):
+        if isinstance(broker, LiveBroker) or guard:
             validate = guard[1] if guard and guard[0] == intent["id"] else None
             broker = _GuardedCycleBroker(broker, validate)
         observed = None
@@ -267,7 +267,7 @@ class CycleExecutor(Executor):
             raise TradingError("账户没有交易权限")
         return snapshot.pair(symbol)
 
-    def start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None):
+    def start(self, account, snapshot, plan, progress, before_submit=None, *, trigger=None, before_send=None):
         admission = getattr(self, "_cycle_admission", None)
         self._cycle_admission = None
         self._cycle_submit_guard = None
@@ -398,8 +398,13 @@ class CycleExecutor(Executor):
             intent["execution_quality"] = quality
         action = "加仓" if plan.phase == "open" else "减回本轮新增"
         persist_started = clock_tick()
-        if isinstance(self.broker, LiveBroker):
-            self._cycle_submit_guard = (token, lambda: self._require_admission_fresh(admission))
+        def validate_send():
+            if isinstance(self.broker, LiveBroker):
+                self._require_admission_fresh(admission)
+            if before_send is not None:
+                before_send()
+        if isinstance(self.broker, LiveBroker) or before_send is not None:
+            self._cycle_submit_guard = (token, validate_send)
         try:
             self.store.create_cycle_intent(intent, f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
             record_duration(quality, "persist_ms", persist_started)

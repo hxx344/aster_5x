@@ -9,6 +9,7 @@ from unittest.mock import patch
 from tests import test_cycle_daily_limit as daily_cases, test_cycle_planning as planning_cases
 from trading.cycle import DailyVolumeLimitError, RollingVolumeLimitError
 from trading.models import TradingError, dec
+from tests.helpers import seed_cycle_capacity
 
 
 class RollingQuotaPlanningTests(TestCase):
@@ -80,6 +81,7 @@ class RollingQuotaEngineTests(TestCase):
             self.engine.tick_account("test")
         before = deepcopy(self.f.broker.state["orders"])
         with patch("trading.engine.time.time", return_value=opened + 86400 - 0.001):
+            seed_cycle_capacity(self.engine)
             self.engine.tick_account("test")
             state = self.engine.state()["accounts"][0]["cycle_state"]
             self.assertEqual(state["phase"], "rolling_limit")

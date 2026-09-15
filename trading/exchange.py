@@ -659,6 +659,15 @@ class MarketData:
             try:
                 caps = {tier: positive(monitor.extract_bracket_cap(payload, symbol, tier), True)
                         for tier in monitor.SUPPORTED_LEVERAGES}
+                # Cycles follow the account's actual leverage, including levels
+                # outside the ordinary 5x / 10x / 20x strategy. Missing levels
+                # remain unavailable; never substitute a neighbouring tier.
+                for tier in range(1, 126):
+                    if tier not in caps:
+                        try:
+                            caps[tier] = positive(monitor.extract_bracket_cap(payload, symbol, tier), True)
+                        except monitor.MonitorError:
+                            continue
             except monitor.MonitorError as exc:
                 raise ExchangeError(str(exc)) from None
             if time.monotonic() - started >= PUBLIC_BRACKETS_MAX_AGE:

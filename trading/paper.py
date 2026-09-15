@@ -33,7 +33,7 @@ class DemoMarket:
 
     def capacities(self, symbol, leverages):
         values = {5: "156800", 10: "85000", 20: "32000"}
-        return {v: dec(values[v]) for v in leverages if v in TIERS}
+        return {v: dec(values[next(t for t in TIERS if t >= v)]) for v in leverages if 1 <= v <= 20}
 
     def depth(self, symbol):
         book = self.book(symbol)

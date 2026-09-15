@@ -8,6 +8,7 @@ export type CycleConfig = {
   spread_limit_bp: string;
   min_notional: string;
   max_notional: string;
+  capacity_multiplier: string;
   notional_scope: 'per_side' | 'gross';
   hold_seconds: number;
   daily_volume_limit: string;
@@ -183,6 +184,7 @@ export const DEFAULT_CYCLE: CycleConfig = {
   spread_limit_bp: '0.1',
   min_notional: '0',
   max_notional: '10000',
+  capacity_multiplier: '1',
   notional_scope: 'per_side',
   hold_seconds: 60,
   daily_volume_limit: '0',
@@ -272,6 +274,9 @@ export function parseCycleDraft(draft: CycleDraft): CycleConfig {
   const bp = amount(draft.spread_limit_bp, '价差上限（bp）', '100');
   const min = amount(draft.min_notional, '名义价值下限', '1000000');
   const max = amount(draft.max_notional, '名义价值上限', '1000000', true);
+  const multiplier = amount(draft.capacity_multiplier, '额度倍数', '100', true);
+  if (compare(multiplier, decimal('1', '额度倍数')) < 0)
+    throw new Error('额度倍数必须为 1 至 100，可使用小数');
   const dailyLimit = amount(
     draft.daily_volume_limit,
     '每日成交额度',
@@ -286,6 +291,7 @@ export function parseCycleDraft(draft: CycleDraft): CycleConfig {
     spread_limit_bp: bp.text,
     min_notional: min.text,
     max_notional: max.text,
+    capacity_multiplier: multiplier.text,
     notional_scope: draft.notional_scope,
     hold_seconds: cycleHoldSeconds(draft.hold_duration, draft.hold_unit),
     daily_volume_limit: dailyLimit.text,
@@ -301,7 +307,7 @@ const PHASES: Record<string, { label: string; reason: string }> = {
   attention: { label: '需要处理', reason: '请核对当前批次，确认成交后再继续' },
   waiting_open: {
     label: '等待开仓',
-    reason: '等待深度价差、可用额度与风险条件满足',
+    reason: '先等待公共额度达到目标金额的设定倍数，再检查热差价及风险条件',
   },
   opening: { label: '多空开仓中', reason: '正在提交并核对本轮多空开仓' },
   reconciling: { label: '核对中', reason: '正在核对成交，暂不开始下一步' },

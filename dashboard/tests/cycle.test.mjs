@@ -121,6 +121,31 @@ test('trading bounds are checked without losing significant decimal digits', () 
   );
 });
 
+test('capacity multiplier preserves decimals and rejects values below one or above 100', () => {
+  const draft = cycleDraft();
+  assert.equal(draft.capacity_multiplier, '1');
+  assert.equal(
+    parseCycleDraft({ ...draft, capacity_multiplier: '2.5' })
+      .capacity_multiplier,
+    '2.5',
+  );
+  for (const value of [
+    '0',
+    '0.99999999999999999999',
+    '-1',
+    '100.000000000000001',
+    'NaN',
+    'Infinity',
+  ])
+    assert.throws(
+      () => parseCycleDraft({ ...draft, capacity_multiplier: value }),
+      /额度倍数/,
+    );
+  const legacy = { ...DEFAULT_CYCLE };
+  delete legacy.capacity_multiplier;
+  assert.equal(cycleDraft(legacy).capacity_multiplier, '1');
+});
+
 test('missing or malformed numeric inputs never produce an executable configuration', () => {
   for (const key of [
     'spread_notional',

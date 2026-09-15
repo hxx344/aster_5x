@@ -328,6 +328,10 @@ class CycleHotEngineTests(unittest.TestCase):
                 harness.engine.cycle_signal_ready["test"] = (SYMBOL, "open", harness.engine.accounts_generation)
                 harness.engine.cycle_hot_waiting.add("test")
                 broker.refresh_cycle_hot_snapshot.return_value = True
+                cache = broker.cycle_cache
+                cache.configure([SYMBOL])
+                cache.set_connected(True)
+                cache.publish(cache.begin_refresh(), self.f.broker.snapshot([SYMBOL]), time.monotonic())
                 harness.engine.wake_cycle_hot_data("test")
             elif step == 3:
                 self.assertNotIn("test", harness.engine.cycle_hot_waiting)

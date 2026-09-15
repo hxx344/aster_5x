@@ -104,6 +104,8 @@ class _Harness:
         return WALL + self.ticks - 100
 
     def refresh(self, *, good=True):
+        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": self.wall, "capacities": {"5": "1000000"}}
+        self.engine.view("test", snapshot={"timestamp": self.wall, "positions": [{"symbol": SYMBOL, "leverage": 5}]})
         ask = "100" if good else "101"
         self.quote.book.return_value = Book(dec("100"), dec(ask), dec("1000"), dec("1000"), dec("100"), self.wall)
         self.depth.snapshot.return_value = DepthSnapshot(((Fraction(100), Fraction(1000)),),
@@ -271,6 +273,24 @@ class CycleWSSchedulerTests(unittest.TestCase):
         h.run(control)
         self.assertEqual([(call["at"], call["signal"] is not None) for call in h.calls],
             [(100, False), (101, True), (102, True), (103, True), (104, True), (105, True), (106, False)])
+
+    def test_capacity_update_at_worker_completion_rechecks_the_same_hot_quote(self):
+        h, held = self.h, _Future(done=False)
+        h.on_submit = lambda aid, signal: held if signal is not None and not h.fast_calls() else _Future()
+        def control(step):
+            if step == 2:
+                h.emit(101)
+            elif step == 3:
+                h.ticks = 101.5
+                h.engine.markets[SYMBOL]["checked_at"] = h.wall
+                held.complete = True
+                self.assertNotIn("test", h.engine.cycle_signal_deferred)
+            elif step == 4:
+                h.ticks = 102
+            elif step == 5:
+                h.engine.shutdown.set()
+        h.run(control)
+        self.assertEqual([call["at"] for call in h.fast_calls()], [101, 102])
 
     def test_expired_update_received_while_busy_is_not_executed_after_completion(self):
         h = self.h

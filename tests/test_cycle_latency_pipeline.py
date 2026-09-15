@@ -11,7 +11,7 @@ from unittest.mock import patch
 from eth_account import Account
 import httpx
 
-from tests.helpers import Fixture
+from tests.helpers import Fixture, seed_cycle_capacity
 from tests.test_exchange_hardening import account_responses
 from trading.cycle import DEFAULT_CYCLE
 from trading.engine import Engine
@@ -105,6 +105,7 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
             with patch.dict("os.environ", {"ASTER_ALLOW_LIVE": "1"}), patch.object(broker, "start_cycle_hot_data"):
                 engine.poll_cycle_hot_data("test")
         background_calls = dict(calls)
+        seed_cycle_capacity(engine)
         calls.clear()
         events.clear()
         if hot_state == "event":

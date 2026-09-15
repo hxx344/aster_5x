@@ -27,6 +27,7 @@ from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic
 from .cycle_guard import ordinary_add_blocks, ordinary_add_symbols, ordinary_selection
 from .cycle_quality import clock_tick, elapsed as observed_elapsed
 from .cycle_signal import cycle_signal_quote
+from .cycle_capacity import require_cycle_capacity
 from .models import cycle_margin_limit
 from .lock import ProcessLock
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
@@ -365,13 +366,15 @@ class Engine:
             state = self.views.get(account["id"], {}).get("cycle_state", {})
             if state.get("phase") in ("attention", "daily_limit", "rolling_limit"):
                 return None
+        progress = self.store.get("cycle:" + account["id"])
+        if not progress or progress.get("phase", "waiting_open") == "waiting_open":
+            self.require_cycle_open_capacity(account["cycle"], self.cycle_actual_leverage(account))
         if isinstance(self.market, MarketData):
             book, depth = self.market.stream.book(symbol), self.market.depth_stream.snapshot(symbol)
         else:
             book, depth = self.market.book(symbol), self.market.depth(symbol)
         if book is None or depth is None:
             return None
-        progress = self.store.get("cycle:" + account["id"])
         hint = cycle_signal_quote(account, progress, book, depth, self.market.rules[symbol], now=time.time())
         return {**hint, "depth": depth, "checked_at": time.time()} if hint else None
 
@@ -379,6 +382,7 @@ class Engine:
         """Coalesce updates; wake once per public-condition opportunity."""
         with self.lock:
             updates = self.cycle_market_updates.copy()
+            capacity_versions = {symbol: (row.get("status"), row.get("checked_at")) for symbol, row in self.markets.items()}
         live_ids = {account["id"] for account in accounts}
         self.cycle_signal_deferred.intersection_update(live_ids)
         for mapping in (self.cycle_signals, self.cycle_signal_seen, self.cycle_signal_ready, self.cycle_signal_after):
@@ -394,7 +398,7 @@ class Engine:
             # Leave the latest signal unseen until this account's existing work
             # finishes. No signal is ever allowed to create a second worker.
             if "account:" + aid in pending_keys:
-                identity = (signal["symbol"], signal["source"], signal["received_monotonic"], self.accounts_generation)
+                identity = (signal["symbol"], signal["source"], signal["received_monotonic"], self.accounts_generation, capacity_versions.get(signal["symbol"]))
                 if self.cycle_signal_seen.get(aid) != identity:
                     self.cycle_signal_deferred.add(aid)
                 continue
@@ -405,7 +409,7 @@ class Engine:
                 self.cycle_signals.pop(aid, None)
                 self.cycle_signal_ready.pop(aid, None)
                 continue
-            identity = (signal["symbol"], signal["source"], signal["received_monotonic"], self.accounts_generation)
+            identity = (signal["symbol"], signal["source"], signal["received_monotonic"], self.accounts_generation, capacity_versions.get(signal["symbol"]))
             if self.cycle_signal_seen.get(aid) == identity:
                 continue
             self.cycle_signal_seen[aid] = identity
@@ -432,7 +436,7 @@ class Engine:
         diagnostic = getattr(exc, "diagnostic", None)
         if not isinstance(diagnostic, dict):
             return False
-        if diagnostic.get("code") in ("reference_depth", "reference_spread", "close_depth", "close_spread"):
+        if diagnostic.get("code") in ("cycle_market_capacity", "reference_depth", "reference_spread", "close_depth", "close_spread"):
             return True
         if diagnostic.get("code") != "cycle_minimum_order":
             return False
@@ -518,6 +522,27 @@ class Engine:
         self.store.put(key, {"failures": count, "until": time.time() + delay})
         self.store.event(account_id, "waiting", f"{intent['symbol']} 本批无新增仓位，新开单等待 {delay} 秒；继续核对已有订单")
 
+    def cycle_actual_leverage(self, account):
+        symbol = account.get("cycle", {}).get("symbol")
+        broker = self.brokers.get(account["id"])
+        if isinstance(broker, LiveBroker):
+            try:
+                return broker.cycle_cache.lease([symbol]).snapshot.pair(symbol)[0].leverage
+            except TradingError:
+                return None
+        with self.lock:
+            snapshot = self.views.get(account["id"], {}).get("snapshot", {})
+            if not -1 <= time.time() - snapshot.get("timestamp", 0) <= 8:
+                return None
+            pair = [p for p in snapshot.get("positions", []) if p["symbol"] == symbol]
+            actual = {p["leverage"] for p in pair}
+        return next(iter(actual)) if len(actual) == 1 else None
+
+    def require_cycle_open_capacity(self, config, leverage, *, minimum_notional=0):
+        with self.lock:
+            row = self.markets.get(config["symbol"], {}).copy()
+        return require_cycle_capacity(config, leverage, row, now=time.time(), minimum_notional=minimum_notional)
+
     def cycle_capacity_targets(self, accounts):
         targets = {}
         with self.lock:
@@ -541,7 +566,7 @@ class Engine:
                     except TradingError:
                         pass
                 leverage = next(iter(actual)) if len(actual) == 1 else None
-                if leverage in TIERS:
+                if type(leverage) is int and 1 <= leverage <= 125:
                     targets.setdefault(symbol, set()).add(leverage)
         return targets
 
@@ -565,10 +590,10 @@ class Engine:
                 accounts = self.store.accounts()
             interval = CYCLE_CAPACITY_POLL_INTERVAL if targets else CAPACITY_POLL_INTERVAL
             full = time.monotonic() - self.capacity_full_checked.get(symbol, -math.inf) >= CAPACITY_POLL_INTERVAL
-            tiers = set(TIERS) if full or not targets else targets
+            tiers = set(TIERS) | targets if full or not targets else targets
             # Network latency is part of the capacity snapshot's age.
             checked_at = time.time()
-            capacities = {tier: value for tier, value in self.market.capacities(symbol, tiers).items() if tier in TIERS}
+            capacities = {tier: value for tier, value in self.market.capacities(symbol, tiers).items() if tier in tiers}
             with self.lock:
                 previous = self.markets.get(symbol, {})
                 values = {k: v for k, v in previous.get("capacities", {}).items() if int(k) not in tiers}
@@ -580,6 +605,8 @@ class Engine:
                        "fast_leverages": sorted(targets)}
                 self.markets[symbol] = {**previous, **json.loads(dumps(row))}
                 self.markets[symbol].pop("error", None)
+            if targets:
+                self.scheduler_event.set()
             # Wake execution before notification storage or quote I/O can delay it.
             if full or not targets:
                 self.wake_capacity_accounts(symbol, capacities, checked_at, accounts)
@@ -592,6 +619,7 @@ class Engine:
                 previous = self.markets.get(symbol, {})
                 self.markets[symbol] = {**previous, "status": "error", "error": str(exc) if isinstance(exc, TradingError) else "行情数据格式异常"}
             self.wake_capacity_accounts(symbol, {}, time.time(), [])
+            self.scheduler_event.set()
             if isinstance(exc, PublicBracketsUnavailable):
                 return CAPACITY_POLL_INTERVAL
             return max(10, getattr(exc, "retry_after", 0))
@@ -1018,6 +1046,7 @@ class Engine:
         snapshot.require_modes([symbol])
         progress = self.cycle_progress(account, snapshot)
         config = progress["config"]
+        opening_capacity = None
         if not account["enabled"] or self.shutdown.is_set():
             reason = account.get("pause_reason") or "循环已暂停，已有仓位和持仓计时保留"
             phase = "attention" if account.get("pause_reason") else "paused"
@@ -1031,6 +1060,7 @@ class Engine:
         allowances = {}
         if progress.get("phase") == "waiting_open":
             allowances = self.cycle_open_allowances(account)
+            opening_capacity = self.require_cycle_open_capacity(config, config["leverage"])
         retry_at = progress.get("retry_at") or 0
         if progress.get("phase") == "waiting_open" and time.time() < retry_at:
             reason = "上一批开仓未完成，等待冷却后重新检查"
@@ -1053,26 +1083,33 @@ class Engine:
         planning_started = clock_tick() if trigger is not None else None
         book, depth = self.cycle_book(symbol), self.cycle_depth(symbol)
         plan = plan_cycle(account, snapshot, book, depth, self.market.rules[symbol], progress,
-                          **allowances)
+                          market_capacity=opening_capacity, **allowances)
         if trigger is not None:
             planning_ms = observed_elapsed(planning_started, clock_tick())
             trigger = {**trigger, "pre_submit": {**trigger.get("pre_submit", {}),
                 "planning_ms": (planning_ms + public_prepare_ms
                                 if planning_ms is not None and public_prepare_ms is not None else None)}}
 
+        capacity_notional = plan.capacity_notional or 0
+
         def before_submit(fresh):
+            nonlocal capacity_notional
             if self.shutdown.is_set() or not self.live_allowed(account):
                 raise TradingError("多空循环已停止提交")
+            final_capacity = self.require_cycle_open_capacity(config, plan.leverage) if plan.phase == "open" else None
             final_book, final_depth = self.cycle_book(symbol), self.cycle_depth(symbol)
             current = plan_cycle(account, fresh, final_book, final_depth,
                                  self.market.rules[symbol], progress,
+                                 market_capacity=final_capacity,
                                  **(self.cycle_open_allowances(account) if plan.phase == "open" else {}))
             if current.phase != plan.phase or current.qty != plan.qty or current.leverage != plan.leverage:
                 raise TradingError("循环计划因账户或盘口变化需要重新计算")
+            capacity_notional = current.capacity_notional or 0
             return {"depth": final_depth, "checked_at": time.time(), "checked_monotonic": time.monotonic(),
                     "quality_plan": current}
 
         reason = executor.start(account, snapshot, plan, progress, before_submit=before_submit,
+                                before_send=(lambda: self.require_cycle_open_capacity(config, plan.leverage, minimum_notional=capacity_notional)) if plan.phase == "open" else None,
                                 **({"trigger": trigger} if trigger is not None else {}))
         remaining = self.store.intent(aid)
         status = "attention" if remaining and remaining["status"] == "attention" else "reconciling" if remaining else "running"
@@ -1133,6 +1170,10 @@ class Engine:
                         "queue_ms": observed_elapsed(cycle_signal["received_monotonic"], worker_started)}}
                     try:
                         ready = self.cycle_public_hint(account)
+                    except CycleConditionError as exc:
+                        self.cycle_wait(account, exc)
+                        self.view(account_id, status="waiting", reason=str(exc))
+                        return 5
                     except (TradingError, KeyError, ValueError, TypeError, OverflowError):
                         ready = None
                     if ready is None:
@@ -1384,7 +1425,7 @@ class Engine:
                     self.record_cycle_check(account, exc)
                 elif old_reason != message and log_wait:
                     self.store.event(account_id, "wait" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) else "error", message)
-                status = "waiting" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) else "error"
+                status = "waiting" if isinstance(exc, (BudgetWait, DailyVolumeLimitError)) or (getattr(exc, "diagnostic", None) or {}).get("code") == "cycle_market_capacity" else "error"
                 if isinstance(exc, (AccountModeError, CyclePositionError)):
                     self.store.pause_account(account, message)
                     pending = self.store.intent(account_id)
@@ -1908,8 +1949,10 @@ class Engine:
                                 seen = self.cycle_signal_seen.get(aid)
                                 with self.lock:
                                     latest_signal = self.cycle_market_updates.get(seen[0]) if seen else None
+                                    latest_capacity = self.markets.get(seen[0], {}) if seen else {}
                                 newer_signal = latest_signal and (latest_signal["source"], latest_signal["received_monotonic"]) != seen[1:3]
-                                if aid in self.cycle_signal_deferred or newer_signal:
+                                newer_capacity = seen and len(seen) > 4 and (latest_capacity.get("status"), latest_capacity.get("checked_at")) != seen[4]
+                                if aid in self.cycle_signal_deferred or newer_signal or newer_capacity:
                                     self.cycle_signal_ready.pop(aid, None)
                                     self.cycle_signal_seen.pop(aid, None)
                                     self.cycle_signal_deferred.discard(aid)

@@ -495,6 +495,28 @@ export function CyclePanel({
               : '例如上限 10,000：多头与空头名义价值合计最多 10,000 USD1。'}{' '}
             金额仅指本轮新增量。下单需扣除原仓占用后仍有当前杠杆额度，并满足可用保证金及循环保证金上限。
           </p>
+          <label htmlFor="cycle-capacity-multiplier">
+            开仓额度倍数 <span>1–100 倍，支持小数</span>
+            <Input
+              id="cycle-capacity-multiplier"
+              type="number"
+              min="1"
+              max="100"
+              step="any"
+              required
+              value={draft.capacity_multiplier}
+              onChange={(event) =>
+                field('capacity_multiplier', event.target.value)
+              }
+            />
+          </label>
+          <p className="muted">
+            先检查实际杠杆的公共余量 ≥ 本轮多空合计目标金额 ×
+            倍数，再检查热差价；提交前再次核对。
+            目标金额按上面的名义价值上限计算：每边 10,000 USD1、2
+            倍，需要公共余量至少 40,000 USD1。
+            减仓不检查额度，只减回本轮新增数量，保留原始多空持仓。
+          </p>
           <div className="cycle-fields">
             <label htmlFor="cycle-hold">
               最短持仓时间

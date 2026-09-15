@@ -273,7 +273,7 @@ class RequestBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_remains_responsive_while_all_sync_workers_are_busy(self):
         started, release = threading.Event(), threading.Event()
 
-        def blocked_state():
+        def blocked_state(**kwargs):
             started.set()
             if not release.wait(timeout=5):
                 raise RuntimeError("Test did not release blocked state")

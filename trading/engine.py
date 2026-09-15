@@ -34,6 +34,7 @@ from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, val
 from .migration_execution import MigrationExecutor
 from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
+from .report_cache import ReportCache
 from .store import dumps
 
 LOG = logging.getLogger("aster.trading")
@@ -151,6 +152,7 @@ class Engine:
         self.brokers, self.signers, self.users = {}, {}, {}
         self.markets, self.views, self.rotation = {}, {}, {}
         self.display_snapshots = {}
+        self.dashboard_reports = ReportCache(self._load_dashboard_report)
         self.wake_accounts, self.urgent_accounts = set(), set()
         self.priority_accounts, self.priority_levels = {}, {}
         self.priority_followups, self.active_priority_accounts = set(), set()
@@ -927,14 +929,15 @@ class Engine:
         updates.setdefault("diagnostic", None)
         self.view(account["id"], cycle_state={**saved, **updates})
 
-    def cycle_volume_state(self, account, now=None, *, symbol=None):
+    def cycle_volume_state(self, account, now=None, *, symbol=None, _store=None):
+        store = self.store if _store is None else _store
         symbol = validate_cycle(account.get("cycle"))["symbol"] if symbol is None else symbol
         now = time.time() if now is None else now
-        daily = self.store.cycle_daily_volume(account["id"], now=now, symbol=symbol)
-        rolling = self.store.cycle_rolling_volume(account["id"], now=now, symbol=symbol)
+        daily = store.cycle_daily_volume(account["id"], now=now, symbol=symbol)
+        rolling = store.cycle_rolling_volume(account["id"], now=now, symbol=symbol)
         limit = dec(validate_cycle(account.get("cycle"))["daily_volume_limit"])
         # Yesterday's unresolved fills can still consume the rolling allowance.
-        backlog = self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, rolling["window_start"]), symbol=symbol)
+        backlog = store.cycle_volume_backlog(account["id"], limit=1, since=max(0, rolling["window_start"]), symbol=symbol)
         def allowance(record):
             used = Fraction(dec(record["volume"]))
             remaining = max(Fraction(0), Fraction(limit) - used)
@@ -1836,43 +1839,50 @@ class Engine:
             self.notification_error = "飞书配置无效"
         return 5
 
-    def state(self):
-        # Database I/O must not hold the view lock shared by all account workers.
+    def _cycle_report(self, store, account, now):
+        aid = account["id"]
+        symbol = validate_cycle(account.get("cycle"))["symbol"]
+        volumes = {item: self.cycle_volume_state(account, now=now, symbol=item, _store=store) for item in SYMBOLS}
+        trades = store.cycle_trade_records(aid, limit=100)
+        try:
+            fills = store.cycle_cost_records(aid, now=now, limit=100)
+            report = calculate_cycle_costs(fills, now=now)
+            trade_costs = {(row["symbol"], row["trade_id"]): row for row in report["trades"]}
+            for trade in trades:
+                cost = trade_costs.get((trade["symbol"], trade["trade_id"]))
+                if cost is not None:
+                    trade["cost"] = {key: value for key, value in cost.items() if key not in ("symbol", "trade_id")}
+            selected = [fill for fill in fills if fill["symbol"] == symbol]
+            costs = report if len(selected) == len(fills) else calculate_cycle_costs(selected, now=now)
+        except Exception as exc:
+            # Reporting never turns missing costs into a zero-cost claim.
+            LOG.warning("Cycle cost report unavailable (%s)", type(exc).__name__)
+            unavailable = {"taker_rate": "0.000125", "taker_rate_percent": "0.0125",
+                           "taker_fee": None, "spread_cost": None, "total_cost": None,
+                           "unmatched_notional": None, "unmatched_fill_count": None,
+                           "complete": False, "error": "成本统计暂不可用，等待重新读取成交记录"}
+            costs = {"daily": dict(unavailable), "rolling": dict(unavailable)}
+        return {"volumes": volumes, "trades": trades, "costs": {key: costs[key] for key in ("daily", "rolling")}}
+
+    def _load_dashboard_report(self, account, now):
+        with self.store.read_snapshot() as reader:
+            return self._cycle_report(reader, account, now)
+
+    def state(self, *, background_reports=False):
+        # HTTP reads neither wait on the execution writer lock nor calculate
+        # history. Synchronous reports remain available to local diagnostics.
         state_now = time.time()
-        saved_accounts = self.store.accounts()
-        events = self.store.events()
-        pending_notifications = self.store.pending_notifications()
-        migration_records = {a["id"]: (self.store.get("migration:" + a["id"]) or {}, self.store.intent(a["id"])) for a in saved_accounts}
-        cycle_records = {a["id"]: self.store.get("cycle:" + a["id"]) or {} for a in saved_accounts}
-        cycle_quality = {a["id"]: self.store.get("cycle_execution:" + a["id"]) for a in saved_accounts}
+        with self.store.read_snapshot() as reader:
+            saved_accounts = reader.accounts()
+            events = reader.events()
+            pending_notifications = reader.pending_notifications()
+            migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
+            cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
+            cycle_quality = {a["id"]: reader.get("cycle_execution:" + a["id"]) for a in saved_accounts}
         cycle_selection = {a["id"]: validate_cycle(a.get("cycle"))["symbol"] for a in saved_accounts}
-        symbol_volumes = {a["id"]: {symbol: self.cycle_volume_state(a, now=state_now, symbol=symbol)
-                                     for symbol in SYMBOLS} for a in saved_accounts}
-        cycle_volumes = {a["id"]: symbol_volumes[a["id"]][cycle_selection[a["id"]]] for a in saved_accounts}
-        cycle_trades = {a["id"]: self.store.cycle_trade_records(a["id"], limit=100) for a in saved_accounts}
+        reports = self.dashboard_reports.read(saved_accounts, state_now) if background_reports else {
+            a["id"]: (self._cycle_report(self.store, a, state_now), None) for a in saved_accounts}
         add_blocks = {a["id"]: ordinary_add_blocks(a) for a in saved_accounts}
-        cycle_costs = {}
-        for account in saved_accounts:
-            aid = account["id"]
-            try:
-                fills = self.store.cycle_cost_records(aid, now=state_now, limit=100)
-                report = calculate_cycle_costs(fills, now=state_now)
-                trade_costs = {(row["symbol"], row["trade_id"]): row for row in report["trades"]}
-                for trade in cycle_trades[aid]:
-                    cost = trade_costs.get((trade["symbol"], trade["trade_id"]))
-                    if cost is not None:
-                        trade["cost"] = {key: value for key, value in cost.items() if key not in ("symbol", "trade_id")}
-                cycle_costs[aid] = calculate_cycle_costs(
-                    [fill for fill in fills if fill["symbol"] == cycle_selection[aid]], now=state_now)
-            except Exception as exc:
-                # Cost reporting is read-only and must not interrupt the account
-                # controls or turn a missing calculation into a zero-cost claim.
-                LOG.warning("Cycle cost report unavailable (%s)", type(exc).__name__)
-                unavailable = {"taker_rate": "0.000125", "taker_rate_percent": "0.0125",
-                               "taker_fee": None, "spread_cost": None, "total_cost": None,
-                               "unmatched_notional": None, "unmatched_fill_count": None,
-                               "complete": False, "error": "成本统计暂不可用，等待重新读取成交记录"}
-                cycle_costs[aid] = {"daily": dict(unavailable), "rolling": dict(unavailable)}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
@@ -1939,7 +1949,9 @@ class Engine:
                 if current_cycle.get("run_id") != saved_cycle.get("run_id"):
                     current_cycle = {}
                 cycle = {**saved_cycle, **current_cycle}
-                daily, rolling = (cycle_volumes[account["id"]][key] for key in ("daily_volume", "rolling_volume"))
+                report, report_status = reports[account["id"]]
+                selected_volumes = report["volumes"][cycle_selection[account["id"]]] if report else {}
+                daily, rolling = (selected_volumes.get(key) for key in ("daily_volume", "rolling_volume"))
                 # Durable phase/ownership must win after an executor completes.
                 if saved_cycle.get("updated_at", 0) > current_cycle.get("updated_at", 0):
                     cycle.update(saved_cycle, diagnostic=None)
@@ -1956,13 +1968,15 @@ class Engine:
                 else:
                     cycle.setdefault("phase", "waiting_open")
                     cycle.setdefault("reason", "等待多空循环检查")
-                    if not cycle.get("opened_at") and rolling["reached"] and dec(rolling["volume"]) > dec(daily["volume"]):
+                    # Background statistics describe their own as-of time; they
+                    # cannot overwrite the current executor phase or diagnostics.
+                    if not background_reports and not cycle.get("opened_at") and rolling["reached"] and dec(rolling["volume"]) > dec(daily["volume"]):
                         cycle.update(phase="rolling_limit", reason="已达到滚动 24 小时成交量上限，等待历史成交移出窗口")
-                    elif not cycle.get("opened_at") and daily["reached"]:
+                    elif not background_reports and not cycle.get("opened_at") and daily["reached"]:
                         cycle.update(phase="daily_limit", reason="已达到 UTC 每日成交量上限，待日额度和滚动 24 小时额度均满足后自动恢复")
-                    elif not cycle.get("opened_at") and rolling["reached"]:
+                    elif not background_reports and not cycle.get("opened_at") and rolling["reached"]:
                         cycle.update(phase="rolling_limit", reason="已达到滚动 24 小时成交量上限，等待历史成交移出窗口")
-                    elif cycle.get("phase") in ("daily_limit", "rolling_limit"):
+                    elif not background_reports and cycle.get("phase") in ("daily_limit", "rolling_limit"):
                         previous_remaining = cycle.get("quota_remaining")
                         if daily["effective_remaining"] is None or (previous_remaining is not None and
                                 dec(daily["effective_remaining"]) > dec(previous_remaining)):
@@ -1972,11 +1986,13 @@ class Engine:
                     cycle["active_batch"] = None
                 if active_cycle or cycle.get("phase") not in ("waiting_open", "waiting_close", "daily_limit", "rolling_limit"):
                     cycle["diagnostic"] = None
-                if active_cycle and pending.get("volume_error"):
+                if report and active_cycle and pending.get("volume_error"):
                     daily = {**daily, "sync_pending": True, "error": pending["volume_error"]}
                     rolling = {**rolling, "sync_pending": True, "error": pending["volume_error"]}
                 for volume, window in ((daily, "daily"), (rolling, "rolling")):
-                    cost = dict(cycle_costs[account["id"]][window])
+                    if volume is None:
+                        continue
+                    cost = dict(report["costs"][window])
                     # An active batch may contain submitted orders whose fills
                     # have not reached the ledger yet, even without an error.
                     sync_pending = bool(volume["sync_pending"] or active_cycle and pending["kind"] == "cycle")
@@ -1985,14 +2001,20 @@ class Engine:
                         cost["complete"] = False
                         cost["error"] = volume.get("error") or cost.get("error")
                     volume["cost"] = cost
-                cycle["volume_by_symbol"] = symbol_volumes[account["id"]]
-                cycle["daily_volume"] = daily
-                cycle["rolling_volume"] = rolling
+                cycle["report_status"] = report_status
+                if report:
+                    cycle["volume_by_symbol"] = report["volumes"]
+                    cycle["daily_volume"] = daily
+                    cycle["rolling_volume"] = rolling
+                    account["cycle_trades"] = report["trades"]
+                else:
+                    for key in ("volume_by_symbol", "daily_volume", "rolling_volume"):
+                        cycle.pop(key, None)
+                    account.pop("cycle_trades", None)
                 cycle["execution_quality"] = cycle_quality[account["id"]]
                 if cycle.get("opened_at") is not None:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
-                account["cycle_trades"] = cycle_trades[account["id"]]
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
                 "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,
@@ -2242,5 +2264,6 @@ class Engine:
                 self.revoke_cycle_hot_data(aid, "交易服务正在停止")
             if self.thread:
                 self.thread.join(timeout=90)
+            self.dashboard_reports.close()
             if not self.thread or not self.thread.is_alive():
                 self.process_lock.release()

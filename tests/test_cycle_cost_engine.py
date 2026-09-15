@@ -144,5 +144,10 @@ class CycleCostStateTests(TestCase):
             with patch("trading.engine.calculate_cycle_costs", side_effect=ValueError("invalid ledger row")), \
                  self.assertLogs("aster.trading", level="WARNING"):
                 response = client.get("/api/state")
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn("daily_volume", response.json()["accounts"][0]["cycle_state"])
+                self.engine.dashboard_reports.worker.join(timeout=5)
+                self.assertFalse(self.engine.dashboard_reports.worker.is_alive())
+                response = client.get("/api/state")
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.json()["accounts"][0]["cycle_state"]["daily_volume"]["cost"]["taker_fee"])

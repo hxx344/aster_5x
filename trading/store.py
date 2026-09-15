@@ -203,6 +203,23 @@ class Store:
             finally:
                 db.close()
 
+    @contextmanager
+    def read_snapshot(self):
+        """Dashboard reads use a consistent WAL snapshot, outside the writer lock.
+
+        SQLite enforces read-only access even if a caller accidentally invokes a
+        mutating Store method. This connection never migrates or creates a DB.
+        """
+        db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=.25)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            reader = _StoreSnapshot(self.path, db)
+            yield reader
+        finally:
+            db.close()
+
     def bind_runtime_mode(self, *, demo):
         """Bind HTTP exposure before an Engine can seed or publish account data."""
         with self.connect() as db:
@@ -980,3 +997,13 @@ class Store:
     def pending_notifications(self):
         with self.connect() as db:
             return db.execute("SELECT count(*) FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>0)").fetchone()[0]
+
+
+class _StoreSnapshot(Store):
+    """Single-threaded reader sharing one read-only transaction."""
+    def __init__(self, path, db):
+        self.path, self.db = path, db
+
+    @contextmanager
+    def connect(self):
+        yield self.db

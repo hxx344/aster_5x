@@ -10,9 +10,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import type { CycleTrade } from '@/lib/cycle';
+import type { CycleReportStatus, CycleTrade } from '@/lib/cycle';
 import {
   cycleAmount,
+  cycleReportSummary,
   cycleTradeAction,
   cycleTradeCostView,
   cycleTradeDates,
@@ -26,13 +27,22 @@ type Props = {
   accountName: string;
   trades?: CycleTrade[];
   stale: boolean;
+  reportStatus?: CycleReportStatus | null;
+  now: number;
 };
 
-export function CycleTradesPanel({ accountName, trades, stale }: Props) {
+export function CycleTradesPanel({
+  accountName,
+  trades,
+  stale,
+  reportStatus,
+  now,
+}: Props) {
   const [selectedDate, setSelectedDate] = useState('');
   const dates = cycleTradeDates(trades);
   const rows = cycleTradesForDate(trades, selectedDate);
   const selectedMissing = selectedDate && !dates.includes(selectedDate);
+  const report = cycleReportSummary(reportStatus, now);
 
   return (
     <section
@@ -44,8 +54,13 @@ export function CycleTradesPanel({ accountName, trades, stale }: Props) {
           <h2 id="cycle-trades-heading">循环成交明细</h2>
           <p>
             {accountName} · 最近 {trades?.length ?? 0} 条已加载记录
-            {stale ? ' · 最近记录，等待刷新' : ''}
+            {stale || report.stale ? ' · 最近记录，等待刷新' : ''}
           </p>
+          {report.notice ? (
+            <p className={stale || report.stale ? 'amber' : 'muted'}>
+              {report.notice}
+            </p>
+          ) : null}
         </div>
         <div className="cycle-date-filter">
           <label htmlFor="cycle-trade-date">成交日期 · UTC</label>

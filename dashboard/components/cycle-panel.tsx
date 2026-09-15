@@ -26,6 +26,7 @@ import {
 import {
   cycleAmount,
   cycleDailySummary,
+  cycleReportSummary,
   cycleRollingSummary,
 } from '@/lib/cycle-daily';
 import { CycleCostSummary } from '@/components/cycle-cost-summary';
@@ -121,8 +122,10 @@ export function CyclePanel({
     stale,
   );
   const spread = cycleSpreadView(state, now, stale);
-  const daily = cycleDailySummary(state?.daily_volume, now, stale);
-  const rolling = cycleRollingSummary(state?.rolling_volume, now, stale);
+  const report = cycleReportSummary(state?.report_status, now);
+  const reportStale = stale || report.stale;
+  const daily = cycleDailySummary(state?.daily_volume, now, reportStale);
+  const rolling = cycleRollingSummary(state?.rolling_volume, now, reportStale);
   const marginLimit = cycleMarginLimit(account.risk_limits);
   const marginLabel =
     marginLimit === null
@@ -170,6 +173,9 @@ export function CyclePanel({
           {account.cycle?.symbol ?? 'XAUUSD1'} 成交额度{' '}
           <span>UTC 日统计 · {daily.date}</span>
         </h3>
+        {report.notice ? (
+          <p className={reportStale ? 'amber' : 'muted'}>{report.notice}</p>
+        ) : null}
         <dl className="cycle-daily-grid">
           <div>
             <dt>已成交 · USD1</dt>
@@ -192,7 +198,7 @@ export function CyclePanel({
         <CycleCostSummary
           label="UTC 当日成本"
           cost={state?.daily_volume?.cost}
-          stale={stale || daily.rolloverPending}
+          stale={reportStale || daily.rolloverPending}
         />
         <p>
           UTC 日额度重置：<time>{daily.resetAt}</time>
@@ -260,6 +266,9 @@ export function CyclePanel({
       {state?.volume_by_symbol ? (
         <section aria-label="各品种循环成交量">
           <h3>各品种独立统计 · USD1</h3>
+          {report.notice ? (
+            <p className={reportStale ? 'amber' : 'muted'}>{report.notice}</p>
+          ) : null}
           <dl className="migration-details cycle-details">
             {Object.entries(state.volume_by_symbol).map(([symbol, volumes]) => (
               <div key={symbol}>

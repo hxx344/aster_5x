@@ -21,6 +21,7 @@ export type CycleDraft = Omit<CycleConfig, 'leverage' | 'hold_seconds'> & {
 };
 
 export type CycleState = {
+  report_status?: CycleReportStatus | null;
   phase?: string;
   reason?: string;
   run_id?: string;
@@ -45,6 +46,14 @@ export type CycleState = {
   >;
   diagnostic?: CycleDiagnostic | null;
   execution_quality?: CycleExecutionQuality | null;
+};
+
+export type CycleReportStatus = {
+  as_of: number | null;
+  max_age_seconds: number;
+  status: 'loading' | 'ready' | 'stale' | 'error';
+  refreshing: boolean;
+  error: string | null;
 };
 
 export function cycleRecoveryReason(

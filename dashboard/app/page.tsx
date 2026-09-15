@@ -998,6 +998,8 @@ export default function Home() {
                     key={account.id}
                     accountName={account.name}
                     trades={account.cycle_trades}
+                    reportStatus={account.cycle_state?.report_status}
+                    now={serverNow}
                     stale={
                       Boolean(connectionError) ||
                       !state?.updated_at ||

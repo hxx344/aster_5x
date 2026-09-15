@@ -285,7 +285,7 @@ def create_app(engine=None, *, demo=False, start_engine=True):
 
     @app.get("/api/state", dependencies=[Depends(authenticated)])
     def state():
-        return engine.state()
+        return engine.state(background_reports=True)
 
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
 

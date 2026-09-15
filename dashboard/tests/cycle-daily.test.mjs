@@ -4,6 +4,7 @@ import { cycleDraft, cycleStatus, parseCycleDraft } from '../lib/cycle.ts';
 import {
   cycleAmount,
   cycleDailySummary,
+  cycleReportSummary,
   cycleTradeAction,
   cycleTradeDates,
   cycleTradesForDate,
@@ -14,6 +15,44 @@ import {
 } from '../lib/cycle-daily.ts';
 
 const midnight = Date.parse('2026-09-14T00:00:00Z') / 1000;
+
+test('background report distinguishes loading, age, refresh failure and UTC rollover', () => {
+  const status = {
+    status: 'ready',
+    as_of: midnight + 100,
+    max_age_seconds: 15,
+    refreshing: false,
+    error: null,
+  };
+  const current = cycleReportSummary(status, midnight + 101);
+  assert.equal(current.stale, false);
+  assert.match(current.notice, /2026-09-14 00:01:40 UTC/);
+  assert.equal(cycleReportSummary(status, midnight + 115).stale, true);
+  assert.equal(cycleReportSummary(status, midnight + 99).stale, true);
+  assert.equal(
+    cycleReportSummary({ ...status, as_of: midnight - 1 }, midnight).stale,
+    true,
+  );
+  assert.match(
+    cycleReportSummary({ ...status, refreshing: true }, midnight + 101).notice,
+    /正在更新/,
+  );
+  const failed = cycleReportSummary(
+    { ...status, error: 'retrying', status: 'stale' },
+    midnight + 101,
+  );
+  assert.equal(failed.stale, true);
+  assert.match(failed.notice, /更新失败，保留上次结果/);
+  assert.match(
+    cycleReportSummary({ ...status, as_of: null, status: 'loading' }, midnight)
+      .notice,
+    /等待首次结果/,
+  );
+  assert.deepEqual(cycleReportSummary(undefined, midnight), {
+    stale: false,
+    notice: '',
+  });
+});
 const daily = {
   utc_date: '2026-09-13',
   volume: '39999.99999999999999',

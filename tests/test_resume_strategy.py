@@ -33,6 +33,7 @@ class ResumeStrategyTests(unittest.TestCase):
             app = create_app(self.engine, start_engine=False)
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
+        self.addCleanup(self.engine.dashboard_reports.close)
         self.client.headers["origin"] = "http://testserver"
         result = self.client.post("/api/login", json={"password": password})
         self.assertEqual(result.status_code, 200, result.text)

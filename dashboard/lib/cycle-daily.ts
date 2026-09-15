@@ -1,10 +1,39 @@
 import type {
   CycleDailyVolume,
+  CycleReportStatus,
   CycleRollingVolume,
   CycleTrade,
   CycleTradeCost,
   CycleWindowCost,
 } from './cycle';
+
+export function cycleReportSummary(
+  report: CycleReportStatus | null | undefined,
+  now: number,
+) {
+  if (!report) return { stale: false, notice: '' };
+  const stamp = report.as_of;
+  const known =
+    typeof stamp === 'number' && Number.isFinite(stamp) && stamp >= 0;
+  const stale =
+    report.status !== 'ready' ||
+    !known ||
+    cycleUtcDate(now) !== cycleUtcDate(stamp) ||
+    now < stamp ||
+    now - stamp >= report.max_age_seconds;
+  const notice = !known
+    ? report.error || '成交统计正在读取，等待首次结果'
+    : `成交统计截至 ${cycleUtcTime(stamp)}${
+        report.error
+          ? ' · 更新失败，保留上次结果'
+          : stale
+            ? ' · 数据待更新'
+            : report.refreshing
+              ? ' · 正在更新'
+              : ''
+      }`;
+  return { stale, notice };
+}
 
 // Keep monetary strings exact, including cumulative values above Number's
 // precise range. The server owns aggregation and UTC day assignment.
@@ -77,7 +106,7 @@ export function cycleCostSummary(
     ...amounts,
     complete,
     notice,
-    staleNotice: stale ? '成本数据待刷新，以下为最近统计' : '',
+    staleNotice: stale && cost ? '成本数据待刷新，以下为最近统计' : '',
     unmatched,
     unmatchedCount: knownCount ? String(count) : '—',
     hasUnmatched,

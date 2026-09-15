@@ -93,6 +93,7 @@ test('missing or failed cost reports never become a complete zero-cost report', 
   assert.equal(absent.fee, '—');
   assert.equal(absent.complete, false);
   assert.match(absent.notice, /尚未提供/);
+  assert.equal(cycleCostSummary(undefined, true).staleNotice, '');
   const failed = cycleCostSummary({
     ...cost,
     taker_fee: null,

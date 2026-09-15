@@ -108,6 +108,7 @@ class CycleDiagnosticStateTests(TestCase):
         with patch.dict(os.environ, {"ASTER_DASHBOARD_PASSWORD": "test-only-diagnostic-password"}, clear=True):
             client = TestClient(create_app(self.engine, start_engine=False))
             self.addCleanup(client.close)
+            self.addCleanup(self.engine.dashboard_reports.close)
             client.headers["origin"] = "http://testserver"
             self.assertEqual(client.get("/api/state").status_code, 401)
             self.assertEqual(client.post("/api/login", json={"password": "test-only-diagnostic-password"}).status_code, 200)

@@ -150,6 +150,7 @@ class Engine:
         self.budget_wait_events = {}
         self.brokers, self.signers, self.users = {}, {}, {}
         self.markets, self.views, self.rotation = {}, {}, {}
+        self.display_snapshots = {}
         self.wake_accounts, self.urgent_accounts = set(), set()
         self.priority_accounts, self.priority_levels = {}, {}
         self.priority_followups, self.active_priority_accounts = set(), set()
@@ -1882,6 +1883,27 @@ class Engine:
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             for account in accounts:
+                previous_display = self.display_snapshots.get(account["id"])
+                if previous_display and previous_display["timestamp"] > (account.get("snapshot") or {}).get("timestamp", 0):
+                    account["snapshot"] = previous_display
+                # Display the already-refreshed exchange values even while the
+                # ordinary strategy worker waits for its budgeted turn. Keep
+                # this response-only: execution views and leases are unchanged.
+                broker = self.brokers.get(account["id"])
+                if account["enabled"] and account.get("cycle", {}).get("enabled") and isinstance(broker, LiveBroker):
+                    try:
+                        lease = broker.cycle_cache.lease([account["cycle"]["symbol"]])
+                        if lease.snapshot.timestamp > (account.get("snapshot") or {}).get("timestamp", 0):
+                            displayed = snapshot_json(lease.snapshot, [account["cycle"]["symbol"]])
+                            lease.require_fresh()
+                            account["snapshot"] = displayed
+                            self.display_snapshots[account["id"]] = displayed
+                    except (TradingError, KeyError, TypeError, ValueError):
+                        # Failed, expired or revoked background data never
+                        # renews the timestamp of the last displayed reading.
+                        pass
+                if account["id"] in self.display_snapshots:
+                    self.display_snapshots[account["id"]] = account["snapshot"]
                 # This is selected-account policy, not a global market lock.
                 # Recompute from saved configuration so an older view cannot
                 # retain a block after the cycle selection changes.

@@ -1,5 +1,6 @@
 """Account maintenance stays independent of trading and retains revocation."""
 from copy import deepcopy
+from dataclasses import replace
 import threading
 import time
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from tests.helpers import Fixture
 from tests.test_cycle_ws_scheduler import _Future, _Harness
 from trading.account_cache import CycleAccountCache, HotAccountUnavailable
 from trading.cycle import DEFAULT_CYCLE
-from trading.engine import CYCLE_HOT_POLL_INTERVAL, Engine
+from trading.engine import CYCLE_HOT_POLL_INTERVAL, Engine, snapshot_json
 from trading.exchange import ExchangeError, LiveBroker
 
 
@@ -58,6 +59,95 @@ class CycleHotEngineTests(unittest.TestCase):
         broker.refresh_cycle_hot_snapshot.return_value = False
         harness.engine.brokers["test"] = broker
         return harness, broker
+
+    def test_dashboard_uses_background_account_refresh_without_waiting_for_a_trade_tick(self):
+        old = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() - 60), [SYMBOL])
+        self.engine.view("test", status="waiting", reason="等待价差", snapshot=old, credential_ready=True)
+        self.f.broker.state["wallet"] = "30000"
+        self.f.broker.state["positions"][SYMBOL + ":LONG"].update(qty="1", entry="4400")
+        self.f.broker.save()
+        self.assertEqual(self.engine.poll_cycle_hot_data("test"), CYCLE_HOT_POLL_INTERVAL)
+        reads = self.broker.refresh_cycle_hot_snapshot.call_count
+        with patch.object(self.engine, "tick_account", side_effect=AssertionError("display must not execute strategy")), \
+             patch.object(self.broker, "cycle_snapshot", side_effect=AssertionError("state must not make REST reads")):
+            current = self.engine.state()["accounts"][0]
+        self.assertEqual(current["snapshot"]["wallet"], "30000")
+        self.assertEqual(next(p["qty"] for p in current["snapshot"]["positions"]
+                              if p["symbol"] == SYMBOL and p["side"] == "LONG"), "1")
+        self.assertGreater(current["snapshot"]["timestamp"], old["timestamp"])
+        self.assertEqual((current["status"], current["reason"]), ("waiting", "等待价差"))
+        self.assertEqual(self.engine.views["test"]["snapshot"], old)
+        self.assertEqual(self.broker.refresh_cycle_hot_snapshot.call_count, reads)
+        self.assertFalse(self.f.broker.state["orders"])
+        self.api.call.assert_not_called()
+
+    def test_dashboard_does_not_replace_a_newer_execution_snapshot(self):
+        current = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() + .1), [SYMBOL])
+        self.engine.view("test", snapshot=current)
+        self.assertEqual(self.engine.state()["accounts"][0]["snapshot"], current)
+        self.api.call.assert_not_called()
+
+    def test_cache_revocation_keeps_the_latest_display_without_reverting_or_renewing_it(self):
+        old = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() - 60), [SYMBOL])
+        self.engine.view("test", snapshot=old)
+        displayed = self.engine.state()["accounts"][0]["snapshot"]
+        self.assertGreater(displayed["timestamp"], old["timestamp"])
+        self.broker.invalidate_cycle_hot_data("账户更新暂不可用")
+        self.assertEqual(self.engine.state()["accounts"][0]["snapshot"], displayed)
+        newer = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() + .1), [SYMBOL])
+        self.engine.view("test", snapshot=newer)
+        self.assertEqual(self.engine.state()["accounts"][0]["snapshot"], newer)
+        self.engine.view("test", snapshot=old)
+        self.assertEqual(self.engine.state()["accounts"][0]["snapshot"], newer)
+        self.api.call.assert_not_called()
+
+    def test_unavailable_background_data_keeps_original_display_and_timestamp(self):
+        old = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() - 60), [SYMBOL])
+        self.engine.view("test", snapshot=old)
+        for failure in ("disconnected", "invalidated", "expired", "wrong_symbol", "read_failed"):
+            with self.subTest(failure=failure):
+                self.broker.cycle_cache = CycleAccountCache()
+                self.warm()
+                if failure == "disconnected":
+                    self.broker.cycle_cache.set_connected(False)
+                elif failure == "invalidated":
+                    self.broker.invalidate_cycle_hot_data("订单变化")
+                elif failure == "expired":
+                    self.broker.cycle_cache._monotonic = lambda: time.monotonic() + 9
+                elif failure == "wrong_symbol":
+                    self.broker.cycle_cache.configure(["CLUSD1"])
+                else:
+                    ticket = self.broker.cycle_cache.begin_refresh()
+                    self.broker.cycle_cache.fail(ticket, RuntimeError("read failed"))
+                self.assertEqual(self.engine.state()["accounts"][0]["snapshot"], old)
+        self.api.call.assert_not_called()
+
+    def test_revocation_during_response_preparation_cannot_publish_old_account_data(self):
+        old = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() - 60), [SYMBOL])
+        self.engine.view("test", snapshot=old)
+
+        def serialize_then_revoke(*args):
+            result = snapshot_json(*args)
+            self.broker.invalidate_cycle_hot_data("提交订单后账户数据已失效")
+            return result
+
+        with patch("trading.engine.snapshot_json", side_effect=serialize_then_revoke):
+            self.assertEqual(self.engine.state()["accounts"][0]["snapshot"], old)
+        self.api.call.assert_not_called()
+
+    def test_other_or_paused_accounts_do_not_use_this_accounts_background_snapshot(self):
+        old = snapshot_json(replace(self.f.broker.snapshot([SYMBOL]), timestamp=time.time() - 60), [SYMBOL])
+        self.engine.view("test", snapshot=old)
+        other = {**self.row, "id": "other", "name": "其他账户"}
+        self.f.store.save_account(other)
+        self.engine.view("other", snapshot=old)
+        views = {a["id"]: a for a in self.engine.state()["accounts"]}
+        self.assertEqual(views["other"]["snapshot"], old)
+        self.f.store.save_account({**self.row, "enabled": False})
+        with patch.object(self.broker.cycle_cache, "lease", side_effect=AssertionError("paused account must not consume hot data")):
+            paused = next(a for a in self.engine.state()["accounts"] if a["id"] == "test")
+        self.assertEqual(paused["snapshot"], views["test"]["snapshot"])
+        self.api.call.assert_not_called()
 
     def test_inactive_accounts_stop_existing_stream_without_creating_a_broker(self):
         for state in ("paused", "cycle_disabled", "paper", "not_authorized", "shutdown", "missing"):

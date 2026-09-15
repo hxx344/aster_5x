@@ -730,6 +730,29 @@ class Store:
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
                        (intent["account_id"], "cycle", progress.get("reason", "多空循环批次已核对"), time.time()))
 
+    def confirm_cycle_recovery(self, account, previous, progress, review):
+        """Archive the acknowledged state and reset tracking atomically, without trading."""
+        aid, now = account["id"], time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+            old = db.execute("SELECT data FROM kv WHERE key=?", ("cycle:" + aid,)).fetchone()
+            pending = db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone()
+            if (not saved or self.account_defaults(json.loads(saved[0])) != account or not old
+                    or json.loads(old[0]) != previous or pending or account["enabled"]):
+                raise TradingError("账户或循环记录已变化，请重新核对")
+            paused = {**account, "enabled": False}
+            paused.pop("pause_reason", None)
+            audit = {"account_id": aid, "confirmed_at": now, "previous": previous,
+                     "previous_pause_reason": account.get("pause_reason"), "review": review, "next": progress}
+            db.execute("INSERT INTO kv VALUES (?,?)", (f"cycle_recovery:{aid}:{progress['run_id']}", dumps(audit)))
+            db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(progress), "cycle:" + aid))
+            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(paused), aid))
+            message = (f"已人工核对 {review['symbol']}：记录多/空 {review['expected']['LONG']}/{review['expected']['SHORT']}，"
+                       f"实际多/空 {review['actual']['LONG']}/{review['actual']['SHORT']}；实际仓位转为原始持仓，"
+                       "本轮跟踪已结束，账户保持暂停，等待手动启动")
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (aid, "control", message, now))
+
     def complete_migration(self, intent, result, snapshot_remaining):
         """Commit the four-leg ledger and migration totals exactly once."""
         with self.connect() as db:

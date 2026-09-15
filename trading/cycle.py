@@ -15,6 +15,7 @@ from .models import (SYMBOLS, TradingError, cycle_margin_limit, dec, decimal_val
 
 SIDES = ("LONG", "SHORT")
 CYCLE_DEPTH_MAX_AGE = 3
+CYCLE_POSITION_MISMATCH = "循环实际多空数量与记录不一致，已停止自动交易，需核对"
 DEFAULT_CYCLE = {
     "enabled": False, "symbol": "XAUUSD1", "leverage": 2,
     "spread_notional": "10000", "spread_limit_bp": "0.1",
@@ -26,6 +27,12 @@ DEFAULT_CYCLE = {
 
 class CyclePositionError(TradingError):
     """Actual holdings no longer match the cycle's exclusive tracked position."""
+
+
+def cycle_recovery_available(account, progress, pending=None):
+    return bool(not account.get("enabled") and account.get("cycle", {}).get("enabled")
+                and account.get("pause_reason") == CYCLE_POSITION_MISMATCH and not pending
+                and isinstance(progress, dict) and progress.get("phase") in ("holding", "waiting_close"))
 
 
 class DailyVolumeLimitError(CycleConditionError):
@@ -128,7 +135,7 @@ def validate_cycle_positions(account, snapshot, progress=None):
     baseline = cycle_baseline(progress)
     if any(Fraction(position.qty) != Fraction(baseline[side]) + Fraction(tracked[side])
            for side, position in zip(SIDES, pair)):
-        raise CyclePositionError("循环实际多空数量与记录不一致，已停止自动交易，需核对")
+        raise CyclePositionError(CYCLE_POSITION_MISMATCH)
     if phase != "waiting_open" and any(position.leverage != config["leverage"] for position in pair):
         raise CyclePositionError("循环持仓期间实际杠杆发生变化，需核对后恢复")
     return pair

@@ -99,6 +99,11 @@ class Login(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+class CycleRecoveryConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    token: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
 class NewAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
@@ -307,6 +312,15 @@ def create_app(engine=None, *, demo=False, start_engine=True):
     @app.post("/api/accounts/{account_id}/retry", dependencies=write_dependencies)
     def retry(account_id: str):
         engine.retry(account_id)
+        return {"ok": True}
+
+    @app.post("/api/accounts/{account_id}/cycle/recovery-preview", dependencies=write_dependencies)
+    def preview_cycle_recovery(account_id: str):
+        return engine.preview_cycle_recovery(account_id)
+
+    @app.post("/api/accounts/{account_id}/cycle/recovery-confirm", dependencies=write_dependencies)
+    def confirm_cycle_recovery(account_id: str, body: CycleRecoveryConfirmation):
+        engine.confirm_cycle_recovery(account_id, body.token)
         return {"ok": True}
 
     output = Path(os.environ.get("ASTER_DASHBOARD_DIR", ROOT / "dashboard" / "dist" / "client"))

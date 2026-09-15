@@ -20,7 +20,7 @@ from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RequestNotSent, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import HotAccountUnavailable
 from .execution import Executor
-from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
+from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, RollingVolumeLimitError, _state as cycle_record_state, cycle_baseline, cycle_recovery_available, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
 from .cycle_cost import calculate_cycle_costs
 from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
@@ -161,6 +161,7 @@ class Engine:
         self.cycle_signal_deferred = set()
         self.cycle_hot_wakes, self.cycle_hot_waiting = set(), set()
         self.cycle_hot_backoff = {}
+        self.cycle_recovery_previews = {}
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
@@ -1606,6 +1607,73 @@ class Engine:
                       reason="策略运行中" if enabled else account.get("pause_reason") or "策略已暂停", **view_updates)
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")
 
+    def _cycle_recovery_read(self, account_id):
+        account = self.store.account(account_id)
+        if not account:
+            raise TradingError("账户不存在")
+        if self.store.intent(account_id):
+            raise TradingError("请先核对未完成批次，完成后再确认持仓")
+        progress = self.store.get("cycle:" + account_id)
+        if not cycle_recovery_available(account, progress):
+            raise TradingError("仅可确认因循环持仓数量不一致而暂停的账户")
+        config, _, tracked = cycle_record_state(account, progress)
+        if config["symbol"] != account["cycle"]["symbol"]:
+            raise TradingError("循环品种与保存设置不一致，请先核对记录")
+        baseline = cycle_baseline(progress)
+        symbol = config["symbol"]
+        snapshot = self.broker(account).cycle_snapshot([symbol], fresh_modes=True)
+        snapshot.require_fresh()
+        snapshot.require_modes([symbol])
+        if not snapshot.can_trade:
+            raise TradingError("账户没有交易权限")
+        pair = snapshot.pair(symbol)
+        actual = {side: wire(position.qty) for side, position in zip(("LONG", "SHORT"), pair)}
+        expected = {side: wire(Fraction(baseline[side]) + Fraction(tracked[side])) for side in actual}
+        review = {"symbol": symbol, "baseline": {side: wire(value) for side, value in baseline.items()},
+                  "quantities": {side: wire(value) for side, value in tracked.items()},
+                  "expected": expected, "actual": actual, "leverage": pair[0].leverage,
+                  "difference": {side: wire(Fraction(actual[side]) - Fraction(expected[side])) for side in actual}}
+        return account, progress, snapshot, review
+
+    def preview_cycle_recovery(self, account_id):
+        with self.account_lock(account_id):
+            account, progress, snapshot, review = self._cycle_recovery_read(account_id)
+            token = uuid.uuid4().hex
+            self.cycle_recovery_previews[account_id] = {"token": token, "expires": time.monotonic() + 300,
+                "account": account, "progress": progress, "review": review}
+            return {**review, "token": token, "checked_at": snapshot.timestamp}
+
+    def confirm_cycle_recovery(self, account_id, token):
+        with self.account_lock(account_id):
+            preview = self.cycle_recovery_previews.get(account_id)
+            if not preview or preview["token"] != token or time.monotonic() >= preview["expires"]:
+                raise TradingError("核对内容已失效，请重新读取持仓后确认")
+            account, previous, snapshot, review = self._cycle_recovery_read(account_id)
+            if account != preview["account"] or previous != preview["progress"] or review != preview["review"]:
+                self.cycle_recovery_previews.pop(account_id, None)
+                raise TradingError("持仓或循环记录已变化，请重新读取后核对")
+            now = time.time()
+            reason = "已人工核对持仓，当前仓位作为原始持仓保留；点击启动账户后开始新一轮循环"
+            progress = {"run_id": uuid.uuid4().hex, "phase": "waiting_open",
+                "config": {**validate_cycle(account["cycle"]), "leverage": review["leverage"]},
+                "baseline": review["actual"], "quantities": {"LONG": "0", "SHORT": "0"},
+                "opened_at": None, "close_eligible_at": None, "active_batch": None,
+                "completed_cycles": previous.get("completed_cycles", 0), "updated_at": now, "reason": reason}
+            displayed_snapshot = snapshot_json(snapshot, [review["symbol"]])
+            snapshot.require_fresh()
+            if time.monotonic() >= preview["expires"]:
+                raise TradingError("核对内容已失效，请重新读取持仓后确认")
+            self.store.confirm_cycle_recovery(account, previous, progress, review)
+            self.cycle_recovery_previews.pop(account_id, None)
+            self.revoke_cycle_hot_data(account_id, "人工核对完成，等待手动启动")
+            with self.lock:
+                self.accounts_generation += 1
+                self.wake_accounts.add(account_id)
+            self.view(account_id, status="paused", reason=reason, snapshot=displayed_snapshot,
+                      credential_ready=True, cycle_state={**progress, "phase": "paused", "diagnostic": None},
+                      strategies={symbol: {"phase": "paused", "reason": "账户已暂停，等待手动启动"}
+                                  for symbol in account["policy"]["symbols"]})
+
     def retry(self, account_id):
         with self.account_lock(account_id):
             intent = self.store.intent(account_id)
@@ -1833,6 +1901,7 @@ class Engine:
                     migration["active_batch"] = None
                 account["migration_state"] = migration
                 saved_cycle = cycle_records[account["id"]]
+                account["cycle_recovery_available"] = cycle_recovery_available(account, saved_cycle, pending)
                 current_cycle = account.get("cycle_state", {})
                 if current_cycle.get("run_id") != saved_cycle.get("run_id"):
                     current_cycle = {}

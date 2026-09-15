@@ -44,6 +44,7 @@ import {
 } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
 import { CyclePanel } from '@/components/cycle-panel';
+import { CycleRecovery } from '@/components/cycle-recovery';
 import { CycleTradesPanel } from '@/components/cycle-trades-panel';
 import { ExecutionEvents } from '@/components/execution-events';
 import { CycleExecutionQualityPanel } from '@/components/cycle-execution-quality';
@@ -115,6 +116,7 @@ type Account = {
   mode: string;
   env_prefix: string;
   enabled: boolean;
+  cycle_recovery_available?: boolean;
   status: string;
   reason: string;
   credential_ready: boolean;
@@ -595,7 +597,19 @@ export default function Home() {
           </output>
         )}
         {account && ['error', 'attention'].includes(account.status) && (
-          <output className="message message-error">{account.reason}</output>
+          <div className="message message-error cycle-recovery-message">
+            <output>{account.reason}</output>
+            {account.cycle_recovery_available ? (
+              <CycleRecovery
+                key={account.id}
+                accountId={account.id}
+                accountName={account.name}
+                disabled={busy || Boolean(connectionError)}
+                action={action}
+                setNotice={setNotice}
+              />
+            ) : null}
+          </div>
         )}
         {state?.demo && (
           <div className="demo-banner">

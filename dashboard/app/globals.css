@@ -1582,6 +1582,22 @@ label input,
 .message {
   display: block;
 }
+.cycle-recovery-message {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cycle-recovery-dialog {
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+}
+.cycle-recovery-dialog th,
+.cycle-recovery-dialog td {
+  height: auto;
+  padding: 12px 10px;
+}
 .reconcile-button {
   display: block;
   margin: 0 22px 18px;

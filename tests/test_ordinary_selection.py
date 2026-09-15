@@ -205,6 +205,7 @@ class OrdinarySelectionTests(TestCase):
         self.assertIn("成交量循环", ordinary_add_blocks(owner)["CLUSD1"])
         self.engine.enable("test", True)
         self.publish()
+        self.engine.markets["CLUSD1"]["capacities"]["2"] = "500000"
         self.engine.tick_account("test")
         self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")
         self.assertEqual({order["symbol"] for order in self.f.broker.state["orders"].values()}, {"CLUSD1"})

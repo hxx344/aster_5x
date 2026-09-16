@@ -598,14 +598,19 @@ class Store:
                    (account_id, date, wire(volume), count, wire(estimated), estimated_count,
                     last["executed_at"], last["symbol"], last["trade_id"], time.time(), symbol))
 
-    def cycle_daily_volume(self, account_id, now=None, *, symbol=None):
+    def cycle_daily_volume(self, account_id, now=None, *, symbol=None, include_pending=False):
         account_identifier(account_id)
         self._cycle_volume_symbol(symbol)
-        date, _, reset = utc_day(now)
+        date, start, reset = utc_day(now)
         with self.connect() as db:
+            # Fills and their pending reservation must come from one WAL snapshot:
+            # a concurrent backfill cannot disappear between the two reads.
+            if include_pending and not db.in_transaction:
+                db.execute("BEGIN")
             rows = db.execute("SELECT * FROM cycle_symbol_volume_days WHERE account_id=? AND utc_date=?"
                               + (" AND symbol=?" if symbol is not None else ""),
                               (account_id, date) + (() if symbol is None else (symbol,))).fetchall()
+            pending = self._cycle_pending_volume(db, account_id, start, symbol) if include_pending else {}
         row = None
         if rows:
             row = {key: sum(r[key] for r in rows) for key in ("trade_count", "estimated_trade_count")}
@@ -616,7 +621,59 @@ class Store:
                 "next_reset_at": reset, "estimated_volume": row["estimated_volume"] if row else "0",
                 "estimated_trade_count": row["estimated_trade_count"] if row else 0,
                 "latest_trade_at": row["latest_trade_at"] if row else None,
-                "cumulative_order": "execution_time", "timezone": "UTC"}
+                "cumulative_order": "execution_time", "timezone": "UTC", **pending}
+
+    @staticmethod
+    def _cycle_pending_volume(db, account_id, start, symbol):
+        """Reserve unrecorded terminal order amounts, without inventing trades.
+
+        Cross-midnight unassigned fills are conservatively charged to today.
+        Only the exchange's cumulative quote amount is used, never a rounded
+        average price. Missing or contradictory evidence keeps capped opens shut.
+        """
+        rows = db.execute("""SELECT i.id,i.data FROM cycle_volume_sync v JOIN intents i ON i.id=v.intent_id
+            WHERE v.account_id=? AND v.synced_at IS NULL AND v.status IN ('complete','aborted')
+            AND i.account_id=v.account_id AND i.status IN ('complete','aborted')
+            AND (v.created_at>=? OR v.completed_at>=? OR v.completed_at IS NULL)
+            """ + (" AND json_extract(i.data,'$.symbol')=?" if symbol is not None else "")
+            + " LIMIT 1001", (account_id, start, start) + (() if symbol is None else (symbol,))).fetchall()
+        reserved, error = Fraction(0), None
+        if len(rows) > 1000:
+            return {"reserved_volume": "0", "quota_pending": True, "sync_pending": True,
+                    "error": "循环待补账批次过多，等待后台同步后核对日额度"}
+        for row in rows:
+            try:
+                intent = json.loads(row["data"])
+                if intent.get("id") != row["id"] or intent.get("account_id") != account_id:
+                    raise TradingError("循环补账批次身份无法核对")
+                fills = {}
+                for fill in db.execute("SELECT client_id,quantity,notional FROM cycle_fills WHERE intent_id=?", (row["id"],)):
+                    totals = fills.setdefault(fill["client_id"], [Fraction(0), Fraction(0)])
+                    totals[0] += Fraction(positive(fill["quantity"]))
+                    totals[1] += Fraction(positive(fill["notional"]))
+                amount = Fraction(0)
+                for cid, (order, receipt, _) in order_bindings(intent).items():
+                    quantity = receipt_quantity(order, receipt, require_terminal=True)
+                    recorded_qty, recorded_quote = fills.get(cid, (Fraction(0), Fraction(0)))
+                    if recorded_qty > quantity:
+                        raise TradingError("循环已入账成交数量超过终态回执")
+                    if recorded_qty == quantity:
+                        continue
+                    quote = receipt.get("cumQuote")
+                    if not isinstance(quote, str):
+                        raise TradingError("循环终态回执缺少累计成交金额，等待明细核对日额度")
+                    remaining = Fraction(positive(quote)) - recorded_quote
+                    if remaining <= 0:
+                        raise TradingError("循环终态回执金额与已入账成交冲突")
+                    # All unrecorded amount is reserved on the current day. This
+                    # also covers orders whose fills span midnight until the
+                    # actual trade timestamps arrive and release the excess.
+                    amount += remaining
+                reserved += amount
+            except (TradingError, KeyError, ValueError, TypeError) as exc:
+                error = str(exc)
+        return {"reserved_volume": wire(reserved), "quota_pending": error is not None,
+                "sync_pending": bool(rows), "error": error}
 
     @staticmethod
     def _cycle_volume_symbol(symbol):

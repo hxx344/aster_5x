@@ -1458,7 +1458,7 @@ class LiveBroker:
             # window next time, retain known fills, and never call a short page 0.
             state.update(from_id=None, window_start=state["begin_ms"],
                          window_end=min(state["end_ms"], state["begin_ms"] + 7 * 86400000 - 1))
-            raise TradingError("循环逐笔成交尚未查全，等待补账后再开新仓")
+            raise TradingError("循环逐笔成交尚未查全，后台继续补账")
         raise TradingError("循环逐笔成交正在分页补账，等待后续核对")
 
     def submit(self, orders):

@@ -309,24 +309,26 @@ class Engine:
     def poll_cycle_history(self, account_id):
         """Only completed batches are backfilled; new orders read the local ledger."""
         account = self.store.account(account_id)
-        if (not account or account["mode"] != "live" or not account["enabled"]
-                or not account.get("cycle", {}).get("enabled") or not self.live_allowed(account)
-                or self.shutdown.is_set()):
+        if (not account or account["mode"] != "live" or not self.live_allowed(account) or self.shutdown.is_set()):
             return 30
         if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
             return 2
-        broker = self.broker(account)
-        executor = CycleExecutor(self.store, broker, self.market)
         backlog = self.store.cycle_volume_backlog(account_id, limit=4, since=max(0, time.time() - 86400))
         if not backlog:
             backlog = self.store.cycle_volume_backlog(account_id, limit=1, since=0)
+        if not backlog:
+            return 10 if account["enabled"] and account.get("cycle", {}).get("enabled") else 30
+        # Pausing trading must not strand reports now that execution no longer
+        # fetches them. Only durable completed batches can reach this reader.
+        broker = self.broker(account)
+        executor = CycleExecutor(self.store, broker, self.market)
         try:
             for intent in backlog:
                 if self.shutdown.is_set() or not executor.sync_volume(account, intent):
                     return 5
-            if backlog:
+            if account["enabled"] and account.get("cycle", {}).get("enabled"):
                 self.cycle_hot_ready(account_id)
-            return 5 if backlog else 10
+            return 5
         except (TradingError, KeyError, ValueError, TypeError) as exc:
             return max(5, getattr(exc, "retry_after", 0))
 
@@ -941,14 +943,16 @@ class Engine:
         store = self.store if _store is None else _store
         symbol = validate_cycle(account.get("cycle"))["symbol"] if symbol is None else symbol
         now = time.time() if now is None else now
-        daily = store.cycle_daily_volume(account["id"], now=now, symbol=symbol)
         limit = Fraction(dec(validate_cycle(account.get("cycle"))["daily_volume_limit"]))
-        backlog = store.cycle_volume_backlog(account["id"], limit=1, since=utc_day(now)[1], symbol=symbol)
-        used = Fraction(dec(daily["volume"]))
+        daily = store.cycle_daily_volume(account["id"], now=now, symbol=symbol, include_pending=bool(limit))
+        if not limit:
+            backlog = store.cycle_volume_backlog(account["id"], limit=1, since=utc_day(now)[1], symbol=symbol)
+            daily.update(sync_pending=bool(backlog), quota_pending=False, reserved_volume="0",
+                         error=backlog[0].get("volume_error") if backlog else None)
+        used = Fraction(dec(daily["volume"])) + Fraction(dec(daily.get("reserved_volume", "0")))
         remaining = wire(max(Fraction(0), limit - used)) if limit else None
         return {**daily, "limit": wire(limit), "remaining": remaining, "effective_remaining": remaining,
-                "reached": bool(limit and used >= limit), "sync_pending": bool(backlog),
-                "error": backlog[0].get("volume_error") if backlog else None}
+                "quota_volume": wire(used), "reached": bool(limit and used >= limit)}
 
     def cycle_volume_state(self, account, now=None, *, symbol=None, _store=None):
         store = self.store if _store is None else _store
@@ -963,16 +967,18 @@ class Engine:
         return {"daily_volume": daily, "rolling_volume": rolling}
 
     def cycle_open_allowances(self, account):
+        if not dec(validate_cycle(account.get("cycle"))["daily_volume_limit"]):
+            return {"daily_remaining": None}
         now = time.time()
         daily = self.cycle_daily_allowance(account, now)
-        if daily["sync_pending"]:
+        if daily["quota_pending"]:
             if account["mode"] == "live":
-                raise HotAccountUnavailable("循环成交明细正在后台同步，完成后再开仓")
-            raise TradingError("循环成交明细仍在同步，完成 UTC 日累计量核对后再开仓")
+                raise HotAccountUnavailable("循环日额度尚无法核实，等待后台补齐成交金额")
+            raise TradingError("循环日额度尚无法核实，等待后台补齐成交金额")
         if daily["reached"]:
             raise diagnostic_error("daily_volume_limit", "已达到 UTC 每日成交量上限，待日额度满足后自动恢复",
                 symbol=account["cycle"]["symbol"], phase="open", checked_at=now,
-                checks=[{"code": "utc_volume", "label": "UTC 当日成交量", "actual": diagnostic_number(daily["volume"]),
+                checks=[{"code": "utc_volume", "label": "UTC 当日成交量（含待补账预留）", "actual": diagnostic_number(daily["quota_volume"]),
                          "required": "< " + diagnostic_number(daily["limit"]), "unit": "USD1", "passed": False}],
                 context=[{"label": "UTC 成交日", "value": daily["utc_date"]},
                          {"label": "当日剩余额度", "value": daily["remaining"], "unit": "USD1"}],
@@ -1064,8 +1070,8 @@ class Engine:
             return 5
         if not self.live_allowed(account):
             raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
-        # Fill history is read-only. A failed sync blocks only new exposure;
-        # tracked positions must remain eligible for closing and repairs.
+        # Only an unprovable configured quota waits for history. Reductions and
+        # unlimited openings do not depend on the reporting ledger.
         allowances = {}
         if progress.get("phase") == "waiting_open":
             allowances = self.cycle_open_allowances(account)

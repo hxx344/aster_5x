@@ -196,6 +196,14 @@ test('missing, stale, incomplete and failed daily statistics remain visibly unce
   );
   assert.equal(unlimited.limit, '不限');
   assert.equal(unlimited.remaining, '不限');
+  assert.match(
+    cycleDailySummary({ ...daily, limit: '0', remaining: null, sync_pending: true }, midnight - 1).notice,
+    /后台同步中，不影响循环/,
+  );
+  assert.match(
+    cycleDailySummary({ ...daily, sync_pending: true, quota_pending: false, reserved_volume: '200' }, midnight - 1).notice,
+    /剩余额度已扣除待补账预留/,
+  );
   assert.equal(
     cycleDailySummary({ ...daily, remaining: undefined }, midnight - 1)
       .remaining,

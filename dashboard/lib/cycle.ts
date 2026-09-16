@@ -108,6 +108,8 @@ export type CycleDailyVolume = {
   remaining: string | null;
   reached: boolean;
   sync_pending?: boolean;
+  quota_pending?: boolean;
+  reserved_volume?: string;
   error?: string;
   cost?: CycleWindowCost;
 };

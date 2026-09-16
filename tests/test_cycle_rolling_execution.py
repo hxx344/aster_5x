@@ -79,9 +79,9 @@ class RollingCycleExecutionTests(unittest.TestCase):
              patch.object(self.f.store, "cycle_rolling_volume", wraps=self.f.store.cycle_rolling_volume) as rolling, \
              patch.object(self.f.store, "cycle_volume_backlog", wraps=self.f.store.cycle_volume_backlog) as backlog:
             self.require_room(now)
-        daily.assert_called_once_with("test", now=now, symbol=SYMBOL)
+        daily.assert_called_once_with("test", now=now, symbol=SYMBOL, include_pending=True)
         rolling.assert_not_called()
-        backlog.assert_called_once_with("test", limit=1, since=now - 3600, symbol=SYMBOL)
+        backlog.assert_not_called()
 
     def test_daily_limit_remains_a_distinct_error_when_both_windows_exceed(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
@@ -100,12 +100,11 @@ class RollingCycleExecutionTests(unittest.TestCase):
     def test_only_backlog_completed_today_or_still_unresolved_blocks_open(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
         intent = self.historical_fill("10000", midnight - 1, synced=False)
-        self.f.account["cycle"]["daily_volume_limit"] = "0"
         self.require_room(midnight + 1)
         for completed in (midnight, None):
             intent["completed_at"] = completed
             self.f.store.save_intent(intent)
-            with self.assertRaisesRegex(TradingError, "明细尚未补齐"):
+            with self.assertRaisesRegex(TradingError, "补齐成交金额"):
                 self.require_room(midnight + 1)
 
     def test_rolling_ledger_is_not_required_for_opening(self):

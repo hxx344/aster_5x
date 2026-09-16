@@ -176,7 +176,11 @@ export function cycleDailySummary(
     : daily.error
       ? `成交统计异常：${daily.error}`
       : daily.sync_pending
-        ? '正在核对成交，额度尚未确认'
+        ? unlimited
+          ? '成交明细后台同步中，不影响循环'
+          : daily.quota_pending === false
+            ? '成交明细后台同步中，剩余额度已扣除待补账预留'
+            : '正在核对成交金额，日额度尚未确认'
         : !date
           ? '统计日期未知，等待刷新'
           : rolloverPending

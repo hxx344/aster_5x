@@ -82,6 +82,7 @@ class CycleVolumeExecutionTests(unittest.TestCase):
             self.open()
 
     def test_accounting_read_failure_never_bypasses_quota(self):
+        self.limit("40000")
         with patch.object(self.f.store, "cycle_daily_volume", side_effect=TradingError("ledger unavailable")), \
              patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")), self.assertRaisesRegex(TradingError, "ledger"):
             self.open()

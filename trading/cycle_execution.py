@@ -10,7 +10,6 @@ from time import monotonic
 from .cycle import (DailyVolumeLimitError, cycle_baseline,
                     cycle_config, validate_cycle, validate_cycle_positions)
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
-from .cycle_volume import utc_day
 from .cycle_quality import (ObservedBroker, actual, clock_tick, estimate, estimate_from_plan,
                             new_quality, record_duration, timestamp)
 from .exchange import ExchangeError, LiveBroker, RequestNotSent
@@ -128,16 +127,16 @@ class CycleExecutor(Executor):
     def _require_daily_room(self, account, plan, config):
         if plan.phase != "open":
             return
-        now = time.time()
-        if self.store.cycle_volume_backlog(account["id"], limit=1, since=utc_day(now)[1], symbol=plan.symbol):
-            raise TradingError("循环成交明细尚未补齐，等待核对后再开新仓")
-        # Even unlimited accounts read the daily ledger so missing accounting
-        # cannot silently become zero when the limit is subsequently configured.
-        daily = self.store.cycle_daily_volume(account["id"], now=now, symbol=plan.symbol)
-        used = Fraction(positive(daily["volume"], True))
         limit = Fraction(positive(config.get("daily_volume_limit", "0"), True))
+        if not limit:
+            return
+        now = time.time()
+        daily = self.store.cycle_daily_volume(account["id"], now=now, symbol=plan.symbol, include_pending=True)
+        if daily.get("quota_pending"):
+            raise TradingError("循环日额度尚无法核实，等待后台补齐成交金额")
+        used = Fraction(positive(daily["volume"], True)) + Fraction(positive(daily.get("reserved_volume", "0"), True))
         roundtrip = 2 * (Fraction(positive(plan.long_notional)) + Fraction(positive(plan.short_notional)))
-        if limit and used + roundtrip > limit:
+        if used + roundtrip > limit:
             checks = [{"code": "daily_projected_volume", "label": "UTC 日预计累计成交量",
                        "actual": diagnostic_number(used + roundtrip), "required": "≤ " + diagnostic_number(limit),
                        "unit": "USD1", "passed": False}]
@@ -239,8 +238,13 @@ class CycleExecutor(Executor):
 
     def attention(self, account, intent, reason):
         result = super().attention(account, intent, reason)
-        self.sync_volume(account, intent)
+        self._sync_local_volume(account, intent)
         return result
+
+    def _sync_local_volume(self, account, intent):
+        # Live trade history belongs to the background worker. Receipt and
+        # position reconciliation above remain on the execution path.
+        return False if isinstance(self.broker, LiveBroker) else self.sync_volume(account, intent)
 
     def _require_progress(self, account, progress):
         saved = self.store.get("cycle:" + account["id"])
@@ -432,7 +436,7 @@ class CycleExecutor(Executor):
         if not intent:
             return "没有未完成循环批次"
         if intent.get("status") in ("complete", "aborted"):
-            self.sync_volume(account, intent)
+            self._sync_local_volume(account, intent)
             return "独立循环批次已结束"
         if intent["kind"] == "cycle_leverage":
             return self._reconcile_leverage(account, intent)
@@ -479,7 +483,7 @@ class CycleExecutor(Executor):
                 absent_repair = True
         self.store.save_intent(intent)
         if unresolved:
-            self.sync_volume(account, intent)
+            self._sync_local_volume(account, intent)
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "独立循环订单结果仍不确定，已暂停；请核对未完成批次")
             return "核对独立循环订单回执中，不重复提交"
@@ -625,7 +629,7 @@ class CycleExecutor(Executor):
         progress = {**progress, "reason": message}
         self.store.complete_cycle(intent, progress)
         account = self.store.account(intent["account_id"])
-        if intent.get("kind") == "cycle" and account and not self.sync_volume(account, intent):
-            message += "；成交明细待补账，暂停下一轮开仓"
+        if intent.get("kind") == "cycle" and account and not self._sync_local_volume(account, intent):
+            message += "；成交明细由后台继续同步"
         self.last_snapshot, self.last_completed_intent = snapshot, copy.deepcopy(intent)
         return message

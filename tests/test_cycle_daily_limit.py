@@ -178,7 +178,7 @@ class DailyQuotaEngineTests(TestCase):
         self.assertEqual(current["config"]["daily_volume_limit"], "0")
 
     @patch("trading.engine.time.time", new=lambda: 1789387200.0)
-    def test_history_sync_failure_does_not_block_close_but_blocks_next_open(self):
+    def test_history_sync_failure_does_not_block_close_or_unlimited_next_open(self):
         self.select()
         self.engine.enable("test", True)
         with patch("trading.cycle_execution.CycleExecutor.sync_volume", return_value=False):
@@ -188,7 +188,7 @@ class DailyQuotaEngineTests(TestCase):
             self.assertEqual(self.f.store.get("cycle:test")["completed_cycles"], 1)
             before = deepcopy(self.f.broker.state["orders"])
             self.engine.tick_account("test")
-            self.assertEqual(before, self.f.broker.state["orders"])
+            self.assertNotEqual(before, self.f.broker.state["orders"])
             self.assertTrue(self.engine.state()["accounts"][0]["cycle_state"]["daily_volume"]["sync_pending"])
         self.engine.tick_account("test")
         self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")

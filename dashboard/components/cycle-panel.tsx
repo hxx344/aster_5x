@@ -69,7 +69,7 @@ export function CyclePanel(props: Props) {
               </p>
             </div>
             <span
-              className={`migration-badge ${stale || ['attention', 'daily_limit', 'rolling_limit'].includes(view.phase) ? 'amber' : ''}`}
+              className={`migration-badge ${stale || ['attention', 'daily_limit'].includes(view.phase) ? 'amber' : ''}`}
             >
               {stale ? '最近记录 · ' : ''}
               {view.label}

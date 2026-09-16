@@ -34,11 +34,11 @@ test('UTC midnight resets only the daily display and leaves the reported rolling
   assert.equal(day.volume, '0');
   assert.equal(day.remaining, '40,000');
   assert.equal(view.volume, '39,999.99999999999999');
-  assert.equal(view.remaining, '0.00000000000001');
+  assert.equal('remaining' in view, false);
   assert.equal(view.releaseAt, '2026-09-15 01:00:00 UTC');
   assert.equal(
     cycleStatus({ phase: 'rolling_limit' }, true, true).label,
-    '等待滚动额度',
+    '等待开仓',
   );
 });
 
@@ -53,9 +53,8 @@ test('the next release never zeroes usage or promises enough capacity to resume'
   assert.equal(before.releasePassed, false);
   const due = cycleRollingSummary(value, midnight + 1);
   assert.equal(due.releasePassed, true);
-  assert.match(due.notice, /等待服务更新额度/);
+  assert.match(due.notice, /等待服务更新统计/);
   assert.equal(due.volume, before.volume);
-  assert.equal(due.remaining, before.remaining);
   assert.doesNotMatch(due.notice, /恢复/);
 });
 
@@ -85,7 +84,6 @@ test('rolling freshness ages from window_end even if the surrounding account res
 test('missing or incomplete rolling records do not appear as fresh zero capacity use', () => {
   const absent = cycleRollingSummary(undefined, midnight);
   assert.equal(absent.volume, '—');
-  assert.equal(absent.remaining, '—');
   assert.equal(absent.windowEnd, '时间未知');
   assert.match(absent.notice, /等待首次/);
   assert.match(
@@ -100,8 +98,7 @@ test('missing or incomplete rolling records do not appear as fresh zero capacity
     { ...rolling, limit: '0', remaining: null, next_release_at: null },
     midnight,
   );
-  assert.equal(unlimited.remaining, '不限');
-  assert.equal(unlimited.releaseAt, '暂无待释放成交');
+  assert.equal(unlimited.releaseAt, '暂无待移出成交');
 });
 
 test('manual pause overrides both quota phases after midnight or a rolling release', () => {

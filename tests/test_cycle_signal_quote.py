@@ -34,7 +34,7 @@ class CycleSignalQuoteTests(unittest.TestCase):
         self.account.pop("policy")
         self.account.update(balance="0", available="0", can_trade=False)
         self.account["cycle"]["daily_volume_limit"] = "1"
-        self.progress.update(daily_remaining="0", rolling_remaining="0")
+        self.progress.update(daily_remaining="0")
         self.assertEqual(self.quote(), {"phase": "open"})
 
     def test_disabled_account_cycle_and_migration_do_not_read_books(self):

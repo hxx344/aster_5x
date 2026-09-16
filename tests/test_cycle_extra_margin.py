@@ -63,13 +63,11 @@ class CycleExtraMarginTests(TestCase):
         self.snapshot.available = dec(100)
         self.assertLess(self.plan().qty, 1)
 
-    def test_daily_and_rolling_limits_remain_independent_gates(self):
+    def test_daily_limit_still_applies_with_extra_margin(self):
         self.prepare()
-        for daily, rolling in (("200", "1000"), ("1000", "200")):
-            with self.subTest(daily=daily, rolling=rolling):
-                plan = self.plan(daily_remaining=daily, rolling_remaining=rolling)
-                self.assertEqual(plan.qty, dec("0.5"))
-                self.assertEqual(2 * (plan.long_notional + plan.short_notional), 200)
+        plan = self.plan(daily_remaining="200")
+        self.assertEqual(plan.qty, dec("0.5"))
+        self.assertEqual(2 * (plan.long_notional + plan.short_notional), 200)
 
     def test_limit_math_preserves_precision_and_does_not_relax_ordinary_five_times(self):
         policy = {"margin_limit": "0.930000000000000000000000000001"}

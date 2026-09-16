@@ -195,6 +195,9 @@ test('unknown checks never bridge contradictory known open and close phases', ()
 
 test('only full approved condition titles or a Chinese-colon suffix are historical checks', () => {
   const titles = [
+    '已达到 UTC 每日成交量上限，待日额度满足后自动恢复',
+    '今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度满足后自动恢复',
+    '今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日额度满足后自动恢复',
     amountTitle,
     '循环可执行金额低于配置的最小金额',
     '循环价差采样金额的双边完整深度不足',

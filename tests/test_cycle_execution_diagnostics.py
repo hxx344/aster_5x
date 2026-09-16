@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from tests import test_cycle_execution as execution_cases, test_cycle_rolling_execution as rolling_cases
 from tests import test_cycle_extra_margin_execution as margin_cases
-from trading.cycle import DailyVolumeLimitError, RollingVolumeLimitError
+from trading.cycle import DailyVolumeLimitError
 from trading.cycle_diagnostics import diagnostic_number
 from trading.models import dec, wire
 
@@ -44,7 +44,7 @@ class CycleExecutionDiagnosticsTests(TestCase):
         with patch("trading.cycle_execution.time", SimpleNamespace(time=lambda: now)):
             self.executor._require_daily_room(self.f.account, plan or self.plan("open"), self.f.account["cycle"])
 
-    def test_daily_quota_failure_has_both_windows_used_remaining_cap_and_roundtrip(self):
+    def test_daily_quota_failure_has_daily_used_remaining_cap_and_roundtrip(self):
         self.configure(daily_volume_limit="40000")
         self.historical_fill("10000", DAY + 1)
         with self.assertRaises(DailyVolumeLimitError) as caught:
@@ -54,33 +54,23 @@ class CycleExecutionDiagnosticsTests(TestCase):
         self.assertEqual((detail["code"], detail["symbol"], detail["phase"], detail["checked_at"]),
                          ("execution_daily_volume", SYMBOL, "open", DAY + 100))
         checks = {row["code"]: row for row in detail["checks"]}
-        for key in ("daily_projected_volume", "rolling_projected_volume"):
+        for key in ("daily_projected_volume",):
             self.assertEqual((checks[key]["actual"], checks[key]["required"], checks[key]["unit"], checks[key]["passed"]),
                              ("45296.12", "≤ 40000", "USD1", False))
         context = {row["label"]: row["value"] for row in detail["context"]}
         self.assertEqual(context, {"本轮预计开平交易量": "35296.12", "UTC 日已用成交量": "10000",
-                                   "UTC 日剩余额度": "30000", "近 24 小时已用成交量": "10000",
-                                   "近 24 小时剩余额度": "30000", "成交量上限": "40000"})
+                                   "UTC 日剩余额度": "30000", "成交量上限": "40000"})
         self.assertIn("预计开仓及平仓", str(error))
         self.assertIn("45296.12", str(error))
         self.assertIn("≤ 40000", str(error))
         self.assertEqual(json.loads(json.dumps(detail, ensure_ascii=False)), detail)
         self.assertIsNone(self.f.store.intent("test"))
 
-    def test_rolling_quota_explains_the_tighter_window_without_failing_daily_check(self):
+    def test_rolling_total_does_not_fail_daily_check(self):
         self.configure(daily_volume_limit="40000")
-        self.historical_fill("10000", DAY - 1)
+        self.historical_fill("50000", DAY - 1)
         self.historical_fill("2000", DAY + 1)
-        with self.assertRaises(RollingVolumeLimitError) as caught:
-            self.require_room(DAY + 100)
-        detail = caught.exception.diagnostic
-        self.assertEqual(detail["code"], "execution_rolling_volume")
-        daily, rolling = detail["checks"]
-        self.assertEqual((daily["actual"], daily["required"], daily["passed"]), ("37296.12", "≤ 40000", True))
-        self.assertEqual((rolling["actual"], rolling["required"], rolling["passed"]), ("47296.12", "≤ 40000", False))
-        context = {row["label"]: row["value"] for row in detail["context"]}
-        self.assertEqual((context["UTC 日已用成交量"], context["UTC 日剩余额度"]), ("2000", "38000"))
-        self.assertEqual((context["近 24 小时已用成交量"], context["近 24 小时剩余额度"]), ("12000", "28000"))
+        self.require_room(DAY + 100)
 
     def test_quota_exact_boundary_and_precision_do_not_depend_on_display_formatting(self):
         plan = self.plan("open")
@@ -100,15 +90,15 @@ class CycleExecutionDiagnosticsTests(TestCase):
     def test_last_callback_fill_still_blocks_submission_and_uses_current_diagnostics(self):
         self.configure(daily_volume_limit="40000")
         def late_fill(snapshot):
-            self.historical_fill("10000", DAY - 1)
+            self.historical_fill("10000", DAY + 1)
         with patch("trading.cycle_execution.time", SimpleNamespace(time=lambda: DAY + 100)), \
              patch.object(self.f.broker, "submit", side_effect=AssertionError("over-limit order must not be sent")), \
-             self.assertRaises(RollingVolumeLimitError) as caught:
+             self.assertRaises(DailyVolumeLimitError) as caught:
             self.executor.start(self.f.account, self.f.broker.cycle_snapshot([SYMBOL]), self.plan("open"),
                                 self.progress_now(), before_submit=late_fill)
         detail = caught.exception.diagnostic
         self.assertEqual(detail["checked_at"], DAY + 100)
-        self.assertEqual(detail["checks"][1]["actual"], "45296.12")
+        self.assertEqual(detail["checks"][0]["actual"], "45296.12")
         self.assertIsNone(self.f.store.intent("test"))
         self.assertEqual(self.quantities(), (0, 0))
 

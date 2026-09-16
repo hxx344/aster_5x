@@ -64,6 +64,22 @@ const LEGACY_CONDITIONS: LegacyCondition[] = [
     phase: 'close',
   },
   {
+    title: '已达到 UTC 每日成交量上限，待日额度满足后自动恢复',
+    summary: '等待 UTC 日成交额度',
+    phase: 'open',
+  },
+  {
+    title: '今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度满足后自动恢复',
+    summary: 'UTC 日剩余额度不足下一轮',
+    phase: 'open',
+  },
+  {
+    title:
+      '今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日额度满足后自动恢复',
+    summary: 'UTC 日剩余额度不足下一轮',
+    phase: 'open',
+  },
+  {
     title: '已达到滚动 24 小时成交量上限，等待历史成交移出窗口后自动重试',
     summary: '等待滚动 24 小时成交额度释放',
     phase: 'open',

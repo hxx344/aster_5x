@@ -8,7 +8,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_cycle_planning as planning
-from trading.cycle import CycleConditionError, DailyVolumeLimitError, RollingVolumeLimitError
+from trading.cycle import CycleConditionError, DailyVolumeLimitError
 from trading.cycle_diagnostics import diagnostic_error, diagnostic_number
 from trading.migration import _Sweep
 from trading.models import Position, TradingError, dec
@@ -35,8 +35,8 @@ class DiagnosticFormattingTests(TestCase):
         checks = [{"code": "example", "label": "可用余额", "actual": "1", "required": "≥ 2",
                    "unit": "USD1", "passed": False}]
         error = diagnostic_error("test", "原有前缀", symbol=planning.SYMBOL, phase="open", checked_at=123,
-                                 checks=checks, error_type=RollingVolumeLimitError)
-        self.assertIs(type(error), RollingVolumeLimitError)
+                                 checks=checks, error_type=DailyVolumeLimitError)
+        self.assertIs(type(error), DailyVolumeLimitError)
         self.assertIsInstance(error, DailyVolumeLimitError)
         self.assertIn("原有前缀：可用余额 1 USD1（要求 ≥ 2 USD1）", str(error))
         checks[0]["actual"] = "changed"
@@ -213,15 +213,13 @@ class CycleDiagnosticsTests(TestCase):
         self.assertEqual(checks["projected_margin_ratio"]["required"], "≤ 54.999999999999999999999999999999999999")
 
     def test_quota_classes_and_nonquota_precedence_are_preserved(self):
-        error, checks = self.failed(daily_remaining="19.999", rolling_remaining="1000")
+        error, checks = self.failed(daily_remaining="19.999")
         self.assertIs(type(error), DailyVolumeLimitError)
         self.assertFalse(checks["daily_volume"]["passed"])
         self.assertEqual(checks["daily_volume"]["required"], "≥ 20")
-        error, checks = self.failed(daily_remaining="1000", rolling_remaining="19.999")
-        self.assertIs(type(error), RollingVolumeLimitError)
-        self.assertFalse(checks["rolling_volume"]["passed"])
+        self.assertNotIn("rolling_volume", checks)
         self.account["cycle"]["max_notional"] = "4.9"
-        error, checks = self.failed(daily_remaining="0", rolling_remaining="0")
+        error, checks = self.failed(daily_remaining="0")
         self.assertIs(type(error), CycleConditionError)
         self.assertFalse(checks["configured_max_notional"]["passed"])
         self.assertFalse(checks["daily_volume"]["passed"])

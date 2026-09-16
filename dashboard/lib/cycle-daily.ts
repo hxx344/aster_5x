@@ -270,28 +270,22 @@ export function cycleRollingSummary(
   const knownRelease =
     typeof release === 'number' && cycleUtcDate(release) !== null;
   const releasePassed = knownRelease && Number.isFinite(now) && now >= release;
-  const unlimited =
-    typeof rolling?.limit === 'string' && /^0+(?:\.0+)?$/.test(rolling.limit);
   const notice = !rolling
     ? '等待首次滚动 24 小时成交统计'
     : rolling.error
       ? `滚动成交统计异常：${rolling.error}`
       : rolling.sync_pending
-        ? '正在核对成交，滚动额度尚未确认'
+        ? '正在核对成交，滚动统计尚未确认'
         : !knownWindow
           ? '滚动统计窗口未知或异常，等待刷新'
           : stale
             ? '滚动统计已过期，以下为最近记录'
             : releasePassed
-              ? '下一笔释放时间已到，等待服务更新额度'
+              ? '下一笔成交移出时间已到，等待服务更新统计'
               : '';
   const estimatedVolume = cycleAmount(rolling?.estimated_volume);
   return {
     volume: cycleAmount(rolling?.volume),
-    remaining:
-      unlimited && rolling?.remaining === null
-        ? '不限'
-        : cycleAmount(rolling?.remaining),
     trades:
       typeof rolling?.trade_count === 'number' &&
       Number.isSafeInteger(rolling.trade_count) &&
@@ -303,7 +297,7 @@ export function cycleRollingSummary(
     releaseAt: knownRelease
       ? cycleUtcTime(release)
       : release === null
-        ? '暂无待释放成交'
+        ? '暂无待移出成交'
         : '等待服务确认',
     notice,
     stale,

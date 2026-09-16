@@ -543,12 +543,12 @@ class CycleWSSchedulerTests(unittest.TestCase):
                 h.run(control)
                 self.assertEqual(h.fast_calls(), [])
 
-    def test_daily_rolling_and_attention_states_prevent_fast_submission(self):
+    def test_daily_and_attention_states_prevent_fast_submission(self):
         h = self.h
 
         def control(step):
             if step in (2, 3, 4):
-                phase = {2: "daily_limit", 3: "rolling_limit", 4: "attention"}[step]
+                phase = {2: "daily_limit", 3: "attention", 4: "attention"}[step]
                 h.engine.views["test"] = {"cycle_state": {"phase": phase}}
                 h.emit(99 + step)
             elif step == 5:
@@ -556,6 +556,19 @@ class CycleWSSchedulerTests(unittest.TestCase):
 
         h.run(control)
         self.assertEqual(h.fast_calls(), [])
+
+    def test_legacy_rolling_wait_does_not_prevent_fast_submission(self):
+        h = self.h
+
+        def control(step):
+            if step == 2:
+                h.engine.views["test"] = {"cycle_state": {"phase": "rolling_limit"}}
+                h.emit(101)
+            elif step == 3:
+                h.engine.shutdown.set()
+
+        h.run(control)
+        self.assertEqual(len(h.fast_calls()), 1)
 
     def test_hold_timer_requires_due_full_close_hint_before_waking(self):
         h = self.h

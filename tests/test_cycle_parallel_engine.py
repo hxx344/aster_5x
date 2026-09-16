@@ -122,7 +122,7 @@ class CycleParallelEngineTests(TestCase):
         self.engine.tick_account("test")
         self.assert_pair_filled("CLUSD1")
         self.assertEqual(tuple(p.qty for p in self.pair("XAUUSD1")), (0, 0))
-        self.assertIn(self.engine.views["test"]["cycle_state"]["phase"], ("daily_limit", "rolling_limit"))
+        self.assertEqual(self.engine.views["test"]["cycle_state"]["phase"], "daily_limit")
         self.assertTrue(self.f.store.account("test")["enabled"])
 
     def test_selected_cycle_market_cannot_upgrade_or_add_at_any_ordinary_tier(self):

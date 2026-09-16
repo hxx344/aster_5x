@@ -6,7 +6,7 @@ from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from trading.cycle import CyclePlan, DEFAULT_CYCLE, DailyVolumeLimitError, RollingVolumeLimitError
+from trading.cycle import CyclePlan, DEFAULT_CYCLE, DailyVolumeLimitError
 from trading.cycle_execution import CycleExecutor
 from trading.models import TradingError, dec, wire
 from .helpers import Fixture
@@ -59,30 +59,29 @@ class RollingCycleExecutionTests(unittest.TestCase):
         with patch("trading.cycle_execution.time", SimpleNamespace(time=lambda: now)):
             self.executor._require_daily_room(self.f.account, self.plan(), self.f.account["cycle"])
 
-    def test_utc_reset_does_not_bypass_previous_days_rolling_volume(self):
+    def test_utc_reset_allows_opening_despite_previous_days_volume(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
-        self.historical_fill("10000", midnight - 1)
-        self.assertEqual(self.f.store.cycle_daily_volume("test", now=midnight + 1)["volume"], "0")
-        with self.assertRaises(RollingVolumeLimitError):
-            self.require_room(midnight + 1)
+        self.historical_fill("50000", midnight - 1)
+        self.assertEqual(self.f.store.cycle_daily_volume("test", now=midnight)["volume"], "0")
+        self.require_room(midnight)
 
-    def test_fill_releases_exactly_at_twenty_four_hours(self):
+    def test_rolling_expiry_changes_only_statistics(self):
         executed_at = datetime(2026, 9, 14, 4, tzinfo=timezone.utc).timestamp()
-        self.historical_fill("10000", executed_at)
-        with self.assertRaises(RollingVolumeLimitError):
-            self.require_room(executed_at + 86400 - .001)
+        self.historical_fill("50000", executed_at)
+        self.require_room(executed_at + 86400 - .001)
+        self.assertEqual(self.f.store.cycle_rolling_volume("test", now=executed_at + 86400 - .001)["volume"], "50000")
         self.require_room(executed_at + 86400)
         self.assertEqual(self.f.store.cycle_rolling_volume("test", now=executed_at + 86400)["volume"], "0")
 
-    def test_both_windows_and_backlog_share_one_guard_timestamp(self):
+    def test_daily_window_and_backlog_share_one_guard_timestamp(self):
         now = datetime(2026, 9, 15, 1, tzinfo=timezone.utc).timestamp()
         with patch.object(self.f.store, "cycle_daily_volume", wraps=self.f.store.cycle_daily_volume) as daily, \
              patch.object(self.f.store, "cycle_rolling_volume", wraps=self.f.store.cycle_rolling_volume) as rolling, \
              patch.object(self.f.store, "cycle_volume_backlog", wraps=self.f.store.cycle_volume_backlog) as backlog:
             self.require_room(now)
         daily.assert_called_once_with("test", now=now, symbol=SYMBOL)
-        rolling.assert_called_once_with("test", now=now, symbol=SYMBOL)
-        backlog.assert_called_once_with("test", limit=1, since=now - 86400, symbol=SYMBOL)
+        rolling.assert_not_called()
+        backlog.assert_called_once_with("test", limit=1, since=now - 3600, symbol=SYMBOL)
 
     def test_daily_limit_remains_a_distinct_error_when_both_windows_exceed(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
@@ -91,49 +90,51 @@ class RollingCycleExecutionTests(unittest.TestCase):
             self.require_room(midnight + 2)
         self.assertIs(type(caught.exception), DailyVolumeLimitError)
 
-    def test_tighter_rolling_window_is_reported_when_both_windows_are_full(self):
+    def test_daily_limit_still_blocks_when_yesterday_volume_is_larger(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
         self.historical_fill("10000", midnight - 1)
         self.historical_fill("10000", midnight + 1)
-        with self.assertRaises(RollingVolumeLimitError):
+        with self.assertRaises(DailyVolumeLimitError):
             self.require_room(midnight + 2)
 
-    def test_yesterdays_unreconciled_fill_blocks_even_unlimited_opening(self):
+    def test_only_backlog_completed_today_or_still_unresolved_blocks_open(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
-        self.historical_fill("10000", midnight - 1, synced=False)
+        intent = self.historical_fill("10000", midnight - 1, synced=False)
         self.f.account["cycle"]["daily_volume_limit"] = "0"
-        with self.assertRaisesRegex(TradingError, "明细尚未补齐"):
-            self.require_room(midnight + 1)
+        self.require_room(midnight + 1)
+        for completed in (midnight, None):
+            intent["completed_at"] = completed
+            self.f.store.save_intent(intent)
+            with self.assertRaisesRegex(TradingError, "明细尚未补齐"):
+                self.require_room(midnight + 1)
 
-    def test_rolling_ledger_failure_cannot_bypass_unlimited_opening(self):
-        self.f.account["cycle"]["daily_volume_limit"] = "0"
-        with patch.object(self.f.store, "cycle_rolling_volume", side_effect=TradingError("rolling ledger unavailable")), \
-             self.assertRaisesRegex(TradingError, "rolling ledger"):
-            self.require_room(time.time())
+    def test_rolling_ledger_is_not_required_for_opening(self):
+        with patch.object(self.f.store, "cycle_rolling_volume", side_effect=AssertionError("statistics only")):
+            for limit in ("0", "40000"):
+                self.f.account["cycle"]["daily_volume_limit"] = limit
+                self.require_room(time.time())
 
-    def test_late_yesterday_fill_at_submit_callback_blocks_the_second_guard(self):
+    def test_late_yesterday_fill_at_submit_callback_allows_submission(self):
         now = time.time()
         midnight = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         def late_fill(snapshot):
-            self.historical_fill("10000", midnight - 1)
-        with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")), \
-             self.assertRaises(RollingVolumeLimitError):
+            self.historical_fill("50000", midnight - 1)
+        with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.open(late_fill)
-        self.assertIsNone(self.f.store.intent("test"))
-        self.assertEqual(self.f.store.cycle_daily_volume("test", now=now)["volume"], "0")
-        self.assertEqual(dec(self.f.store.cycle_rolling_volume("test", now=now)["volume"]), 10000)
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")
 
-    def test_midnight_during_submit_callback_still_checks_rolling_usage(self):
+    def test_midnight_during_submit_callback_uses_the_new_daily_allowance(self):
         midnight = datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()
-        clock = Mock(side_effect=[midnight - 1, midnight + 1])
+        clock = Mock(return_value=midnight - 1)
         def just_before_midnight(snapshot):
-            self.historical_fill("10000", midnight - .5)
+            self.historical_fill("50000", midnight - .5)
+            clock.return_value = midnight + 1
         with patch("trading.cycle_execution.time", SimpleNamespace(time=clock)), \
-             patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")), \
-             self.assertRaises(RollingVolumeLimitError):
+             patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
             self.open(just_before_midnight)
-        self.assertEqual(clock.call_count, 2)
-        self.assertIsNone(self.f.store.intent("test"))
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")
 
     def test_close_does_not_read_or_require_volume_room(self):
         self.open()

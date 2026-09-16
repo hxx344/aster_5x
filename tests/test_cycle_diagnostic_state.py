@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from tests import test_cycle_engine as engine_cases
 from tests.helpers import account, seed_cycle_capacity
-from trading.cycle import DailyVolumeLimitError, RollingVolumeLimitError
+from trading.cycle import DailyVolumeLimitError
 from trading.models import TradingError
 from trading.server import create_app
 
@@ -122,21 +122,16 @@ class CycleDiagnosticStateTests(TestCase):
         self.assertEqual(checks[0]["account_id"], "test")
         self.assertEqual(checks[0]["cycle_check"]["diagnostic"], first["cycle_state"]["diagnostic"])
 
-    def test_reached_volume_limit_details_preserve_error_priority_and_both_windows(self):
+    def test_reached_daily_limit_details_exclude_rolling_statistics(self):
         self.select(daily_volume_limit="100")
         saved = self.f.store.account("test")
-        state = self.engine.cycle_volume_state(saved)
-        state["daily_volume"].update(volume="100", remaining="0", reached=True)
-        state["rolling_volume"].update(volume="110", remaining="0", reached=True)
-        with patch.object(self.engine, "cycle_volume_state", return_value=state):
-            with self.assertRaises(RollingVolumeLimitError) as caught:
-                self.engine.cycle_open_allowances(saved)
-        diagnostic = caught.exception.diagnostic
-        self.assertEqual([check["actual"] for check in diagnostic["checks"]], ["100", "110"])
-        self.assertTrue(all(check["required"] == "< 100" and check["passed"] is False for check in diagnostic["checks"]))
-        state["rolling_volume"].update(volume="100")
-        with patch.object(self.engine, "cycle_volume_state", return_value=state):
+        daily = self.engine.cycle_daily_allowance(saved)
+        daily.update(volume="100", remaining="0", reached=True)
+        with patch.object(self.engine, "cycle_daily_allowance", return_value=daily), \
+             patch.object(self.f.store, "cycle_rolling_volume", side_effect=AssertionError("statistics only")):
             with self.assertRaises(DailyVolumeLimitError) as caught:
                 self.engine.cycle_open_allowances(saved)
-        self.assertNotIsInstance(caught.exception, RollingVolumeLimitError)
-        self.assertEqual(caught.exception.diagnostic["code"], "daily_volume_limit")
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual([check["actual"] for check in diagnostic["checks"]], ["100"])
+        self.assertTrue(all(check["required"] == "< 100" and check["passed"] is False for check in diagnostic["checks"]))
+        self.assertEqual(diagnostic["code"], "daily_volume_limit")

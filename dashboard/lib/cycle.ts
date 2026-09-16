@@ -352,13 +352,7 @@ const PHASES: Record<string, { label: string; reason: string }> = {
   closing: { label: '多空平仓中', reason: '正在提交并核对本轮多空平仓' },
   daily_limit: {
     label: '等待日额度',
-    reason:
-      '当日额度已用完或不足开启下一轮，需同时满足 UTC 日与滚动 24 小时额度后恢复新增',
-  },
-  rolling_limit: {
-    label: '等待滚动额度',
-    reason:
-      '滚动 24 小时额度已用完或不足开启下一轮，等待成交逐笔移出统计，且 UTC 日额度也足够后恢复新增',
+    reason: '当日额度已用完或不足开启下一轮，待 UTC 日额度满足后恢复新增',
   },
 };
 
@@ -381,6 +375,13 @@ export function cycleStatus(
       reason: enabled
         ? '账户已手动暂停，额度释放后仍需手动启动'
         : PHASES.disabled.reason,
+    };
+  }
+  if (phase === 'rolling_limit') {
+    return {
+      phase: 'waiting_open',
+      label: PHASES.waiting_open.label,
+      reason: '滚动成交量限制已取消，等待重新核对开仓条件',
     };
   }
   const fallback = PHASES[phase] || {

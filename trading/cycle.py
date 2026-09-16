@@ -39,10 +39,6 @@ class DailyVolumeLimitError(CycleConditionError):
     """A new cycle must wait for sufficient volume allowance."""
 
 
-class RollingVolumeLimitError(DailyVolumeLimitError):
-    """Recent fills must leave the rolling 24-hour window before reopening."""
-
-
 @dataclass(frozen=True)
 class CyclePlan:
     phase: str
@@ -186,7 +182,7 @@ def _check(code, label, actual, required, unit, passed):
 def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
                         maximum_qty, mark, exchange_minimum, cap, fee, margin_limit,
                         occupied, available, equity, minimum, maximum, limit_bp,
-                        daily_budget, rolling_budget, executable_qty,
+                        daily_budget, executable_qty,
                         error_type=CycleConditionError):
     """Explain the minimum required order using original inputs, not a search probe.
 
@@ -262,11 +258,10 @@ def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
         _check("projected_margin_ratio", "全账户预计保证金占比", number(ratio, 100) if ratio is not None else None,
                "≤ " + number(margin_limit, 100), "%", ratio <= margin_limit if ratio is not None else None),
     ])
-    for code, label, budget in (("daily_volume", "UTC 日剩余成交额度", daily_budget),
-                                 ("rolling_volume", "滚动 24 小时剩余成交额度", rolling_budget)):
-        if budget is not None:
-            checks.append(_check(code, label, number(budget), "≥ " + number(reserve) if priced else None,
-                                 "USD1", budget >= reserve if priced else None))
+    if daily_budget is not None:
+        checks.append(_check("daily_volume", "UTC 日剩余成交额度", number(daily_budget),
+                             "≥ " + number(reserve) if priced else None,
+                             "USD1", daily_budget >= reserve if priced else None))
     context = [
         {"label": "最小要求数量", "value": target_text},
         {"label": "当前可执行数量", "value": number(executable_qty)},
@@ -292,7 +287,7 @@ def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
 
 
 def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None,
-               rolling_remaining=None, market_capacity=None):
+               market_capacity=None):
     """Maximize one exact pair, or close precisely the recorded completed pair.
 
     The configured reference amount sweeps each side separately. Its VWAP
@@ -424,9 +419,7 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     available, equity = Fraction(snapshot.available), Fraction(snapshot.equity)
     minimum, maximum = (Fraction(dec(config[key])) for key in ("min_notional", "max_notional"))
     daily_budget = None if daily_remaining is None else Fraction(positive(daily_remaining, True))
-    rolling_budget = None if rolling_remaining is None else Fraction(positive(rolling_remaining, True))
-    budgets = [value for value in (daily_budget, rolling_budget) if value is not None]
-    volume_budget = min(budgets) if budgets else None
+    volume_budget = daily_budget
     upper = min(maximum_qty, bids.quantity, asks.quantity)
     if config["notional_scope"] == "per_side":
         upper = min(upper, asks.quantity_for(maximum), bids.quantity_for(maximum))
@@ -479,17 +472,13 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     if error:
         error_type = CycleConditionError
         if volume_budget is not None and not minimum_error(search(quota=False), quota=False):
-            if rolling_budget is not None and (daily_budget is None or rolling_budget < daily_budget):
-                error_type = RollingVolumeLimitError
-                error = "滚动 24 小时剩余额度不足以完成下一轮开平仓，等待历史成交移出窗口后自动重试"
-            else:
-                error_type = DailyVolumeLimitError
-                error = "今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度和滚动 24 小时额度均满足后自动恢复"
+            error_type = DailyVolumeLimitError
+            error = "今日剩余额度不足以完成下一轮开平仓，待 UTC 日额度满足后自动恢复"
         raise _minimum_diagnostic(error, config=config, now=now, bids=bids, asks=asks, step=step,
             minimum_qty=minimum_qty, maximum_qty=maximum_qty, mark=mark, exchange_minimum=exchange_minimum,
             cap=cap, fee=fee, margin_limit=margin_limit, occupied=occupied, available=available, equity=equity,
             minimum=minimum, maximum=maximum, limit_bp=limit_bp, daily_budget=daily_budget,
-            rolling_budget=rolling_budget, executable_qty=qty, error_type=error_type)
+            executable_qty=qty, error_type=error_type)
     buy, sell, projected_ratio = resources(qty)
     require_search_time()
     return CyclePlan("open", rule.symbol, decimal_value(qty, exact=True), config["leverage"],

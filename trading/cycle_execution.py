@@ -7,9 +7,10 @@ from contextlib import nullcontext
 from fractions import Fraction
 from time import monotonic
 
-from .cycle import (DailyVolumeLimitError, RollingVolumeLimitError, cycle_baseline,
+from .cycle import (DailyVolumeLimitError, cycle_baseline,
                     cycle_config, validate_cycle, validate_cycle_positions)
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
+from .cycle_volume import utc_day
 from .cycle_quality import (ObservedBroker, actual, clock_tick, estimate, estimate_from_plan,
                             new_quality, record_duration, timestamp)
 from .exchange import ExchangeError, LiveBroker, RequestNotSent
@@ -128,40 +129,25 @@ class CycleExecutor(Executor):
         if plan.phase != "open":
             return
         now = time.time()
-        if self.store.cycle_volume_backlog(account["id"], limit=1, since=max(0, now - 86400), symbol=plan.symbol):
+        if self.store.cycle_volume_backlog(account["id"], limit=1, since=utc_day(now)[1], symbol=plan.symbol):
             raise TradingError("循环成交明细尚未补齐，等待核对后再开新仓")
-        # Even unlimited accounts read the ledger: missing accounting cannot be
-        # silently treated as zero when the limit is subsequently configured.
-        # Both windows share one timestamp, including at a UTC day boundary.
+        # Even unlimited accounts read the daily ledger so missing accounting
+        # cannot silently become zero when the limit is subsequently configured.
         daily = self.store.cycle_daily_volume(account["id"], now=now, symbol=plan.symbol)
-        rolling = self.store.cycle_rolling_volume(account["id"], now=now, symbol=plan.symbol)
-        used_day = Fraction(positive(daily["volume"], True))
-        used_24h = Fraction(positive(rolling["volume"], True))
+        used = Fraction(positive(daily["volume"], True))
         limit = Fraction(positive(config.get("daily_volume_limit", "0"), True))
         roundtrip = 2 * (Fraction(positive(plan.long_notional)) + Fraction(positive(plan.short_notional)))
-        def exceeded(code, title, error_type):
-            checks = [{"code": check_code, "label": label, "actual": diagnostic_number(used + roundtrip),
-                       "required": "≤ " + diagnostic_number(limit), "unit": "USD1",
-                       "passed": used + roundtrip <= limit}
-                      for check_code, label, used in (("daily_projected_volume", "UTC 日预计累计成交量", used_day),
-                                                      ("rolling_projected_volume", "近 24 小时预计累计成交量", used_24h))]
+        if limit and used + roundtrip > limit:
+            checks = [{"code": "daily_projected_volume", "label": "UTC 日预计累计成交量",
+                       "actual": diagnostic_number(used + roundtrip), "required": "≤ " + diagnostic_number(limit),
+                       "unit": "USD1", "passed": False}]
             context = [{"label": label, "value": diagnostic_number(value), "unit": "USD1"}
-                       for label, value in (("本轮预计开平交易量", roundtrip),
-                                            ("UTC 日已用成交量", used_day),
-                                            ("UTC 日剩余额度", max(Fraction(0), limit - used_day)),
-                                            ("近 24 小时已用成交量", used_24h),
-                                            ("近 24 小时剩余额度", max(Fraction(0), limit - used_24h)),
-                                            ("成交量上限", limit))]
-            return diagnostic_error(code, title, symbol=plan.symbol, phase="open", checked_at=now,
-                                    checks=checks, context=context, error_type=error_type)
-        if limit and used_day + roundtrip > limit and used_day >= used_24h:
-            raise exceeded("execution_daily_volume",
-                           "今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日与滚动 24 小时额度均满足后自动恢复",
-                           DailyVolumeLimitError)
-        if limit and used_24h + roundtrip > limit:
-            raise exceeded("execution_rolling_volume",
-                           "最近 24 小时交易量余量不足以覆盖本轮预计开仓及平仓，待较早成交移出窗口且两项额度均满足后自动恢复",
-                           RollingVolumeLimitError)
+                       for label, value in (("本轮预计开平交易量", roundtrip), ("UTC 日已用成交量", used),
+                                            ("UTC 日剩余额度", max(Fraction(0), limit - used)), ("成交量上限", limit))]
+            raise diagnostic_error("execution_daily_volume",
+                "今日 UTC 交易量余量不足以覆盖本轮预计开仓及平仓，待 UTC 日额度满足后自动恢复",
+                symbol=plan.symbol, phase="open", checked_at=now, checks=checks, context=context,
+                error_type=DailyVolumeLimitError)
 
     def sync_volume(self, account, intent):
         """Idempotently account known fills; missing details never block reductions."""

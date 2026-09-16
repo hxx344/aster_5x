@@ -258,7 +258,7 @@ class Engine:
         broker.start_cycle_hot_data([account["cycle"]["symbol"]],
                                     on_invalidate=lambda: self.wake_cycle_hot_data(account_id))
         if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
-            broker.invalidate_cycle_hot_data("本账户未完成批次正在核对")
+            broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
             with self.lock:
                 self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
             return CYCLE_HOT_POLL_INTERVAL
@@ -271,9 +271,13 @@ class Engine:
                     broker.cycle_snapshot_weight([account["cycle"]["symbol"]], fresh_modes=True) + 5)
             published = broker.refresh_cycle_hot_snapshot()
             latest = self.store.account(account_id)
-            if (self.shutdown.is_set() or not latest or not latest["enabled"] or latest.get("cycle") != account.get("cycle")
-                    or self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id)):
-                broker.invalidate_cycle_hot_data("账户或批次在后台更新期间发生变化", refresh_modes=True)
+            if (self.shutdown.is_set() or not latest or not latest["enabled"] or latest.get("cycle") != account.get("cycle")):
+                broker.invalidate_cycle_hot_data("账户配置在后台更新期间发生变化", refresh_modes=True)
+                return CYCLE_HOT_POLL_INTERVAL
+            if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+                broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
+                with self.lock:
+                    self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
                 return CYCLE_HOT_POLL_INTERVAL
             if published:
                 self.cycle_hot_ready(account_id)
@@ -296,7 +300,7 @@ class Engine:
                         self.accounts_generation += 1
             return 30
         except (TradingError, KeyError, ValueError, TypeError) as exc:
-            broker.invalidate_cycle_hot_data("账户后台更新暂不可用")
+            broker.discard_cycle_hot_snapshot("账户后台更新暂不可用")
             delay = max(CYCLE_HOT_POLL_INTERVAL, getattr(exc, "retry_after", 0))
             with self.lock:
                 self.work(account_id).hot_backoff = time.monotonic() + delay
@@ -773,7 +777,7 @@ class Engine:
     def market_error(self, account_id, symbol, exc):
         reason = str(exc) if isinstance(exc, TradingError) else "交易数据格式异常"
         self.strategy(account_id, symbol, reason, "waiting")
-        if isinstance(exc, (AccountModeError, RequestNotSent)) or self.store.intent(account_id):
+        if isinstance(exc, (AccountModeError, RequestNotSent, SnapshotSuperseded)) or self.store.intent(account_id):
             # No new symbol work until an existing intent is resolved.
             raise exc
         if isinstance(exc, ExchangeError) and exc.retry_after:
@@ -1273,7 +1277,7 @@ class Engine:
                         return self.tick_cycle_account(account, broker, None)
                     try:
                         self.tick_cycle_account(account, broker, None)
-                    except (ExchangeError, AccountModeError, CyclePositionError):
+                    except (ExchangeError, AccountModeError, CyclePositionError, SnapshotSuperseded):
                         # Shared budget, transport, and account integrity errors
                         # keep their account-wide stop/backoff behavior.
                         raise
@@ -1479,6 +1483,29 @@ class Engine:
                 if campaign and (snapshot.margin_exceeds(campaign_limit, include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):
                     self.store.finish_campaign(account, last_reason, snapshot.ratio)
                 return 5
+            except SnapshotSuperseded as exc:
+                # A revoked GET did not fail an order. Retain the durable batch
+                # and retry its read; never turn this into a new submission.
+                pending = self.store.intent(account_id)
+                attention = account.get("pause_reason") or (pending and pending["status"] == "attention")
+                reason = (account.get("pause_reason") or (pending or {}).get("last_error") or str(exc)) if attention else str(exc)
+                status = "attention" if attention else "waiting" if account["enabled"] else "paused"
+                self.view(account_id, status=status, reason=reason, credential_ready=account_id in self.brokers)
+                if cycle_context or (pending and pending.get("kind") in ("cycle", "cycle_leverage")):
+                    progress = self.store.get("cycle:" + account_id) or {}
+                    phase = ("attention" if attention else "reconciling" if pending else "paused" if not account["enabled"]
+                             else "waiting_close" if progress.get("opened_at") is not None else "waiting_open")
+                    self.cycle_view(account, phase=phase, reason=reason)
+                if account.get("migration", {}).get("enabled") or (pending and pending.get("kind") == "migration"):
+                    self.migration_view(account, phase="attention" if attention else "reconciling" if pending else "waiting", reason=reason)
+                with self.lock:
+                    work = self.work(account_id)
+                    work.cycle.rearm()
+                    work.wake = True
+                    work.backoff = max(work.backoff, time.monotonic() + 1)
+                    work.quote_backoff = None
+                self.wake_cycle_hot_data(account_id)
+                return 1
             except HotAccountUnavailable as exc:
                 # Missing hot data queues background work; it must never cause
                 # an on-demand query or a long account-wide network backoff.

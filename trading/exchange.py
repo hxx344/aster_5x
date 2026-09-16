@@ -771,6 +771,14 @@ class LiveBroker:
 
     def invalidate_cycle_hot_data(self, reason, *, refresh_modes=False):
         self._invalidate_snapshot_reads(refresh_modes=refresh_modes)
+        self.discard_cycle_hot_snapshot(reason, refresh_modes=refresh_modes)
+
+    def discard_cycle_hot_snapshot(self, reason, *, refresh_modes=False):
+        """Revoke hot leases/publication without interrupting recovery GETs.
+
+        Maintenance waiting on a batch or a failed refresh is not an account
+        mutation. Actual writes, events and controls still invalidate both.
+        """
         self.cycle_cache.invalidate(reason, refresh_modes=refresh_modes)
 
     def _invalidate_snapshot_reads(self, *, refresh_modes=False):

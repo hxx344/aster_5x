@@ -139,7 +139,7 @@ class AlignedBudgetTests(unittest.TestCase):
         self.budget.block(180)
         self.now = 106
         self.assertEqual(self.budget.snapshot()["retry_after"], 174)
-        with self.assertRaisesRegex(ExchangeError, "退避中"):
+        with self.assertRaisesRegex(ExchangeError, "接口冷却中"):
             self.budget.reserve(1)
 
     def test_api_releases_tracked_requests_on_all_failure_paths(self):

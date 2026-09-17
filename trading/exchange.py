@@ -81,6 +81,7 @@ class RateBudget:
             raise ExchangeError("额度监控保留预算无效")
         self.lock = threading.Lock()
         self.until, self.window, self.weight = 0.0, time.monotonic(), 0
+        self.cooldown_reason = "未记录触发原因"
         self.deadline = self.window + 60
         self.server_minute = None
         self.local_weight, self.reported_weight = 0, None
@@ -169,7 +170,7 @@ class RateBudget:
     def _require_available(self, weight, now):
         self._refresh(now)
         if now < self.until:
-            raise RequestNotSent("接口退避中", retry_after=self.until - now)
+            raise RequestNotSent(self._cooldown_message(now), retry_after=self.until - now)
         monitoring = getattr(self.priority, "capacity_monitoring", False)
         critical = (getattr(self.priority, "reconciliation", False) and not monitoring
                     and not getattr(self.priority, "cycle_accounting", False))
@@ -276,7 +277,15 @@ class RateBudget:
                     "ordinary_remaining": max(0, execution_limit - self.weight),
                     "reset_after": reset_after, "retry_after": retry_after}
 
-    def block(self, seconds):
+    def _cooldown_message(self, now):
+        remaining = max(0, math.ceil(self.until - now))
+        return f"接口冷却中：{self.cooldown_reason}；本次请求时剩余 {remaining} 秒"
+
+    def cooldown_message(self):
+        with self.lock:
+            return self._cooldown_message(time.monotonic())
+
+    def block(self, seconds, *, reason="未记录触发原因"):
         try:
             seconds = float(seconds)
         except (TypeError, ValueError, OverflowError):
@@ -284,11 +293,26 @@ class RateBudget:
         if not math.isfinite(seconds) or seconds < 0:
             seconds = 180.0
         with self.lock:
-            self.until = max(self.until, time.monotonic() + seconds)
+            until = time.monotonic() + seconds
+            # Keep the cause of the deadline actually governing admission.
+            if until >= self.until:
+                self.until = until
+                self.cooldown_reason = reason
         return seconds
 
 
 BUDGET = RateBudget()
+
+
+def cooldown_reason(method, path, *, status=None, codes=()):
+    reasons = {403: "访问被拒绝或被防护规则拦截", 429: "请求频率超限", 418: "IP 被临时封禁",
+               -1003: "请求频率或权重超限", -1015: "下单频率超限"}
+    details = []
+    if status is not None:
+        details.append(f"HTTP {status}，{reasons[status]}")
+    details.extend(f"错误码 {code}，{reasons[code]}" for code in sorted(set(codes)))
+    # Only include the endpoint, never signed parameters or response bodies.
+    return f"Aster {'；'.join(details)}；触发接口 {method} {path.split('?', 1)[0]}"
 
 
 class API:
@@ -346,9 +370,9 @@ class API:
                     delay = max(delay, supplied_delay)
             except ValueError:
                 pass
-            self.budget.block(delay)
+            self.budget.block(delay, reason=cooldown_reason(method, path, status=response.status_code))
             if response.status_code != 403:
-                raise ExchangeError("Aster 接口限流", retry_after=delay, http_status=response.status_code)
+                raise ExchangeError(self.budget.cooldown_message(), retry_after=delay, http_status=response.status_code)
             # Preserve a WAF Retry-After even for non-JSON gateway pages, while
             # still honoring an explicit unknown-execution code in a JSON body.
             gateway_delay = delay
@@ -359,21 +383,35 @@ class API:
                 data = response.json()
         except ValueError:
             error = AmbiguousOrder if is_write else ExchangeError
-            raise error("Aster 返回无法识别的响应", retry_after=gateway_delay, http_status=response.status_code) from None
-        if isinstance(data, list) and any(isinstance(row, dict) and row.get("code") in (-1003, -1015) for row in data):
+            message = "Aster 返回无法识别的响应"
+            if gateway_delay:
+                message += f"；{self.budget.cooldown_message()}"
+            raise error(message, retry_after=gateway_delay, http_status=response.status_code) from None
+        batch_codes = ([row.get("code") for row in data
+                        if isinstance(row, dict) and row.get("code") in (-1003, -1015)]
+                       if isinstance(data, list) else [])
+        if batch_codes:
             # Batch responses may mix fills and rate-limit failures. Retain every
             # receipt so the executor can reconcile/repair the successful leg.
-            self.budget.block(180)
+            self.budget.block(180, reason=cooldown_reason(method, path, codes=batch_codes))
         code = data.get("code") if isinstance(data, dict) else None
         if isinstance(code, int) and code < 0:
             if code in (-1003, -1015):
-                self.budget.block(180)
-                raise ExchangeError("Aster 请求或订单限流", code, retry_after=max(180, gateway_delay), http_status=response.status_code)
+                self.budget.block(180, reason=cooldown_reason(method, path,
+                    status=response.status_code if gateway_delay else None, codes=(code,)))
+                raise ExchangeError(self.budget.cooldown_message(), code, retry_after=max(180, gateway_delay), http_status=response.status_code)
             if code in (-1006, -1007) and is_write:
-                raise AmbiguousOrder("Aster 请求超时，需核对订单", code, retry_after=gateway_delay, http_status=response.status_code)
-            raise ExchangeError(f"Aster 拒绝请求（代码 {code}）", code, retry_after=gateway_delay, http_status=response.status_code)
+                message = "Aster 请求超时，需核对订单"
+                if gateway_delay:
+                    message += f"；{self.budget.cooldown_message()}"
+                raise AmbiguousOrder(message, code, retry_after=gateway_delay, http_status=response.status_code)
+            message = f"Aster 拒绝请求（代码 {code}）"
+            if gateway_delay:
+                message += f"；{self.budget.cooldown_message()}"
+            raise ExchangeError(message, code, retry_after=gateway_delay, http_status=response.status_code)
         if not response.is_success:
-            raise ExchangeError(f"Aster HTTP {response.status_code}", code, retry_after=gateway_delay, http_status=response.status_code)
+            message = self.budget.cooldown_message() if gateway_delay else f"Aster HTTP {response.status_code}"
+            raise ExchangeError(message, code, retry_after=gateway_delay, http_status=response.status_code)
         return data
 
     def close(self):
@@ -649,8 +687,9 @@ class MarketData:
                         delay = max(delay, supplied)
                 except ValueError:
                     pass
-                self.api.budget.block(delay)
-                raise ExchangeError("公共额度接口限流", retry_after=delay)
+                self.api.budget.block(delay, reason="公共额度接口：" + cooldown_reason(
+                    "POST" if brackets else "GET", path, status=response.status_code))
+                raise ExchangeError(self.api.budget.cooldown_message(), retry_after=delay, http_status=response.status_code)
             if not response.is_success:
                 raise ExchangeError(f"公共额度 HTTP {response.status_code}")
             try:

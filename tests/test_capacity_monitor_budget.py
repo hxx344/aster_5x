@@ -131,7 +131,7 @@ class CapacityMonitorBudgetTests(unittest.TestCase):
             for context in (nullcontext, budget.capacity_monitoring, budget.reconciliation):
                 with self.subTest(channel=context.__name__), context():
                     for check in (budget.require_available, budget.reserve):
-                        with self.assertRaisesRegex(RequestNotSent, "退避中") as caught:
+                        with self.assertRaisesRegex(RequestNotSent, "接口冷却中") as caught:
                             check(1)
                         self.assertEqual(caught.exception.retry_after, 120)
             self.assertEqual(budget.weight, 0)

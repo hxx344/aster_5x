@@ -71,8 +71,9 @@ class InstallerHarness:
         path.chmod(0o755)
 
     def install_commands(self):
-        for name in ("chown", "id", "useradd", "sleep", "journalctl"):
+        for name in ("chown", "id", "useradd", "sleep"):
             self.executable(self.commands / name, "exit 0")
+        self.executable(self.commands / "journalctl", 'printf "fixture service diagnostics\\n"')
         for name in ("apt-get", "dnf"):
             self.executable(self.commands / name, 'printf "1\\n" >> "$HARNESS_COUNTERS/apt"')
         # An incompatible command earlier on PATH forces discovery of the existing
@@ -133,7 +134,11 @@ esac''')
         self.executable(self.commands / "curl", '''case "$*" in
 *nodejs.org*) printf '1\\n' >> "$HARNESS_COUNTERS/node-curl"; exit 42 ;;
 *127.0.0.1:8765/api/health*)
-  [[ ! -f "$HARNESS_BASE/fail-health" ]] || exit 22
+  printf '1\\n' >> "$HARNESS_COUNTERS/health"
+  if [[ -f "$HARNESS_BASE/fail-health" ]] || { [[ -f "$HARNESS_BASE/slow-health" ]] && [[ $(wc -l < "$HARNESS_COUNTERS/health") -le 2 ]]; }; then
+    printf "curl: (7) Failed to connect to 127.0.0.1 port 8765: Couldn't connect to server\\n" >&2
+    exit 7
+  fi
   printf '{"status":"ok"}'
   ;;
 *) printf 'Unexpected network request blocked by installer harness\\n' >&2; exit 41 ;;
@@ -318,6 +323,21 @@ class TradingInstallerTests(unittest.TestCase):
         self.assertEqual(self.h.unit.read_text(), "old unit")
         self.assertEqual((self.h.base / "service-state").read_text(), "active")
         self.assertNotIn("disable --now aster-5x", (self.h.base / "service-calls").read_text())
+        self.assertEqual(self.h.count("health"), 30)
+        self.assertIn("Service health check failed after 30 attempts", result.stderr)
+        self.assertIn("fixture service diagnostics", result.stdout)
+        self.assertNotIn("Couldn't connect", result.stderr)
+        self.assertNotIn("Aster Desk installed", result.stdout)
+
+    def test_slow_http_start_retries_quietly_and_finishes_upgrade(self):
+        (self.h.base / "slow-health").touch()
+        result = self.h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+        self.assertEqual(self.h.count("health"), 3)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Aster Desk installed", result.stdout)
+        self.assertNotIn("fixture service diagnostics", result.stdout)
+        self.assertNotEqual(self.h.current, self.h.old)
 
     def test_termination_during_switch_restores_previous_service(self):
         for signal, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):

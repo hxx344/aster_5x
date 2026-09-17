@@ -215,13 +215,19 @@ install -m 755 "$stage/deploy/aster-desk" /usr/local/bin/aster-desk
 systemctl daemon-reload
 systemctl enable --now aster-desk
 healthy=0
+# systemd can report active before the HTTP listener is ready. Retry quietly;
+# only the final timeout is an upgrade failure, with service logs below.
 for attempt in $(seq 1 30); do
-  if systemctl is-active --quiet aster-desk && curl --max-time 2 -fsS http://127.0.0.1:8765/api/health | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok"' 2>/dev/null; then
+  if systemctl is-active --quiet aster-desk && curl --max-time 2 -fsS http://127.0.0.1:8765/api/health 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok"' 2>/dev/null; then
     healthy=1; break
   fi
   sleep 2
 done
-[[ $healthy -eq 1 ]] || { journalctl -u aster-desk --no-pager -n 15; exit 1; }
+if [[ $healthy -ne 1 ]]; then
+  printf '[upgrade] Service health check failed after 30 attempts; restoring the previous service. Recent service logs:\n' >&2
+  journalctl -u aster-desk --no-pager -n 15
+  exit 1
+fi
 switched=0
 if systemctl list-unit-files aster-5x.service --no-legend 2>/dev/null | grep -q '^aster-5x.service'; then
   systemctl disable --now aster-5x

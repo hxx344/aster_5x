@@ -20,6 +20,8 @@ from .request_timing import observe_database, transport_stage
 
 
 SIDES = ("LONG", "SHORT")
+POSITION_SYNC_INTERVAL = 5
+POSITION_SYNC_CHECKS = 3
 
 
 class _GuardedCycleBroker:
@@ -487,6 +489,14 @@ class CycleExecutor(Executor):
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "独立循环订单结果仍不确定，已暂停；请核对未完成批次")
             return "核对独立循环订单回执中，不重复提交"
+        sync = intent.get("position_sync")
+        if isinstance(self.broker, LiveBroker) and sync and sync["checks"] < POSITION_SYNC_CHECKS:
+            # Yield to the account scheduler instead of sleeping with its lock.
+            # Persisted wall time survives restart; a backwards clock jump must
+            # not turn this bounded wait into an indefinite one.
+            delay = sync["next_check_at"] - time.time()
+            if 0 < delay <= POSITION_SYNC_INTERVAL:
+                return self._position_sync_reason(sync)
         snapshot = self.broker.cycle_snapshot([intent["symbol"]])
         snapshot.require_fresh()
         try:
@@ -514,8 +524,28 @@ class CycleExecutor(Executor):
         expected = {side: Fraction(dec(intent["baseline"][side])) + (original[side] if opening else -original[side]) - repaired[side]
                     for side in SIDES}
         actual = {"LONG": Fraction(long.qty), "SHORT": Fraction(short.qty)}
-        if any(expected[side] < floor[side] or actual[side] != expected[side] for side in SIDES):
-            return self.attention(account, intent, "独立循环持仓变化与回执不一致，禁止处理外部仓位；已暂停并等待核对")
+        if any(expected[side] < floor[side] for side in SIDES):
+            # An impossible receipt-derived balance is not exchange read lag.
+            return self.attention(account, intent, "独立循环回执推算持仓低于原始持仓，已暂停并等待核对")
+        if any(actual[side] != expected[side] for side in SIDES):
+            if isinstance(self.broker, LiveBroker):
+                checked_at = time.time()
+                sync = intent["position_sync"] = {
+                    "checks": min((sync or {}).get("checks", 0) + 1, POSITION_SYNC_CHECKS),
+                    "checked_at": checked_at, "next_check_at": checked_at + POSITION_SYNC_INTERVAL,
+                    "expected": {side: wire(expected[side]) for side in SIDES},
+                    "actual": {side: wire(actual[side]) for side in SIDES},
+                }
+                if sync["checks"] < POSITION_SYNC_CHECKS:
+                    self.store.save_intent(intent)
+                    return self._position_sync_reason(sync)
+            details = "；".join(f"{label}预期 {wire(expected[side])}、实际 {wire(actual[side])}"
+                               for side, label in (("LONG", "多头"), ("SHORT", "空头")))
+            return self.attention(account, intent,
+                "独立循环持仓变化与回执不一致，禁止处理外部仓位；已暂停并等待核对（" + intent["symbol"] + "；" + details + "）")
+        # A later repair has its own expected balance and synchronization window.
+        if intent.pop("position_sync", None) is not None:
+            self.store.save_intent(intent)
         remaining = {side: actual[side] - floor[side] for side in SIDES}
         full_open = opening and not intent["repairs"] and all(original[side] == Fraction(dec(intent["quantity"])) for side in SIDES)
         if full_open:
@@ -605,6 +635,11 @@ class CycleExecutor(Executor):
         if not_sent is not None:
             raise not_sent
         return self._reconcile_cycle(account, intent)
+
+    @staticmethod
+    def _position_sync_reason(sync):
+        return (f"独立循环持仓与回执暂未一致，等待持仓同步（第 {sync['checks']}/{POSITION_SYNC_CHECKS} 次核对；"
+                f"约 {POSITION_SYNC_INTERVAL} 秒后重查）")
 
     def _reconcile_leverage(self, account, intent):
         snapshot = self.broker.cycle_snapshot([intent["symbol"]], fresh_modes=True)

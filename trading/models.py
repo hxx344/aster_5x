@@ -42,9 +42,17 @@ def dec(value):
     return result
 
 
-def positive(value, allow_zero=False):
-    result = dec(value)
+def positive(value, allow_zero=False, *, field=None):
+    try:
+        result = dec(value)
+    except TradingError as exc:
+        if field is not None:
+            raise TradingError(f"{field}：{exc}") from None
+        raise
     if result < 0 or (not allow_zero and result == 0):
+        if field is not None:
+            requirement = "非负数" if allow_zero else "正数"
+            raise TradingError(f"{field}必须为{requirement}（收到 {result}）")
         raise TradingError("数值必须为正数")
     return result
 
@@ -297,10 +305,10 @@ def validate_brackets(brackets):
         raise TradingError("缺少账户风控档位")
     previous = None
     for row in sorted(brackets, key=lambda b: dec(b["notionalFloor"])):
-        floor = positive(row["notionalFloor"], True)
-        cap = positive(row["notionalCap"])
-        rate = positive(row["maintMarginRatio"])
-        cum = positive(row["cum"], True)
+        floor = positive(row["notionalFloor"], True, field="账户风控档位下限（notionalFloor）")
+        cap = positive(row["notionalCap"], field="账户风控档位上限（notionalCap）")
+        rate = positive(row["maintMarginRatio"], field="账户维持保证金率（maintMarginRatio）")
+        cum = positive(row["cum"], True, field="账户维持保证金速算额（cum）")
         if cap <= floor or rate > 1 or cum > floor * rate or not 1 <= int(row["initialLeverage"]) <= 125:
             raise TradingError("账户风控档位数值异常")
         if previous:

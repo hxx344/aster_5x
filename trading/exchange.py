@@ -963,7 +963,7 @@ class LiveBroker:
         unrealized = decimal_value(selected_pnl, exact=True)
         available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
         equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
-        return AccountSnapshot(equity, positive(asset["maintMargin"], True), available, wallet,
+        return AccountSnapshot(equity, positive(asset["maintMargin"], True, field="USD1 维持保证金（maintMargin）"), available, wallet,
             unrealized, positions, None, hedge, multi, account.get("canTrade") is True,
             started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets or {}, current_caps or {})
 
@@ -1016,9 +1016,12 @@ class LiveBroker:
                     raise TradingError("检测到非 USD1 仓位，需要核对风险范围")
                 continue
             qty = dec(row["positionAmt"]).copy_abs()
-            entry = positive(row["entryPrice"], allow_zero=not qty)
+            field_prefix = f"{row['symbol']} {row['positionSide']}"
+            entry = positive(row["entryPrice"], allow_zero=not qty, field=f"{field_prefix} 开仓价（entryPrice）")
             positions.append(Position(row["symbol"], row["positionSide"], qty, entry,
-                positive(row["markPrice"]), self._leverage(row.get("leverage")), dec(row["unRealizedProfit"]), positive(row["liquidationPrice"], True),
+                positive(row["markPrice"], field=f"{field_prefix} 标记价（markPrice）"),
+                self._leverage(row.get("leverage"), field=f"{field_prefix} 实际杠杆（leverage）"), dec(row["unRealizedProfit"]),
+                positive(row["liquidationPrice"], True, field=f"{field_prefix} 强平价（liquidationPrice）"),
                 isolated=row["marginType"].lower() not in ("cross", "crossed")))
         # Never combine balances and positions from different fills.
         represented = {(p.symbol, p.side) for p in positions}
@@ -1042,7 +1045,10 @@ class LiveBroker:
                 b = matches[0]
             if not isinstance(b, dict) or b.get("symbol") != symbol:
                 raise TradingError("账户风控档位交易代码不匹配")
-            brackets[symbol] = validate_brackets(b["brackets"])
+            try:
+                brackets[symbol] = validate_brackets(b["brackets"])
+            except TradingError as exc:
+                raise TradingError(f"{symbol}：{exc}") from None
         # External orders are not queried; None must not imply a verified empty
         # order book. Fees are a fixed planning estimate, not a fetched fee rate.
         snapshot = self._account_snapshot(account, asset, positions, symbols, hedge=dual["dualSidePosition"],
@@ -1113,11 +1119,11 @@ class LiveBroker:
                 raise TradingError("检测到非 USD1 仓位，需要核对风险范围")
             if type(row.get("isolated")) is not bool:
                 raise TradingError("账户全仓保证金模式响应无效")
-            leverage = self._leverage(row.get("leverage"))
+            leverage = self._leverage(row.get("leverage"), field=f"{symbol} {side} 实际杠杆（leverage）")
             if symbol in leverages and leverages[symbol] != leverage:
                 raise TradingError("多空杠杆不一致")
             leverages[symbol] = leverage
-            positive(row.get("entryPrice"), allow_zero=not dec(row["positionAmt"]))
+            positive(row.get("entryPrice"), allow_zero=not dec(row["positionAmt"]), field=f"{symbol} {side} 开仓价（entryPrice）")
             dec(row.get("unrealizedProfit"))
 
         marks = {symbol: self._cycle_local_mark(symbol) for symbol in dict.fromkeys(key[0] for key in relevant)}
@@ -1150,7 +1156,7 @@ class LiveBroker:
             risk_row = risk.get(key)
             mark = marks[symbol]
             if mark is None and risk_row is not None:
-                mark = positive(risk_row.get("markPrice"))
+                mark = positive(risk_row.get("markPrice"), field=f"{symbol} {side} 标记价（markPrice）")
             if mark is None:
                 if qty:
                     raise TradingError("账户持仓缺少有效标记价格")
@@ -1161,8 +1167,9 @@ class LiveBroker:
                 mark = marks[symbol] = positive(book.mark)
             liquidation = None
             if risk_row is not None and risk_row.get("liquidationPrice") is not None:
-                liquidation = positive(risk_row["liquidationPrice"], True)
-            positions.append(Position(symbol, side, qty, positive(row["entryPrice"], allow_zero=not qty),
+                liquidation = positive(risk_row["liquidationPrice"], True, field=f"{symbol} {side} 强平价（liquidationPrice）")
+            positions.append(Position(symbol, side, qty, positive(row["entryPrice"], allow_zero=not qty,
+                field=f"{symbol} {side} 开仓价（entryPrice）"),
                 mark, leverages[symbol], dec(row["unrealizedProfit"]), liquidation, isolated=row["isolated"]))
         return positions, rows, leverages, risk_unrealized
 
@@ -1329,10 +1336,10 @@ class LiveBroker:
             raise
 
     @staticmethod
-    def _leverage(value):
-        leverage = positive(value)
+    def _leverage(value, *, field="账户实际杠杆（leverage）"):
+        leverage = positive(value, field=field)
         if not 1 <= leverage <= 125 or leverage != leverage.to_integral_value():
-            raise TradingError("账户实际杠杆无效")
+            raise TradingError(f"{field}无效：必须为 1 至 125 的整数（收到 {leverage}）")
         return int(leverage)
 
     def set_leverage(self, symbol, leverage, *, checked_snapshot=None, before_submit=None):

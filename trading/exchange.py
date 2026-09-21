@@ -910,7 +910,7 @@ class LiveBroker:
         def due(key, ttl):
             # Leave time for this read to complete before reusing an expiring item.
             return now - self.cached_at.get(key, -1e9) + 8 >= ttl
-        weight = 10 + 2 * len(symbols)  # Balances, all positions, flat marks.
+        weight = 10 + 2 * len(symbols)  # Balances, all positions, missing marks.
         weight += sum(30 for key in ("dual", "multi") if fresh_modes or due(key, 15))
         weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
         return weight
@@ -924,11 +924,11 @@ class LiveBroker:
             return self._cycle_snapshot_weight(symbols, fresh_modes=fresh_modes)
 
     def _cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
-        """Include conditional risk/flat-mark/tier reads without issuing them."""
+        """Include conditional risk/missing-mark/tier reads without issuing them."""
         symbols = tuple(dict.fromkeys(symbols))
         now = time.monotonic()
         # Account; reserve for one full risk fallback and the
-        # existing two-request flat quote fallback when risk omits a symbol.
+        # two-request quote fallback when risk omits a flat row or reports zero.
         weight = 5 + 5 + 2 * len(symbols)
         if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= 15:
             weight += 30
@@ -994,17 +994,15 @@ class LiveBroker:
         present = self._position_rows(rows)
         # Some V3 responses omit flat symbols; use authenticated account rows for
         # their configured leverage and margin mode, rather than inventing defaults.
-        rows, flat_marks = list(rows), {}
+        rows = list(rows)
         for row in account_positions.values():
             if row["symbol"] in symbols and (row["symbol"], row["positionSide"]) not in present:
                 if type(row.get("isolated")) is not bool:
                     raise TradingError("账户全仓保证金模式响应无效")
                 if dec(row["positionAmt"]):
                     raise TradingError("账户与持仓接口尚未同步")
-                if row["symbol"] not in flat_marks:
-                    flat_marks[row["symbol"]] = wire(self.market.book(row["symbol"]).mark)
                 rows.append({"symbol": row["symbol"], "positionSide": row["positionSide"], "positionAmt": "0",
-                             "entryPrice": "0", "markPrice": flat_marks[row["symbol"]],
+                             "entryPrice": "0", "markPrice": "0",
                              "leverage": row["leverage"], "unRealizedProfit": "0", "liquidationPrice": "0",
                              "marginType": "isolated" if row["isolated"] else "cross"})
         positions = []
@@ -1019,7 +1017,7 @@ class LiveBroker:
             field_prefix = f"{row['symbol']} {row['positionSide']}"
             entry = positive(row["entryPrice"], allow_zero=not qty, field=f"{field_prefix} 开仓价（entryPrice）")
             positions.append(Position(row["symbol"], row["positionSide"], qty, entry,
-                positive(row["markPrice"], field=f"{field_prefix} 标记价（markPrice）"),
+                positive(row["markPrice"], True, field=f"{field_prefix} 标记价（markPrice）"),
                 self._leverage(row.get("leverage"), field=f"{field_prefix} 实际杠杆（leverage）"), dec(row["unRealizedProfit"]),
                 positive(row["liquidationPrice"], True, field=f"{field_prefix} 强平价（liquidationPrice）"),
                 isolated=row["marginType"].lower() not in ("cross", "crossed")))
@@ -1033,6 +1031,7 @@ class LiveBroker:
                 raise TradingError("账户余额与持仓快照正在同步，稍后重试")
             if type(other.get("isolated")) is not bool or other["isolated"] != p.isolated:
                 raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
+        positions = self._fill_missing_marks(positions)
         brackets = {}
         for symbol in symbols:
             b = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
@@ -1085,6 +1084,24 @@ class LiveBroker:
                 raise TradingError("持仓接口返回重复记录，无法核对总占用保证金")
             result[key] = row
         return result
+
+    def _fill_missing_marks(self, positions):
+        """Resolve zero marks during snapshot reads, never on the cycle hot path."""
+        marks = {}
+        for position in positions:
+            if position.mark != 0 or position.symbol in marks:
+                continue
+            # market.book prefers a valid stream quote and otherwise performs a
+            # budgeted public read. A zero risk mark is never zero exposure.
+            book = self.market.book(position.symbol)
+            try:
+                book.require_fresh()
+            except TradingError as exc:
+                raise TradingError(f"{position.symbol} 持仓标记价缺失，备用行情不可用：{exc}") from None
+            marks[position.symbol] = positive(book.mark, field=f"{position.symbol} 行情标记价（markPrice）")
+        # A mixed pair of a recovered and an older mark would distort its PnL.
+        # Revalue both sides together, including positions outside the strategy.
+        return [replace(p, mark=marks[p.symbol]) if p.symbol in marks else p for p in positions]
 
     def _cycle_local_mark(self, symbol):
         """Use only local stream state here; live market.book may issue REST."""
@@ -1156,22 +1173,20 @@ class LiveBroker:
             risk_row = risk.get(key)
             mark = marks[symbol]
             if mark is None and risk_row is not None:
-                mark = positive(risk_row.get("markPrice"), field=f"{symbol} {side} 标记价（markPrice）")
+                mark = positive(risk_row.get("markPrice"), True, field=f"{symbol} {side} 标记价（markPrice）")
             if mark is None:
                 if qty:
                     raise TradingError("账户持仓缺少有效标记价格")
-                # Only a selected flat symbol omitted by risk reaches the
-                # existing public quote fallback, once for its two flat legs.
-                book = self.market.book(symbol)
-                book.require_fresh()
-                mark = marks[symbol] = positive(book.mark)
+                # Resolve omitted flat rows and reported zero marks together
+                # after parsing, so both sides use the same fresh price.
+                mark = dec(0)
             liquidation = None
             if risk_row is not None and risk_row.get("liquidationPrice") is not None:
                 liquidation = positive(risk_row["liquidationPrice"], True, field=f"{symbol} {side} 强平价（liquidationPrice）")
             positions.append(Position(symbol, side, qty, positive(row["entryPrice"], allow_zero=not qty,
                 field=f"{symbol} {side} 开仓价（entryPrice）"),
                 mark, leverages[symbol], dec(row["unrealizedProfit"]), liquidation, isolated=row["isolated"]))
-        return positions, rows, leverages, risk_unrealized
+        return self._fill_missing_marks(positions), rows, leverages, risk_unrealized
 
     @staticmethod
     def _cycle_current_caps(symbols, rows, leverages, read):

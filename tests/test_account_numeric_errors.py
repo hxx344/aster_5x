@@ -13,7 +13,7 @@ from .test_cycle_account_snapshot import ACCOUNT, RISK, SYMBOL, LocalQuoteMarket
 
 class AccountNumericErrorTests(unittest.TestCase):
     def test_position_errors_identify_symbol_side_field_and_numeric_value(self):
-        cases = (("entryPrice", "0", "正数"), ("markPrice", "0", "正数"),
+        cases = (("entryPrice", "0", "正数"), ("markPrice", "-1", "非负数"),
                  ("liquidationPrice", "-1", "非负数"), ("leverage", "0", "正数"))
         for field, value, requirement in cases:
             with self.subTest(field=field):

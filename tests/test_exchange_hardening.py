@@ -310,6 +310,42 @@ class QuoteHardeningTests(unittest.TestCase):
                     with self.assertRaises(TradingError):
                         market.book("XAUUSD1")
 
+    def test_time_error_identifies_symbol_sources_direction_limits_and_request_duration(self):
+        cases = (
+            (96000, 100000, "盘口（BBO）落后程序时间 4.000 秒（已过期）", "标记价落后程序时间 0.000 秒（有效）"),
+            (100000, 96000, "盘口（BBO）落后程序时间 0.000 秒（有效）", "标记价落后程序时间 4.000 秒（已过期）"),
+            (102000, 100000, "盘口（BBO）领先程序时间 2.000 秒（时间超前）", "标记价落后程序时间 0.000 秒（有效）"),
+            (96000, 102000, "盘口（BBO）落后程序时间 4.000 秒（已过期）", "标记价领先程序时间 2.000 秒（时间超前）"),
+        )
+        for bid, mark, bbo_detail, mark_detail in cases:
+            with self.subTest(bid=bid, mark=mark):
+                market = self.market(bid, mark)
+                ticks = [10.0]
+                original_call = market.api.call
+                def delayed(*args, **kwargs):
+                    ticks[0] += .125
+                    return original_call(*args, **kwargs)
+                market.api.call = delayed
+                with patch("trading.exchange.time.time", return_value=100), \
+                     patch("trading.exchange.time.monotonic", side_effect=lambda: ticks[0]), \
+                     self.assertRaises(TradingError) as caught:
+                    market.book("XAUUSD1")
+                message = str(caught.exception)
+                for detail in ("XAUUSD1 备用行情时间无效", bbo_detail, mark_detail,
+                               "允许落后最多 3 秒、领先最多 1 秒", "查询耗时 0.250 秒", "已跳过该报价"):
+                    self.assertIn(detail, message)
+                self.assertEqual(len(market.api.calls), 2)
+                self.assertNotIn("XAUUSD1", market.books)
+
+    def test_malformed_timestamp_identifies_the_affected_source(self):
+        for source, label in (("bid", "盘口（BBO）"), ("mark", "标记价")):
+            for stamp in (None, "NaN", "Infinity", 0, True):
+                with self.subTest(source=source, stamp=stamp):
+                    market = self.market(**{source + "_time": stamp})
+                    with self.assertRaises(TradingError) as caught:
+                        market.book("XAUUSD1")
+                    self.assertIn(f"XAUUSD1 备用{label}时间戳（time）", str(caught.exception))
+
     def test_exact_freshness_boundaries_and_oldest_timestamp_are_preserved(self):
         for bid, mark in ((97000, 101000), (101000, 97000), (100000, 100000)):
             with self.subTest(bid=bid, mark=mark), patch("trading.exchange.time.time", return_value=100):

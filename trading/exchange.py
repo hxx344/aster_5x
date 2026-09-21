@@ -584,16 +584,28 @@ class MarketData:
 
     def _read_book(self, symbol):
         # Fetch mark first so the executable BBO is as recent as possible.
+        started = time.monotonic()
         mark = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
         row = self.api.call("GET", "/fapi/v3/ticker/bookTicker", {"symbol": symbol}, weight=1)
         if not isinstance(row, dict) or not isinstance(mark, dict):
             raise TradingError("报价响应无效")
         if row.get("symbol") != symbol or mark.get("symbol") != symbol:
             raise TradingError("报价交易代码不匹配")
-        timestamps = [float(positive(source.get("time"))) / 1000 for source in (row, mark)]
+        sources = (("盘口（BBO）", row), ("标记价", mark))
+        timestamps = [float(positive(source.get("time"), field=f"{symbol} 备用{label}时间戳（time）")) / 1000
+                      for label, source in sources]
         now = time.time()
-        if any(not -1 <= now - stamp <= 3 for stamp in timestamps):
-            raise TradingError("BBO 或标记价格时间无效，等待新报价")
+        ages = [now - stamp for stamp in timestamps]
+        if any(not -1 <= age <= 3 for age in ages):
+            details = []
+            for (label, _), age in zip(sources, ages):
+                direction = "落后" if age >= 0 else "领先"
+                state = "已过期" if age > 3 else "时间超前" if age < -1 else "有效"
+                details.append(f"{label}{direction}程序时间 {abs(age):.3f} 秒（{state}）")
+            elapsed = time.monotonic() - started
+            raise TradingError(f"{symbol} 备用行情时间无效：{'；'.join(details)}；"
+                               f"允许落后最多 3 秒、领先最多 1 秒；本次查询耗时 {elapsed:.3f} 秒。"
+                               "已跳过该报价，等待行情更新；持续发生时检查行情连接与服务器时钟")
         book = Book(positive(row["bidPrice"]), positive(row["askPrice"]), positive(row["bidQty"]),
                     positive(row["askQty"]), positive(mark["markPrice"]), min(timestamps))
         book.require_fresh(now)
@@ -1093,12 +1105,15 @@ class LiveBroker:
                 continue
             # market.book prefers a valid stream quote and otherwise performs a
             # budgeted public read. A zero risk mark is never zero exposure.
-            book = self.market.book(position.symbol)
             try:
+                book = self.market.book(position.symbol)
                 book.require_fresh()
+                marks[position.symbol] = positive(book.mark, field=f"{position.symbol} 行情标记价（markPrice）")
             except TradingError as exc:
-                raise TradingError(f"{position.symbol} 持仓标记价缺失，备用行情不可用：{exc}") from None
-            marks[position.symbol] = positive(book.mark, field=f"{position.symbol} 行情标记价（markPrice）")
+                # Keep the original error type and retry metadata: adding read
+                # context must not turn a rate-limit wait into an ordinary error.
+                exc.args = (f"{position.symbol} 持仓标记价缺失，补充行情失败，本次账户快照未更新：{exc}",)
+                raise
         # A mixed pair of a recovered and an older mark would distort its PnL.
         # Revalue both sides together, including positions outside the strategy.
         return [replace(p, mark=marks[p.symbol]) if p.symbol in marks else p for p in positions]

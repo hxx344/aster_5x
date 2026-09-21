@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock
 
 from trading.engine import Engine
-from trading.exchange import LiveBroker, RateBudget, SnapshotSuperseded
+from trading.exchange import BudgetWait, ExchangeError, LiveBroker, RateBudget, RequestNotSent, SnapshotSuperseded
 from trading.models import TradingError, dec
 from trading.paper import PAPER_BRACKETS
 from .helpers import Fixture
@@ -92,6 +92,26 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 with self.assertRaises(TradingError):
                     broker.snapshot([SYMBOL], fresh_modes=True)
                 self.assertIsNone(broker.leverage_snapshot)
+
+    def test_quote_read_failure_explains_snapshot_context_and_preserves_retry_semantics(self):
+        for kind in (TradingError, ExchangeError, RequestNotSent, BudgetWait, SnapshotSuperseded):
+            with self.subTest(kind=kind):
+                responses = ordinary_responses()
+                responses[RISK][0]["markPrice"] = "0E-8"
+                broker, _, market = self.broker(responses)
+                failure = kind("备用行情失败")
+                if isinstance(failure, ExchangeError):
+                    failure.code, failure.http_status, failure.retry_after = -1003, 429, 180
+                market.book.side_effect = failure
+                with self.assertRaises(kind) as caught:
+                    broker.snapshot([SYMBOL])
+                self.assertIs(caught.exception, failure)
+                self.assertIn(f"{SYMBOL} 持仓标记价缺失", str(caught.exception))
+                self.assertIn("本次账户快照未更新：备用行情失败", str(caught.exception))
+                if isinstance(failure, ExchangeError):
+                    self.assertEqual((failure.code, failure.http_status, failure.retry_after), (-1003, 429, 180))
+                self.assertIsNone(broker.leverage_snapshot)
+                market.book.assert_called_once_with(SYMBOL)
 
     def test_other_invalid_marks_remain_errors_and_valid_marks_do_not_fetch(self):
         for value in ("-1", "NaN", None, "bad"):

@@ -15,6 +15,7 @@ from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positi
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
+from .account_deletion import deletion_block
 from .request_timing import database_clock, database_duration
 from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, identifier, normalize_fill,
                            order_bindings, receipt_quantity, sort_key, utc_day, validate_fill_binding)
@@ -75,6 +76,9 @@ class Store:
             schema = """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id TEXT PRIMARY KEY, data TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS deleted_accounts (
+                    id TEXT PRIMARY KEY, data TEXT NOT NULL, deleted_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS intents (
@@ -298,7 +302,7 @@ class Store:
                 raise TradingError("账本用途与启动模式不符；演示与正式服务必须使用独立的数据目录")
             return
         if demo:
-            expected = {"accounts", "kv", "intents", "events", "outbox", "cycle_fills",
+            expected = {"accounts", "deleted_accounts", "kv", "intents", "events", "outbox", "cycle_fills",
                         "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync", "cycle_fill_versions"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
@@ -341,7 +345,34 @@ class Store:
     def save_account(self, account):
         account = self.account_defaults(account)
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM deleted_accounts WHERE id=?", (account["id"],)).fetchone():
+                raise TradingError("该账户标识已有删除记录，请使用新的账户标识")
             db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(account)))
+
+    def account_id_used(self, account_id):
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM accounts WHERE id=? UNION ALL SELECT 1 FROM deleted_accounts WHERE id=?",
+                              (account_id, account_id)).fetchone() is not None
+
+    def delete_account(self, account_id):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            reader = _StoreSnapshot(self, db)
+            account = reader.account(account_id)
+            if account is None:
+                if db.execute("SELECT 1 FROM deleted_accounts WHERE id=?", (account_id,)).fetchone():
+                    return  # Retrying an acknowledged or timed-out deletion is safe.
+                raise TradingError("账户不存在")
+            reason = deletion_block(account, reader.intent(account_id), reader.get("post_fill_check:" + account_id),
+                                    reader.get("cycle:" + account_id))
+            if reason:
+                raise TradingError(reason)
+            now = time.time()
+            db.execute("INSERT INTO deleted_accounts VALUES (?,?,?)", (account_id, dumps(account), now))
+            db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
+                       (account_id, "config", "账户已从工作台删除，历史记录保留", now))
 
     def pause_account(self, account, reason):
         account.update(enabled=False, pause_reason=reason)

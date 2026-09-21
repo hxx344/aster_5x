@@ -69,7 +69,7 @@ export function useTradingDesk() {
   const action = async (
     url: string,
     body?: object,
-    method: 'POST' | 'PATCH' = 'POST',
+    method: 'POST' | 'PATCH' | 'DELETE' = 'POST',
   ) => {
     if (operationPending.current) return false;
     operationPending.current = true;

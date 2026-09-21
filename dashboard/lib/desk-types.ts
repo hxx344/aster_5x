@@ -36,6 +36,7 @@ export type Account = {
   mode: string;
   env_prefix: string;
   enabled: boolean;
+  deletion_block?: string | null;
   cycle_recovery_available?: boolean;
   status: string;
   reason: string;
@@ -111,7 +112,7 @@ export type State = {
 export type DeskAction = (
   url: string,
   body?: object,
-  method?: 'POST' | 'PATCH',
+  method?: 'POST' | 'PATCH' | 'DELETE',
 ) => Promise<boolean>;
 export type FeatureProps = {
   account: Account;

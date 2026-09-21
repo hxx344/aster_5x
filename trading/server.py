@@ -301,6 +301,11 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         engine.configure(account_id, body.model_dump(exclude_unset=True))
         return {"ok": True}
 
+    @app.delete("/api/accounts/{account_id}", dependencies=write_dependencies)
+    def delete_account(account_id: str):
+        engine.delete_account(account_id)
+        return {"ok": True}
+
     @app.post("/api/accounts/{account_id}/enable", dependencies=write_dependencies)
     def enable(account_id: str):
         engine.enable(account_id, True)

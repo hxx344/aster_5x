@@ -19,6 +19,7 @@ import monitor
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import HotAccountUnavailable
+from .account_deletion import deletion_block
 from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, _state as cycle_record_state, cycle_baseline, cycle_recovery_available, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
 from .cycle_execution import CycleExecutor
@@ -155,6 +156,7 @@ class Engine:
         self.account_locks = {}
         self.budget_wait_events = {}
         self.brokers, self.signers, self.users = {}, {}, {}
+        self.deleted_accounts = set()
         self.markets, self.views, self.rotation = {}, {}, {}
         self.display_snapshots = {}
         self.dashboard_reports = ReportCache(self._load_dashboard_report)
@@ -167,7 +169,7 @@ class Engine:
         self.capacity_notification_errors = {}
         self.capacity_targets, self.capacity_accounts = {}, []
         self.capacity_full_checked = {}
-        if demo and not store.accounts():
+        if demo and not store.accounts() and not store.account_id_used("demo"):
             account = {"id": "demo", "name": "示例子账户", "mode": "paper", "env_prefix": "ASTER_DEMO", "enabled": False, "policy": {**DEFAULT_POLICY}}
             store.save_account(account)
             self.brokers["demo"] = PaperBroker("demo", self.market, store, seed=True)
@@ -198,6 +200,8 @@ class Engine:
         # Background refresh and trading may first reach an account together.
         # Construction is local; serialize registration, never an HTTP read.
         with self.lock:
+            if aid in self.deleted_accounts:
+                raise TradingError("账户已删除")
             if aid in self.brokers:
                 return self.brokers[aid]
             if account["mode"] == "paper":
@@ -1591,13 +1595,41 @@ class Engine:
             accounts = self.store.accounts()
             if len(accounts) >= MAX_ACCOUNTS:
                 raise TradingError("单实例最多管理 8 个账户")
-            if any(a["id"] == account["id"] or a["env_prefix"] == account["env_prefix"] for a in accounts):
+            if self.store.account_id_used(account["id"]):
+                raise TradingError("账户标识已使用，包含已删除的历史账户；请使用新的账户标识")
+            if any(a["env_prefix"] == account["env_prefix"] for a in accounts):
                 raise TradingError("账户标识或环境变量前缀已使用")
             self.store.save_account(account)
             with self.lock:
                 self.accounts_generation += 1
         self.store.event(account["id"], "config", "账户已添加，默认暂停")
         return account
+
+    def delete_account(self, account_id):
+        # Serialize removal with trading, controls and registration. Retain the
+        # account lock object so queued workers cannot acquire a different lock.
+        with self.account_lock(account_id), self.registration_lock:
+            with self.lock:
+                self.store.delete_account(account_id)
+                self.deleted_accounts.add(account_id)
+                broker = self.brokers.pop(account_id, None)
+                for registry in (self.signers, self.users):
+                    for key in [key for key, aid in registry.items() if aid == account_id]:
+                        registry.pop(key)
+                work = self.account_work.pop(account_id, None)
+                if work and work.ordinary_read:
+                    work.ordinary_read.future.cancel()
+                for cache in (self.views, self.display_snapshots, self.rotation, self.cycle_recovery_previews,
+                              self.budget_wait_events):
+                    cache.pop(account_id, None)
+                self.capacity_accounts = [a for a in self.capacity_accounts if a["id"] != account_id]
+                self.accounts_generation += 1
+            self.scheduler_event.set()
+            if isinstance(broker, LiveBroker):
+                try:
+                    broker.close()
+                except Exception:
+                    LOG.warning("Deleted account client cleanup failed")
 
     def configure(self, account_id, changes):
         with self.account_lock(account_id):
@@ -1996,6 +2028,8 @@ class Engine:
             pending_notifications = reader.pending_notifications()
             migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
             cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
+            deletion_blocks = {a["id"]: deletion_block(a, migration_records[a["id"]][1],
+                reader.get("post_fill_check:" + a["id"]), cycle_records[a["id"]]) for a in saved_accounts}
             cycle_quality = {a["id"]: reader.get("cycle_execution:" + a["id"]) for a in saved_accounts
                              if not compact or a["id"] == history_account}
         cycle_selection = {a["id"]: validate_cycle(a.get("cycle"))["symbol"] for a in saved_accounts}
@@ -2013,6 +2047,7 @@ class Engine:
                 "status": "attention" if a.get("pause_reason") else "starting",
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             for account in accounts:
+                account["deletion_block"] = deletion_blocks[account["id"]]
                 previous_display = self.display_snapshots.get(account["id"])
                 if previous_display and previous_display["timestamp"] > (account.get("snapshot") or {}).get("timestamp", 0):
                     account["snapshot"] = previous_display

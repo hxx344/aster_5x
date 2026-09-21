@@ -21,6 +21,7 @@ import { Progress } from '@/components/ui/progress';
 import { fmt, pct, clock } from '@/lib/desk-format';
 import { accountModeView } from '@/lib/account-modes';
 import { accountConfigurationLock } from '@/lib/account-config';
+import { DeleteAccountDialog } from '@/components/delete-account-dialog';
 import {
   cycleMarginLimit,
   marginLimitFromPercent,
@@ -324,6 +325,14 @@ export function AccountOverview({
           </details>
         </div>
       </div>
+      <DeleteAccountDialog
+        key={account.id}
+        account={account}
+        busy={busy}
+        action={action}
+        setNotice={setNotice}
+        connectionError={connectionError}
+      />
     </div>
   );
 }

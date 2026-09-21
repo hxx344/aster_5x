@@ -1,0 +1,18 @@
+name: Deployment storage and upgrade checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check standalone installer syntax
+        run: bash -n install-trading.sh
+      - name: Exercise isolated storage and upgrade fixtures
+        run: sudo python3 -m unittest tests.test_install_storage tests.test_trading_install -v

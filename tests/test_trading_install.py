@@ -53,7 +53,8 @@ class InstallerHarness:
         mappings = {"/opt/aster-desk": str(self.root), "/etc/aster-desk": str(self.etc),
                     "/var/lib/aster-desk": str(self.runtime), "/etc/systemd/system/aster-desk.service": str(self.unit),
                     "/usr/local/bin/aster-desk": str(self.base / "cli"), "/run/systemd/system": str(self.base),
-                    "/run/lock/aster-desk-install.lock": str(self.base / "install.lock")}
+                    "/run/lock/aster-desk-install.lock": str(self.base / "install.lock"),
+                    '"/proc/$pid/cwd"': '"' + str(self.base / 'proc') + '/$pid/cwd"'}
         for before, after in mappings.items():
             script = script.replace(before, after)
         self.write("install-trading.sh", script)
@@ -74,6 +75,14 @@ class InstallerHarness:
         for name in ("chown", "id", "useradd", "sleep"):
             self.executable(self.commands / name, "exit 0")
         self.executable(self.commands / "journalctl", 'printf "fixture service diagnostics\\n"')
+        self.executable(self.commands / "systemd-run", 'printf "%s\\n" "$HARNESS_BASE/runtime"')
+        self.executable(self.commands / "df", '''if [[ -f "$HARNESS_BASE/fail-space" ]]; then
+  printf 'Filesystem Blocks Used Available Capacity Mounted\\nfixture 100 100 0 100%% /\\n'
+elif [[ -f "$HARNESS_BASE/fail-inodes" && $1 == -Pi ]]; then
+  printf 'Filesystem Inodes Used Available Capacity Mounted\\nfixture 100 100 0 100%% /\\n'
+else
+  exec /bin/df "$@"
+fi''')
         for name in ("apt-get", "dnf"):
             self.executable(self.commands / name, 'printf "1\\n" >> "$HARNESS_COUNTERS/apt"')
         # An incompatible command earlier on PATH forces discovery of the existing
@@ -146,6 +155,17 @@ esac''')
         self.executable(self.commands / "systemctl", '''printf '%s\\n' "$*" >> "$HARNESS_BASE/service-calls"
 case "$1" in
 is-active) [[ $(cat "$HARNESS_BASE/service-state") == active ]] ;;
+is-enabled) exit 0 ;;
+show)
+  [[ ! -f "$HARNESS_BASE/fail-inspect" ]] || exit 1
+  if [[ $* == *MainPID* ]]; then
+    if [[ $(cat "$HARNESS_BASE/service-state") == active ]]; then
+      mkdir -p "$HARNESS_BASE/proc/123"
+      ln -sfn "$(readlink -f "$HARNESS_BASE/opt/current")" "$HARNESS_BASE/proc/123/cwd"
+      printf '123\\n'
+    else printf '0\\n'; fi
+  else printf 'no\\n'; fi
+  ;;
 stop)
   printf stopped > "$HARNESS_BASE/service-state"
   if [[ -f "$HARNESS_BASE/rollback-pending" ]]; then
@@ -169,11 +189,11 @@ start|enable)
 list-unit-files) printf 'aster-5x.service enabled\\n' ;;
 esac''')
 
-    def run(self, fail=None):
+    def run(self, fail=None, args=()):
         if fail:
             (self.base / ("fail-" + fail)).touch()
         try:
-            result = subprocess.run(["bash", str(self.source / "install-trading.sh")], cwd=self.source,
+            result = subprocess.run(["bash", str(self.source / "install-trading.sh"), *args], cwd=self.source,
                                     env={**os.environ, "PATH": str(self.commands) + ":/usr/bin:/bin",
                                          "HARNESS_BASE": str(self.base), "HARNESS_COMMANDS": str(self.commands),
                                          "HARNESS_COUNTERS": str(self.counters), "HARNESS_REAL_PYTHON": sys.executable,
@@ -229,8 +249,11 @@ class TradingInstallerTests(unittest.TestCase):
         self.assertNotEqual(self.h.unit.read_text(), "old unit")
         self.h.assert_counts(pip=1, npm_ci=1, build=1)
         environment = self.h.assert_stable_venv(first)
+        before_calls = (self.h.base / "service-calls").read_text().splitlines()
         second = self.h.success()
-        self.assertNotEqual(first, second)
+        self.assertEqual(first, second, "an unchanged install must not create another release")
+        after_calls = (self.h.base / "service-calls").read_text().splitlines()[len(before_calls):]
+        self.assertFalse(any(line.split()[0] in {"start", "stop", "restart", "enable"} for line in after_calls))
         self.h.assert_counts(pip=1, npm_ci=1, build=1)
         self.assertEqual(self.h.assert_stable_venv(second), environment)
         self.assertEqual((first / "dashboard/dist/client/index.html").read_bytes(),
@@ -403,3 +426,59 @@ class TradingInstallerTests(unittest.TestCase):
         self.assertEqual(self.h.current, self.h.old)
         self.assertFalse((self.h.base / "service-calls").exists())
         self.h.assert_counts(pip=0, npm_ci=0, build=0)
+
+    def test_upgrade_keeps_current_and_one_successful_rollback_with_referenced_environments(self):
+        first = self.h.success()
+        first_env = self.h.assert_stable_venv(first)
+        self.h.append("requirements.lock", "# second runtime\n")
+        second = self.h.success()
+        second_env = self.h.assert_stable_venv(second)
+        self.h.append("requirements.lock", "# third runtime\n")
+        third = self.h.success()
+        self.assertEqual(set(self.h.root.joinpath("releases").glob("release-*")), {second, third})
+        # Explicit pressure cleanup drops unused dependency caches, never the
+        # rollback's environment or the currently running environment.
+        result = self.h.run(args=("--cleanup",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(first_env.exists())
+        self.assertTrue(second_env.exists())
+        self.assertTrue(self.h.assert_stable_venv(third).exists())
+
+    def test_failed_build_and_failed_health_do_not_leave_managed_release_directories(self):
+        previous = self.h.success()
+        before = set(self.h.root.joinpath("releases").iterdir())
+        for failure in ("build", "health"):
+            with self.subTest(failure=failure):
+                self.h.append("dashboard/app/page.tsx", "updated frontend\n")
+                result = self.h.run(fail=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.h.current, previous)
+                self.assertEqual(set(self.h.root.joinpath("releases").iterdir()), before)
+
+    def test_cleanup_does_not_build_or_restart_and_retains_unknown_files(self):
+        previous = self.h.success()
+        unknown = self.h.root / "releases" / "user-backup"
+        unknown.mkdir()
+        sentinel = unknown / "keep"
+        sentinel.write_text("untouched")
+        calls = (self.h.base / "service-calls").read_text().splitlines()
+        result = self.h.run(args=("--cleanup",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.h.current, previous)
+        self.assertEqual(sentinel.read_text(), "untouched")
+        self.h.assert_counts(pip=1, npm_ci=1, build=1)
+        new_calls = (self.h.base / "service-calls").read_text().splitlines()[len(calls):]
+        self.assertFalse(any(line.split()[0] in {"start", "stop", "restart", "enable"} for line in new_calls))
+
+    def test_space_inode_and_service_inspection_failures_stop_before_build_or_switch(self):
+        previous = self.h.success()
+        self.h.append("trading/server.py", "# require an upgrade\n")
+        before = set(self.h.root.joinpath("releases").iterdir())
+        for failure in ("space", "inodes", "inspect"):
+            with self.subTest(failure=failure):
+                result = self.h.run(fail=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.h.current, previous)
+                self.assertEqual(set(self.h.root.joinpath("releases").iterdir()), before)
+                self.assertEqual((self.h.base / "service-state").read_text(), "active")
+                self.h.assert_counts(pip=1, npm_ci=1, build=1)

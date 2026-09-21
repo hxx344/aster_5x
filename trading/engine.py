@@ -1281,7 +1281,9 @@ class Engine:
                     cycle_context = True
                     progressed = True
                     return self.tick_cycle_account(account, broker, pending)
-                if not pending and cycling and not self.ordinary_snapshot_ready(account_id) and not self.store.get("post_fill_check:" + account_id):
+                # Paused accounts still take the scheduled read below. The
+                # cycle's paused fast return must not bypass that refresh.
+                if account["enabled"] and not pending and cycling and not self.ordinary_snapshot_ready(account_id) and not self.store.get("post_fill_check:" + account_id):
                     cycle_context = True
                     if not ordinary_markets:
                         return self.tick_cycle_account(account, broker, None)
@@ -1365,6 +1367,8 @@ class Engine:
                         self.strategy(account_id, symbol, "策略已暂停", "paused")
                     if snapshot.equity > 0:
                         self.store.finish_campaign(account, "策略已暂停", snapshot.ratio)
+                    if cycling and not self.shutdown.is_set():
+                        return self.tick_cycle_account(account, broker, None)
                     return 5
                 if not self.live_allowed(account):
                     raise TradingError("服务器尚未设置 ASTER_ALLOW_LIVE=1")
@@ -2038,6 +2042,7 @@ class Engine:
             a["id"]: (self._load_dashboard_report(a, state_now), None) for a in saved_accounts}
         add_blocks = {a["id"]: ordinary_add_blocks(a) for a in saved_accounts}
         request_budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else None
+        snapshot_schedules = self.scheduling(saved_accounts)
         with self.lock:
             accounts = [{**a, "risk_limits": {"base": a["policy"]["margin_limit"],
                                             "high_leverage": wire(opening_margin_limit(a["policy"], 10)),
@@ -2048,6 +2053,14 @@ class Engine:
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             for account in accounts:
                 account["deletion_block"] = deletion_blocks[account["id"]]
+                # Display cadence only; this never extends a snapshot's
+                # eight-second execution authority or starts an exchange read.
+                hot_refresh = (account["mode"] == "live" and account["enabled"]
+                               and account.get("cycle", {}).get("enabled") and self.live_allowed(account))
+                interval = (CYCLE_HOT_POLL_INTERVAL if hot_refresh else
+                    snapshot_schedules.get(account["id"], {}).get("interval",
+                        60 if not account["enabled"] and account.get("cycle", {}).get("enabled") else 5))
+                account["snapshot_refresh"] = {"interval_seconds": interval}
                 previous_display = self.display_snapshots.get(account["id"])
                 if previous_display and previous_display["timestamp"] > (account.get("snapshot") or {}).get("timestamp", 0):
                     account["snapshot"] = previous_display

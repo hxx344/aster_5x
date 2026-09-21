@@ -41,6 +41,7 @@ export type Account = {
   status: string;
   reason: string;
   credential_ready: boolean;
+  snapshot_refresh?: { interval_seconds: number };
   policy: Policy;
   migration?: MigrationConfig;
   migration_state?: MigrationState;

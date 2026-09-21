@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { Progress } from '@/components/ui/progress';
 import { fmt, pct, clock } from '@/lib/desk-format';
-import { accountModeView } from '@/lib/account-modes';
+import { accountModeView, accountSnapshotView } from '@/lib/account-modes';
 import { accountConfigurationLock } from '@/lib/account-config';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
 import {
@@ -44,11 +44,13 @@ export function AccountOverview({
     snapshot?.positions.filter((p) => Number(p.qty) !== 0) ?? [];
   const ratio = snapshot ? Number(snapshot.ratio ?? 1) : 0;
   const modeView = accountModeView(snapshot, now, connectionError);
-  const fresh =
-    snapshot &&
-    now - snapshot.timestamp < 8 &&
-    now >= snapshot.timestamp - 1 &&
-    !connectionError;
+  const snapshotView = accountSnapshotView(
+    snapshot,
+    now,
+    connectionError,
+    account.snapshot_refresh,
+    account.status === 'error' ? account.reason : undefined,
+  );
   const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
   const marginPercent = percentFromMarginLimit(
     account?.policy.margin_limit ?? '0.5',
@@ -117,8 +119,13 @@ export function AccountOverview({
         <div className="panel positions-panel">
           <div className="section-head">
             <h2>当前持仓 · {positions.length}</h2>
-            <span className={fresh ? 'small-note' : 'small-note amber'}>
-              {fresh ? '已同步' : '最近记录'} {clock(snapshot?.timestamp)}
+            <span
+              className={
+                snapshotView.warning ? 'small-note amber' : 'small-note'
+              }
+              title={snapshotView.notice}
+            >
+              {snapshotView.label} {clock(snapshot?.timestamp)}
             </span>
           </div>
           <div className="table-scroll">
@@ -270,7 +277,11 @@ export function AccountOverview({
                     ? '账户快照时间未知'
                     : '等待首次账户核验'}
               </p>
-              {modeView.notice && <p className="amber">{modeView.notice}</p>}
+              {snapshotView.notice && (
+                <p className={snapshotView.warning ? 'amber' : ''}>
+                  {snapshotView.notice}
+                </p>
+              )}
             </div>
             <div className="risk-caption">
               三项账户模式必须满足，仅核验，不自动修改。下单前与成交后均检查风险。

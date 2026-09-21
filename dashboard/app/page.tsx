@@ -24,6 +24,7 @@ import { useAccountDraft } from '@/lib/use-account-draft';
 import { fmt, pct, clock } from '@/lib/desk-format';
 import { cycleDraft, cycleRecoveryReason } from '@/lib/cycle';
 import { accountRunScope } from '@/lib/account-scope';
+import { accountSnapshotView } from '@/lib/account-modes';
 import { cycleMarginLimit } from '@/lib/policy';
 import { CyclePanel } from '@/components/cycle-panel';
 import { CycleRecovery } from '@/components/cycle-recovery';
@@ -83,11 +84,13 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     Boolean(connectionError) ||
     !state?.updated_at ||
     serverNow - state.updated_at >= 8;
-  const snapshotFresh =
-    snapshot &&
-    !connectionError &&
-    serverNow - snapshot.timestamp < 8 &&
-    serverNow >= snapshot.timestamp - 1;
+  const snapshotView = accountSnapshotView(
+    snapshot,
+    serverNow,
+    connectionError,
+    account?.snapshot_refresh,
+    account?.status === 'error' ? account.reason : undefined,
+  );
   const events =
     state?.events.filter(
       (event) =>
@@ -307,10 +310,11 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 </div>
               </dl>
               <span
-                className={`snapshot-stamp ${snapshotFresh ? '' : 'amber'}`}
+                className={`snapshot-stamp ${snapshotView.warning ? 'amber' : ''}`}
+                title={snapshotView.notice}
               >
                 {snapshot
-                  ? `${snapshotFresh ? '已同步' : '最近记录 · 数据过期'} ${clock(snapshot.timestamp)}`
+                  ? `${snapshotView.label} ${clock(snapshot.timestamp)}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
                   : '等待账户数据'}
                 {state?.demo ? ' · 模拟环境' : ''}
               </span>

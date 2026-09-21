@@ -351,6 +351,9 @@ if [[ -n $old && -f $old/.install-ready && -f $old/.venv/.complete && -s $old/da
     systemctl is-active --quiet aster-desk && systemctl is-enabled --quiet aster-desk &&
     [[ $(systemctl show --property=NeedDaemonReload --value aster-desk) == no ]] &&
     curl --max-time 2 -fsS http://127.0.0.1:8765/api/health 2>/dev/null | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ok"' 2>/dev/null; then
+  # A docs-only commit can have identical deployment inputs. Remember the
+  # verified revision so subsequent runs also skip its archive download.
+  if [[ -n $source_revision ]]; then printf '%s\n' "$source_revision" > "$old/.install-revision"; fi
   printf '[upgrade] Code, dependencies and service configuration unchanged; skipped build, release creation and restart.\n'
   exit 0
 fi

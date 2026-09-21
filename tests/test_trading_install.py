@@ -36,6 +36,7 @@ class InstallerHarness:
         self.npm_version = self.base / "npm-version"
         self.node_version.write_text("v22.23.2\n")
         self.npm_version.write_text("10.9.2\n")
+        (self.base / "remote-revision").write_text("a" * 40)
         self.node = self.root / "node-v22.23.2" / "bin"
         self.node.mkdir(parents=True)
         for name in ("trading", "dashboard", "dashboard/app", "dashboard/lib", "deploy"):
@@ -142,6 +143,16 @@ run)
 esac''')
         self.executable(self.commands / "curl", '''case "$*" in
 *nodejs.org*) printf '1\\n' >> "$HARNESS_COUNTERS/node-curl"; exit 42 ;;
+*api.github.com/repos/hxx344/aster_5x/commits/main*)
+  printf '{"sha":"%s"}' "$(cat "$HARNESS_BASE/remote-revision")" ;;
+*codeload.github.com/hxx344/aster_5x/tar.gz/*)
+  printf '1\\n' >> "$HARNESS_COUNTERS/source-curl"
+  while [[ $# -gt 0 ]]; do
+    if [[ $1 == -o ]]; then target=$2; break; fi
+    shift
+  done
+  tar -C "$HARNESS_BASE" -czf "$target" source
+  ;;
 *127.0.0.1:8765/api/health*)
   printf '1\\n' >> "$HARNESS_COUNTERS/health"
   if [[ -f "$HARNESS_BASE/fail-health" ]] || { [[ -f "$HARNESS_BASE/slow-health" ]] && [[ $(wc -l < "$HARNESS_COUNTERS/health") -le 2 ]]; }; then
@@ -189,15 +200,17 @@ start|enable)
 list-unit-files) printf 'aster-5x.service enabled\\n' ;;
 esac''')
 
-    def run(self, fail=None, args=()):
+    def run(self, fail=None, args=(), remote=False):
         if fail:
             (self.base / ("fail-" + fail)).touch()
         try:
-            result = subprocess.run(["bash", str(self.source / "install-trading.sh"), *args], cwd=self.source,
+            command = ["bash", "-s", "--", *args] if remote else ["bash", str(self.source / "install-trading.sh"), *args]
+            result = subprocess.run(command, cwd=self.base if remote else self.source,
                                     env={**os.environ, "PATH": str(self.commands) + ":/usr/bin:/bin",
                                          "HARNESS_BASE": str(self.base), "HARNESS_COMMANDS": str(self.commands),
                                          "HARNESS_COUNTERS": str(self.counters), "HARNESS_REAL_PYTHON": sys.executable,
                                          "HARNESS_NODE_VERSION": str(self.node_version), "HARNESS_NPM_VERSION": str(self.npm_version)},
+                                    input=(self.source / "install-trading.sh").read_text() if remote else None,
                                     capture_output=True, text=True, timeout=45)
         finally:
             if fail:
@@ -482,3 +495,22 @@ class TradingInstallerTests(unittest.TestCase):
                 self.assertEqual(set(self.h.root.joinpath("releases").iterdir()), before)
                 self.assertEqual((self.h.base / "service-state").read_text(), "active")
                 self.h.assert_counts(pip=1, npm_ci=1, build=1)
+
+    def test_docs_only_remote_revision_is_remembered_without_release_or_repeat_download(self):
+        first = self.h.run(remote=True)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        previous = self.h.current
+        self.h.write("README.md", "documentation-only update\n")
+        revision = "b" * 40
+        (self.h.base / "remote-revision").write_text(revision)
+        second = self.h.run(remote=True)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(self.h.current, previous)
+        self.assertEqual((previous / ".install-revision").read_text().strip(), revision)
+        self.assertEqual(self.h.count("source-curl"), 2)
+        third = self.h.run(remote=True)
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+        self.assertEqual(self.h.current, previous)
+        self.assertEqual(self.h.count("source-curl"), 2)
+        self.assertIn("skipping archive download", third.stdout)
+        self.h.assert_counts(pip=1, npm_ci=1, build=1)

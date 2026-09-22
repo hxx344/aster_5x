@@ -547,23 +547,10 @@ class CycleExecutor(Executor):
         if intent.pop("position_sync", None) is not None:
             self.store.save_intent(intent)
         remaining = {side: actual[side] - floor[side] for side in SIDES}
+        # Confirm the persisted order quantities exactly. The configured amount
+        # range sizes orders before submission; fill prices can move afterward.
         full_open = opening and not intent["repairs"] and all(original[side] == Fraction(dec(intent["quantity"])) for side in SIDES)
         if full_open:
-            config = intent["progress"]["config"]
-            minimum, maximum = Fraction(dec(config["min_notional"])), Fraction(dec(config["max_notional"]))
-            notionals = {side: Fraction(0) for side in SIDES}
-            for order in intent["orders"]:
-                receipt = intent["receipts"][order["newClientOrderId"]]
-                notionals[order["positionSide"]] += Fraction(dec(receipt["executedQty"])) * Fraction(dec(receipt["avgPrice"]))
-            compared = list(notionals.values()) if config["notional_scope"] == "per_side" else [sum(notionals.values())]
-            if any(not minimum <= amount <= maximum for amount in compared):
-                full_open = False
-                scope = "每边" if config["notional_scope"] == "per_side" else "多空合计"
-                intent["rollback_reason"] = ("实际成交金额超出本轮范围：多头 " + diagnostic_number(notionals["LONG"])
-                                             + " USD1，空头 " + diagnostic_number(notionals["SHORT"])
-                                             + " USD1，多空合计 " + diagnostic_number(sum(notionals.values()))
-                                             + " USD1；要求" + scope + "金额 " + diagnostic_number(minimum)
-                                             + "–" + diagnostic_number(maximum) + " USD1")
             try:
                 margin_limit = cycle_margin_limit(account["policy"])
                 if snapshot.margin_exceeds(margin_limit):
@@ -585,7 +572,9 @@ class CycleExecutor(Executor):
             progress = copy.deepcopy(intent["progress"])
             progress.update(phase="holding", quantities={side: wire(remaining[side]) for side in SIDES}, opened_at=time.time(),
                             failure_count=0, retry_at=0, close_eligible_at=None)
-            return self._finish(intent, progress, snapshot, "循环双向加仓已核实，原始持仓已记录，开始计算持仓时间")
+            return self._finish(intent, progress, snapshot,
+                f"循环双向加仓已核实：每边计划数量 {intent['quantity']}，多头成交数量 {wire(original['LONG'])}，"
+                f"空头成交数量 {wire(original['SHORT'])}；原始持仓已记录，开始计算持仓时间")
         if not any(remaining.values()):
             progress = copy.deepcopy(intent["progress"])
             progress.update(phase="waiting_open", quantities=dict.fromkeys(SIDES, "0"), opened_at=None, close_eligible_at=None)

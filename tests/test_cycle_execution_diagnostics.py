@@ -102,38 +102,37 @@ class CycleExecutionDiagnosticsTests(TestCase):
         self.assertIsNone(self.f.store.intent("test"))
         self.assertEqual(self.quantities(), (0, 0))
 
-    def test_actual_notional_rollback_explains_each_leg_and_configured_scope_range(self):
-        for scope, minimum, maximum, execution_price, expected_long, expected_short, expected_total in (
-                ("per_side", "0", "10000", "6000", "12000.02", "12000", "24000.02"),
-                ("gross", "0", "18000", "4510", "9020.02", "9020", "18040.02"),
-                ("per_side", "8700", "10000", "4300", "8600.02", "8600", "17200.02")):
-            with self.subTest(scope=scope, minimum=minimum):
-                self.configure(notional_scope=scope, min_notional=minimum, max_notional=maximum)
-                original_book, original_submit = self.f.market.book, self.f.broker.submit
-                execution_started = []
-                def moved_book(symbol):
-                    book = original_book(symbol)
-                    if execution_started and symbol == SYMBOL:
-                        book.bid = book.mark = dec(execution_price)
-                        book.ask = dec(execution_price) + dec("0.01")
-                    return book
-                def slipped(orders):
-                    execution_started.append(True)
-                    return original_submit(orders)
-                with patch.object(self.f.market, "book", side_effect=moved_book), \
-                     patch.object(self.f.broker, "submit", side_effect=slipped) as submit:
-                    self.open()
-                reason = self.progress_now()["reason"]
-                self.assertIn("实际成交金额超出本轮范围", reason)
-                self.assertIn("多头 " + expected_long + " USD1", reason)
-                self.assertIn("空头 " + expected_short + " USD1", reason)
-                self.assertIn("多空合计 " + expected_total + " USD1", reason)
-                label = "每边" if scope == "per_side" else "多空合计"
-                self.assertIn("要求" + label + "金额 " + minimum + "–" + maximum + " USD1", reason)
-                self.assertEqual(submit.call_count, 2)
-                self.assertEqual(self.quantities(), (0, 0))
-                self.assertIsNone(self.progress_now()["opened_at"])
-                self.assertNotIn("diagnostic", self.executor.last_completed_intent)
+    def test_quantity_confirmation_preserves_actual_fill_amounts_for_accounting(self):
+        self.configure(notional_scope="per_side", min_notional="0", max_notional="10000")
+        original_book, original_submit = self.f.market.book, self.f.broker.submit
+        execution_started = []
+        def moved_book(symbol):
+            book = original_book(symbol)
+            if execution_started and symbol == SYMBOL:
+                book.bid = book.mark = dec("4999.760775")
+                book.ask = dec("5000.03348996475")
+            return book
+        def slipped(orders):
+            execution_started.append(True)
+            return original_submit(orders)
+        with patch.object(self.f.market, "book", side_effect=moved_book), \
+             patch.object(self.f.broker, "submit", side_effect=slipped) as submit:
+            self.open()
+        self.assertEqual(submit.call_count, 1)
+        self.assertEqual(self.quantities(), (2, 2))
+        progress = self.progress_now()
+        self.assertEqual(progress["phase"], "holding")
+        self.assertIsNotNone(progress["opened_at"])
+        for detail in ("每边计划数量 2", "多头成交数量 2", "空头成交数量 2"):
+            self.assertIn(detail, progress["reason"])
+        completed = self.executor.last_completed_intent
+        self.assertEqual(completed["repairs"], [])
+        amounts = {order["positionSide"]: Fraction(completed["receipts"][order["newClientOrderId"]]["avgPrice"]) * 2
+                   for order in completed["orders"]}
+        self.assertEqual(amounts, {"LONG": Fraction("10000.0669799295"), "SHORT": Fraction("9999.52155")})
+        daily = self.f.store.cycle_daily_volume("test", symbol=SYMBOL)
+        self.assertEqual(Fraction(daily["volume"]), Fraction("19999.5885299295"))
+        self.assertEqual(daily["trade_count"], 2)
 
     def test_actual_margin_rollback_reports_ratio_effective_cap_occupied_and_equity(self):
         for base, wallet, cap in (("0.5", "15000", "55"), ("0.98", "8000", "100")):

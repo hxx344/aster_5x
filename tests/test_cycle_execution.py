@@ -262,7 +262,7 @@ class CycleExecutionTests(unittest.TestCase):
         self.executor.reconcile(self.f.account)
         self.assertGreaterEqual(self.progress_now()["opened_at"], confirmed_after)
 
-    def test_actual_fill_amount_outside_range_rolls_back_and_backs_off(self):
+    def test_full_quantity_fill_outside_planned_amount_range_starts_holding(self):
         for scope, minimum, maximum, execution_price in (("per_side", "0", "10000", "6000"),
                                                           ("gross", "0", "18000", "4510"),
                                                           ("per_side", "8700", "10000", "4300")):
@@ -285,14 +285,16 @@ class CycleExecutionTests(unittest.TestCase):
                     return original_submit(orders)
                 with patch.object(self.f.market, "book", side_effect=moved_book), patch.object(self.f.broker, "submit", side_effect=slipped) as submit:
                     self.open()
-                self.assertEqual(submit.call_count, 2)
-                self.assertEqual(self.quantities(), (0, 0))
+                self.assertEqual(submit.call_count, 1)
+                self.assertEqual(self.quantities(), (2, 2))
                 result = self.progress_now()
-                self.assertEqual(result["phase"], "waiting_open")
-                self.assertEqual(result["failure_count"], 1)
-                self.assertGreater(result["retry_at"], time.time() + 25)
-                self.assertIsNone(result["opened_at"])
-                self.assertIn("实际成交金额", result["reason"])
+                self.assertEqual(result["phase"], "holding")
+                self.assertEqual(result["quantities"], {"LONG": "2", "SHORT": "2"})
+                self.assertEqual(result["failure_count"], 0)
+                self.assertEqual(result["retry_at"], 0)
+                self.assertIsNotNone(result["opened_at"])
+                self.assertIsNone(self.f.store.intent("test"))
+                self.close_cycle()
 
     def test_post_fill_margin_above_limit_rolls_back(self):
         original = self.f.broker.submit

@@ -18,6 +18,8 @@ class ReportCache:
         self.lock = threading.Lock()
         self.entries = {}
         self.worker = None
+        self.producer = None
+        self.wakeup = threading.Event()
         self.due = 0
         self.closed = False
         self.history = LedgerCache()
@@ -27,12 +29,50 @@ class ReportCache:
         config = account.get("cycle", {})
         return config.get("symbol"), config.get("daily_volume_limit")
 
+    def start(self, accounts_reader):
+        """Produce reports independently of browser and hub reads."""
+        with self.lock:
+            if self.closed or self.producer is not None:
+                return
+            self.producer = threading.Thread(target=self._produce, args=(accounts_reader,),
+                                             name="aster-report-producer", daemon=True)
+            self.producer.start()
+
+    def _produce(self, accounts_reader):
+        while True:
+            self.wakeup.clear()
+            with self.lock:
+                if self.closed:
+                    return
+            try:
+                self.request_refresh(accounts_reader())
+            except Exception as exc:
+                LOG.warning("Dashboard report scheduling unavailable (%s)", type(exc).__name__)
+            with self.lock:
+                if self.closed:
+                    return
+                remaining = self.due - time.monotonic()
+                delay = min(REPORT_INTERVAL, remaining) if remaining > 0 else REPORT_INTERVAL
+            self.wakeup.wait(delay)
+
+    def _request_locked(self, accounts):
+        live_ids = {account["id"] for account in accounts}
+        self.entries = {aid: row for aid, row in self.entries.items() if aid in live_ids}
+        running = self.worker is not None and self.worker.is_alive()
+        if not self.closed and not running and time.monotonic() >= self.due and accounts:
+            self.worker = threading.Thread(target=self._refresh, args=(deepcopy(accounts),),
+                                           name="aster-dashboard-reports", daemon=True)
+            self.worker.start()
+            running = True
+        return running
+
+    def request_refresh(self, accounts):
+        with self.lock:
+            self._request_locked(accounts)
+
     def read(self, accounts, now, *, history_revisions=None):
         with self.lock:
-            live_ids = {account["id"] for account in accounts}
-            self.entries = {aid: row for aid, row in self.entries.items() if aid in live_ids}
-            running = self.worker is not None and self.worker.is_alive()
-            start = not self.closed and not running and time.monotonic() >= self.due and bool(accounts)
+            running = self._request_locked(accounts)
             result = {}
             for account in accounts:
                 entry = self.entries.get(account["id"], {})
@@ -51,13 +91,7 @@ class ReportCache:
                 result[account["id"]] = (deepcopy(selected), {
                     "as_of": stamp, "max_age_seconds": REPORT_MAX_AGE,
                     "status": ("stale" if stale or error else "ready") if data is not None else ("error" if error else "loading"),
-                    "refreshing": bool(running or start), "error": error})
-            if start:
-                # A slow report is shared by every browser; requests never queue
-                # another calculation or wait for this worker to finish.
-                self.worker = threading.Thread(target=self._refresh, args=(deepcopy(accounts),),
-                                               name="aster-dashboard-reports", daemon=True)
-                self.worker.start()
+                    "refreshing": running, "error": error})
             return result
 
     def _refresh(self, accounts):
@@ -83,10 +117,15 @@ class ReportCache:
         finally:
             with self.lock:
                 self.due = time.monotonic() + REPORT_INTERVAL
+            self.wakeup.set()
 
     def close(self):
         with self.lock:
             self.closed = True
+            producer = self.producer
             worker = self.worker
+        self.wakeup.set()
+        if producer is not None and producer is not threading.current_thread():
+            producer.join(timeout=5)
         if worker is not None:
             worker.join(timeout=5)

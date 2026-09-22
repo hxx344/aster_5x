@@ -177,6 +177,78 @@ class DashboardReportTests(TestCase):
 
 
 class ReportCacheTests(TestCase):
+    def test_producer_refreshes_without_page_reads_and_tracks_account_changes(self):
+        accounts = [account("test")]
+        calls, updated = [], threading.Event()
+        def load(a, now):
+            calls.append((a["id"], ReportCache.key(a), now))
+            updated.set()
+            return {"owner": a["id"]}
+        cache = ReportCache(load)
+        self.addCleanup(cache.close)
+        with patch("trading.report_cache.REPORT_INTERVAL", .03):
+            cache.start(lambda: deepcopy(accounts))
+            self.assertTrue(updated.wait(2))
+            cache.worker.join(timeout=2)
+            first = cache.entries["test"]["as_of"]
+            updated.clear()
+            self.assertTrue(updated.wait(2))
+            cache.worker.join(timeout=2)
+            self.assertGreater(cache.entries["test"]["as_of"], first)
+            accounts[:] = [account("second")]
+            accounts[0]["cycle"] = {"symbol": "CLUSD1", "daily_volume_limit": "999"}
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and "second" not in cache.entries:
+                updated.clear()
+                updated.wait(.1)
+            self.assertNotIn("test", cache.entries)
+            self.assertEqual(cache.entries["second"]["key"], ("CLUSD1", "999"))
+            cache.close()
+            count = len(calls)
+            cache.request_refresh(accounts)
+            self.assertEqual(len(calls), count)
+            self.assertFalse(cache.producer.is_alive())
+            self.assertFalse(cache.worker.is_alive())
+
+    def test_slow_producer_and_page_reads_share_one_worker(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def load(a, now):
+            calls.append(a["id"])
+            entered.set()
+            release.wait(3)
+            return {"owner": a["id"]}
+        cache = ReportCache(load)
+        self.addCleanup(cache.close)
+        with patch("trading.report_cache.REPORT_INTERVAL", .02):
+            cache.start(lambda: [account("test")])
+            try:
+                self.assertTrue(entered.wait(2))
+                for _ in range(12):
+                    cache.read([account("test")], time.time())
+                    cache.request_refresh([account("test")])
+                self.assertEqual(calls, ["test"])
+            finally:
+                release.set()
+                cache.close()
+
+    def test_producer_recovers_after_account_list_failure(self):
+        loaded = threading.Event()
+        attempts = []
+        def accounts():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("private detail")
+            return [account("test")]
+        cache = ReportCache(lambda a, now: loaded.set() or {})
+        self.addCleanup(cache.close)
+        with patch("trading.report_cache.REPORT_INTERVAL", .02), self.assertLogs("aster.trading", level="WARNING") as logs:
+            cache.start(accounts)
+            self.assertTrue(loaded.wait(2))
+            cache.close()
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertNotIn("private detail", str(logs.output))
+
     def test_failure_keeps_last_result_and_timestamp_without_crossing_account_or_config(self):
         accounts = [account("test"), account("second")]
         cache = ReportCache(lambda a, now: {"owner": a["id"], "value": "123"})

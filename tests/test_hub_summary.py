@@ -1,6 +1,7 @@
 """Portal summaries stay small and never initiate exchange/history work."""
 from datetime import datetime, timezone
 import time
+import threading
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from tests.helpers import Fixture, account
 from trading.engine import Engine
 from trading.hub_summary import hub_summary
 from trading.server import create_app
+from trading.models import TradingError
 
 
 class HubSummaryTests(TestCase):
@@ -36,6 +38,37 @@ class HubSummaryTests(TestCase):
 
     def metrics(self, result):
         return {item["key"]: item["value"] for item in result["data"]["metrics"]}
+
+    def test_engine_produces_reports_even_without_pages_or_market_readiness(self):
+        self.live()
+        self.engine.dashboard_reports.entries.clear()
+        self.engine.ready = False
+        generated = threading.Event()
+        original = self.engine.dashboard_reports.load
+        def load(saved, now):
+            value = original(saved, now)
+            generated.set()
+            return value
+        self.engine.dashboard_reports.load = load
+        with patch.object(self.engine, "state", side_effect=AssertionError("page read")), \
+             patch.object(self.engine.market, "load_rules", side_effect=TradingError("rules unavailable")), \
+             patch("trading.report_cache.REPORT_INTERVAL", .03):
+            self.engine.start()
+            try:
+                self.assertTrue(generated.wait(3))
+                self.engine.dashboard_reports.worker.join(timeout=2)
+                first = self.engine.dashboard_reports.entries["test"]["as_of"]
+                generated.clear()
+                self.assertTrue(generated.wait(2))
+                self.engine.dashboard_reports.worker.join(timeout=2)
+                self.assertGreater(self.engine.dashboard_reports.entries["test"]["as_of"], first)
+                result = hub_summary(self.engine)
+                self.assertIsNotNone(self.metrics(result)["daily_volume"])
+                self.assertNotIn("成交统计尚未生成", result["data"]["health"]["message"])
+                self.assertIn("交易服务尚未就绪", result["data"]["health"]["message"])
+            finally:
+                self.engine.stop()
+        self.assertFalse(self.engine.dashboard_reports.producer.is_alive())
 
     def test_uses_only_enabled_live_accounts_and_matches_units_without_heavy_reads(self):
         self.live()

@@ -2020,6 +2020,10 @@ class Engine:
         with self.store.read_snapshot() as reader:
             return self._cycle_report(reader, account, now)
 
+    def _dashboard_report_accounts(self):
+        with self.store.read_snapshot() as reader:
+            return reader.accounts()
+
     def state(self, *, background_reports=False, compact=False, history_account="", history_revision=""):
         # HTTP reads neither wait on the execution writer lock nor calculate
         # history. Synchronous reports remain available to local diagnostics.
@@ -2165,6 +2169,7 @@ class Engine:
         saved_accounts = []
         # Account refresh and history never occupy an execution worker's slot.
         try:
+            self.dashboard_reports.start(self._dashboard_report_accounts)
             if isinstance(self.market, MarketData) and not self.shutdown.is_set():
                 self.market.api.budget.configure_capacity_reserve(CAPACITY_MONITOR_RESERVE)
                 self.market.set_update_listener(self.on_cycle_market_update)
@@ -2358,6 +2363,7 @@ class Engine:
             self._ordinary_pool = None
             self.shutdown.set()
             self.scheduler_event.set()
+            self.dashboard_reports.close()
             with self.lock:
                 self.ready = False
                 brokers = list(self.brokers.items())

@@ -25,17 +25,37 @@ def _sum(values):
     return _number(sum(values))
 
 
+def _text(value, fallback):
+    return value.strip()[:120] if isinstance(value, str) and value.strip() else fallback
+
+
+def _message(base, reasons):
+    message = base
+    for index, reason in enumerate(reasons):
+        candidate = f"{message}；{reason}"
+        # The portal validates JavaScript string length (UTF-16 code units).
+        if len(candidate.encode("utf-16-le")) // 2 + 40 > 500:
+            return f"{message}；另有 {len(reasons) - index} 项异常，请进入项目查看"
+        message = candidate
+    return message
+
+
 def hub_summary(engine, *, now=None):
     """Never start account reads, history calculations or report refresh workers."""
     now = time.time() if now is None else now
     with engine.store.read_snapshot() as reader:
         accounts = [account for account in reader.accounts() if account.get("enabled")]
     live = [account for account in accounts if account.get("mode") == "live"]
-    stamps, margins, volumes = [], [], []
+    stamps, margins, volumes, reasons = [], [], [], []
     with engine.lock:
         ready, error = engine.ready, engine.error
+        if error:
+            reasons.append(f"交易服务异常：{_text(error, '上游未提供具体原因')}")
+        if not ready:
+            reasons.append("交易服务尚未就绪")
         for account in live:
             aid = account["id"]
+            label = f"{_text(account.get('name'), '实盘账户')}（{_text(aid, '未知账户')}）"
             snapshot = engine.views.get(aid, {}).get("snapshot") or {}
             displayed = engine.display_snapshots.get(aid) or {}
             if (_number(displayed.get("timestamp")) or 0) > (_number(snapshot.get("timestamp")) or 0):
@@ -43,6 +63,15 @@ def hub_summary(engine, *, now=None):
             stamp = _number(snapshot.get("timestamp"))
             stamps.append(stamp if stamp is not None and 0 < stamp <= now + 60 else None)
             margins.append(_number(snapshot.get("occupied_margin")))
+            if not snapshot:
+                reasons.append(f"{label}：缺少账户快照")
+            else:
+                if stamps[-1] is None:
+                    reasons.append(f"{label}：快照缺少有效更新时间")
+                elif now - stamp >= STALE_AFTER_SECONDS:
+                    reasons.append(f"{label}：账户快照已过期（超过 {STALE_AFTER_SECONDS} 秒）")
+                if margins[-1] is None:
+                    reasons.append(f"{label}：保证金数据缺失或无效")
     utc_date = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
     reports = engine.dashboard_reports
     with reports.lock:
@@ -55,16 +84,34 @@ def hub_summary(engine, *, now=None):
             report = entry.get("data") or {}
             daily = report.get("volumes", {}).get(account["cycle"]["symbol"], {}).get("daily_volume", {})
             volumes.append(_number(daily.get("volume")) if valid and daily.get("utc_date") == utc_date else None)
+            if volumes[-1] is None:
+                label = f"{_text(account.get('name'), '实盘账户')}（{_text(account['id'], '未知账户')}）"
+                if entry.get("error"):
+                    reason = f"成交统计读取失败：{_text(entry['error'], '上游未提供具体原因')}"
+                elif not entry or not report:
+                    reason = "成交统计尚未生成"
+                elif entry.get("key") != reports.key(account):
+                    reason = "账户配置已变更，成交统计等待重新生成"
+                elif stamp is None or stamp > now:
+                    reason = "成交统计缺少有效更新时间"
+                elif now // 86400 != stamp // 86400 or daily.get("utc_date") != utc_date:
+                    reason = "成交统计缺少当日 UTC 数据"
+                elif now - stamp >= REPORT_MAX_AGE:
+                    reason = f"成交统计已过期（超过 {REPORT_MAX_AGE} 秒）"
+                else:
+                    reason = "今日成交量缺失或无效"
+                reasons.append(f"{label}：{reason}")
     oldest = min(stamps) if stamps and all(stamp is not None for stamp in stamps) else None
     updated_at = (datetime.fromtimestamp(oldest, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
                   if oldest is not None else None)
     partial = bool(error or not ready or any(value is None for value in [*stamps, *margins, *volumes]))
     offline = engine.shutdown.is_set() or (engine.thread is not None and not engine.thread.is_alive())
     health = "offline" if offline else "stale" if oldest is not None and now - oldest >= STALE_AFTER_SECONDS else "partial" if partial else "online"
-    message = ("上游为演示模式；交易数据不计入资产汇总" if engine.demo
-               else "交易服务已连接；保证金与成交量使用 USD1 口径")
-    if health != "online":
-        message += {"offline": "；交易服务已停止", "stale": "；账户快照已过期", "partial": "；部分数据尚未就绪"}[health]
+    if offline:
+        reasons.insert(0, "交易服务已停止")
+    message = _message("上游为演示模式；交易数据不计入资产汇总" if engine.demo
+                       else "交易服务已连接；保证金与成交量使用 USD1 口径" if health == "online"
+                       else "保证金与成交量使用 USD1 口径", reasons)
     metrics = [
         {"key": "accounts", "label": "启用账户", "value": len(accounts), "unit": "个"},
         {"key": "live_accounts", "label": "实盘账户", "value": len(live), "unit": "个"},

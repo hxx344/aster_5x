@@ -61,6 +61,61 @@ class HubSummaryTests(TestCase):
         self.assertIsNone(result["data"]["updatedAt"])
         self.assertIsNone(self.metrics(result)["occupied_margin"])
         self.assertIsNone(self.metrics(result)["daily_volume"])
+        self.assertIn("测试子账户（test）：缺少账户快照", result["data"]["health"]["message"])
+        self.assertIn("测试子账户（test）：成交统计尚未生成", result["data"]["health"]["message"])
+
+    def test_reports_explain_why_volume_is_unavailable(self):
+        for changes, reason in (
+            ({"as_of": self.now - 16}, "成交统计已过期（超过 15 秒）"),
+            ({"as_of": None}, "成交统计缺少有效更新时间"),
+            ({"as_of": self.now + 1}, "成交统计缺少有效更新时间"),
+            ({"error": "成交统计暂不可用，正在重新读取"}, "成交统计读取失败：成交统计暂不可用，正在重新读取"),
+            ({"key": ("different", "0")}, "账户配置已变更，成交统计等待重新生成"),
+            ({"data": {}}, "成交统计尚未生成"),
+        ):
+            with self.subTest(reason=reason):
+                self.live()
+                self.engine.dashboard_reports.entries["test"].update(changes)
+                result = hub_summary(self.engine, now=self.now)
+                self.assertIn(f"测试子账户（test）：{reason}", result["data"]["health"]["message"])
+                self.assertEqual(result["data"]["health"]["state"], "partial")
+        self.live(volume=None)
+        self.assertIn("今日成交量缺失或无效", hub_summary(self.engine, now=self.now)["data"]["health"]["message"])
+
+    def test_service_and_account_reasons_survive_health_priority(self):
+        self.live(margin=None)
+        self.engine.views["test"]["snapshot"]["timestamp"] = None
+        self.engine.ready, self.engine.error = False, "交易规则加载失败"
+        result = hub_summary(self.engine, now=self.now)
+        message = result["data"]["health"]["message"]
+        for reason in ("交易服务异常：交易规则加载失败", "交易服务尚未就绪", "测试子账户（test）：快照缺少有效更新时间", "测试子账户（test）：保证金数据缺失或无效"):
+            self.assertIn(reason, message)
+        self.engine.shutdown.set()
+        result = hub_summary(self.engine, now=self.now)
+        self.assertEqual(result["data"]["health"]["state"], "offline")
+        self.assertIn("交易服务已停止", result["data"]["health"]["message"])
+        self.assertIn("保证金数据缺失或无效", result["data"]["health"]["message"])
+        self.assertNotIn("已连接", result["data"]["health"]["message"])
+
+    def test_many_accounts_fit_the_portals_utf16_message_limit_without_heavy_reads(self):
+        for index in range(15):
+            aid = f"account-{index}"
+            self.live(aid, margin=None)
+            saved = self.f.store.account(aid)
+            saved["name"] = "账户😀" * 10
+            self.f.store.save_account(saved)
+        self.live("disabled", enabled=False, margin=None)
+        self.engine.error = {"secret": "never-serialize"}
+        with patch.object(self.engine, "state", side_effect=AssertionError("full state")), \
+             patch.object(self.engine.dashboard_reports, "read", side_effect=AssertionError("start reports")):
+            message = hub_summary(self.engine, now=self.now)["data"]["health"]["message"]
+        self.assertLessEqual(len(message.encode("utf-16-le")) // 2, 500)
+        self.assertIn("另有", message)
+        self.assertIn("account-0", message)
+        self.assertIn("保证金数据缺失或无效", message)
+        self.assertNotIn("disabled", message)
+        self.assertNotIn("never-serialize", message)
+        self.assertIsNone(self.engine.dashboard_reports.worker)
 
     def test_oldest_published_snapshot_controls_staleness(self):
         self.live(stamp=self.now - 121)
@@ -69,6 +124,7 @@ class HubSummaryTests(TestCase):
         expected = datetime.fromtimestamp(self.now - 121, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         self.assertEqual(result["data"]["updatedAt"], expected)
         self.assertEqual(result["data"]["health"]["state"], "stale")
+        self.assertIn("测试子账户（test）：账户快照已过期", result["data"]["health"]["message"])
         self.engine.display_snapshots["test"] = {"timestamp": self.now, "occupied_margin": "20"}
         result = hub_summary(self.engine, now=self.now)
         self.assertEqual(result["data"]["health"]["state"], "online")
@@ -104,6 +160,8 @@ class HubSummaryTests(TestCase):
         result = hub_summary(self.engine, now=self.now + 2)
         self.assertIsNone(self.metrics(result)["daily_volume"])
         self.assertEqual(result["data"]["health"]["state"], "partial")
+
+        self.assertIn("成交统计缺少当日 UTC 数据", result["data"]["health"]["message"])
 
     def test_missing_one_account_timestamp_does_not_borrow_another_accounts_freshness(self):
         self.live()

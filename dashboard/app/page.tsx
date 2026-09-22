@@ -156,7 +156,14 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
       </header>
       <div className="workspace">
         <div className="page-heading">
-          <h1>交易工作台</h1>
+          <div className="flex items-center gap-3">
+            <h1>交易工作台</h1>
+            {desk.hubConnected && (
+              <Button variant="ghost" onClick={desk.openAssets}>
+                查看资产账本
+              </Button>
+            )}
+          </div>
           <div className="account-controls">
             {' '}
             {account && (

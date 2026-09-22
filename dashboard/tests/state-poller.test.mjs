@@ -190,3 +190,49 @@ test('account switch cancels an old history response before it can enter the cac
     poller.pause();
   }
 });
+
+test('hidden activity cancels in-flight work and cannot be bypassed by resume or manual refresh', async (t) => {
+  const f = fixture(t);
+  const pending = f.poller.refresh();
+  f.poller.setActivity(false);
+  assert.equal(f.calls[0].signal.aborted, true);
+  f.poller.resume();
+  await f.poller.refresh({ resume: true });
+  f.poller.cancel();
+  await f.poller.refresh();
+  assert.equal(f.calls.length, 1);
+  f.calls[0].resolve(Response.json({ stale: true }));
+  await pending;
+  assert.deepEqual(f.states, []);
+  f.poller.setActivity(true);
+  const recovered = f.poller.refresh();
+  assert.equal(f.calls.length, 2);
+  f.calls[1].resolve(Response.json({ current: true }));
+  await recovered;
+  assert.deepEqual(f.states, [{ current: true }]);
+});
+
+test('restoring visibility preserves operation and unauthorized pauses', async (t) => {
+  const f = fixture(t);
+  f.poller.pause();
+  f.poller.setActivity(false);
+  f.poller.setActivity(true);
+  await f.poller.refresh();
+  assert.equal(f.calls.length, 0);
+  f.poller.resume();
+  const pending = f.poller.refresh();
+  f.calls[0].resolve(new Response(null, { status: 401 }));
+  await pending;
+  f.poller.setActivity(false);
+  f.poller.setActivity(true);
+  await f.poller.refresh();
+  assert.equal(f.calls.length, 1);
+});
+
+test('switching accounts cancels data without resuming a paused mutation', async (t) => {
+  const f = fixture(t);
+  f.poller.pause();
+  f.poller.cancel();
+  await f.poller.refresh();
+  assert.equal(f.calls.length, 0);
+});

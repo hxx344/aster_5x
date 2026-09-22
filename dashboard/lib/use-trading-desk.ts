@@ -4,6 +4,7 @@ import type { State } from './desk-types';
 import type { CycleTrade } from './cycle';
 import { createStatePoller } from './state-poller';
 import { createStateHistory } from './state-history';
+import { connectHubBridge } from './hub-bridge';
 export function useTradingDesk() {
   const [state, setState] = useState<State | null>(null);
   const [selected, setSelected] = useState('');
@@ -18,6 +19,8 @@ export function useTradingDesk() {
   const [now, setNow] = useState(0);
   const [notice, setNotice] = useState('');
   const operationPending = useRef(false);
+  const hubBridge = useRef<ReturnType<typeof connectHubBridge> | null>(null);
+  const [hubConnected, setHubConnected] = useState(false);
   const clearSession = useCallback(() => {
     setNeedsLogin(true);
     setState(null);
@@ -44,28 +47,61 @@ export function useTradingDesk() {
       onError: setConnectionError,
     }),
   );
-  const selectAccount = (id: string) => {
-    history.select(id);
-    setSelected(id);
-    poller.pause();
-    poller.resume();
-    void poller.refresh();
-  };
+  const selectAccount = useCallback(
+    (id: string) => {
+      history.select(id);
+      setSelected(id);
+      poller.cancel();
+      void poller.refresh();
+    },
+    [history, poller],
+  );
   const refresh = useCallback(() => poller.refresh(), [poller]);
   useEffect(() => {
     poller.resume();
+    let hubActive = true;
+    let timer: ReturnType<typeof setInterval> | undefined;
     const tick = () => {
       setNow(Date.now() / 1000);
       void refresh();
     };
-    const initial = setTimeout(tick, 0);
-    const timer = setInterval(tick, 3000);
-    return () => {
-      clearTimeout(initial);
+    const updateActivity = () => {
       clearInterval(timer);
+      timer = undefined;
+      const active = document.visibilityState === 'visible' && navigator.onLine && hubActive;
+      poller.setActivity(active);
+      if (active) {
+        tick();
+        timer = setInterval(tick, 3000);
+      }
+    };
+    const bridge = connectHubBridge(window, {
+      onActivity: (active) => {
+        hubActive = active;
+        updateActivity();
+      },
+      onConnected: setHubConnected,
+      onNavigate: (accountId) => {
+        if (accountId) selectAccount(accountId);
+        else void refresh();
+      },
+    });
+    hubBridge.current = bridge;
+    document.addEventListener('visibilitychange', updateActivity);
+    window.addEventListener('online', updateActivity);
+    window.addEventListener('offline', updateActivity);
+    updateActivity();
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', updateActivity);
+      window.removeEventListener('online', updateActivity);
+      window.removeEventListener('offline', updateActivity);
+      bridge.dispose();
+      hubBridge.current = null;
+      poller.setActivity(false);
       poller.pause();
     };
-  }, [refresh, poller]);
+  }, [refresh, poller, selectAccount]);
   const action = async (
     url: string,
     body?: object,
@@ -96,6 +132,8 @@ export function useTradingDesk() {
         resumePolling = false;
       }
       if (!r.ok) throw new Error(data.detail || '操作未完成');
+      if (url.startsWith('/api/accounts') && !url.endsWith('/recovery-preview'))
+        hubBridge.current?.changed();
       if (url === '/api/logout') {
         clearSession();
         resumePolling = false;
@@ -137,6 +175,8 @@ export function useTradingDesk() {
     password,
     setPassword,
     busy,
+    hubConnected,
+    openAssets: () => hubBridge.current?.openAssets(),
     now,
     serverNow,
     notice,

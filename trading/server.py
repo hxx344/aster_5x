@@ -4,10 +4,12 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
+import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import re
 import socket
 import threading
 from time import monotonic
@@ -21,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from starlette.datastructures import MutableHeaders
 
 from .engine import Engine
+from .hub_summary import hub_summary
 from .models import TIERS, TradingError
 from .store import Store
 
@@ -31,6 +34,33 @@ SESSION_SECONDS = 43200
 MAX_SESSIONS = 1024
 LOGIN_WINDOW_SECONDS = 300
 MAX_LOGIN_CLIENTS = 1024
+
+
+class DashboardStaticFiles(StaticFiles):
+    """Cache only hashed public JS/CSS listed in this build's own manifest."""
+
+    def __init__(self, directory):
+        super().__init__(directory=directory, html=True)
+        self.immutable_paths = set()
+        try:
+            manifest = json.loads((Path(directory) / ".vite" / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(manifest, dict):
+            return
+        for entry in manifest.values():
+            if not isinstance(entry, dict):
+                continue
+            css = entry.get("css")
+            for path in [entry.get("file"), *(css if isinstance(css, list) else [])]:
+                if isinstance(path, str) and re.fullmatch(r"_next/static/(?:chunks|css)/[^/\\]+[-.][A-Za-z0-9_-]{8,}\.(?:js|css)", path):
+                    self.immutable_paths.add(path)
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 304) and path.replace("\\", "/") in self.immutable_paths:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
 
 class RequestSecurityMiddleware:
@@ -289,6 +319,10 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         return engine.state(background_reports=True, compact=compact,
                             history_account=history_account, history_revision=history_revision)
 
+    @app.get("/api/hub/summary", dependencies=[Depends(authenticated)])
+    def summary(schema_version: int = Query(2, alias="schemaVersion", ge=2, le=2)):
+        return hub_summary(engine)
+
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
 
     @app.post("/api/accounts", dependencies=write_dependencies)
@@ -332,7 +366,7 @@ def create_app(engine=None, *, demo=False, start_engine=True):
 
     output = Path(os.environ.get("ASTER_DASHBOARD_DIR", ROOT / "dashboard" / "dist" / "client"))
     if output.exists():
-        app.mount("/", StaticFiles(directory=output, html=True), name="dashboard")
+        app.mount("/", DashboardStaticFiles(output), name="dashboard")
     else:
         @app.get("/")
         def missing_dashboard():

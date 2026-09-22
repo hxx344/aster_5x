@@ -16,6 +16,7 @@ export function createStatePoller<T>({
   timeoutMs = 10000,
 }: PollerOptions<T>) {
   let paused = false;
+  let activeView = true;
   let active: AbortController | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -27,6 +28,13 @@ export function createStatePoller<T>({
   };
 
   return {
+    // Visibility is independent from session/mutation pauses: resume and an
+    // explicit refresh may never make a background module start requests.
+    setActivity(value: boolean) {
+      activeView = value;
+      if (!activeView) cancel();
+    },
+    cancel,
     pause() {
       paused = true;
       cancel();
@@ -36,7 +44,7 @@ export function createStatePoller<T>({
     },
     async refresh({ resume = false }: { resume?: boolean } = {}) {
       if (resume) paused = false;
-      if (paused || active) return;
+      if (paused || !activeView || active) return;
       const controller = new AbortController();
       active = controller;
       timer = setTimeout(() => {

@@ -71,6 +71,57 @@ def wait_for(predicate):
 
 
 class PublicQuoteCacheTests(unittest.TestCase):
+    def test_mark_is_available_without_any_bbo_and_after_bbo_expiry(self):
+        stream, wall, ticks = connected_cache()
+        stream._handle_message(event("mark"))
+        mark = stream.mark_price(SYMBOL)
+        self.assertEqual((mark.symbol, mark.price, mark.timestamp), (SYMBOL, Decimal("100.5"), NOW))
+        self.assertIsNone(stream.book(SYMBOL))
+        stream._handle_message(event())
+        self.assertIsNotNone(stream.book(SYMBOL))
+        wall.return_value, ticks.return_value = NOW + 3.001, 103.001
+        stream._handle_message(event("mark", E=MS + 3001))
+        self.assertIsNone(stream.book(SYMBOL))
+        self.assertEqual(stream.mark_price(SYMBOL).timestamp, NOW + 3.001)
+
+    def test_independent_mark_keeps_exact_source_time_limits(self):
+        for offset, valid in ((-3001, False), (-3000, True), (1000, True), (1001, False)):
+            with self.subTest(offset=offset):
+                stream, _, _ = connected_cache()
+                stream._handle_message(event("mark", E=MS + offset))
+                self.assertEqual(stream.mark_price(SYMBOL) is not None, valid)
+
+    def test_mark_clock_rollback_cannot_extend_or_revive_expired_value(self):
+        for expiry in ("source", "monotonic"):
+            with self.subTest(expiry=expiry):
+                stream, wall, ticks = connected_cache()
+                stream._handle_message(event("mark", E=MS - 2000))
+                self.assertIsNotNone(stream.mark_price(SYMBOL))
+                if expiry == "source":
+                    wall.return_value = NOW + 1.001
+                else:
+                    wall.return_value, ticks.return_value = NOW - 1, 101.001
+                self.assertIsNone(stream.mark_price(SYMBOL))
+                wall.return_value = NOW
+                self.assertIsNone(stream.mark_price(SYMBOL))
+
+    def test_bad_or_mismatched_mark_is_unusable_without_bbo(self):
+        for changes in ({"p": "0"}, {"p": "NaN"}, {"E": None}, {"s": "CLUSD1"}):
+            with self.subTest(changes=changes):
+                stream, _, _ = connected_cache()
+                stream._handle_message(event("mark"))
+                stream._handle_message(event("mark", **{"E": MS + 1, **changes}))
+                self.assertIsNone(stream.mark_price(SYMBOL))
+
+    def test_out_of_order_mark_does_not_replace_or_refresh_without_bbo(self):
+        stream, wall, ticks = connected_cache()
+        stream._handle_message(event("mark"))
+        for stamp in (MS, MS - 1):
+            stream._handle_message(event("mark", E=stamp, p="999"))
+            self.assertEqual(stream.mark_price(SYMBOL).price, Decimal("100.5"))
+        wall.return_value, ticks.return_value = NOW + 3.001, 103.001
+        self.assertIsNone(stream.mark_price(SYMBOL))
+
     def test_complete_quote_is_copied_and_keeps_all_book_fields(self):
         stream, _, _ = connected_cache()
         self.assertIsNone(stream.book(SYMBOL))
@@ -360,11 +411,13 @@ class PublicQuoteLifecycleTests(unittest.TestCase):
         first.messages.put(OSError("disconnected"))
         self.assertTrue(reconnecting.wait(1))
         self.assertIsNone(stream.book(SYMBOL))
+        self.assertIsNone(stream.mark_price(SYMBOL))
         allow_reconnect.set()
         self.assertTrue(second.receiving.wait(1))
         second.messages.put(event("mark"))
         wait_for(lambda: second.received == 1)
         self.assertIsNone(stream.book(SYMBOL))
+        self.assertIsNotNone(stream.mark_price(SYMBOL))
         second.messages.put(event(u=1))
         wait_for(lambda: stream.book(SYMBOL) is not None)
         self.assertEqual(stream.book(SYMBOL).timestamp, NOW)

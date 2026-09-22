@@ -88,7 +88,7 @@ def measure_pipeline(*, response_delay=0.04, changed=None, phase="open", warm_mo
         key = bytes(range(1, 33))
         credentials = {"private_key": key, "signer": Account.from_key(key).address, "user": "0x" + "22" * 20}
         api = API(credentials, transport=httpx.MockTransport(handle), budget=RateBudget())
-        market = MarketData(api, stream=SimpleNamespace(book=fixture.market.book),
+        market = MarketData(api, stream=SimpleNamespace(book=fixture.market.book, mark_price=fixture.market.mark_price),
             depth_stream=SimpleNamespace(snapshot=fixture.market.depth))
         market.rules, market.assets = fixture.market.rules, fixture.market.assets
         broker = LiveBroker(credentials, market, api=api)
@@ -209,12 +209,12 @@ class CycleLatencyPipelineTests(unittest.TestCase):
                 self.assertIsNone(result["pending"])
                 self.assertTrue(result["account_enabled"])
 
-    def test_unsynced_history_blocks_open_locally_without_querying_on_trade_worker(self):
+    def test_unsynced_history_allows_unlimited_open_without_querying_on_trade_worker(self):
         result = measure_pipeline(response_delay=0, during_history=True)
         self.assertEqual(result["private_gets"], 0)
         self.assertEqual(result["history_reads"], 0)
-        self.assertEqual(result["orders"], [])
-        self.assertIsNone(result["pending"])
+        self.assertEqual(len(result["orders"]), 1)
+        self.assertIsNotNone(result["pending"])
 
     def test_external_order_response_is_never_requested(self):
         result = measure_pipeline(response_delay=0, changed="orders")

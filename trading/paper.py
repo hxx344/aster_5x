@@ -5,7 +5,7 @@ import time
 
 from .exchange import ExchangeError
 from .depth import DepthSnapshot
-from .models import AccountSnapshot, Book, MIN_OPEN_LEVERAGE, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, TradingError, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, require_supported_leverage, wire
+from .models import AccountSnapshot, Book, MarkPrice, MIN_OPEN_LEVERAGE, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TIERS, TradingError, dec, floor_step, maintenance_for, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 
 
 PAPER_BRACKETS = [{"notionalFloor": "0", "notionalCap": "1000000", "maintMarginRatio": "0.025", "cum": "0", "initialLeverage": 20}]
@@ -29,6 +29,11 @@ class DemoMarket:
     def book(self, symbol):
         bid = {"XAUUSD1": dec("4412.01"), "SPCXUSD1": dec("724.18"), "CLUSD1": dec("79.32")}[symbol]
         return Book(bid, bid + dec("0.01"), dec(50), dec(50), bid + dec("0.005"), time.time())
+
+    def mark_price(self, symbol):
+        book = self.book(symbol)
+        book.require_fresh()
+        return MarkPrice(symbol, book.mark, book.timestamp, time.monotonic() + 3 - (time.time() - book.timestamp))
 
     def capacities(self, symbol, leverages):
         values = {5: "156800", 10: "85000", 20: "32000"}

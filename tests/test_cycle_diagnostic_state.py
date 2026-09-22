@@ -126,7 +126,7 @@ class CycleDiagnosticStateTests(TestCase):
         self.select(daily_volume_limit="100")
         saved = self.f.store.account("test")
         daily = self.engine.cycle_daily_allowance(saved)
-        daily.update(volume="100", remaining="0", reached=True)
+        daily.update(volume="100", quota_volume="100", remaining="0", reached=True)
         with patch.object(self.engine, "cycle_daily_allowance", return_value=daily), \
              patch.object(self.f.store, "cycle_rolling_volume", side_effect=AssertionError("statistics only")):
             with self.assertRaises(DailyVolumeLimitError) as caught:

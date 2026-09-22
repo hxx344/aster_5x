@@ -24,7 +24,7 @@ from .depth_stream import PublicDepthStream
 from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
 from .request_timing import transport_stage
-from .models import AccountModeError, AccountSnapshot, Book, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 PUBLIC_BRACKETS_REFRESH_INTERVAL = 60
@@ -444,6 +444,8 @@ class MarketData:
         self.assets = {}
         self.books, self.book_locks = {}, {}
         self.book_guard = threading.Lock()
+        self.marks, self.mark_locks = {}, {}
+        self.mark_guard = threading.Lock()
         self.depth_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
         self.depth_retry_at = {}
         self.public_brackets = {}
@@ -581,6 +583,61 @@ class MarketData:
             raise HotAccountUnavailable("循环报价热数据尚未就绪，等待行情更新")
         book.require_fresh()
         return book
+
+    def _stream_mark_price(self, symbol):
+        """Only the connected stream owns its mark cache; never copy it to REST."""
+        getter = getattr(self.stream, "mark_price", None)
+        if callable(getter):
+            try:
+                value = getter(symbol)
+                if value is not None:
+                    if not isinstance(value, MarkPrice) or value.symbol != symbol:
+                        raise TradingError("标记价交易代码不匹配")
+                    value.require_fresh()
+                    return value
+            except TradingError:
+                pass
+        return None
+
+    def mark_price(self, symbol):
+        """WS-first valuation mark, independent of executable BBO and its lock."""
+        value = self._stream_mark_price(symbol)
+        if value is not None:
+            return value
+        with self.mark_guard:
+            lock = self.mark_locks.setdefault(symbol, threading.Lock())
+        with lock:
+            value = self._stream_mark_price(symbol)
+            if value is not None:
+                return value
+            cached = self.marks.get(symbol)
+            if cached is not None and 0 <= time.monotonic() - cached[0] < 1:
+                try:
+                    cached[1].require_fresh()
+                    return cached[1]
+                except TradingError:
+                    pass
+            self.marks.pop(symbol, None)
+            started = time.monotonic()
+            value = self._read_mark_price(symbol)
+            self.marks[symbol] = (started, value)
+            return value
+
+    def _read_mark_price(self, symbol):
+        started = time.monotonic()
+        row = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
+        if not isinstance(row, dict) or row.get("symbol") != symbol:
+            raise TradingError(f"{symbol} 备用标记价响应或交易代码无效")
+        try:
+            timestamp = float(positive(row.get("time"), field=f"{symbol} 备用标记价时间戳（time）")) / 1000
+            now, ticks = time.time(), time.monotonic()
+            value = MarkPrice(symbol, positive(row.get("markPrice"), field=f"{symbol} 备用标记价（markPrice）"),
+                              timestamp, ticks + 3 - (now - timestamp))
+            value.require_fresh(now, monotonic=ticks)
+        except TradingError as exc:
+            raise TradingError(f"{symbol} 备用标记价无效：{exc}；本次查询耗时 {time.monotonic() - started:.3f} 秒。"
+                               "已跳过该标记价，等待行情更新；持续发生时检查标记价连接与服务器时钟") from None
+        return value
 
     def _read_book(self, symbol):
         # Fetch mark first so the executable BBO is as recent as possible.
@@ -922,7 +979,7 @@ class LiveBroker:
         def due(key, ttl):
             # Leave time for this read to complete before reusing an expiring item.
             return now - self.cached_at.get(key, -1e9) + 8 >= ttl
-        weight = 10 + 2 * len(symbols)  # Balances, all positions, missing marks.
+        weight = 10 + len(symbols)  # Balances, all positions, mark-only fallback.
         weight += sum(30 for key in ("dual", "multi") if fresh_modes or due(key, 15))
         weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
         return weight
@@ -940,8 +997,8 @@ class LiveBroker:
         symbols = tuple(dict.fromkeys(symbols))
         now = time.monotonic()
         # Account; reserve for one full risk fallback and the
-        # two-request quote fallback when risk omits a flat row or reports zero.
-        weight = 5 + 5 + 2 * len(symbols)
+        # one-request mark fallback when risk omits a flat row or reports zero.
+        weight = 5 + 5 + len(symbols)
         if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= 15:
             weight += 30
         weight += sum(1 for symbol in symbols if now - self.cached_at.get("bracket:" + symbol, -1e9) + 8 >= 5)
@@ -1103,24 +1160,45 @@ class LiveBroker:
         for position in positions:
             if position.mark != 0 or position.symbol in marks:
                 continue
-            # market.book prefers a valid stream quote and otherwise performs a
-            # budgeted public read. A zero risk mark is never zero exposure.
+            # Valuation requires only a fresh mark, not an executable BBO.
+            # A zero risk mark is never zero exposure.
             try:
-                book = self.market.book(position.symbol)
-                book.require_fresh()
-                marks[position.symbol] = positive(book.mark, field=f"{position.symbol} 行情标记价（markPrice）")
+                value = self.market.mark_price(position.symbol)
+                if not isinstance(value, MarkPrice) or value.symbol != position.symbol:
+                    raise TradingError("标记价交易代码不匹配")
+                value.require_fresh()
+                marks[position.symbol] = value
             except TradingError as exc:
                 # Keep the original error type and retry metadata: adding read
                 # context must not turn a rate-limit wait into an ordinary error.
                 exc.args = (f"{position.symbol} 持仓标记价缺失，补充行情失败，本次账户快照未更新：{exc}",)
                 raise
+        # Another symbol's fallback may have taken long enough to expire the
+        # first result. Do not publish that partially stale valuation set.
+        for symbol, value in marks.items():
+            try:
+                value.require_fresh()
+            except TradingError as exc:
+                exc.args = (f"{symbol} 补充标记价在账户读取期间失效，本次账户快照未更新：{exc}",)
+                raise
         # A mixed pair of a recovered and an older mark would distort its PnL.
         # Revalue both sides together, including positions outside the strategy.
-        return [replace(p, mark=marks[p.symbol]) if p.symbol in marks else p for p in positions]
+        return [replace(p, mark=marks[p.symbol].price) if p.symbol in marks else p for p in positions]
 
     def _cycle_local_mark(self, symbol):
-        """Use only local stream state here; live market.book may issue REST."""
+        """Use only local stream state here; live mark_price may issue REST."""
         try:
+            getter = getattr(self.market, "_stream_mark_price", None)
+            if callable(getter):
+                value = getter(symbol)
+                if value is not None:
+                    if not isinstance(value, MarkPrice) or value.symbol != symbol:
+                        return None
+                    value.require_fresh()
+                    return positive(value.price)
+                return None
+            # Older injected/demo markets can still provide a stricter complete
+            # local book. Never use their public fallback for a live hot read.
             if getattr(self.market, "demo", False) is True:
                 book = self.market.book(symbol)
             elif callable(getattr(self.market, "_stream_book", None)):

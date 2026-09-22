@@ -11,7 +11,7 @@ import time
 
 from websockets.sync.client import connect as websocket_connect
 
-from .models import Book, SYMBOLS, TradingError, positive
+from .models import Book, MarkPrice, SYMBOLS, TradingError, positive
 
 
 _LOG = logging.getLogger(__name__)
@@ -154,6 +154,22 @@ class PublicQuoteStream:
                         min(bbo.event_ms, bbo.transaction_ms, mark.event_ms) / 1000)
             book.require_fresh(now, self._MAX_AGE)
             return book
+
+    def mark_price(self, symbol):
+        """Read valuation data independently; this never authorizes a trade."""
+        with self._lock:
+            if not self._connected or self._stop.is_set():
+                return None
+            mark = self._mark.get(symbol)
+            if mark is None:
+                return None
+            now, ticks = self._now(), self._ticks()
+            if not self._fresh(mark.event_ms, now) or ticks > mark.expires:
+                self._mark.pop(symbol, None)
+                return None
+            value = MarkPrice(symbol, mark.price, mark.event_ms / 1000, mark.expires)
+            value.require_fresh(now, self._MAX_AGE, ticks)
+            return value
 
     def _fresh(self, event_ms, now):
         return -self._FUTURE_ALLOWANCE <= now - event_ms / 1000 <= self._MAX_AGE

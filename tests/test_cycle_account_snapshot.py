@@ -378,13 +378,13 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         clock = SimpleNamespace(now=100.0)
         broker, api, _ = self.make_broker()
         with patch("trading.exchange.time.monotonic", side_effect=lambda: clock.now):
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 43)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 42)
             broker.cycle_snapshot([SYMBOL])
             api.calls.clear()
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 13)
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL], fresh_modes=True), 43)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 12)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL], fresh_modes=True), 42)
             clock.now = 107
-            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 43)
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 42)
             self.assertEqual(api.calls, [])
 
 

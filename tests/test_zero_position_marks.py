@@ -3,11 +3,11 @@ import copy
 from dataclasses import replace
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from trading.engine import Engine
-from trading.exchange import BudgetWait, ExchangeError, LiveBroker, RateBudget, RequestNotSent, SnapshotSuperseded
-from trading.models import TradingError, dec
+from trading.exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, RateBudget, RequestNotSent, SnapshotSuperseded
+from trading.models import MarkPrice, Position, TradingError, dec
 from trading.paper import PAPER_BRACKETS
 from .helpers import Fixture
 from .test_cycle_account_snapshot import ACCOUNT, RISK, LocalQuoteMarket, cycle_account_responses, risk_row
@@ -32,8 +32,33 @@ class ZeroPositionMarkTests(unittest.TestCase):
     def broker(self, responses):
         market = LocalQuoteMarket()
         market.book = Mock(wraps=market.book)
+        market.mark_price = Mock(side_effect=lambda symbol: MarkPrice(symbol, market.marks[symbol], time.time()))
+        market._stream_mark_price = Mock(side_effect=lambda symbol: (
+            MarkPrice(symbol, market.marks[symbol], time.time()) if symbol in market.connected else None))
         api = FixtureAPI(responses)
         return LiveBroker({}, market, api=api), api, market
+
+    def test_account_mark_recovery_ignores_stale_bbo_but_trading_still_rejects_it(self):
+        for method in ("snapshot", "cycle_snapshot"):
+            with self.subTest(method=method), patch("trading.exchange.time.time", return_value=100):
+                responses = ordinary_responses()
+                responses[RISK][0]["markPrice"] = "0E-8"
+                responses["/fapi/v3/premiumIndex"] = {"symbol": SYMBOL, "markPrice": "50", "time": 100000}
+                responses["/fapi/v3/ticker/bookTicker"] = {
+                    "symbol": SYMBOL, "bidPrice": "49", "askPrice": "51", "bidQty": "10", "askQty": "10", "time": 90000}
+                api = FixtureAPI(responses)
+                market = MarketData(api)
+                market.assets = LocalQuoteMarket().assets
+                broker = LiveBroker({}, market, api=api)
+                snapshot = getattr(broker, method)([SYMBOL])
+                self.assertEqual([position.mark for position in snapshot.positions], [50, 50])
+                self.assertEqual(sum(call[1] == "/fapi/v3/premiumIndex" for call in api.calls), 1)
+                self.assertFalse(any(call[1] in ("/fapi/v3/ticker/bookTicker", "/fapi/v3/commissionRate") for call in api.calls))
+                with self.assertRaises(TradingError):
+                    market.book(SYMBOL)
+                with self.assertRaises(TradingError):
+                    market.cycle_book(SYMBOL)
+                self.assertTrue(all(call[0] == "GET" for call in api.calls))
 
     def test_flat_and_held_zero_marks_use_one_fresh_price_for_both_sides(self):
         for flat in (False, True):
@@ -49,7 +74,8 @@ class ZeroPositionMarkTests(unittest.TestCase):
                     self.assertEqual(snapshot.total_notional, 0 if flat else 100)
                     self.assertEqual(snapshot.occupied_margin, 0 if flat else 25)
                     self.assertEqual(snapshot.unrealized, 0)
-                    market.book.assert_called_once_with(SYMBOL)
+                    market.mark_price.assert_called_once_with(SYMBOL)
+                    market.book.assert_not_called()
                     self.assertEqual(responses, original)
                     self.assertTrue(all(call[0] == "GET" for call in api.calls))
 
@@ -67,7 +93,8 @@ class ZeroPositionMarkTests(unittest.TestCase):
         self.assertEqual(snapshot.unrealized, -80)
         self.assertEqual(snapshot.equity, 120)
         self.assertEqual(snapshot.available, 70)
-        market.book.assert_called_once_with(SYMBOL)
+        market.mark_price.assert_called_once_with(SYMBOL)
+        market.book.assert_not_called()
         responses[RISK][0]["unRealizedProfit"] = "0"
         snapshot = broker.snapshot([])
         self.assertEqual(snapshot.unrealized, -50)
@@ -79,15 +106,15 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 responses = ordinary_responses()
                 responses[RISK][0]["markPrice"] = "0E-8"
                 broker, _, market = self.broker(responses)
-                quote = market._quote(SYMBOL)
+                quote = MarkPrice(SYMBOL, dec(50), time.time())
                 if failure == "unavailable":
-                    market.book.side_effect = TradingError("行情未就绪")
+                    market.mark_price.side_effect = TradingError("行情未就绪")
                 else:
-                    market.book.side_effect = None
-                    market.book.return_value = replace(quote, **{
+                    market.mark_price.side_effect = None
+                    market.mark_price.return_value = replace(quote, **{
                         "stale": {"timestamp": time.time() - 30},
                         "future": {"timestamp": time.time() + 30},
-                        "zero": {"mark": dec(0)},
+                        "zero": {"price": dec(0)},
                     }[failure])
                 with self.assertRaises(TradingError):
                     broker.snapshot([SYMBOL], fresh_modes=True)
@@ -102,7 +129,7 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 failure = kind("备用行情失败")
                 if isinstance(failure, ExchangeError):
                     failure.code, failure.http_status, failure.retry_after = -1003, 429, 180
-                market.book.side_effect = failure
+                market.mark_price.side_effect = failure
                 with self.assertRaises(kind) as caught:
                     broker.snapshot([SYMBOL])
                 self.assertIs(caught.exception, failure)
@@ -111,7 +138,8 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 if isinstance(failure, ExchangeError):
                     self.assertEqual((failure.code, failure.http_status, failure.retry_after), (-1003, 429, 180))
                 self.assertIsNone(broker.leverage_snapshot)
-                market.book.assert_called_once_with(SYMBOL)
+                market.mark_price.assert_called_once_with(SYMBOL)
+                market.book.assert_not_called()
 
     def test_other_invalid_marks_remain_errors_and_valid_marks_do_not_fetch(self):
         for value in ("-1", "NaN", None, "bad"):
@@ -122,9 +150,11 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 with self.assertRaises(TradingError):
                     broker.snapshot([SYMBOL])
                 market.book.assert_not_called()
+                market.mark_price.assert_not_called()
         broker, _, market = self.broker(ordinary_responses())
         self.assertEqual(broker.snapshot([SYMBOL]).occupied_margin, 50)
         market.book.assert_not_called()
+        market.mark_price.assert_not_called()
 
     def test_account_change_during_quote_read_revokes_snapshot(self):
         responses = ordinary_responses()
@@ -133,8 +163,8 @@ class ZeroPositionMarkTests(unittest.TestCase):
         def changed(symbol):
             with broker._snapshot_lock:
                 broker._snapshot_generation += 1
-            return market._quote(symbol)
-        market.book.side_effect = changed
+            return MarkPrice(symbol, dec(50), time.time())
+        market.mark_price.side_effect = changed
         with self.assertRaises(SnapshotSuperseded):
             broker.snapshot([SYMBOL], fresh_modes=True)
         self.assertIsNone(broker.leverage_snapshot)
@@ -154,7 +184,8 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 self.assertEqual([p.mark for p in snapshot.positions], [50, 50])
                 self.assertEqual(snapshot.occupied_margin, 0 if flat else 20)
                 self.assertEqual(snapshot.unrealized, 0)
-                market.book.assert_called_once_with(SYMBOL)
+                market.mark_price.assert_called_once_with(SYMBOL)
+                market.book.assert_not_called()
                 self.assertTrue(all(call[0] == "GET" for call in api.calls))
 
     def test_zero_mark_does_not_hide_account_position_mismatch(self):
@@ -164,6 +195,42 @@ class ZeroPositionMarkTests(unittest.TestCase):
         with self.assertRaisesRegex(TradingError, "余额与持仓快照正在同步"):
             broker.snapshot([SYMBOL], fresh_modes=True)
         market.book.assert_not_called()
+        market.mark_price.assert_not_called()
+        self.assertIsNone(broker.leverage_snapshot)
+
+    def test_cycle_local_mark_needs_no_bbo_and_never_starts_rest(self):
+        broker, _, market = self.broker(ordinary_responses())
+        market._stream_book = Mock(side_effect=AssertionError("BBO should not be read"))
+        self.assertEqual(broker._cycle_local_mark(SYMBOL), dec(50))
+        market.connected.clear()
+        self.assertIsNone(broker._cycle_local_mark(SYMBOL))
+        market.mark_price.assert_not_called()
+        market.book.assert_not_called()
+
+    def test_earlier_mark_is_revalidated_after_another_symbol_read(self):
+        broker, _, market = self.broker(ordinary_responses())
+        now = [100.0]
+        positions = [Position(symbol, "LONG", dec(1), dec(100), dec(0), 5)
+                     for symbol in (SYMBOL, "XAUUSD1")]
+
+        def delayed(symbol):
+            if symbol == "XAUUSD1":
+                now[0] += 4
+            return MarkPrice(symbol, dec(50), now[0])
+
+        market.mark_price.side_effect = delayed
+        with patch("trading.models.time.time", side_effect=lambda: now[0]), self.assertRaises(TradingError):
+            broker._fill_missing_marks(positions)
+        self.assertEqual([position.mark for position in positions], [0, 0])
+
+    def test_wrong_symbol_mark_cannot_revalue_snapshot(self):
+        responses = ordinary_responses()
+        responses[RISK][0]["markPrice"] = "0"
+        broker, _, market = self.broker(responses)
+        market.mark_price.side_effect = None
+        market.mark_price.return_value = MarkPrice("XAUUSD1", dec(50), time.time())
+        with self.assertRaises(TradingError):
+            broker.snapshot([SYMBOL])
         self.assertIsNone(broker.leverage_snapshot)
 
     def test_new_account_loads_all_positions_and_stays_paused(self):

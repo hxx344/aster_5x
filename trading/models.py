@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+import math
 import time
 
 
@@ -124,6 +125,28 @@ class Rules:
     max_qty: Decimal
     min_notional: Decimal
     margin_asset: str = "USD1"
+
+
+@dataclass(frozen=True)
+class MarkPrice:
+    """A valuation price with its own source age, never an executable quote."""
+    symbol: str
+    price: Decimal
+    timestamp: float
+    expires_monotonic: float | None = None
+
+    def require_fresh(self, now=None, max_age=3, monotonic=None):
+        stamp = float(positive(self.timestamp, field=f"{self.symbol} 标记价源时间戳"))
+        age = (time.time() if now is None else now) - stamp
+        if not -1 <= age <= max_age:
+            direction = "落后" if age >= 0 else "领先"
+            raise TradingError(f"{self.symbol} 标记价时间无效：{direction}程序时间 {abs(age):.3f} 秒；"
+                               f"允许落后最多 {max_age} 秒、领先最多 1 秒")
+        if self.expires_monotonic is not None:
+            ticks = time.monotonic() if monotonic is None else monotonic
+            if not math.isfinite(self.expires_monotonic) or ticks > self.expires_monotonic:
+                raise TradingError(f"{self.symbol} 标记价已超过有效期，等待新价格")
+        positive(self.price, field=f"{self.symbol} 标记价（markPrice）")
 
 
 @dataclass

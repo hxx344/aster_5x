@@ -118,13 +118,13 @@ class LeverageReadEfficiencyTests(unittest.TestCase):
         self.assertEqual(self.calls.count("/fapi/v3/leverage"), 1)
 
     def test_snapshot_cost_estimate_uses_caches_but_keeps_all_account_reads(self):
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 73)
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 72)
         self.broker.snapshot([SYMBOL])
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 13)
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL], fresh_modes=True), 73)
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 12)
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL], fresh_modes=True), 72)
         self.broker.cached_at["dual"] = time.monotonic() - 8
         self.broker.cached_at["multi"] = time.monotonic() - 8
-        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 73)
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 72)
 
 
 class SharedQuoteTests(unittest.TestCase):

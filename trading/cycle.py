@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
+import json
 import math
+from pathlib import Path
 import time
 
 from .cycle_diagnostics import CycleConditionError, diagnostic_error, diagnostic_number
@@ -16,13 +18,9 @@ from .models import (SYMBOLS, TradingError, cycle_margin_limit, dec, decimal_val
 SIDES = ("LONG", "SHORT")
 CYCLE_DEPTH_MAX_AGE = 3
 CYCLE_POSITION_MISMATCH = "循环实际多空数量与记录不一致，已停止自动交易，需核对"
-DEFAULT_CYCLE = {
-    "enabled": False, "symbol": "XAUUSD1", "leverage": 2,
-    "spread_notional": "10000", "spread_limit_bp": "0.1",
-    "min_notional": "0", "max_notional": "10000",
-    "capacity_multiplier": "1",
-    "notional_scope": "per_side", "hold_seconds": 60, "daily_volume_limit": "0",
-}
+_CONFIG = json.loads(Path(__file__).with_name("cycle-config.json").read_text(encoding="utf-8"))
+DEFAULT_CYCLE = _CONFIG["defaults"]
+CYCLE_MAXIMUM = {key: dec(value) if isinstance(value, str) else value for key, value in _CONFIG["maximum"].items()}
 
 
 class CyclePositionError(TradingError):
@@ -62,9 +60,9 @@ def validate_cycle(config=None):
         raise TradingError("循环开关必须为布尔值")
     if result["symbol"] not in SYMBOLS:
         raise TradingError("循环品种仅支持 XAUUSD1、SPCXUSD1、CLUSD1")
-    if type(result["leverage"]) is not int or not 1 <= result["leverage"] <= 125:
+    if type(result["leverage"]) is not int or not 1 <= result["leverage"] <= CYCLE_MAXIMUM["leverage"]:
         raise TradingError("循环杠杆必须为 1 至 125 的整数")
-    if type(result["hold_seconds"]) is not int or not 1 <= result["hold_seconds"] <= 604800:
+    if type(result["hold_seconds"]) is not int or not 1 <= result["hold_seconds"] <= CYCLE_MAXIMUM["hold_seconds"]:
         raise TradingError("循环持仓时间必须为 1 至 604800 秒的整数")
     if result["notional_scope"] not in ("per_side", "gross"):
         raise TradingError("循环金额口径必须为单边金额或多空合计金额")
@@ -72,16 +70,16 @@ def validate_cycle(config=None):
         if not isinstance(result[key], str):
             raise TradingError("循环金额及价差必须为十进制字符串")
         result[key] = wire(dec(result[key]))
-    if not 0 <= dec(result["spread_limit_bp"]) <= 100:
+    if not 0 <= dec(result["spread_limit_bp"]) <= CYCLE_MAXIMUM["spread_limit_bp"]:
         raise TradingError("循环价差阈值必须为 0 至 100 bp")
-    if not 0 < dec(result["spread_notional"]) <= 1000000:
+    if not 0 < dec(result["spread_notional"]) <= CYCLE_MAXIMUM["notional"]:
         raise TradingError("循环价差采样金额必须大于 0 且不超过 1000000 USD1")
     minimum, maximum = (dec(result[key]) for key in ("min_notional", "max_notional"))
-    if not 0 < maximum <= 1000000 or not 0 <= minimum <= maximum:
+    if not 0 < maximum <= CYCLE_MAXIMUM["notional"] or not 0 <= minimum <= maximum:
         raise TradingError("循环金额范围必须满足 0 ≤ 最小金额 ≤ 最大金额 ≤ 1000000，且最大金额大于 0")
-    if not 0 <= dec(result["daily_volume_limit"]) <= 1000000000000:
+    if not 0 <= dec(result["daily_volume_limit"]) <= CYCLE_MAXIMUM["daily_volume_limit"]:
         raise TradingError("循环每日成交量上限必须为 0 至 1000000000000 USD1，0 表示不限")
-    if not 1 <= dec(result["capacity_multiplier"]) <= 100:
+    if not 1 <= dec(result["capacity_multiplier"]) <= CYCLE_MAXIMUM["capacity_multiplier"]:
         raise TradingError("循环额度倍数必须为 1 至 100，可使用小数")
     return result
 

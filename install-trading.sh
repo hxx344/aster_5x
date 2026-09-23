@@ -327,7 +327,7 @@ python_key = digest('python-v1:' + python_runtime, [source / 'requirements.lock'
 node_runtime = json.dumps([sys.argv[2:], platform.libc_ver()])
 npm_key = digest('npm-v1:' + node_runtime, [source / 'dashboard/package.json', source / 'dashboard/package-lock.json'])
 ignored = {'node_modules', 'dist', '.wrangler', '.vinext', '.next', '.git', '__pycache__'}
-files = []
+files = [source / 'trading/cycle-config.json']
 for directory, dirs, names in os.walk(source / 'dashboard'):
     dirs[:] = [name for name in dirs if name not in ignored]
     files.extend(Path(directory) / name for name in names if not name.startswith('.env') and name != 'tsconfig.tsbuildinfo')

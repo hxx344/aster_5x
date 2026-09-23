@@ -42,6 +42,7 @@ class InstallerHarness:
         for name in ("trading", "dashboard", "dashboard/app", "dashboard/lib", "deploy"):
             (self.source / name).mkdir()
         self.write("trading/server.py", "def create_app(): pass\n")
+        self.write("trading/cycle-config.json", (ROOT / "trading/cycle-config.json").read_text())
         self.write("dashboard/app/page.tsx", "initial frontend\n")
         self.write("dashboard/lib/helper.ts", "initial helper\n")
         self.write("dashboard/package.json", '{"name":"installer-fixture","version":"1.0.0","private":true}\n')
@@ -299,6 +300,14 @@ class TradingInstallerTests(unittest.TestCase):
         self.h.append("dashboard/package.json", "\n")
         self.h.success()
         self.h.assert_counts(pip=1, npm_ci=3, build=4)
+
+    def test_shared_cycle_configuration_rebuilds_frontend_without_reinstalling_dependencies(self):
+        self.h.success()
+        self.h.append("trading/cycle-config.json", "\n")
+        self.h.success()
+        self.h.assert_counts(pip=1, npm_ci=1, build=2)
+        self.h.success()
+        self.h.assert_counts(pip=1, npm_ci=1, build=2)
 
     def test_python_lock_change_rebuilds_only_dependency_environment_at_final_creation_path(self):
         previous = self.h.success()

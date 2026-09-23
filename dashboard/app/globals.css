@@ -171,9 +171,6 @@ a {
 .limit-marker.high-limit-marker {
   background: var(--positive);
 }
-.muted-bg {
-  background: var(--muted-foreground);
-}
 .topbar {
   height: 72px;
   display: flex;
@@ -236,12 +233,6 @@ a {
   align-items: center;
   margin-bottom: 27px;
 }
-.eyebrow {
-  color: var(--muted-foreground);
-  font-size: 12px;
-  letter-spacing: 0.15em;
-  margin-bottom: 7px;
-}
 h1 {
   font-size: 27px;
   margin: 0;
@@ -294,21 +285,6 @@ h3 {
   font-size: 12px;
   color: var(--muted-foreground);
   margin: 8px 0 0;
-}
-.main-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 24px;
-}
-.primary-column,
-.secondary-column {
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
-  min-width: 0;
-}
-.secondary-column {
-  gap: 17px;
 }
 .panel {
   background: var(--card);
@@ -585,11 +561,6 @@ td:last-child {
   font-size: 12px;
   line-height: 1.75;
 }
-.symbol-tag {
-  font-size: 12px;
-  color: var(--muted-foreground);
-  font-family: var(--font-sans);
-}
 .gate {
   display: flex;
   justify-content: space-between;
@@ -676,21 +647,6 @@ td:last-child {
 .ordinary-condition-value span:last-child {
   color: var(--muted-foreground);
 }
-.execution-buttons {
-  display: flex;
-  gap: 8px;
-  padding: 16px 22px;
-}
-.execution-buttons > * {
-  flex: 1;
-}
-.account-controls-note {
-  margin: 0;
-  padding: 0 22px 16px;
-  color: var(--muted-foreground);
-  font-size: 12px;
-  line-height: 1.7;
-}
 .settings-panel form {
   padding: 0 22px 20px;
 }
@@ -770,11 +726,6 @@ label input,
   margin: 0;
   border: 0;
 }
-.cycle-account-name {
-  margin-bottom: 6px;
-  color: var(--foreground);
-  overflow-wrap: anywhere;
-}
 .cycle-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -798,13 +749,6 @@ label input,
 }
 .cycle-details dd small.amber {
   color: var(--warning);
-}
-.cycle-buttons {
-  border-top: 1px solid var(--border);
-  flex-wrap: wrap;
-}
-.cycle-buttons > button {
-  min-width: 130px;
 }
 .cycle-diagnostic {
   margin: 0 22px 18px;
@@ -894,55 +838,6 @@ label input,
   line-height: 1.7;
   white-space: pre-wrap;
 }
-.cycle-daily-summary {
-  margin: 0 22px 18px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface-muted);
-}
-.cycle-daily-summary h3 {
-  margin: 0 0 14px;
-  font-size: 14px;
-  font-weight: 500;
-}
-.cycle-daily-summary h3 span {
-  display: block;
-  margin-top: 5px;
-  font-size: 12px;
-  color: var(--muted-foreground);
-}
-.cycle-daily-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px 10px;
-  margin: 0 0 12px;
-}
-.cycle-daily-grid dt {
-  color: var(--muted-foreground);
-  font-size: 11px;
-}
-.cycle-daily-grid dd {
-  margin: 5px 0 0;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-.cycle-daily-summary p {
-  margin: 7px 0 0;
-  font-size: 12px;
-  line-height: 1.7;
-}
-.cycle-rolling-heading {
-  margin: 16px 0 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
-  font-size: 13px;
-  font-weight: 500;
-}
-.cycle-rolling-grid {
-  grid-template-columns: minmax(0, 1fr);
-}
 .cycle-cost-summary {
   margin: 14px 0;
   padding-top: 12px;
@@ -971,15 +866,6 @@ label input,
 }
 .cycle-cost-total dd {
   font-weight: 600;
-}
-.cycle-cost-note {
-  color: var(--muted-foreground);
-}
-.cycle-rolling-window time {
-  display: block;
-}
-.cycle-rolling-window > span {
-  color: var(--muted-foreground);
 }
 .cycle-date-filter {
   min-width: 190px;
@@ -1097,19 +983,6 @@ label input,
     font-family: var(--font-sans);
     font-size: 11px;
   }
-}
-.notification-state {
-  padding: 0 6px;
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  color: var(--muted-foreground);
-  font-size: 12px;
-  line-height: 1.7;
-}
-.notification-state svg {
-  margin-top: 2px;
-  flex: none;
 }
 .footer {
   display: flex;
@@ -1432,12 +1305,6 @@ label input,
   border-color: var(--danger-border);
   color: var(--danger);
 }
-.demo-banner {
-  background: var(--warning-subtle);
-  border-color: var(--warning-border);
-  color: var(--warning);
-  font-size: 13px;
-}
 .login-panel {
   max-width: 430px;
   padding: 30px;
@@ -1474,10 +1341,6 @@ label input,
   .topbar {
     padding: 0 32px;
   }
-  .main-grid {
-    grid-template-columns: minmax(0, 1fr) 295px;
-    gap: 16px;
-  }
   .metric {
     padding: 18px;
   }
@@ -1490,16 +1353,6 @@ label input,
   }
 }
 @media (max-width: 1020px) {
-  .main-grid {
-    grid-template-columns: 1fr;
-  }
-  .secondary-column {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .notification-state {
-    align-self: center;
-  }
   .metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
@@ -1627,9 +1480,6 @@ label input,
   }
   .metric-label {
     font-size: 12px;
-  }
-  .secondary-column {
-    display: flex;
   }
   .section-head {
     padding: 18px 16px;

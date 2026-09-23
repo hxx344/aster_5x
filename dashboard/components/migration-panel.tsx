@@ -1,8 +1,11 @@
 'use client';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import {
+  ConfigurationField,
+  SettingsForm,
+} from '@/components/configuration-fields';
 import type { FeatureProps } from '@/lib/desk-types';
-import { useAccountDraft } from '@/lib/use-account-draft';
+import { draftFields, useAccountDraft } from '@/lib/use-account-draft';
 import { Switch } from '@/components/ui/switch';
 import { fmt } from '@/lib/desk-format';
 import { accountConfigurationLock } from '@/lib/account-config';
@@ -44,6 +47,7 @@ export function MigrationPanel({
       account.migration?.notional_tolerance ?? '0.05',
     ),
   });
+  const fields = draftFields(migrationForm, setMigrationForm);
   return (
     <section className="panel settings-panel migration-panel">
       <div className="section-head">
@@ -189,34 +193,20 @@ export function MigrationPanel({
       </details>
       <details className="disclosure inset">
         <summary>迁移设置</summary>
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            if (locked) return;
-            try {
-              const migrationSettings = {
-                enabled: migrationForm.enabled,
-                spread_limit_bp: migrationForm.spread_limit_bp,
-                batch_notional: migrationForm.batch_notional,
-                notional_tolerance: migrationToleranceFromPercent(
-                  migrationForm.tolerance_percent,
-                ),
-              };
-              if (
-                await action(
-                  `/api/accounts/${account.id}`,
-                  { migration: migrationSettings },
-                  'PATCH',
-                )
-              ) {
-                clearDraft();
-                setNotice('迁移设置已保存，启动账户后按设置运行');
-              }
-            } catch (e) {
-              setNotice('');
-              setError(e instanceof Error ? e.message : '迁移设置无效');
-            }
-          }}
+        <SettingsForm
+          {...{ account, action, locked, clearDraft, setNotice, setError }}
+          changes={() => ({
+            migration: {
+              enabled: migrationForm.enabled,
+              spread_limit_bp: migrationForm.spread_limit_bp,
+              batch_notional: migrationForm.batch_notional,
+              notional_tolerance: migrationToleranceFromPercent(
+                migrationForm.tolerance_percent,
+              ),
+            },
+          })}
+          success="迁移设置已保存，启动账户后按设置运行"
+          errorFallback="迁移设置无效"
         >
           <div className="migration-toggle">
             <label htmlFor="migration-enabled">允许迁移 XAU 仓位</label>
@@ -230,63 +220,31 @@ export function MigrationPanel({
               }
             />
           </div>
-          <label htmlFor="migration-spread">
-            目标深度价差上限 <span>bp</span>
-            <Input
-              id="migration-spread"
-              type="number"
-              min="0"
-              max="100"
-              step="any"
-              required
-              disabled={locked}
-              value={migrationForm.spread_limit_bp}
-              onChange={(e) =>
-                setMigrationForm({
-                  ...migrationForm,
-                  spread_limit_bp: e.target.value,
-                })
-              }
-            />
-          </label>
-          <label htmlFor="migration-batch">
-            单批每边上限 <span>USD1</span>
-            <Input
-              id="migration-batch"
-              type="number"
-              min="500"
-              max="1000000"
-              step="any"
-              required
-              disabled={locked}
-              value={migrationForm.batch_notional}
-              onChange={(e) =>
-                setMigrationForm({
-                  ...migrationForm,
-                  batch_notional: e.target.value,
-                })
-              }
-            />
-          </label>
-          <label htmlFor="migration-tolerance">
-            每边金额误差上限 <span>%</span>
-            <Input
-              id="migration-tolerance"
-              type="number"
-              min="0"
-              max="50"
-              step="any"
-              required
-              disabled={locked}
-              value={migrationForm.tolerance_percent}
-              onChange={(e) =>
-                setMigrationForm({
-                  ...migrationForm,
-                  tolerance_percent: e.target.value,
-                })
-              }
-            />
-          </label>
+          <ConfigurationField
+            id="migration-spread"
+            label="目标深度价差上限"
+            unit="bp"
+            max="100"
+            disabled={locked}
+            {...fields('spread_limit_bp')}
+          />
+          <ConfigurationField
+            id="migration-batch"
+            label="单批每边上限"
+            unit="USD1"
+            min="500"
+            max="1000000"
+            disabled={locked}
+            {...fields('batch_notional')}
+          />
+          <ConfigurationField
+            id="migration-tolerance"
+            label="每边金额误差上限"
+            unit="%"
+            max="50"
+            disabled={locked}
+            {...fields('tolerance_percent')}
+          />
           <details className="disclosure">
             <summary>执行规则</summary>
             <p className="muted">
@@ -311,7 +269,7 @@ export function MigrationPanel({
           >
             保存迁移设置
           </Button>
-        </form>
+        </SettingsForm>
       </details>
     </section>
   );

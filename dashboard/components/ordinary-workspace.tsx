@@ -1,7 +1,10 @@
 'use client';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import {
+  ConfigurationField,
+  SettingsForm,
+} from '@/components/configuration-fields';
 import {
   Select,
   SelectContent,
@@ -10,7 +13,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import type { FeatureProps } from '@/lib/desk-types';
-import { useAccountDraft } from '@/lib/use-account-draft';
+import { draftFields, useAccountDraft } from '@/lib/use-account-draft';
 import { SlidersHorizontal } from 'lucide-react';
 import type { Market, PolicyDraft } from '@/lib/desk-types';
 import { names, symbols } from '@/lib/desk-format';
@@ -20,6 +23,10 @@ import { ordinaryAddBlock } from '@/lib/ordinary-add';
 import { accountConfigurationLock } from '@/lib/account-config';
 import { OrdinaryConditions } from '@/components/ordinary-conditions';
 import { MarketPanel } from '@/components/market-panel';
+const leverageOptions = SUPPORTED_LEVERAGES.map((value): [string, string] => [
+  String(value),
+  `${value}x`,
+]);
 export function OrdinaryWorkspace({
   account,
   busy,
@@ -59,6 +66,7 @@ export function OrdinaryWorkspace({
     now,
     connectionError,
   );
+  const fields = draftFields(form, setForm);
   return (
     <div className="feature-stack">
       <div className="feature-grid">
@@ -133,115 +141,68 @@ export function OrdinaryWorkspace({
           ) : null}
           <details className="disclosure inset">
             <summary>编辑普通开仓参数</summary>
-            <form
-              onSubmit={async (e) => {
-                e.preventDefault();
-                if (locked) return;
-                try {
-                  const policy = {
-                    ordinary_symbol: form.ordinary_symbol,
-                    threshold: form.threshold,
-                    order_notional: form.order_notional,
-                    min_open_leverage: parseMinimumLeverage(
-                      form.min_open_leverage,
-                    ),
-                  };
-                  if (
-                    await action(`/api/accounts/${account.id}`, policy, 'PATCH')
-                  ) {
-                    clearDraft();
-                    setNotice('策略设置已保存');
-                  }
-                } catch (e) {
-                  setNotice('');
-                  setError(e instanceof Error ? e.message : '设置无效');
-                }
-              }}
+            <SettingsForm
+              {...{ account, action, locked, clearDraft, setNotice, setError }}
+              changes={() => ({
+                ordinary_symbol: form.ordinary_symbol,
+                threshold: form.threshold,
+                order_notional: form.order_notional,
+                min_open_leverage: parseMinimumLeverage(form.min_open_leverage),
+              })}
+              success="策略设置已保存"
+              errorFallback="设置无效"
             >
-              <label htmlFor="ordinary-symbol">
-                有额度开仓交易对
-                <Select
-                  required
-                  disabled={locked}
-                  value={form.ordinary_symbol}
-                  onValueChange={(value) =>
-                    value && setForm({ ...form, ordinary_symbol: value })
-                  }
-                >
-                  <SelectTrigger id="ordinary-symbol" className="full-width">
-                    <SelectValue>
-                      {form.ordinary_symbol === 'all'
-                        ? '全部交易对'
-                        : `仅 ${form.ordinary_symbol}`}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">全部交易对</SelectItem>
-                    {(account?.policy.symbols ?? symbols).map((symbol) => (
-                      <SelectItem key={symbol} value={symbol}>
-                        仅 {symbol}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+              <ConfigurationField
+                id="ordinary-symbol"
+                label="有额度开仓交易对"
+                required
+                disabled={locked}
+                display={
+                  form.ordinary_symbol === 'all'
+                    ? '全部交易对'
+                    : `仅 ${form.ordinary_symbol}`
+                }
+                {...fields('ordinary_symbol')}
+                items={[
+                  ['all', '全部交易对'],
+                  ...(account?.policy.symbols ?? symbols).map(
+                    (symbol): [string, string] => [symbol, `仅 ${symbol}`],
+                  ),
+                ]}
+              >
                 <span>
                   指定后，普通开仓与升杠杆仅操作所选交易对。循环与迁移按各自设置执行。
                 </span>
-              </label>
-              <label htmlFor="threshold">
-                额度阈值 <span>USD1</span>
-                <Input
-                  id="threshold"
-                  type="number"
-                  min="0"
-                  step="any"
-                  required
-                  disabled={locked}
-                  value={form.threshold}
-                  onChange={(e) =>
-                    setForm({ ...form, threshold: e.target.value })
-                  }
-                />
-              </label>
-              <label htmlFor="order-notional">
-                单笔每边上限 <span>USD1</span>
-                <Input
-                  id="order-notional"
-                  type="number"
-                  min="500"
-                  max="1000000"
-                  step="any"
-                  required
-                  disabled={locked}
-                  value={form.order_notional}
-                  onChange={(e) =>
-                    setForm({ ...form, order_notional: e.target.value })
-                  }
-                />
+              </ConfigurationField>
+              <ConfigurationField
+                id="threshold"
+                label="额度阈值"
+                unit="USD1"
+                disabled={locked}
+                {...fields('threshold')}
+              />
+              <ConfigurationField
+                id="order-notional"
+                label="单笔每边上限"
+                unit="USD1"
+                min="500"
+                max="1000000"
+                disabled={locked}
+                {...fields('order_notional')}
+              >
                 <span>新开仓固定每边至少 500 USD1</span>
-              </label>
-              <label htmlFor="min-open-leverage">
-                最低开仓杠杆 <span>x</span>
-                <Select
-                  required
-                  disabled={locked}
-                  value={form.min_open_leverage || null}
-                  onValueChange={(value) =>
-                    value && setForm({ ...form, min_open_leverage: value })
-                  }
-                >
-                  <SelectTrigger id="min-open-leverage" className="full-width">
-                    <SelectValue placeholder="请选择最低开仓杠杆" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SUPPORTED_LEVERAGES.map((value) => (
-                      <SelectItem key={value} value={String(value)}>
-                        {value}x
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </label>
+              </ConfigurationField>
+              <ConfigurationField
+                id="min-open-leverage"
+                label="最低开仓杠杆"
+                unit="x"
+                required
+                disabled={locked}
+                {...fields('min_open_leverage')}
+                value={form.min_open_leverage || null}
+                placeholder="请选择最低开仓杠杆"
+                items={leverageOptions}
+              />
               <p className="muted">
                 暂停账户后可修改。基础风险上限在「账户」页统一设置；实际开仓仍需通过余额、价差和持仓检查。
               </p>
@@ -253,7 +214,7 @@ export function OrdinaryWorkspace({
               >
                 保存设置
               </Button>
-            </form>
+            </SettingsForm>
           </details>
         </section>
       </div>

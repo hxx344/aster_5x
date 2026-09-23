@@ -1,15 +1,14 @@
 'use client';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import {
+  ConfigurationField,
+  SettingsForm,
+} from '@/components/configuration-fields';
+import { draftFields } from '@/lib/use-account-draft';
 import { Switch } from '@/components/ui/switch';
+import { names, symbols } from '@/lib/desk-format';
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
-import {
+  CYCLE_MAXIMUM,
   cycleActualLeverage,
   cycleDraft,
   cycleHasPosition,
@@ -18,6 +17,14 @@ import {
 } from '@/lib/cycle';
 import type { FeatureProps } from '@/lib/desk-types';
 import { accountConfigurationLock } from '@/lib/account-config';
+const scopeOptions = [
+  ['per_side', '每个方向分别计算'],
+  ['gross', '多头与空头合计'],
+] as const;
+const holdUnits = [
+  ['minutes', '分钟'],
+  ['seconds', '秒'],
+] as const;
 export type CycleSettingsProps = FeatureProps & {
   draft: CycleDraft;
   setDraft: (draft: CycleDraft) => void;
@@ -51,6 +58,7 @@ export function CycleSettings({
   );
   const field = (key: keyof CycleDraft, value: string | boolean) =>
     setDraft({ ...draft, [key]: value });
+  const fields = draftFields(draft, setDraft);
   return (
     <section className="panel settings-panel cycle-settings">
       <div className="section-head">
@@ -90,29 +98,16 @@ export function CycleSettings({
       ) : null}
       <details className="disclosure inset">
         <summary>编辑循环参数{dirty ? ' · 未保存' : ''}</summary>
-        <form
-          onSubmit={async (event) => {
-            event.preventDefault();
-            if (locked) return;
-            try {
-              const cycle = parseCycleDraft(draft);
-              if (cycle.enabled && account.migration?.enabled)
-                throw new Error('请先停止 XAU 迁移，再开启多空循环');
-              if (
-                await action(`/api/accounts/${account.id}`, { cycle }, 'PATCH')
-              ) {
-                clearDraft();
-                setNotice(
-                  '多空循环设置已保存，账户保持暂停；点击启动后开始执行',
-                );
-              }
-            } catch (error) {
-              setNotice('');
-              setError(
-                error instanceof Error ? error.message : '多空循环设置无效',
-              );
-            }
+        <SettingsForm
+          {...{ account, action, locked, clearDraft, setNotice, setError }}
+          changes={() => {
+            const cycle = parseCycleDraft(draft);
+            if (cycle.enabled && account.migration?.enabled)
+              throw new Error('请先停止 XAU 迁移，再开启多空循环');
+            return { cycle };
           }}
+          success="多空循环设置已保存，账户保持暂停；点击启动后开始执行"
+          errorFallback="多空循环设置无效"
         >
           <fieldset disabled={locked} className="cycle-form-grid">
             <div className="migration-toggle">
@@ -131,23 +126,17 @@ export function CycleSettings({
               </p>
             ) : null}
             <div className="cycle-fields">
-              <label htmlFor="cycle-symbol">
-                循环品种
-                <Select
-                  value={draft.symbol}
-                  disabled={locked}
-                  onValueChange={(value) => value && field('symbol', value)}
-                >
-                  <SelectTrigger id="cycle-symbol" className="full-width">
-                    <SelectValue>{draft.symbol}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="XAUUSD1">黄金 · XAUUSD1</SelectItem>
-                    <SelectItem value="SPCXUSD1">SpaceX · SPCXUSD1</SelectItem>
-                    <SelectItem value="CLUSD1">原油 · CLUSD1</SelectItem>
-                  </SelectContent>
-                </Select>
-              </label>
+              <ConfigurationField
+                id="cycle-symbol"
+                label="循环品种"
+                {...fields('symbol')}
+                disabled={locked}
+                display={draft.symbol}
+                items={symbols.map((symbol) => [
+                  symbol,
+                  `${names[symbol]} · ${symbol}`,
+                ])}
+              />
               <div>
                 <span>杠杆自动跟随</span>
                 <p>
@@ -158,158 +147,82 @@ export function CycleSettings({
               </div>
             </div>
 
-            <label htmlFor="cycle-depth">
-              深度价差参考金额 <span>USD1 / 每边</span>
-              <Input
-                id="cycle-depth"
-                type="number"
-                min="0"
-                max="1000000"
-                step="any"
-                required
-                value={draft.spread_notional}
-                onChange={(event) =>
-                  field('spread_notional', event.target.value)
-                }
-              />
-            </label>
-            <label htmlFor="cycle-spread">
-              开仓和平仓价差上限 <span>bp</span>
-              <Input
-                id="cycle-spread"
-                type="number"
-                min="0"
-                max="100"
-                step="any"
-                required
-                value={draft.spread_limit_bp}
-                onChange={(event) =>
-                  field('spread_limit_bp', event.target.value)
-                }
-              />
-            </label>
+            <ConfigurationField
+              id="cycle-depth"
+              label="深度价差参考金额"
+              unit="USD1 / 每边"
+              max={CYCLE_MAXIMUM.notional}
+              {...fields('spread_notional')}
+            />
+            <ConfigurationField
+              id="cycle-spread"
+              label="开仓和平仓价差上限"
+              unit="bp"
+              max={CYCLE_MAXIMUM.spread_limit_bp}
+              {...fields('spread_limit_bp')}
+            />
 
-            <label htmlFor="cycle-scope">
-              名义价值范围口径
-              <Select
-                value={draft.notional_scope}
+            <ConfigurationField
+              id="cycle-scope"
+              label="名义价值范围口径"
+              {...fields('notional_scope')}
+              disabled={locked}
+              display={
+                draft.notional_scope === 'gross'
+                  ? '多头与空头合计'
+                  : '每个方向分别计算'
+              }
+              items={scopeOptions}
+            />
+            <div className="cycle-fields">
+              <ConfigurationField
+                id="cycle-min"
+                label="名义价值下限"
+                unit="USD1"
+                max={CYCLE_MAXIMUM.notional}
+                {...fields('min_notional')}
+              />
+              <ConfigurationField
+                id="cycle-max"
+                label="名义价值上限"
+                unit="USD1"
+                max={CYCLE_MAXIMUM.notional}
+                {...fields('max_notional')}
+              />
+            </div>
+
+            <ConfigurationField
+              id="cycle-capacity-multiplier"
+              label="开仓额度倍数"
+              unit="1–100 倍，支持小数"
+              min="1"
+              max={CYCLE_MAXIMUM.capacity_multiplier}
+              {...fields('capacity_multiplier')}
+            />
+
+            <div className="cycle-fields">
+              <ConfigurationField
+                id="cycle-hold"
+                label="最短持仓时间"
+                {...fields('hold_duration')}
+              />
+              <ConfigurationField
+                id="cycle-hold-unit"
+                label="时间单位"
+                {...fields('hold_unit')}
                 disabled={locked}
-                onValueChange={(value) =>
-                  value && field('notional_scope', value)
-                }
-              >
-                <SelectTrigger id="cycle-scope" className="full-width">
-                  <SelectValue>
-                    {draft.notional_scope === 'gross'
-                      ? '多头与空头合计'
-                      : '每个方向分别计算'}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="per_side">每个方向分别计算</SelectItem>
-                  <SelectItem value="gross">多头与空头合计</SelectItem>
-                </SelectContent>
-              </Select>
-            </label>
-            <div className="cycle-fields">
-              <label htmlFor="cycle-min">
-                名义价值下限 <span>USD1</span>
-                <Input
-                  id="cycle-min"
-                  type="number"
-                  min="0"
-                  max="1000000"
-                  step="any"
-                  required
-                  value={draft.min_notional}
-                  onChange={(event) =>
-                    field('min_notional', event.target.value)
-                  }
-                />
-              </label>
-              <label htmlFor="cycle-max">
-                名义价值上限 <span>USD1</span>
-                <Input
-                  id="cycle-max"
-                  type="number"
-                  min="0"
-                  max="1000000"
-                  step="any"
-                  required
-                  value={draft.max_notional}
-                  onChange={(event) =>
-                    field('max_notional', event.target.value)
-                  }
-                />
-              </label>
+                display={draft.hold_unit === 'minutes' ? '分钟' : '秒'}
+                items={holdUnits}
+              />
             </div>
 
-            <label htmlFor="cycle-capacity-multiplier">
-              开仓额度倍数 <span>1–100 倍，支持小数</span>
-              <Input
-                id="cycle-capacity-multiplier"
-                type="number"
-                min="1"
-                max="100"
-                step="any"
-                required
-                value={draft.capacity_multiplier}
-                onChange={(event) =>
-                  field('capacity_multiplier', event.target.value)
-                }
-              />
-            </label>
-
-            <div className="cycle-fields">
-              <label htmlFor="cycle-hold">
-                最短持仓时间
-                <Input
-                  id="cycle-hold"
-                  type="number"
-                  min="0"
-                  step="any"
-                  required
-                  value={draft.hold_duration}
-                  onChange={(event) =>
-                    field('hold_duration', event.target.value)
-                  }
-                />
-              </label>
-              <label htmlFor="cycle-hold-unit">
-                时间单位
-                <Select
-                  value={draft.hold_unit}
-                  disabled={locked}
-                  onValueChange={(value) => value && field('hold_unit', value)}
-                >
-                  <SelectTrigger id="cycle-hold-unit" className="full-width">
-                    <SelectValue>
-                      {draft.hold_unit === 'minutes' ? '分钟' : '秒'}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="minutes">分钟</SelectItem>
-                    <SelectItem value="seconds">秒</SelectItem>
-                  </SelectContent>
-                </Select>
-              </label>
-            </div>
-
-            <label htmlFor="cycle-daily-volume">
-              成交额度上限 <span>USD1 · 0 为不限</span>
-              <Input
-                id="cycle-daily-volume"
-                type="number"
-                min="0"
-                max="1000000000000"
-                step="any"
-                required
-                value={draft.daily_volume_limit}
-                onChange={(event) =>
-                  field('daily_volume_limit', event.target.value)
-                }
-              />
-            </label>
+            <ConfigurationField
+              id="cycle-daily-volume"
+              label="成交额度上限"
+              unit="USD1 · 0 为不限"
+              max={CYCLE_MAXIMUM.daily_volume_limit}
+              {...fields('daily_volume_limit')}
+            />
           </fieldset>
 
           {ownedPosition ? (
@@ -336,7 +249,7 @@ export function CycleSettings({
               撤销修改
             </Button>
           </div>
-        </form>
+        </SettingsForm>
       </details>
       <details className="disclosure inset">
         <summary>循环规则与参数说明</summary>

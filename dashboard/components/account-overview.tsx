@@ -8,7 +8,10 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import {
+  ConfigurationField,
+  SettingsForm,
+} from '@/components/configuration-fields';
 import type { FeatureProps } from '@/lib/desk-types';
 import { useAccountDraft } from '@/lib/use-account-draft';
 import {
@@ -285,42 +288,24 @@ export function AccountOverview({
           </section>
           <details className="disclosure panel settings-panel">
             <summary>账户基础风险设置</summary>
-            <form
-              onSubmit={async (event) => {
-                event.preventDefault();
-                if (locked) return;
-                try {
-                  if (
-                    await action(
-                      `/api/accounts/${account.id}`,
-                      { margin_limit: marginLimitFromPercent(riskDraft) },
-                      'PATCH',
-                    )
-                  ) {
-                    clear();
-                    setNotice('账户风险上限已保存');
-                  }
-                } catch (error) {
-                  setError(
-                    error instanceof Error ? error.message : '风险上限无效',
-                  );
-                }
-              }}
+            <SettingsForm
+              {...{ account, action, locked, setNotice, setError }}
+              clearDraft={clear}
+              changes={() => ({
+                margin_limit: marginLimitFromPercent(riskDraft),
+              })}
+              success="账户风险上限已保存"
+              errorFallback="风险上限无效"
+              clearNoticeOnError={false}
             >
-              <label htmlFor="margin-percent">
-                基础保证金占用上限 · %
-                <Input
-                  id="margin-percent"
-                  type="number"
-                  min="0"
-                  max="100"
-                  step="any"
-                  required
-                  disabled={locked}
-                  value={riskDraft}
-                  onChange={(event) => setRiskDraft(event.target.value)}
-                />
-              </label>
+              <ConfigurationField
+                id="margin-percent"
+                label="基础保证金占用上限 · %"
+                max="100"
+                disabled={locked}
+                value={riskDraft}
+                onValueChange={(value) => setRiskDraft(value)}
+              />
               <p className="muted">
                 此设置由普通开仓、循环和迁移共用。
                 {configurationLock || '各功能适用上限见上方风险约束。'}
@@ -328,7 +313,7 @@ export function AccountOverview({
               <Button type="submit" variant="outline" disabled={locked}>
                 保存账户风险上限
               </Button>
-            </form>
+            </SettingsForm>
           </details>
         </div>
       </div>

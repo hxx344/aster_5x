@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from starlette.datastructures import MutableHeaders
 
 from .engine import Engine
+from .cycle import CYCLE_MAXIMUM
 from .hub_summary import hub_summary
 from .models import TIERS, TradingError
 from .store import Store
@@ -166,7 +167,7 @@ class CycleEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool | None = None
     symbol: Literal["XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
-    leverage: StrictInt | None = Field(default=None, ge=1, le=125)
+    leverage: StrictInt | None = Field(default=None, ge=1, le=CYCLE_MAXIMUM["leverage"])
     spread_notional: str | None = Field(default=None, min_length=1, max_length=40)
     spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
     min_notional: str | None = Field(default=None, min_length=1, max_length=40)
@@ -174,7 +175,7 @@ class CycleEdit(BaseModel):
     capacity_multiplier: str | None = Field(default=None, min_length=1, max_length=40)
     daily_volume_limit: str | None = Field(default=None, min_length=1, max_length=40)
     notional_scope: Literal["per_side", "gross"] | None = None
-    hold_seconds: StrictInt | None = Field(default=None, ge=1, le=604800)
+    hold_seconds: StrictInt | None = Field(default=None, ge=1, le=CYCLE_MAXIMUM["hold_seconds"])
 
     @model_validator(mode="before")
     @classmethod

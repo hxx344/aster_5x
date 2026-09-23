@@ -1,0 +1,23 @@
+{
+  "defaults": {
+    "enabled": false,
+    "symbol": "XAUUSD1",
+    "leverage": 2,
+    "spread_notional": "10000",
+    "spread_limit_bp": "0.1",
+    "min_notional": "0",
+    "max_notional": "10000",
+    "capacity_multiplier": "1",
+    "notional_scope": "per_side",
+    "hold_seconds": 60,
+    "daily_volume_limit": "0"
+  },
+  "maximum": {
+    "leverage": 125,
+    "hold_seconds": 604800,
+    "notional": "1000000",
+    "spread_limit_bp": "100",
+    "capacity_multiplier": "100",
+    "daily_volume_limit": "1000000000000"
+  }
+}

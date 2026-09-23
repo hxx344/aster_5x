@@ -1,4 +1,5 @@
 import type { CycleExecutionQuality } from './cycle-quality';
+import configuration from '../../trading/cycle-config.json' with { type: 'json' };
 
 export type CycleConfig = {
   enabled: boolean;
@@ -211,19 +212,8 @@ export function cycleActualLeverage(
   return pair[0].leverage;
 }
 
-export const DEFAULT_CYCLE: CycleConfig = {
-  enabled: false,
-  symbol: 'XAUUSD1',
-  leverage: 2,
-  spread_notional: '10000',
-  spread_limit_bp: '0.1',
-  min_notional: '0',
-  max_notional: '10000',
-  capacity_multiplier: '1',
-  notional_scope: 'per_side',
-  hold_seconds: 60,
-  daily_volume_limit: '0',
-};
+export const DEFAULT_CYCLE: CycleConfig = configuration.defaults as CycleConfig;
+export const CYCLE_MAXIMUM = configuration.maximum;
 
 export function cycleDraft(config?: CycleConfig): CycleDraft {
   const value = { ...DEFAULT_CYCLE, ...config };
@@ -288,34 +278,54 @@ export function cycleHoldSeconds(
   if (
     units === BigInt(0) ||
     units % divisor !== BigInt(0) ||
-    units / divisor > BigInt(604800)
+    units / divisor > BigInt(CYCLE_MAXIMUM.hold_seconds)
   )
     throw new Error('持仓时间必须换算为 1 至 604800 的整数秒（最多 7 天）');
   return Number(units / divisor);
 }
 
 export function parseCycleDraft(draft: CycleDraft): CycleConfig {
+  const maximum = CYCLE_MAXIMUM;
   if (!['XAUUSD1', 'SPCXUSD1', 'CLUSD1'].includes(draft.symbol))
     throw new Error('请选择支持的循环品种');
   if (
     !/^\d+$/.test(draft.leverage) ||
     Number(draft.leverage) < 1 ||
-    Number(draft.leverage) > 125
+    Number(draft.leverage) > maximum.leverage
   )
     throw new Error('循环杠杆必须是 1 至 125 的整数');
   if (!['per_side', 'gross'].includes(draft.notional_scope))
     throw new Error('请选择单边或多空合计的名义价值口径');
-  const spread = amount(draft.spread_notional, '深度参考金额', '1000000', true);
-  const bp = amount(draft.spread_limit_bp, '价差上限（bp）', '100');
-  const min = amount(draft.min_notional, '名义价值下限', '1000000');
-  const max = amount(draft.max_notional, '名义价值上限', '1000000', true);
-  const multiplier = amount(draft.capacity_multiplier, '额度倍数', '100', true);
+  const spread = amount(
+    draft.spread_notional,
+    '深度参考金额',
+    maximum.notional,
+    true,
+  );
+  const bp = amount(
+    draft.spread_limit_bp,
+    '价差上限（bp）',
+    maximum.spread_limit_bp,
+  );
+  const min = amount(draft.min_notional, '名义价值下限', maximum.notional);
+  const max = amount(
+    draft.max_notional,
+    '名义价值上限',
+    maximum.notional,
+    true,
+  );
+  const multiplier = amount(
+    draft.capacity_multiplier,
+    '额度倍数',
+    maximum.capacity_multiplier,
+    true,
+  );
   if (compare(multiplier, decimal('1', '额度倍数')) < 0)
     throw new Error('额度倍数必须为 1 至 100，可使用小数');
   const dailyLimit = amount(
     draft.daily_volume_limit,
     '每日成交额度',
-    '1000000000000',
+    maximum.daily_volume_limit,
   );
   if (compare(min, max) > 0) throw new Error('名义价值下限不能大于上限');
   return {

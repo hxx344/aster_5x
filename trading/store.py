@@ -392,6 +392,16 @@ class Store:
             row = db.execute("SELECT data FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (account_id,)).fetchone()
             return json.loads(row[0]) if row else None
 
+    def save_listing_state(self, state, alerts=()):
+        """Persist discovery progress and its notification outbox atomically."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("usd1_listings", dumps(state)))
+            for notification_id, message in alerts:
+                db.execute("INSERT OR IGNORE INTO outbox(id,message,due_at) VALUES (?,?,?)",
+                           (notification_id, message, time.time()))
+
     def save_intent(self, intent):
         with self.connect() as db:
             db.execute("INSERT INTO intents VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data",

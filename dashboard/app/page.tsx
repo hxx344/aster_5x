@@ -33,6 +33,7 @@ import { MigrationPanel } from '@/components/migration-panel';
 import { AccountOverview } from '@/components/account-overview';
 import { RecordsWorkspace } from '@/components/records-workspace';
 import { AddAccountDialog } from '@/components/add-account-dialog';
+import { ListingsPanel } from '@/components/listings-panel';
 
 export default function Home() {
   const desk = useTradingDesk();
@@ -335,6 +336,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 <TabsTrigger value="cycle">多空循环</TabsTrigger>
                 <TabsTrigger value="ordinary">普通开仓</TabsTrigger>
                 <TabsTrigger value="migration">仓位迁移</TabsTrigger>
+                <TabsTrigger value="listings">USD1 上新</TabsTrigger>
                 <TabsTrigger value="account">账户</TabsTrigger>
                 <TabsTrigger value="records">记录</TabsTrigger>
               </TabsList>
@@ -370,6 +372,14 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                   connectionError={connectionError}
                 />
               </TabsContent>
+              <TabsContent value="listings">
+                <ListingsPanel
+                  listings={state?.listings}
+                  notification={state?.notification}
+                  now={serverNow}
+                  connectionError={connectionError}
+                />
+              </TabsContent>
               <TabsContent value="records">
                 <RecordsWorkspace
                   account={account}
@@ -394,9 +404,17 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             </footer>
           </>
         ) : !needsLogin ? (
-          <section className="panel empty-state">
-            <h2>{state ? '添加账户以开始' : '正在连接交易服务'}</h2>
-          </section>
+          <>
+            <ListingsPanel
+              listings={state?.listings}
+              notification={state?.notification}
+              now={serverNow}
+              connectionError={connectionError}
+            />
+            <section className="panel empty-state">
+              <h2>{state ? '添加账户以开始' : '正在连接交易服务'}</h2>
+            </section>
+          </>
         ) : null}
       </div>
     </main>

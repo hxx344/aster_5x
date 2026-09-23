@@ -33,6 +33,7 @@ from .cycle_projection import cycle_overlay, project_cycle_state
 from .cycle_capacity import require_cycle_capacity
 from .models import cycle_margin_limit
 from .lock import ProcessLock
+from .listings import ListingMonitor, POLL_SECONDS as LISTING_POLL_SECONDS, STALE_SECONDS as LISTING_STALE_SECONDS
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
 from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
@@ -169,6 +170,7 @@ class Engine:
         self.capacity_notification_errors = {}
         self.capacity_targets, self.capacity_accounts = {}, []
         self.capacity_full_checked = {}
+        self.listing_monitor = ListingMonitor(store, self.market, self.shutdown) if not demo and isinstance(self.market, MarketData) else None
         if demo and not store.accounts() and not store.account_id_used("demo"):
             account = {"id": "demo", "name": "示例子账户", "mode": "paper", "env_prefix": "ASTER_DEMO", "enabled": False, "policy": {**DEFAULT_POLICY}}
             store.save_account(account)
@@ -2034,6 +2036,9 @@ class Engine:
                                    saved_accounts[0]["id"] if saved_accounts else None)
             events = reader.events(account_id=history_account if compact else None)
             pending_notifications = reader.pending_notifications()
+            listings = reader.get("usd1_listings") or {"initialized": False, "checked_at": None, "rows": {}}
+            listings.update(enabled=self.listing_monitor is not None, poll_seconds=LISTING_POLL_SECONDS,
+                            stale_seconds=LISTING_STALE_SECONDS)
             migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
             cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
             deletion_blocks = {a["id"]: deletion_block(a, migration_records[a["id"]][1],
@@ -2156,7 +2161,7 @@ class Engine:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
-                "accounts": accounts, "markets": self.markets, "events": events, "updated_at": time.time(), "request_budget": request_budget,
+                "accounts": accounts, "markets": self.markets, "listings": listings, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,
                                  "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
@@ -2297,6 +2302,8 @@ class Engine:
                         jobs.update({"book:" + s: (self.poll_book, s) for s in SYMBOLS})
                         jobs.update({"depth:" + s: (self.poll_depth, s) for s in SYMBOLS})
                         jobs["notify"] = (self.notify,)
+                        if self.listing_monitor is not None:
+                            jobs["listings"] = (self.listing_monitor.poll,)
                         live_ids = [a["id"] for a in saved_accounts if a["mode"] == "live"]
                         jobs.update({"cycle-data:" + aid: (self.poll_cycle_hot_data, aid) for aid in live_ids})
                         jobs.update({"cycle-history:" + aid: (self.poll_cycle_history, aid) for aid in live_ids})

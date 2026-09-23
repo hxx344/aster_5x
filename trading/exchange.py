@@ -734,9 +734,31 @@ class MarketData:
         DepthSnapshot.from_response(data, requested_at=requested_at)
         return data
 
-    def _public_json(self, path, symbol, *, brackets=False):
+    def listing_symbols(self):
+        return self.api.call("GET", "/fapi/v3/exchangeInfo")
+
+    def listing_detail(self, symbol):
+        from .listings import maximum_leverage
+        started = time.time()
+        brackets = self._public_json(monitor.BRACKETS_PATH, symbol, brackets=True, priority=False)
+        try:
+            leverage, cap = maximum_leverage(brackets, symbol)
+        except monitor.MonitorError:
+            raise ExchangeError("公开杠杆档位数据无效") from None
+        detail = {"max_leverage": leverage, "bracket_cap": str(cap), "brackets_checked_at": started,
+                  "capacity": None, "remaining": None, "checked_at": None, "error": None}
+        try:
+            oi = self._public_json(monitor.OI_PATH, symbol, priority=False)
+            capacity, remaining, cap = monitor.extract_capacity(oi, brackets, symbol, leverage)
+        except (monitor.MonitorError, ExchangeError):
+            detail["error"] = "最大杠杆对应的公开额度暂不可用，等待重试"
+            return detail
+        detail.update(capacity=str(capacity), remaining=str(remaining), checked_at=started)
+        return detail
+
+    def _public_json(self, path, symbol, *, brackets=False, priority=True):
         # Reuse the public client's connections; no account signature or data.
-        with self.api.budget.capacity_monitoring():
+        with self.api.budget.capacity_monitoring() if priority else nullcontext():
             ticket = self.api.budget.reserve(1, track=True)
         try:
             try:

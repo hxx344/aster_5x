@@ -100,11 +100,35 @@ export type Market = {
   depth?: DepthQuote;
   depth_error?: string;
 };
+export type Listing = {
+  symbol: string;
+  status: string;
+  onboard_at?: number | null;
+  detected_at?: number;
+  is_new?: boolean;
+  max_leverage?: number;
+  capacity?: string | null;
+  remaining?: string | null;
+  bracket_cap?: string | null;
+  checked_at?: number | null;
+  brackets_checked_at?: number;
+  error?: string | null;
+};
+export type Listings = {
+  enabled: boolean;
+  initialized: boolean;
+  checked_at?: number | null;
+  poll_seconds: number;
+  stale_seconds: number;
+  error?: string | null;
+  rows: Record<string, Listing>;
+};
 export type State = {
   demo: boolean;
   ready: boolean;
   accounts: Account[];
   markets: Record<string, Market>;
+  listings?: Listings;
   events: ExecutionEvent[];
   updated_at: number;
   notification: { configured: boolean; pending: number; error?: string };

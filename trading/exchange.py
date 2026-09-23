@@ -442,6 +442,8 @@ class MarketData:
         self.depth_stream = depth_stream if depth_stream is not None else PublicDepthStream()
         self.rules = {}
         self.assets = {}
+        self.assets_lock = threading.Lock()
+        self.assets_retry_at = 0
         self.books, self.book_locks = {}, {}
         self.book_guard = threading.Lock()
         self.marks, self.mark_locks = {}, {}
@@ -501,13 +503,41 @@ class MarketData:
             raise TradingError("市价数量上下限没有有效步进，暂停该规则加载")
         return step, minimum, maximum
 
+    @staticmethod
+    def _margin_assets(data):
+        if not isinstance(data, dict) or not isinstance(data.get("symbols"), list) or not data["symbols"]:
+            raise TradingError("交易所保证金资产信息响应无效")
+        assets = {}
+        for row in data["symbols"]:
+            if (not isinstance(row, dict) or not isinstance(row.get("symbol"), str) or not row["symbol"]
+                    or not isinstance(row.get("marginAsset"), str) or not row["marginAsset"]
+                    or row["symbol"] in assets):
+                raise TradingError("交易所保证金资产信息缺失或重复")
+            assets[row["symbol"]] = row["marginAsset"]
+        return assets
+
+    def margin_asset(self, symbol):
+        asset = self.assets.get(symbol)
+        if asset is not None:
+            return asset
+        # Newly listed holdings may postdate startup. Share one read across
+        # accounts; unknown symbols and failed reads must not create a loop.
+        with self.assets_lock:
+            if symbol not in self.assets and time.monotonic() >= self.assets_retry_at:
+                self.assets_retry_at = time.monotonic() + 30
+                try:
+                    assets = self._margin_assets(self.api.call("GET", "/fapi/v3/exchangeInfo"))
+                except TradingError as exc:
+                    self.assets_retry_at = time.monotonic() + max(30, getattr(exc, "retry_after", 0))
+                    raise
+                self.assets = assets
+            return self.assets.get(symbol)
+
     def load_rules(self):
         data = self.api.call("GET", "/fapi/v3/exchangeInfo")
-        if not isinstance(data, dict) or not isinstance(data.get("symbols"), list):
-            raise TradingError("交易规则响应无效")
-        rules, assets = {}, {}
+        assets = self._margin_assets(data)
+        rules = {}
         for row in data["symbols"]:
-            assets[row["symbol"]] = row["marginAsset"]
             # All assets are needed to account for outside holdings, but only the
             # configured strategy universe needs executable MARKET quantity rules.
             if row.get("status") != "TRADING" or row["symbol"] not in SYMBOLS:
@@ -534,7 +564,8 @@ class MarketData:
                 step, minimum, maximum = self.market_quantity_limits(lot, filters.get("MARKET_LOT_SIZE"))
                 rules[row["symbol"]] = Rules(row["symbol"], step, positive(price["tickSize"]), minimum, maximum,
                     positive(notional.get("notional", notional.get("minNotional")), True), row["marginAsset"])
-        self.rules, self.assets = rules, assets
+        with self.assets_lock:
+            self.rules, self.assets = rules, assets
         for rate in data.get("rateLimits", []):
             if rate.get("rateLimitType") == "REQUEST_WEIGHT" and rate.get("interval") == "MINUTE" and rate.get("intervalNum") == 1:
                 self.api.budget.limit = min(1800, max(1, int(rate["limit"] * .8)))
@@ -1058,6 +1089,14 @@ class LiveBroker:
             unrealized, positions, None, hedge, multi, account.get("canTrade") is True,
             started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets or {}, current_caps or {})
 
+    def _require_usd1(self, symbol):
+        resolve = getattr(self.market, "margin_asset", None)
+        asset = resolve(symbol) if callable(resolve) else self.market.assets.get(symbol)
+        if asset is None:
+            raise TradingError(f"{symbol} 保证金资产尚未确认，等待交易所市场信息更新")
+        if asset != "USD1":
+            raise TradingError(f"{symbol} 保证金资产为 {asset}；检测到非 USD1 仓位，需要核对风险范围")
+
     def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None):
         """Shared parsing; the ordinary path retains its sequential reads."""
         with self._snapshot_lock:
@@ -1100,10 +1139,7 @@ class LiveBroker:
         for row in rows:
             if row["symbol"] not in symbols and not dec(row["positionAmt"]):
                 continue
-            if self.market.assets.get(row["symbol"]) != "USD1":
-                if dec(row["positionAmt"]):
-                    raise TradingError("检测到非 USD1 仓位，需要核对风险范围")
-                continue
+            self._require_usd1(row["symbol"])
             qty = dec(row["positionAmt"]).copy_abs()
             field_prefix = f"{row['symbol']} {row['positionSide']}"
             entry = positive(row["entryPrice"], allow_zero=not qty, field=f"{field_prefix} 开仓价（entryPrice）")
@@ -1247,8 +1283,7 @@ class LiveBroker:
         relevant = {key: row for key, row in rows.items() if key[0] in symbols or dec(row["positionAmt"])}
         leverages = {}
         for (symbol, side), row in relevant.items():
-            if self.market.assets.get(symbol) != "USD1":
-                raise TradingError("检测到非 USD1 仓位，需要核对风险范围")
+            self._require_usd1(symbol)
             if type(row.get("isolated")) is not bool:
                 raise TradingError("账户全仓保证金模式响应无效")
             leverage = self._leverage(row.get("leverage"), field=f"{symbol} {side} 实际杠杆（leverage）")

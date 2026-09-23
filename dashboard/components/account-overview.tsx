@@ -110,7 +110,7 @@ export function AccountOverview({
         <Metric
           label="未实现盈亏"
           value={fmt(snapshot?.unrealized)}
-          sub={`${positions.length} 个方向持仓`}
+          sub={snapshot ? `${positions.length} 个方向持仓` : '等待账户仓位数据'}
           accent={Number(snapshot?.unrealized) < 0 ? 'danger' : 'mint'}
           icon={<ArrowUpRight size={17} />}
         />
@@ -118,7 +118,7 @@ export function AccountOverview({
       <div className="feature-grid">
         <div className="panel positions-panel">
           <div className="section-head">
-            <h2>当前持仓 · {positions.length}</h2>
+            <h2>当前持仓 · {snapshot ? positions.length : '—'}</h2>
             <span
               className={
                 snapshotView.warning ? 'small-note amber' : 'small-note'
@@ -183,12 +183,8 @@ export function AccountOverview({
           {!positions.length && (
             <div className="empty-state">
               <Layers3 size={27} />
-              <h3>{account ? '暂无持仓' : '尚未添加子账户'}</h3>
-              <p>
-                {account
-                  ? '满足额度、价差与风险条件后，策略才会分批开仓。'
-                  : '添加账户后查看双向持仓、当前杠杆与风险。'}
-              </p>
+              <h3>{snapshotView.emptyTitle}</h3>
+              <p>{snapshotView.emptyNotice}</p>
             </div>
           )}
         </div>

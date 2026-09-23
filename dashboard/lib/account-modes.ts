@@ -78,6 +78,16 @@ export function accountSnapshotView(
     label,
     notice,
     elapsed: validAge ? elapsedLabel(age) : null,
+    emptyTitle: !snapshot
+      ? connectionError || accountError
+        ? '账户仓位读取失败'
+        : '正在读取账户仓位'
+      : fresh && !warning
+        ? '暂无持仓'
+        : '最近快照暂无持仓',
+    emptyNotice: !snapshot
+      ? `${connectionError || accountError ? `${notice}。` : ''}仓位会自动读取，无需启动账户。`
+      : '已读取的账户快照中没有持仓；暂停期间仍会自动同步。',
   };
 }
 

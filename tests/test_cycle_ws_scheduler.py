@@ -133,6 +133,10 @@ class _Harness:
             stack.enter_context(patch("trading.engine.time.time", side_effect=lambda: self.wall))
             stack.enter_context(patch.object(self.engine, "scheduling", return_value=self.timing))
             stack.enter_context(patch.object(self.engine, "tick_account", side_effect=self.submit_account))
+            # Keep the independent listing feed out of quote/execution request
+            # assertions, just like the other background market pollers below.
+            if self.engine.listing_monitor is not None:
+                stack.enter_context(patch.object(self.engine.listing_monitor, "poll", return_value=60))
             for name in ("poll_market", "poll_book", "poll_depth", "notify"):
                 stack.enter_context(patch.object(self.engine, name, return_value=60))
             self.engine.run()

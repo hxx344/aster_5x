@@ -6,6 +6,34 @@ const timestamp = 1_750_000_000;
 const snapshot = { timestamp };
 const paused = { interval_seconds: 60 };
 
+test('positions distinguish first read, failed read and a verified empty snapshot', () => {
+  const loading = accountSnapshotView(undefined, timestamp, '', paused);
+  assert.equal(loading.emptyTitle, '正在读取账户仓位');
+  assert.match(loading.emptyNotice, /无需启动账户/);
+  for (const [connection, error] of [
+    ['离线', ''],
+    ['', 'MOONSHOTUSD1 保证金资产尚未确认'],
+  ]) {
+    const failed = accountSnapshotView(
+      undefined,
+      timestamp,
+      connection,
+      paused,
+      error,
+    );
+    assert.equal(failed.emptyTitle, '账户仓位读取失败');
+    assert.ok(failed.emptyNotice.includes(failed.notice));
+    assert.match(failed.emptyNotice, /无需启动账户/);
+  }
+  const empty = accountSnapshotView(snapshot, timestamp, '', paused);
+  assert.equal(empty.emptyTitle, '暂无持仓');
+  assert.match(empty.emptyNotice, /暂停期间仍会自动同步/);
+  assert.equal(
+    accountSnapshotView(snapshot, timestamp + 90, '', paused).emptyTitle,
+    '最近快照暂无持仓',
+  );
+});
+
 test('scheduled records stop being fresh at eight seconds without declaring a refresh failure', () => {
   assert.equal(
     accountSnapshotView(snapshot, timestamp + 7.999, '', paused).fresh,

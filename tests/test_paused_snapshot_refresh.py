@@ -1,12 +1,15 @@
 """Pausing trading must not skip scheduled account reads."""
 from copy import deepcopy
 from dataclasses import replace
+import os
+import threading
 import time
 from unittest import TestCase
 from unittest.mock import patch
 
 from tests.helpers import Fixture
 from tests.test_exchange_hardening import FixtureAPI, account_responses
+from tests.test_account_market_assets import OTHER, list_other, market_and_api
 from trading.engine import Engine, snapshot_json
 from trading.exchange import LiveBroker, RateBudget
 from trading.models import TradingError
@@ -102,3 +105,74 @@ class PausedSnapshotRefreshTests(TestCase):
         self.assertTrue(all(call[0] == "GET" for call in api.calls))
         self.assertFalse(self.f.store.account("test")["enabled"])
         self.assertIsNone(self.f.store.intent("test"))
+
+    def test_scheduler_reads_moonshot_before_account_has_ever_been_started(self):
+        # Exercise the actual scheduler, cold views and live adapter after a
+        # restart, including when the account has a saved cycle-only policy.
+        for cycling in (False, True):
+            with self.subTest(cycling=cycling):
+                saved = self.f.store.account("test")
+                saved.update(mode="live", enabled=False)
+                saved["cycle"] = {"enabled": cycling, "symbol": "XAUUSD1"}
+                self.f.store.save_account(saved)
+                engine = Engine(self.f.store, market=self.f.market)
+                market, api = market_and_api()
+                list_other(api)
+                engine.brokers["test"] = LiveBroker({}, market, api=api)
+                seen = threading.Event()
+                original_view = engine.view
+
+                def publish(aid, **updates):
+                    original_view(aid, **updates)
+                    if updates.get("status") == "paused":
+                        seen.set()
+
+                with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "0"}), \
+                     patch.object(engine, "view", side_effect=publish), \
+                     patch.object(engine.dashboard_reports, "start"), \
+                     patch.object(engine, "notify", return_value=60):
+                    engine.start()
+                    try:
+                        self.assertTrue(seen.wait(3), engine.views)
+                        view = engine.state()["accounts"][0]
+                        self.assertEqual(view["status"], "paused")
+                        self.assertIn(OTHER, [p["symbol"] for p in view["snapshot"]["positions"]])
+                        self.assertEqual(view["snapshot"]["occupied_margin"], "90")
+                    finally:
+                        engine.stop()
+                self.assertFalse(self.f.store.account("test")["enabled"])
+                self.assertTrue(all(call[0] == "GET" for call in api.calls))
+                self.assertIsNone(self.f.store.intent("test"))
+
+    def test_adding_live_account_reads_holdings_without_enabling_it(self):
+        market, api = market_and_api()
+        list_other(api)
+        self.engine.brokers["second"] = LiveBroker({}, market, api=api)
+        seen = threading.Event()
+        original_view = self.engine.view
+
+        def publish(aid, **updates):
+            original_view(aid, **updates)
+            if aid == "second" and updates.get("status") == "paused":
+                seen.set()
+
+        with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "0"}), \
+             patch.object(self.engine, "view", side_effect=publish), \
+             patch.object(self.engine.dashboard_reports, "start"), \
+             patch.object(self.engine, "notify", return_value=60):
+            self.engine.start()
+            try:
+                with self.engine.account_lock("second"):
+                    self.engine.add_account({"id": "second", "name": "未启动账户", "mode": "live", "env_prefix": "ASTER_SECOND"})
+                    # This fixture only returns the selected market's flat legs.
+                    saved = self.f.store.account("second")
+                    saved["policy"]["symbols"] = ["XAUUSD1"]
+                    self.f.store.save_account(saved)
+                self.assertTrue(seen.wait(3), self.engine.views)
+                positions = self.engine.views["second"]["snapshot"]["positions"]
+                self.assertIn(OTHER, [p["symbol"] for p in positions])
+            finally:
+                self.engine.stop()
+        self.assertFalse(self.f.store.account("second")["enabled"])
+        self.assertTrue(all(call[0] == "GET" for call in api.calls))
+        self.assertIsNone(self.f.store.intent("second"))

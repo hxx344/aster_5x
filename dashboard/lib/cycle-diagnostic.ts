@@ -1,4 +1,5 @@
 import type { CycleDiagnostic } from './cycle';
+import { isDisplayTimestamp } from './display-time.ts';
 
 function diagnosticText(value: unknown, fallback = '—'): string {
   return typeof value === 'string' && value.trim() ? value : fallback;
@@ -9,13 +10,7 @@ export function cycleDiagnosticView(
 ) {
   if (!diagnostic || typeof diagnostic !== 'object') return null;
   const timestamp = diagnostic.checked_at;
-  const checkedAt =
-    typeof timestamp === 'number' &&
-    Number.isFinite(timestamp) &&
-    timestamp >= 0 &&
-    Number.isFinite(new Date(timestamp * 1000).getTime())
-      ? timestamp
-      : undefined;
+  const checkedAt = isDisplayTimestamp(timestamp) ? timestamp : undefined;
   return {
     title: diagnosticText(diagnostic.title, '循环检查未通过'),
     symbol: diagnosticText(diagnostic.symbol, '品种未知'),

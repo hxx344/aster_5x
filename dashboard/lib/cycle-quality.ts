@@ -1,3 +1,5 @@
+import { isDisplayTimestamp as validTime } from './display-time.ts';
+
 export type CycleExecutionEstimate = {
   status: 'available' | 'unavailable';
   sampled_at: number | null;
@@ -110,15 +112,6 @@ function sameQuantity(left: unknown, right: unknown): boolean {
     return `${whole.replace(/^0+/, '') || '0'}.${fraction.replace(/0+$/, '')}`;
   };
   return normalized(left as string) === normalized(right as string);
-}
-
-function validTime(value: unknown): value is number {
-  return (
-    typeof value === 'number' &&
-    Number.isFinite(value) &&
-    value >= 0 &&
-    Number.isFinite(new Date(value * 1000).getTime())
-  );
 }
 
 export function cycleQualityTime(value: number | null | undefined): string {

@@ -1,4 +1,5 @@
 import type { CycleDiagnostic, CycleState } from './cycle';
+import { isDisplayTimestamp as validTime } from './display-time.ts';
 
 export type CycleCheckEvent = {
   symbol: string;
@@ -125,15 +126,6 @@ function legacyCondition(message: string): LegacyCondition | undefined {
   if (OPERATIONAL_MESSAGE.test(message)) return undefined;
   return LEGACY_CONDITIONS.find(
     ({ title }) => message === title || message.startsWith(`${title}：`),
-  );
-}
-
-function validTime(value: unknown): value is number {
-  return (
-    typeof value === 'number' &&
-    Number.isFinite(value) &&
-    value >= 0 &&
-    Number.isFinite(new Date(value * 1000).getTime())
   );
 }
 

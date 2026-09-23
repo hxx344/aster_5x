@@ -2038,7 +2038,7 @@ class Engine:
             pending_notifications = reader.pending_notifications()
             listings = reader.get("usd1_listings") or {"initialized": False, "checked_at": None, "rows": {}}
             listings.update(enabled=self.listing_monitor is not None, poll_seconds=LISTING_POLL_SECONDS,
-                            stale_seconds=LISTING_STALE_SECONDS)
+                            stale_seconds=LISTING_STALE_SECONDS, watched_symbols=reader.listing_watch_symbols())
             migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
             cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
             deletion_blocks = {a["id"]: deletion_block(a, migration_records[a["id"]][1],

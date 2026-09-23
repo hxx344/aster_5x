@@ -1,4 +1,6 @@
-import type { Listings, State } from '@/lib/desk-types';
+'use client';
+import { useState } from 'react';
+import type { DeskAction, Listings, State } from '@/lib/desk-types';
 import { fmt } from '@/lib/desk-format';
 import {
   Table,
@@ -27,12 +29,33 @@ export function ListingsPanel({
   notification,
   now,
   connectionError,
+  action,
+  busy,
 }: {
   listings?: Listings;
   notification?: State['notification'];
   now: number;
   connectionError: string;
+  action: DeskAction;
+  busy: boolean;
 }) {
+  const [pendingWatch, setPendingWatch] = useState<{
+    symbol: string;
+    enabled: boolean;
+  } | null>(null);
+  const toggleWatch = async (symbol: string, enabled: boolean) => {
+    if (busy || pendingWatch) return;
+    setPendingWatch({ symbol, enabled });
+    try {
+      await action(
+        `/api/listings/${encodeURIComponent(symbol)}/capacity-alert`,
+        { enabled },
+        'PATCH',
+      );
+    } finally {
+      setPendingWatch(null);
+    }
+  };
   const rows = Object.values(listings?.rows ?? {}).sort(
     (a, b) =>
       Number(Boolean(b.is_new)) - Number(Boolean(a.is_new)) ||
@@ -45,6 +68,7 @@ export function ListingsPanel({
     now - stamp >= (listings?.stale_seconds ?? 180);
   const catalogStale =
     Boolean(connectionError || listings?.error) || stale(listings?.checked_at);
+  const watched = new Set(listings?.watched_symbols ?? []);
   return (
     <section className="panel listings-panel">
       <div className="section-head">
@@ -61,6 +85,10 @@ export function ListingsPanel({
         <p>
           首次运行建立现有交易对基线，之后发现新上线即推送飞书。公开可用额度 =
           该最大杠杆的公开剩余额度与档位上限的较小值，单位 USD1。
+        </p>
+        <p>
+          勾选即保存。最大杠杆可用额度 &gt; 0
+          时提醒一次，持续有额度不重复；归零后恢复、最大杠杆变化或重新勾选时再次提醒。无需启动账户。
         </p>
         <p className={notification?.error ? 'amber' : 'muted'}>
           {notification?.error ||
@@ -85,6 +113,7 @@ export function ListingsPanel({
           <Table className="listings-table">
             <TableHeader>
               <TableRow>
+                <TableHead>额度 &gt; 0 提醒</TableHead>
                 <TableHead>交易对 / 状态</TableHead>
                 <TableHead className="number">最大杠杆</TableHead>
                 <TableHead className="number">公开可用额度 · USD1</TableHead>
@@ -102,6 +131,32 @@ export function ListingsPanel({
                   stale(row.checked_at);
                 return (
                   <TableRow key={row.symbol}>
+                    <TableCell>
+                      <label className="listing-watch-toggle">
+                        <input
+                          type="checkbox"
+                          aria-label={`${row.symbol} 最大杠杆额度大于零时提醒`}
+                          checked={
+                            pendingWatch?.symbol === row.symbol
+                              ? pendingWatch.enabled
+                              : watched.has(row.symbol)
+                          }
+                          disabled={
+                            busy ||
+                            Boolean(connectionError) ||
+                            !listings?.enabled
+                          }
+                          onChange={(event) =>
+                            void toggleWatch(row.symbol, event.target.checked)
+                          }
+                        />
+                        {pendingWatch?.symbol === row.symbol
+                          ? '保存中…'
+                          : watched.has(row.symbol)
+                            ? '已勾选'
+                            : '勾选'}
+                      </label>
+                    </TableCell>
                     <TableCell>
                       <strong>{row.symbol}</strong>
                       <small>

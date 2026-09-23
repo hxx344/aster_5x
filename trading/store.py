@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
+from . import listing_alerts
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -401,6 +402,16 @@ class Store:
             for notification_id, message in alerts:
                 db.execute("INSERT OR IGNORE INTO outbox(id,message,due_at) VALUES (?,?,?)",
                            (notification_id, message, time.time()))
+            listing_alerts.observe_all(db, state, time.time())
+
+    def set_listing_watch(self, symbol, enabled):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            listing_alerts.set_watch(db, symbol, enabled, time.time())
+
+    def listing_watch_symbols(self):
+        with self.connect() as db:
+            return listing_alerts.selected_symbols(db)
 
     def save_intent(self, intent):
         with self.connect() as db:
@@ -1149,6 +1160,8 @@ class Store:
     @staticmethod
     def _notification_item(db, row):
         item = dict(row)
+        if item["id"].startswith(listing_alerts.MESSAGE_PREFIX) and not listing_alerts.deliverable(db, item, time.time()):
+            return None
         if item["capacity_key"]:
             if item["capacity_key"] not in CAPACITY_ALERT_KEYS:
                 return None
@@ -1185,6 +1198,8 @@ class Store:
             now = time.time()
             if success:
                 db.execute("UPDATE outbox SET delivered_at=? WHERE id=?", (now, item["id"]))
+                if item["id"].startswith(listing_alerts.MESSAGE_PREFIX):
+                    listing_alerts.delivered(db, item)
                 if row["capacity_key"]:
                     saved = db.execute("SELECT data FROM kv WHERE key=?", (row["capacity_key"],)).fetchone()
                     gate = json.loads(saved[0]) if saved else None

@@ -142,6 +142,11 @@ class NewAccount(BaseModel):
     mode: Literal["paper", "live"]
 
 
+class ListingWatchEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool
+
+
 class MigrationEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool | None = None
@@ -324,6 +329,13 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         return hub_summary(engine)
 
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
+
+    @app.patch("/api/listings/{symbol}/capacity-alert", dependencies=write_dependencies)
+    def listing_capacity_alert(symbol: str, body: ListingWatchEdit):
+        if engine.demo:
+            raise TradingError("模拟环境不运行额度提醒")
+        engine.store.set_listing_watch(symbol, body.enabled)
+        return {"ok": True}
 
     @app.post("/api/accounts", dependencies=write_dependencies)
     def add_account(body: NewAccount):

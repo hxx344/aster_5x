@@ -15,6 +15,18 @@
   margin-top: 5px;
   font-size: 12px;
 }
+.listing-watch-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  cursor: pointer;
+}
+.listing-watch-toggle input {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--primary);
+}
 @custom-variant dark (&:is(.dark *));
 @theme inline {
   --color-background: var(--background);

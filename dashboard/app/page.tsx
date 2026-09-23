@@ -374,6 +374,8 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
               </TabsContent>
               <TabsContent value="listings">
                 <ListingsPanel
+                  action={action}
+                  busy={busy}
                   listings={state?.listings}
                   notification={state?.notification}
                   now={serverNow}
@@ -406,13 +408,15 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
         ) : !needsLogin ? (
           <>
             <ListingsPanel
+              action={action}
+              busy={busy}
               listings={state?.listings}
               notification={state?.notification}
               now={serverNow}
               connectionError={connectionError}
             />
             <section className="panel empty-state">
-              <h2>{state ? '添加账户以开始' : '正在连接交易服务'}</h2>
+              <h2>{state ? '添加账户以管理交易' : '正在连接交易服务'}</h2>
             </section>
           </>
         ) : null}

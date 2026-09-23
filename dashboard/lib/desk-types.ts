@@ -122,6 +122,7 @@ export type Listings = {
   stale_seconds: number;
   error?: string | null;
   rows: Record<string, Listing>;
+  watched_symbols?: string[];
 };
 export type State = {
   demo: boolean;

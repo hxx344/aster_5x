@@ -42,7 +42,7 @@ class PriorityCapacitySignalTests(PriorityCapacityFixture):
     def test_only_capacity_strictly_above_the_account_threshold_wakes(self):
         self.f.account["policy"]["threshold"] = "20000"
         self.f.store.save_account(self.f.account)
-        self.assertEqual(self.publish({5: 500000, 10: 20000, 20: 19999}), 2)
+        self.assertEqual(self.publish({5: 20000, 10: 20000, 20: 19999}), 2)
         self.assertFalse(self.engine.work("test").priority)
 
         self.publish({10: "20000.0001", 20: 20000})
@@ -348,6 +348,9 @@ class PriorityCapacitySchedulerTests(PriorityCapacityFixture):
             self.assertTrue(ordinary_done.wait(1))
             sending.assert_not_called()
             started = time.monotonic()
+            # Publish a full-tier sample: fast 5x-only polls intentionally do
+            # not discover new 10x/20x capacity until their regular refresh.
+            self.engine.capacity_full_checked.pop(SYMBOL, None)
             self.publish({5: 500000, 10: 500000, 20: 500000})
             self.assertTrue(opened.wait(3), "upgrade/confirmation/opening waited for the ordinary interval")
             self.assertLess(time.monotonic() - started, 3)

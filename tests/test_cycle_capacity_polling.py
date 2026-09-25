@@ -98,6 +98,11 @@ class CapacitySelectionTests(unittest.TestCase):
         self.addCleanup(self.f.close)
         self.h = _Harness(self.f)
         self.engine = self.h.engine
+        # These cadence tests isolate the cycle's targets; ordinary 5x has its
+        # own selection/cadence tests and is disabled by this opening floor.
+        owner = self.f.store.account("test")
+        owner["policy"]["min_open_leverage"] = 10
+        self.f.store.save_account(owner)
         self.engine.view("test", snapshot={"positions": [{"symbol": SYMBOL, "leverage": 5}]})
 
     def test_enabled_symbols_share_actual_leverages_and_pause_stops_fast_target(self):

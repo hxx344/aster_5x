@@ -6,6 +6,7 @@ import time
 
 import monitor
 from .models import TradingError
+from . import monitoring
 
 STATE_KEY = "usd1_listings"
 POLL_SECONDS = 60
@@ -91,27 +92,32 @@ class ListingMonitor:
         if self.shutdown.is_set():
             return POLL_SECONDS
         state = deepcopy(self.store.get(STATE_KEY) or {"initialized": False, "checked_at": None, "rows": {}})
+        config = self.store.monitoring_settings()
+        if not config["monitoring_enabled"]:
+            return 5
         now = time.time()
-        if time.monotonic() >= self.catalog_due:
+        if config["discovery_enabled"] and time.monotonic() >= self.catalog_due:
             try:
                 symbols = parse_symbols(self.market.listing_symbols())
                 for symbol, current in symbols.items():
                     row = state["rows"].setdefault(symbol, {"symbol": symbol, "first_seen_at": now, "seen_trading": False})
                     if current["status"] == "TRADING" and not row["seen_trading"]:
-                        row.update(seen_trading=True, is_new=state["initialized"], detected_at=now,
-                                   notification_phase="pending" if state["initialized"] else "baseline")
+                        is_new = state["initialized"] and not state.get("rebaseline", False)
+                        row.update(seen_trading=True, is_new=is_new, detected_at=now,
+                                   notification_phase="pending" if is_new else "baseline")
                     row.update(current)
                 for symbol, row in state["rows"].items():
                     if symbol not in symbols:
                         row["status"] = "MISSING"
-                state.update(initialized=True, checked_at=now, error=None)
+                state.update(initialized=True, checked_at=now, error=None, rebaseline=False)
             except Exception:
                 state["error"] = "上新检查失败，保留上次结果并自动重试"
-            self.store.save_listing_state(state)
+            self.store.save_listing_state(state, policy_revision=config["revision"])
             self.catalog_due = time.monotonic() + POLL_SECONDS
         if self.shutdown.is_set():
             return POLL_SECONDS
         eligible = [row for row in state["rows"].values() if row["status"] == "TRADING"
+                    and monitoring.monitored(config, row["symbol"])
                     and time.monotonic() >= self.detail_due.get(row["symbol"], 0)]
         if not eligible:
             return 5
@@ -120,6 +126,9 @@ class ListingMonitor:
         row = min(eligible, key=lambda row: (row.get("notification_phase") != "pending",
                                             self.detail_due.get(row["symbol"], 0), row["symbol"]))
         symbol, alerts = row["symbol"], []
+        config = self.store.monitoring_settings()
+        if not monitoring.monitored(config, symbol):
+            return 1
         try:
             detail = self.market.listing_detail(symbol)
             row.update(detail)
@@ -133,6 +142,6 @@ class ListingMonitor:
             alerts.append((f"usd1-listing:{symbol}" + (":detail" if supplement else ""),
                            notification_text(row, supplement=supplement)))
             row["notification_phase"] = "incomplete" if row.get("error") else "queued"
-        self.store.save_listing_state(state, alerts)
+        self.store.save_listing_state(state, alerts, policy_revision=config["revision"])
         self.detail_due[symbol] = time.monotonic() + POLL_SECONDS
         return 1

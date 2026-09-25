@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import listing_alerts
+from . import listing_alerts, monitoring
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -159,7 +159,7 @@ class Store:
                            f"AFTER {action} ON cycle_fills BEGIN {updates} END")
             # Existing trade notifications keep NULL expiry and remain deliverable.
             columns = {row[1] for row in db.execute("PRAGMA table_info(outbox)")}
-            for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT")):
+            for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT"), ("category", "TEXT"), ("symbols", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {kind}")
             event_columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
@@ -394,13 +394,57 @@ class Store:
             row = db.execute("SELECT data FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (account_id,)).fetchone()
             return json.loads(row[0]) if row else None
 
-    def save_listing_state(self, state, alerts=()):
+    def monitoring_settings(self):
+        with self.connect() as db:
+            return monitoring.read(db)
+
+    def edit_monitoring(self, changes, *, symbol=None):
+        fields = ("monitor", "alerts", "max_capacity_alert") if symbol is not None else monitoring.DEFAULTS
+        monitoring.validate_edit(changes, fields)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = listing_alerts.read(db, "usd1_listings", {})
+            config = monitoring.register_symbols(db, set(SYMBOLS) | set(state.get("rows", {})))
+            if symbol is not None:
+                monitoring.validate_symbol(db, symbol)
+                options = config["symbols"][symbol]
+                previous_watch = listing_alerts.read(db, listing_alerts.WATCH_PREFIX + symbol, {}).get("enabled", False)
+                if all(value == (previous_watch if key == "max_capacity_alert" else options[key]) for key, value in changes.items()):
+                    return config
+                options.update({key: value for key, value in changes.items() if key != "max_capacity_alert"})
+            else:
+                if all(config[key] == value for key, value in changes.items()):
+                    return config
+                config.update(changes)
+            config["revision"] += 1
+            monitoring.write(db, config)
+            if "max_capacity_alert" in changes:
+                listing_alerts.set_watch(db, symbol, changes["max_capacity_alert"], time.time())
+            monitoring.cancel_disabled(db, config)
+            return config
+
+    def save_listing_state(self, state, alerts=(), *, policy_revision=None):
         """Persist discovery progress and its notification outbox atomically."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            config = monitoring.register_symbols(db, state.get("rows", {}))
+            previous = listing_alerts.read(db, "usd1_listings", {})
+            changed = policy_revision is not None and policy_revision != config["revision"]
+            if not config["monitoring_enabled"] or not config["discovery_enabled"]:
+                state["rebaseline"] = True
+            elif changed and previous.get("rebaseline"):
+                state["rebaseline"] = True
+            for symbol, row in state.get("rows", {}).items():
+                old = previous.get("rows", {}).get(symbol, {})
+                if (changed or old.get("notification_phase") == "suppressed"
+                        or not monitoring.allowed(config, "new_listing", [symbol])) and row.get("notification_phase") in ("pending", "incomplete"):
+                    row["notification_phase"] = "suppressed"
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                        ("usd1_listings", dumps(state)))
             for notification_id, message in alerts:
+                item = {"id": notification_id}
+                if changed or not monitoring.message_allowed(db, item, config):
+                    continue
                 db.execute("INSERT OR IGNORE INTO outbox(id,message,due_at) VALUES (?,?,?)",
                            (notification_id, message, time.time()))
             listing_alerts.observe_all(db, state, time.time())
@@ -1076,7 +1120,16 @@ class Store:
             message = "\n".join(lines)
             # Simulated trading must never send external completion messages.
             if account["mode"] == "live":
-                db.execute("INSERT OR IGNORE INTO outbox(id,message,due_at) VALUES (?,?,?)", (campaign["id"], message, time.time()))
+                config = monitoring.read(db)
+                for symbol, values in totals.items():
+                    if not monitoring.allowed(config, "trade_summary", [symbol]):
+                        continue
+                    batches = sum(batch["symbol"] == symbol for batch in campaign["batches"])
+                    text = "\n".join([*lines[:2],
+                        f"{symbol} · {values['leverage']}x · 本轮多头增加 {values['long_qty']}，空头增加 {values['short_qty']}，新增总名义金额 {values['notional']:,.2f} USD1",
+                        *lines[-3:-1], f"该币批次数：{batches}"])
+                    db.execute("INSERT OR IGNORE INTO outbox(id,message,due_at,category,symbols) VALUES (?,?,?,?,?)",
+                        (f"{campaign['id']}:trade:{symbol}", text, time.time(), "trade_summary", dumps([symbol])))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (account["id"], "complete", message, time.time()))
             db.execute("DELETE FROM kv WHERE key=?", (key,))
 
@@ -1118,8 +1171,12 @@ class Store:
             # Serialize read-modify-write across separate Store instances/processes.
             if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
+            if not monitoring.allowed(monitoring.read(db), "strategy_capacity", [symbol]):
+                return False
             row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
             gate = json.loads(row[0]) if row else None
+            if gate and checked_at <= gate.get("resume_after", 0):
+                return False
             if not gate or gate.get("identity") != identity:
                 if gate and gate.get("pending_id"):
                     db.execute("UPDATE outbox SET expires_at=0 WHERE id=? AND delivered_at IS NULL", (gate["pending_id"],))
@@ -1161,6 +1218,8 @@ class Store:
     @staticmethod
     def _notification_item(db, row):
         item = dict(row)
+        if not monitoring.message_allowed(db, item):
+            return None
         if item["id"].startswith(listing_alerts.MESSAGE_PREFIX) and not listing_alerts.deliverable(db, item, time.time()):
             return None
         if item["capacity_key"]:
@@ -1179,8 +1238,14 @@ class Store:
             now = time.time()
             rows = db.execute("""SELECT * FROM outbox WHERE delivered_at IS NULL AND due_at<=?
                 AND (expires_at IS NULL OR expires_at>?)
-                ORDER BY (capacity_key IS NOT NULL),due_at,id LIMIT 5""", (now, now)).fetchall()
-            return [item for row in rows if (item := self._notification_item(db, row)) is not None]
+                ORDER BY (capacity_key IS NOT NULL),due_at,id""", (now, now))
+            result = []
+            for row in rows:
+                if (item := self._notification_item(db, row)) is not None:
+                    result.append(item)
+                    if len(result) == 5:
+                        break
+            return result
 
     def notification_for_delivery(self, notification_id):
         """Re-read just before sending: a queued estimate may have fallen or expired."""
@@ -1218,7 +1283,9 @@ class Store:
 
     def pending_notifications(self):
         with self.connect() as db:
-            return db.execute("SELECT count(*) FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>0)").fetchone()[0]
+            config = monitoring.read(db)
+            rows = db.execute("SELECT * FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>0)")
+            return sum(monitoring.message_allowed(db, dict(row), config) for row in rows)
 
 
 class _StoreSnapshot(Store):

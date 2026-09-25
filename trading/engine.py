@@ -16,6 +16,7 @@ import time
 import uuid
 
 import monitor
+from . import monitoring
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import HotAccountUnavailable
@@ -629,6 +630,69 @@ class Engine:
     def capacity_interval(self, symbol):
         return self.capacity_intervals.get(symbol, FAST_CAPACITY_POLL_INTERVAL if symbol in self.capacity_targets else CAPACITY_POLL_INTERVAL)
 
+    def required_monitoring_symbols(self, reader=None, accounts=None):
+        reader = reader or self.store
+        accounts = reader.accounts() if accounts is None else accounts
+        required = {}
+        for account in accounts:
+            symbols = set()
+            if account["enabled"]:
+                symbols.update(ordinary_add_symbols(account))
+                if account.get("cycle", {}).get("enabled"):
+                    symbols.add(account["cycle"]["symbol"])
+                if account.get("migration", {}).get("enabled"):
+                    symbols.update(SYMBOLS)
+            pending = reader.intent(account["id"]) or {}
+            if pending:
+                symbols.update(pending.get(key) for key in ("symbol", "source_symbol", "target_symbol"))
+                symbols.update(order.get("symbol") for order in pending.get("orders", []))
+            check = reader.get("post_fill_check:" + account["id"]) or {}
+            if isinstance(check, dict):
+                symbols.add(check.get("symbol"))
+            elif check:
+                # Older ledgers stored a boolean obligation for the whole account.
+                symbols.update(account["policy"]["symbols"])
+            cycle = reader.get("cycle:" + account["id"]) or {}
+            if cycle.get("phase") in ("holding", "waiting_close", "closing", "reconciling", "attention"):
+                symbols.add(cycle.get("config", account.get("cycle", {})).get("symbol"))
+            for symbol in symbols.intersection(SYMBOLS):
+                required.setdefault(symbol, []).append(account["name"])
+        return required
+
+    def monitored_market_symbols(self, accounts=None):
+        with self.store.read_snapshot() as reader:
+            config = reader.monitoring_settings()
+            selected = {symbol for symbol in SYMBOLS if monitoring.monitored(config, symbol)}
+            if len(selected) == len(SYMBOLS):
+                return selected
+            return selected | self.required_monitoring_symbols(reader, accounts).keys()
+
+    def edit_monitoring(self, changes, *, symbol=None):
+        if self.demo:
+            raise TradingError("模拟环境不运行监控或飞书告警")
+        self.store.edit_monitoring(changes, symbol=symbol)
+        with self.lock:
+            self.accounts_generation += 1
+        self.scheduler_event.set()
+
+    def monitoring_state(self, reader=None, accounts=None):
+        reader = reader or self.store
+        config = reader.monitoring_settings()
+        listings = reader.get("usd1_listings") or {}
+        watched = set(reader.listing_watch_symbols())
+        required = self.required_monitoring_symbols(reader, accounts)
+        symbols = set(SYMBOLS) | set(listings.get("rows", {})) | config["symbols"].keys()
+        return {"settings": {key: config[key] for key in monitoring.DEFAULTS},
+                "revision": config["revision"],
+                "strategy_capacity_environment_enabled": os.environ.get("ASTER_CAPACITY_ALERT_ENABLED", "1").strip() == "1",
+                "symbols": [{"symbol": symbol, **monitoring.symbol_options(config, symbol),
+                    "max_capacity_alert": symbol in watched, "can_watch": symbol in listings.get("rows", {}),
+                    "strategy_market": symbol in SYMBOLS, "required_by": required.get(symbol, []),
+                    "effective_monitor": not self.demo and (monitoring.monitored(config, symbol) or symbol in required),
+                    "detail_enabled": not self.demo and monitoring.monitored(config, symbol),
+                    "status": listings.get("rows", {}).get(symbol, {}).get("status", "TRADING")}
+                    for symbol in sorted(symbols)]}
+
     def capacity_poll_schedule(self, targets):
         """Fit all public quota samples, including brackets, into their real reserve."""
         count = len(targets)
@@ -647,7 +711,7 @@ class Engine:
         return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL * scale, True
 
     def poll_public_brackets(self, symbol):
-        if self.shutdown.is_set() or not self.capacity_poll_enabled:
+        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.monitored_market_symbols():
             return self.capacity_brackets_interval
         try:
             self.market.refresh_public_brackets(symbol)
@@ -656,7 +720,7 @@ class Engine:
             return max(10, getattr(exc, "retry_after", 0))
 
     def poll_market(self, symbol):
-        if self.shutdown.is_set() or not self.capacity_poll_enabled:
+        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.monitored_market_symbols():
             return self.capacity_interval(symbol)
         try:
             with self.lock:
@@ -704,7 +768,7 @@ class Engine:
 
     def poll_book(self, symbol):
         """Keep the strategy's BBO indicator independent of display depth."""
-        if self.shutdown.is_set():
+        if self.shutdown.is_set() or symbol not in self.monitored_market_symbols():
             return 5
         try:
             book = self.market.book(symbol)
@@ -723,7 +787,7 @@ class Engine:
 
     def poll_depth(self, symbol):
         """Display depth cannot hold up the shared capacity feed."""
-        if self.shutdown.is_set():
+        if self.shutdown.is_set() or symbol not in self.monitored_market_symbols():
             return DEPTH_POLL_INTERVAL
         try:
             depth = self.market.depth(symbol)
@@ -1968,6 +2032,8 @@ class Engine:
             self.store.event(account_id, "control", "重新核对未完成批次；不重复提交原开仓订单")
 
     def notification_config(self):
+        if not self.store.monitoring_settings()["feishu_enabled"]:
+            return None
         webhook = os.environ.get("FEISHU_WEBHOOK_URL", "")
         if not webhook:
             return None
@@ -1990,8 +2056,11 @@ class Engine:
         if cooldown > 86400:
             raise TradingError("额度提醒冷却时间超出范围")
         accounts = sorted(self.store.accounts(), key=lambda account: account["id"])
+        settings = self.store.monitoring_settings()
         markets = {}
         for symbol in SYMBOLS:
+            if not monitoring.allowed(settings, "strategy_capacity", [symbol]):
+                continue
             sources = []
             for account in accounts:
                 if symbol not in account["policy"]["symbols"]:
@@ -2158,6 +2227,9 @@ class Engine:
             listings = reader.get("usd1_listings") or {"initialized": False, "checked_at": None, "rows": {}}
             listings.update(enabled=self.listing_monitor is not None, poll_seconds=LISTING_POLL_SECONDS,
                             stale_seconds=LISTING_STALE_SECONDS, watched_symbols=reader.listing_watch_symbols())
+            monitoring_state = self.monitoring_state(reader, saved_accounts)
+            listings.update(monitoring_enabled=monitoring_state["settings"]["monitoring_enabled"],
+                            discovery_enabled=monitoring_state["settings"]["discovery_enabled"])
             migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
             cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
             deletion_blocks = {a["id"]: deletion_block(a, migration_records[a["id"]][1],
@@ -2280,8 +2352,8 @@ class Engine:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
-                "accounts": accounts, "markets": self.markets, "listings": listings, "events": events, "updated_at": time.time(), "request_budget": request_budget,
-                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "pending": pending_notifications,
+                "accounts": accounts, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
+                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
     def run(self):
@@ -2433,11 +2505,12 @@ class Engine:
                                     ordinary_priority.add(aid)
                                     if time.monotonic() < work.ordinary_priority_after:
                                         priority_accounts.discard(aid)
-                        jobs = {"market:" + s: (self.poll_market, s) for s in SYMBOLS}
+                        monitored_symbols = self.monitored_market_symbols(saved_accounts)
+                        jobs = {"market:" + s: (self.poll_market, s) for s in monitored_symbols}
                         if isinstance(self.market, MarketData):
-                            jobs.update({"brackets:" + s: (self.poll_public_brackets, s) for s in SYMBOLS})
-                        jobs.update({"book:" + s: (self.poll_book, s) for s in SYMBOLS})
-                        jobs.update({"depth:" + s: (self.poll_depth, s) for s in SYMBOLS})
+                            jobs.update({"brackets:" + s: (self.poll_public_brackets, s) for s in monitored_symbols})
+                        jobs.update({"book:" + s: (self.poll_book, s) for s in monitored_symbols})
+                        jobs.update({"depth:" + s: (self.poll_depth, s) for s in monitored_symbols})
                         jobs["notify"] = (self.notify,)
                         if self.listing_monitor is not None:
                             jobs["listings"] = (self.listing_monitor.poll,)

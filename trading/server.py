@@ -148,6 +148,37 @@ class ListingWatchEdit(BaseModel):
     enabled: bool
 
 
+class MonitoringEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    monitoring_enabled: bool | None = None
+    discovery_enabled: bool | None = None
+    auto_monitor_new: bool | None = None
+    feishu_enabled: bool | None = None
+    new_listing_alerts: bool | None = None
+    strategy_capacity_alerts: bool | None = None
+    listing_capacity_alerts: bool | None = None
+    trade_summary_alerts: bool | None = None
+
+    @model_validator(mode="after")
+    def nonempty_booleans(self):
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("请提交至少一个有效开关")
+        return self
+
+
+class MonitoringSymbolEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    monitor: bool | None = None
+    alerts: bool | None = None
+    max_capacity_alert: bool | None = None
+
+    @model_validator(mode="after")
+    def nonempty_booleans(self):
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("请提交至少一个有效开关")
+        return self
+
+
 class MigrationEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool | None = None
@@ -330,6 +361,21 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         return hub_summary(engine)
 
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
+
+    @app.get("/api/monitoring", dependencies=[Depends(authenticated)])
+    def monitoring_settings():
+        with engine.store.read_snapshot() as reader:
+            return engine.monitoring_state(reader)
+
+    @app.patch("/api/monitoring", dependencies=write_dependencies)
+    def edit_monitoring(body: MonitoringEdit):
+        engine.edit_monitoring(body.model_dump(exclude_unset=True))
+        return {"ok": True}
+
+    @app.patch("/api/monitoring/symbols/{symbol}", dependencies=write_dependencies)
+    def edit_monitoring_symbol(symbol: str, body: MonitoringSymbolEdit):
+        engine.edit_monitoring(body.model_dump(exclude_unset=True), symbol=symbol)
+        return {"ok": True}
 
     @app.patch("/api/listings/{symbol}/capacity-alert", dependencies=write_dependencies)
     def listing_capacity_alert(symbol: str, body: ListingWatchEdit):

@@ -26,6 +26,7 @@ const statuses: Record<string, string> = {
 
 export function ListingsPanel({
   listings,
+  monitoring,
   notification,
   now,
   connectionError,
@@ -33,6 +34,7 @@ export function ListingsPanel({
   busy,
 }: {
   listings?: Listings;
+  monitoring?: State['monitoring'];
   notification?: State['notification'];
   now: number;
   connectionError: string;
@@ -68,40 +70,55 @@ export function ListingsPanel({
     now - stamp >= (listings?.stale_seconds ?? 180);
   const catalogStale =
     Boolean(connectionError || listings?.error) || stale(listings?.checked_at);
+  const detailCatalogStale =
+    Boolean(connectionError) ||
+    (listings?.discovery_enabled !== false && catalogStale);
   const watched = new Set(listings?.watched_symbols ?? []);
+  const controls = new Map(monitoring?.symbols.map((row) => [row.symbol, row]));
   return (
     <section className="panel listings-panel">
       <div className="section-head">
         <div>
           <h2>USD1 交易对上新</h2>
           <p>
-            每 {listings?.poll_seconds ?? 60} 秒检查永续交易对 ·
-            关闭网页后继续监控
+            {listings?.monitoring_enabled === false ||
+            listings?.discovery_enabled === false
+              ? '目录扫描已暂停'
+              : `每 ${listings?.poll_seconds ?? 60} 秒检查永续交易对`}{' '}
+            · 关闭网页后继续监控
           </p>
         </div>
         <span className="small-note">{rows.length} 个交易对</span>
       </div>
       <div className="listings-summary">
         <p>
-          首次运行建立现有交易对基线，之后发现新上线即推送飞书。公开可用额度 =
-          该最大杠杆的公开剩余额度与档位上限的较小值，单位 USD1。
+          首次运行建立现有交易对基线，之后按「监控与告警」的币种与通知开关推送上新。公开可用额度
+          = 该最大杠杆的公开剩余额度与档位上限的较小值，单位 USD1。
         </p>
         <p>
           勾选即保存。最大杠杆可用额度 &gt; 0
           时提醒一次，持续有额度不重复；归零后恢复、最大杠杆变化或重新勾选时再次提醒。无需启动账户。
         </p>
         <p className={notification?.error ? 'amber' : 'muted'}>
-          {notification?.error ||
-            (notification?.configured
-              ? `飞书已配置${notification.pending ? ` · ${notification.pending} 条通知待发送` : ''}`
-              : '飞书未配置，请在服务器配置 FEISHU_WEBHOOK_URL')}{' '}
+          {notification?.enabled === false
+            ? '飞书告警已关闭，可在「监控与告警」开启'
+            : notification?.error ||
+              (notification?.configured
+                ? `飞书已配置${notification.pending ? ` · ${notification.pending} 条通知待发送` : ''}`
+                : '飞书未配置，请在服务器配置 FEISHU_WEBHOOK_URL')}{' '}
           · 公开额度随市场变化，不代表账户实际可开额度。
         </p>
         <p className={catalogStale ? 'amber' : 'muted'}>
           {listings?.enabled === false
             ? '模拟环境不运行上新监控或发送通知'
-            : listings?.error ||
-              (catalogStale ? '等待有效列表 / 列表已过期' : '监控运行中')}{' '}
+            : listings?.monitoring_enabled === false
+              ? '独立监控已关闭'
+              : listings?.discovery_enabled === false
+                ? '目录扫描已关闭，已选币详情按设置采样'
+                : listings?.error ||
+                  (catalogStale
+                    ? '等待有效列表 / 列表已过期'
+                    : '监控运行中')}{' '}
           · 列表检查 {date(listings?.checked_at)}
         </p>
       </div>
@@ -124,8 +141,11 @@ export function ListingsPanel({
             </TableHeader>
             <TableBody>
               {rows.map((row) => {
+                const control = controls.get(row.symbol);
+                const stopped = control?.detail_enabled === false;
                 const unavailable =
-                  catalogStale ||
+                  stopped ||
+                  detailCatalogStale ||
                   row.status !== 'TRADING' ||
                   Boolean(row.error) ||
                   stale(row.checked_at);
@@ -167,7 +187,7 @@ export function ListingsPanel({
                     <TableCell className="number">
                       {row.max_leverage == null ? '—' : `${row.max_leverage}x`}
                       {row.max_leverage != null &&
-                      (catalogStale || stale(row.brackets_checked_at)) ? (
+                      (detailCatalogStale || stale(row.brackets_checked_at)) ? (
                         <small className="amber">上次档位</small>
                       ) : null}
                     </TableCell>
@@ -190,8 +210,12 @@ export function ListingsPanel({
                     <TableCell>
                       {date(row.checked_at)}
                       <small className={unavailable ? 'amber' : 'muted'}>
-                        {row.error ||
-                          (unavailable ? '等待更新 / 数据已过期' : '有效采样')}
+                        {stopped
+                          ? '独立监控已关闭 · 上次采样'
+                          : row.error ||
+                            (unavailable
+                              ? '等待更新 / 数据已过期'
+                              : '有效采样')}
                       </small>
                     </TableCell>
                   </TableRow>

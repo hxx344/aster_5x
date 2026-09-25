@@ -3,9 +3,11 @@ from datetime import datetime, timezone
 import json
 import math
 import re
+import time
 import uuid
 
 import monitor
+from . import monitoring
 from .listings import STALE_SECONDS, STATE_KEY
 from .models import TradingError
 
@@ -23,11 +25,13 @@ def write(db, key, value):
                (key, json.dumps(value, ensure_ascii=False, separators=(",", ":"))))
 
 
-def sample(state, row, now):
+def sample(state, row, now, *, require_catalog_fresh=True):
     """Unknown never means zero, including when only the leverage read succeeded."""
-    if not state.get("initialized") or state.get("error") or not row or row.get("error") or row.get("status") != "TRADING":
+    if not state.get("initialized") or (require_catalog_fresh and state.get("error")) or not row or row.get("error") or row.get("status") != "TRADING":
         return None
-    stamps = [state.get("checked_at"), row.get("checked_at"), row.get("brackets_checked_at")]
+    stamps = [row.get("checked_at"), row.get("brackets_checked_at")]
+    if require_catalog_fresh:
+        stamps.append(state.get("checked_at"))
     if any(type(stamp) not in (int, float) or not math.isfinite(stamp) or not -1 <= now - stamp < STALE_SECONDS for stamp in stamps):
         return None
     leverage = row.get("max_leverage")
@@ -50,9 +54,15 @@ def cancel(db, gate, *, forget=False):
 
 
 def observe(db, symbol, gate, state, now):
+    config = monitoring.read(db)
+    if not monitoring.allowed(config, "listing_capacity", [symbol]):
+        cancel(db, gate, forget=True)
+        gate.update(notified=False, resume_after=time.time())
+        write(db, WATCH_PREFIX + symbol, gate)
+        return
     row = state.get("rows", {}).get(symbol)
-    current = sample(state, row, now)
-    if not current or current[2] < gate.get("checked_at", 0):
+    current = sample(state, row, now, require_catalog_fresh=config["discovery_enabled"])
+    if not current or current[2] < gate.get("checked_at", 0) or current[2] <= gate.get("resume_after", 0):
         cancel(db, gate)
         return
     leverage, amount, checked_at, expires_at = current
@@ -122,7 +132,8 @@ def deliverable(db, item, now):
     if not gate.get("enabled") or gate.get("notified") or gate.get("pending_id") != item["id"]:
         return False
     state = read(db, STATE_KEY, {})
-    current = sample(state, state.get("rows", {}).get(symbol), now)
+    current = sample(state, state.get("rows", {}).get(symbol), now,
+                     require_catalog_fresh=monitoring.read(db)["discovery_enabled"])
     return bool(current and current[1] > 0 and current[0] == gate.get("leverage") and current[2] == gate.get("checked_at"))
 
 

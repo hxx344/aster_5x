@@ -116,6 +116,8 @@ export type Listing = {
 };
 export type Listings = {
   enabled: boolean;
+  monitoring_enabled?: boolean;
+  discovery_enabled?: boolean;
   initialized: boolean;
   checked_at?: number | null;
   poll_seconds: number;
@@ -124,15 +126,49 @@ export type Listings = {
   rows: Record<string, Listing>;
   watched_symbols?: string[];
 };
+export type MonitoringSettings = {
+  monitoring_enabled: boolean;
+  discovery_enabled: boolean;
+  auto_monitor_new: boolean;
+  feishu_enabled: boolean;
+  new_listing_alerts: boolean;
+  strategy_capacity_alerts: boolean;
+  listing_capacity_alerts: boolean;
+  trade_summary_alerts: boolean;
+};
+export type MonitoredSymbol = {
+  symbol: string;
+  monitor: boolean;
+  alerts: boolean;
+  max_capacity_alert: boolean;
+  can_watch: boolean;
+  strategy_market: boolean;
+  required_by: string[];
+  effective_monitor: boolean;
+  detail_enabled: boolean;
+  status: string;
+};
+export type Monitoring = {
+  settings: MonitoringSettings;
+  revision: number;
+  strategy_capacity_environment_enabled: boolean;
+  symbols: MonitoredSymbol[];
+};
 export type State = {
   demo: boolean;
   ready: boolean;
   accounts: Account[];
   markets: Record<string, Market>;
   listings?: Listings;
+  monitoring?: Monitoring;
   events: ExecutionEvent[];
   updated_at: number;
-  notification: { configured: boolean; pending: number; error?: string };
+  notification: {
+    configured: boolean;
+    enabled?: boolean;
+    pending: number;
+    error?: string;
+  };
 };
 
 export type DeskAction = (

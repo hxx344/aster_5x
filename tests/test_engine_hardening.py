@@ -320,6 +320,7 @@ class EngineHardeningTests(unittest.TestCase):
             return .01
 
         with patch("trading.engine.CAPACITY_POLL_INTERVAL", .01), \
+             patch("trading.engine.FAST_CAPACITY_POLL_INTERVAL", .01), \
              patch.object(self.engine, "tick_account", side_effect=blocked_account), \
              patch.object(self.engine, "poll_market", side_effect=market), \
              patch.object(self.engine, "notify", side_effect=notify), \

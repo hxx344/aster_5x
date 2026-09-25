@@ -34,6 +34,7 @@ import { AccountOverview } from '@/components/account-overview';
 import { RecordsWorkspace } from '@/components/records-workspace';
 import { AddAccountDialog } from '@/components/add-account-dialog';
 import { ListingsPanel } from '@/components/listings-panel';
+import { MonitoringPanel } from '@/components/monitoring-panel';
 
 export default function Home() {
   const desk = useTradingDesk();
@@ -62,6 +63,14 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     refresh,
   } = desk;
   const account = state?.accounts.find((account) => account.id === selected);
+  const monitoringProps = {
+    monitoring: state?.monitoring,
+    notification: state?.notification,
+    demo: Boolean(state?.demo),
+    busy,
+    connectionError,
+    action,
+  };
   const cycle = useAccountDraft(selected, cycleDraft(account?.cycle));
   const snapshot = account?.snapshot;
   const recoveryReason = cycleRecoveryReason(account, {
@@ -337,6 +346,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 <TabsTrigger value="ordinary">普通开仓</TabsTrigger>
                 <TabsTrigger value="migration">仓位迁移</TabsTrigger>
                 <TabsTrigger value="listings">USD1 上新</TabsTrigger>
+                <TabsTrigger value="monitoring">监控与告警</TabsTrigger>
                 <TabsTrigger value="account">账户</TabsTrigger>
                 <TabsTrigger value="records">记录</TabsTrigger>
               </TabsList>
@@ -377,10 +387,14 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                   action={action}
                   busy={busy}
                   listings={state?.listings}
+                  monitoring={state?.monitoring}
                   notification={state?.notification}
                   now={serverNow}
                   connectionError={connectionError}
                 />
+              </TabsContent>
+              <TabsContent value="monitoring">
+                <MonitoringPanel {...monitoringProps} />
               </TabsContent>
               <TabsContent value="records">
                 <RecordsWorkspace
@@ -394,10 +408,12 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             <footer className="footer">
               <span>
                 <Bell size={13} />{' '}
-                {state?.notification.error ||
-                  (state?.notification.configured
-                    ? `飞书已连接${state.notification.pending ? ` · ${state.notification.pending} 条待发送` : ''}`
-                    : '飞书未配置')}
+                {state?.notification.enabled === false
+                  ? '飞书告警已关闭'
+                  : state?.notification.error ||
+                    (state?.notification.configured
+                      ? `飞书已连接${state.notification.pending ? ` · ${state.notification.pending} 条待发送` : ''}`
+                      : '飞书未配置')}
               </span>
               <span>
                 {state?.accounts.length} 个账户 · 更新{' '}
@@ -407,14 +423,30 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
           </>
         ) : !needsLogin ? (
           <>
-            <ListingsPanel
-              action={action}
-              busy={busy}
-              listings={state?.listings}
-              notification={state?.notification}
-              now={serverNow}
-              connectionError={connectionError}
-            />
+            <Tabs defaultValue="listings" className="workspace-tabs">
+              <TabsList
+                variant="line"
+                aria-label="监控功能"
+                className="workspace-navigation"
+              >
+                <TabsTrigger value="listings">USD1 上新</TabsTrigger>
+                <TabsTrigger value="monitoring">监控与告警</TabsTrigger>
+              </TabsList>
+              <TabsContent value="listings">
+                <ListingsPanel
+                  action={action}
+                  busy={busy}
+                  listings={state?.listings}
+                  monitoring={state?.monitoring}
+                  notification={state?.notification}
+                  now={serverNow}
+                  connectionError={connectionError}
+                />
+              </TabsContent>
+              <TabsContent value="monitoring">
+                <MonitoringPanel {...monitoringProps} />
+              </TabsContent>
+            </Tabs>
             <section className="panel empty-state">
               <h2>{state ? '添加账户以管理交易' : '正在连接交易服务'}</h2>
             </section>

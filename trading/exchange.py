@@ -21,6 +21,7 @@ import monitor
 from .account_cache import CycleAccountCache, HotAccountUnavailable
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from .depth_stream import PublicDepthStream
+from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
 from .request_timing import transport_stage
@@ -394,6 +395,15 @@ class API:
             # Batch responses may mix fills and rate-limit failures. Retain every
             # receipt so the executor can reconcile/repair the successful leg.
             self.budget.block(180, reason=cooldown_reason(method, path, codes=batch_codes))
+        # Only structured error messages cross into durable diagnostics. The
+        # actual signed values are available here, before any receipt is saved.
+        secrets = [params.get("signature")]
+        if self.credentials:
+            secrets.extend(self.credentials.get(key) for key in ("private_key", "user", "signer"))
+        if isinstance(data, list):
+            data = [{**row, "msg": exchange_reason(row.get("msg"), secrets=secrets)}
+                    if isinstance(row, dict) and isinstance(row.get("code"), int) and row["code"] < 0 and "msg" in row
+                    else row for row in data]
         code = data.get("code") if isinstance(data, dict) else None
         if isinstance(code, int) and code < 0:
             if code in (-1003, -1015):
@@ -406,6 +416,8 @@ class API:
                     message += f"；{self.budget.cooldown_message()}"
                 raise AmbiguousOrder(message, code, retry_after=gateway_delay, http_status=response.status_code)
             message = f"Aster 拒绝请求（代码 {code}）"
+            if code not in (-1006, -1007):
+                message += "：" + (exchange_reason(data.get("msg"), secrets=secrets) or MISSING_REJECT_REASON)
             if gateway_delay:
                 message += f"；{self.budget.cooldown_message()}"
             raise ExchangeError(message, code, retry_after=gateway_delay, http_status=response.status_code)

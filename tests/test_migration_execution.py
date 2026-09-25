@@ -103,7 +103,7 @@ class MigrationExecutionTests(unittest.TestCase):
             nonlocal source_first
             if orders[0]["symbol"] == SOURCE and source_first:
                 source_first = False
-                return [original(orders[:1])[0], {"code": -2019}]
+                return [original(orders[:1])[0], {"code": -2019, "msg": "Example source reduction rejection."}]
             if orders[0]["symbol"] == SOURCE:
                 self.assertEqual([(o["positionSide"], o["side"]) for o in orders], [("SHORT", "BUY")])
             return original(orders)
@@ -111,6 +111,8 @@ class MigrationExecutionTests(unittest.TestCase):
             self.start()
         self.assertEqual(self.quantities(SOURCE), (dec("4.774"), dec("4.774")))
         self.assert_complete()
+        errors = [event["message"] for event in self.f.store.events() if event["kind"] == "error"]
+        self.assertEqual(errors, [f"{SOURCE} 订单提交异常：空头 REJECTED（code=-2019）：Example source reduction rejection."])
 
     def test_partial_source_pair_trims_target_without_reopening_source(self):
         original_book, original_submit = self.f.market.book, self.f.broker.submit

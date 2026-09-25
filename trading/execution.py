@@ -5,7 +5,8 @@ from contextlib import nullcontext
 from fractions import Fraction
 
 from .cycle_guard import cycle_add_block_reason, ordinary_add_block_reason
-from .exchange import ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
+from .exchange import AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
+from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
@@ -67,6 +68,7 @@ class Executor:
 
     def send(self, intent, orders, *, repair=False):
         not_sent = None
+        rejections = []
         try:
             result = self.broker.submit(orders)
             if not isinstance(result, list) or len(result) != len(orders):
@@ -77,7 +79,9 @@ class Executor:
                     # A batch-level timeout still needs a query, even inside HTTP 200.
                     if row["code"] not in (-1006, -1007):
                         intent["receipts"][cid] = {**order, "clientOrderId": cid, "status": "REJECTED", "executedQty": "0",
-                                                   "avgPrice": "0", "reject_code": row["code"]}
+                                                   "avgPrice": "0", "reject_code": row["code"],
+                                                   "reject_reason": exchange_reason(row.get("msg")) or MISSING_REJECT_REASON}
+                        rejections.append(self.order_outcome(order, intent["receipts"][cid]))
                 else:
                     self.validate_receipt(order, row)
                     intent["receipts"][cid] = row
@@ -99,8 +103,23 @@ class Executor:
         except TradingError as exc:
             # Even a transport failure may have reached the exchange. Never resend.
             intent["last_error"] = str(exc)
+            if isinstance(exc, ExchangeError) and not isinstance(exc, AmbiguousOrder) and exc.code not in (-1006, -1007):
+                rejections.append(str(exc))
         self.store.save_intent(intent)
+        if rejections:
+            symbols = "/".join(dict.fromkeys(order["symbol"] for order in orders))
+            self.store.event(intent["account_id"], "error", f"{symbols} 订单提交异常：{'；'.join(rejections)}")
         return not_sent
+
+    @staticmethod
+    def order_outcome(order, row):
+        side = "多头" if order["positionSide"] == "LONG" else "空头"
+        outcome = "本地未发送" if row.get("local_not_sent") else row["status"]
+        code = row.get("reject_code")
+        text = f"{side} {outcome}" + (f"（code={code}）" if isinstance(code, int) else "")
+        if row["status"] == "REJECTED" and not row.get("local_not_sent") and not row.get("paper_not_committed"):
+            text += "：" + (exchange_reason(row.get("reject_reason")) or MISSING_REJECT_REASON)
+        return text
 
     @staticmethod
     def validate_receipt(order, row):
@@ -348,10 +367,7 @@ class Executor:
             outcomes = []
             for order in intent["orders"]:
                 row = intent["receipts"][order["newClientOrderId"]]
-                side = "多头" if order["positionSide"] == "LONG" else "空头"
-                outcome = "本地未发送" if row.get("local_not_sent") else row["status"]
-                code = row.get("reject_code")
-                outcomes.append(f"{side} {outcome}" + (f"（code={code}）" if isinstance(code, int) else ""))
+                outcomes.append(self.order_outcome(order, row))
             self.store.event(account["id"], "order", f"{intent['symbol']} 本批未形成新增双向仓位，订单已核对：{'；'.join(outcomes)}")
         # Reuse only the account read that verified every terminal receipt and
         # the final retained holdings, never the snapshot before a repair.

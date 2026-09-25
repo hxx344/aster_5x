@@ -33,17 +33,22 @@ class ExecutionNotSentTests(unittest.TestCase):
         self.assertEqual(tuple(p.qty for p in self.executor.last_snapshot.pair("XAUUSD1")), (0, 0))
         self.assertIn("本地未发送", self.f.store.events()[0]["message"])
 
-    def test_exchange_rejection_codes_are_retained_without_raw_error_messages(self):
-        rows = [{"code": -2019, "msg": "private raw error text"}, {"code": -2027, "msg": "another private detail"}]
+    def test_exchange_rejection_codes_and_safe_reasons_are_retained(self):
+        rows = [{"code": -2019, "msg": "Margin is insufficient. signature=private-signature"},
+                {"code": -5018, "msg": "Example exchange rejection. private_key=private-key-value"}]
         with patch.object(self.f.broker, "submit", return_value=rows), \
              patch.object(self.f.broker, "query", side_effect=AssertionError("both rejections are terminal")):
             self.open()
         completed = self.executor.last_completed_intent
-        self.assertEqual({row["reject_code"] for row in completed["receipts"].values()}, {-2019, -2027})
+        self.assertEqual({row["reject_code"] for row in completed["receipts"].values()}, {-2019, -5018})
         message = self.f.store.events()[0]["message"]
         self.assertIn("多头 REJECTED（code=-2019）", message)
-        self.assertIn("空头 REJECTED（code=-2027）", message)
-        self.assertNotIn("private", str(completed) + message)
+        self.assertIn("空头 REJECTED（code=-5018）", message)
+        self.assertIn("Margin is insufficient.", message)
+        self.assertIn("Example exchange rejection.", message)
+        self.assertTrue(all(row["reject_reason"] for row in completed["receipts"].values()))
+        self.assertNotIn("private-signature", str(completed) + message)
+        self.assertNotIn("private-key-value", str(completed) + message)
 
     def test_unknown_network_result_still_preserves_intent_and_does_not_mark_local_rejection(self):
         with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("network response lost")) as submit, \

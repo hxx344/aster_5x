@@ -18,6 +18,7 @@ from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
 from .account_deletion import deletion_block
 from .request_timing import database_clock, database_duration
+from .capacity_timing import capacity_timing_text
 from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, identifier, normalize_fill,
                            order_bindings, receipt_quantity, sort_key, utc_day, validate_fill_binding)
 
@@ -1037,7 +1038,7 @@ class Store:
             campaign["last_fill_at"] = time.time()
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(campaign)))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (
-                intent["account_id"], "fill", f"{intent['symbol']} {intent['leverage']}x 本批成交已核对，多头增加 {quantities['long_qty']}，空头增加 {quantities['short_qty']}", time.time()))
+                intent["account_id"], "fill", f"{intent['symbol']} {intent['leverage']}x 本批成交已核对，多头增加 {quantities['long_qty']}，空头增加 {quantities['short_qty']}" + capacity_timing_text(intent), time.time()))
 
     def abort_pair(self, intent):
         """Even a fully repaired batch may have reduced equity through fees."""

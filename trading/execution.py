@@ -9,6 +9,7 @@ from .exchange import AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroke
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
+from .capacity_timing import initial_timing, observe_capacity_submit, capacity_timing_text
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -19,7 +20,7 @@ class Executor:
         self.last_snapshot = None
         self.last_completed_intent = None
 
-    def open_pair(self, account, snapshot, symbol, plan, book):
+    def open_pair(self, account, snapshot, symbol, plan, book, *, capacity_observation=None):
         self.last_snapshot = None
         self.last_completed_intent = None
         blocked = ordinary_add_block_reason(account, symbol)
@@ -55,10 +56,11 @@ class Executor:
                             side[0] + token[:28]) for side in ("LONG", "SHORT")]
         intent = {"id": token, "kind": "pair", "account_id": account["id"], "symbol": symbol, "leverage": long.leverage,
                   "status": "pending", "created_at": time.time(), "baseline": {"LONG": wire(long.qty), "SHORT": wire(short.qty)},
-                  "orders": orders, "receipts": {}, "repairs": [], "repair_attempts": 0}
+                  "orders": orders, "receipts": {}, "repairs": [], "repair_attempts": 0,
+                  "capacity_timing": initial_timing(symbol, long.leverage, capacity_observation)}
         self.store.save_intent(intent)  # FULL synchronous commit before any write request.
         self.store.event(account["id"], "order", f"{symbol} {long.leverage}x 提交双向市价批次，每边 {wire(plan.qty)}")
-        self.send(intent, orders)
+        self.send(intent, orders, capacity_observation=capacity_observation)
         return self.reconcile(account, intent)
 
     @staticmethod
@@ -66,11 +68,15 @@ class Executor:
         return {"symbol": symbol, "positionSide": position_side, "side": side, "type": "MARKET",
                 "quantity": wire(qty), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
 
-    def send(self, intent, orders, *, repair=False):
+    def send(self, intent, orders, *, repair=False, capacity_observation=None):
         not_sent = None
         rejections = []
         try:
-            result = self.broker.submit(orders)
+            measurement = (observe_capacity_submit(intent["capacity_timing"], capacity_observation,
+                                                   live=isinstance(self.broker, LiveBroker))
+                           if not repair and intent.get("kind") == "pair" and "capacity_timing" in intent else nullcontext())
+            with measurement:
+                result = self.broker.submit(orders)
             if not isinstance(result, list) or len(result) != len(orders):
                 raise TradingError("批量订单响应格式异常，等待逐笔核对")
             for order, row in zip(orders, result):
@@ -106,6 +112,9 @@ class Executor:
             if isinstance(exc, ExchangeError) and not isinstance(exc, AmbiguousOrder) and exc.code not in (-1006, -1007):
                 rejections.append(str(exc))
         self.store.save_intent(intent)
+        if not repair and intent.get("kind") == "pair" and "capacity_timing" in intent:
+            self.store.event(intent["account_id"], "order", f"{intent['symbol']} {intent['leverage']}x 本批开仓耗时"
+                             + capacity_timing_text(intent))
         if rejections:
             symbols = "/".join(dict.fromkeys(order["symbol"] for order in orders))
             self.store.event(intent["account_id"], "error", f"{symbols} 订单提交异常：{'；'.join(rejections)}")

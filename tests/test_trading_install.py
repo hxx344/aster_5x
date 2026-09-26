@@ -45,11 +45,12 @@ class InstallerHarness:
         self.write("trading/cycle-config.json", (ROOT / "trading/cycle-config.json").read_text())
         self.write("dashboard/app/page.tsx", "initial frontend\n")
         self.write("dashboard/lib/helper.ts", "initial helper\n")
+        self.write("dashboard/tsconfig.json", '{"compilerOptions":{"incremental":true}}\n')
         self.write("dashboard/package.json", '{"name":"installer-fixture","version":"1.0.0","private":true}\n')
         self.write("dashboard/package-lock.json", '{"name":"installer-fixture","lockfileVersion":3,"packages":{}}\n')
         for name in ("requirements.txt", "requirements.lock", "monitor.py", "config.json", "DEPLOYMENT.md"):
             self.write(name, "")
-        for name in ("aster-desk.service", "aster-desk", "trading.env.example"):
+        for name in ("aster-desk.service", "aster-desk", "trading.env.example", "build-dashboard.py"):
             self.write("deploy/" + name, (ROOT / "deploy" / name).read_text())
         script = (ROOT / "install-trading.sh").read_text()
         mappings = {"/opt/aster-desk": str(self.root), "/etc/aster-desk": str(self.etc),
@@ -126,13 +127,19 @@ ci)
   ;;
 run)
   printf '1\\n' >> "$HARNESS_COUNTERS/npm-${2:-unknown}"
+  if [[ ${2:-} == typecheck ]]; then
+    if [[ -f tsconfig.tsbuildinfo ]]; then printf '1\\n' >> "$HARNESS_COUNTERS/ts-warm"; fi
+    printf '{"version":"fixture"}\\n' > tsconfig.tsbuildinfo
+    [[ ! -f "$HARNESS_BASE/fail-typecheck" ]] || exit 50
+  fi
+  if [[ ${2:-} == lint ]]; then [[ ! -f "$HARNESS_BASE/fail-lint" ]] || exit 51; fi
   if [[ ${2:-} == build ]]; then
     [[ -f node_modules/install-token ]] || exit 45
     [[ ! -L node_modules ]] || exit 48
-    for cached in "$HARNESS_BASE"/opt/cache/npm-deps-*/node_modules/install-token; do
-      [[ ! -e "$cached" || ! "$cached" -ef node_modules/install-token ]] || exit 49
-    done
-    printf 'modified by build\\n' >> node_modules/install-token
+    [[ $PWD == "$HARNESS_BASE"/opt/cache/npm-deps-*/dashboard ]] || exit 49
+    mkdir -p node_modules/.vite-rsc-temp/rsc
+    printf 'temporary build output\\n' > node_modules/.vite-rsc-temp/rsc/output.js
+    if [[ -f "$HARNESS_BASE/mutate-package" ]]; then printf 'modified by build\\n' >> node_modules/install-token; fi
     mkdir -p dist/client
     printf '<html>' > dist/client/index.html
     cat app/page.tsx lib/helper.ts >> dist/client/index.html
@@ -338,12 +345,56 @@ class TradingInstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.h.current, previous)
         self.assertTrue((environment / "bin/python").is_file())
-        self.assertEqual(self.h.cache_modules(), modules)
+        self.assertTrue(modules)
+        self.assertFalse(self.h.cache_modules(), "failed build workspace must be reclaimed, never reused")
         self.h.assert_counts(pip=1, npm_ci=1, build=2)
         current = self.h.success()
         self.assertNotEqual(current, previous)
-        self.h.assert_counts(pip=1, npm_ci=1, build=3)
+        self.h.assert_counts(pip=1, npm_ci=2, build=3)
         self.assertIn("build to retry", (current / "dashboard/dist/client/index.html").read_text())
+
+    def test_typescript_cache_survives_source_changes_but_not_config_changes(self):
+        self.h.success()
+        self.assertEqual(self.h.count("ts-warm"), 0)
+        modules = self.h.cache_modules()
+        self.h.append("dashboard/lib/helper.ts", "source edit\n")
+        result = self.h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.h.count("ts-warm"), 1)
+        self.assertEqual(self.h.cache_modules(), modules)
+        for message in ("no dependency copy", "Reuse TypeScript incremental cache", "Typecheck dashboard:",
+                        "Lint dashboard:", "Build dashboard assets:"):
+            self.assertIn(message, result.stdout)
+        self.h.append("dashboard/tsconfig.json", "\n")
+        self.h.success()
+        self.assertEqual(self.h.count("ts-warm"), 1)
+        self.h.assert_counts(pip=1, npm_ci=1, build=3)
+
+    def test_changed_package_invalidates_workspace_without_affecting_current_assets(self):
+        self.h.success()
+        self.h.append("dashboard/lib/helper.ts", "source edit\n")
+        marker = self.h.base / "mutate-package"
+        marker.touch()
+        result = self.h.run()
+        marker.unlink()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("discard workspace cache", result.stdout)
+        self.assertFalse(self.h.cache_modules())
+        previous = self.h.current
+        self.assertTrue((previous / "dashboard/dist/client/index.html").is_file())
+        self.h.append("dashboard/lib/helper.ts", "next source edit\n")
+        self.h.success()
+        self.h.assert_counts(pip=1, npm_ci=2, build=3)
+
+    def test_typecheck_or_lint_failure_stops_before_build_and_service_switch(self):
+        previous = self.h.success()
+        for check in ("typecheck", "lint"):
+            self.h.append("dashboard/lib/helper.ts", check + " edit\n")
+            result = self.h.run(fail=check)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.h.current, previous)
+            self.assertEqual(self.h.count("npm-build"), 1)
+            self.assertIn("FAILED after", result.stdout)
 
     def test_failed_dependency_installs_are_not_reused(self):
         previous = self.h.success()

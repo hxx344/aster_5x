@@ -138,7 +138,8 @@ if real_directory(cache):
             continue
         kind = match[1]
         legacy = ((kind == 'python-env' and (path / 'pyvenv.cfg').is_file() and (path / 'bin/python').is_file()) or
-                  (kind == 'npm-deps' and (path / '.complete').is_file() and (path / 'node_modules').is_dir()) or
+                  (kind == 'npm-deps' and (path / '.complete').is_file() and
+                   ((path / 'node_modules').is_dir() or (path / 'dashboard/node_modules').is_dir())) or
                   (kind == 'frontend-build' and (path / '.complete').is_file() and (path / 'client/index.html').is_file()))
         if not (path / '.install-owned').is_file() and not legacy:
             continue
@@ -327,12 +328,12 @@ python_key = digest('python-v1:' + python_runtime, [source / 'requirements.lock'
 node_runtime = json.dumps([sys.argv[2:], platform.libc_ver()])
 npm_key = digest('npm-v1:' + node_runtime, [source / 'dashboard/package.json', source / 'dashboard/package-lock.json'])
 ignored = {'node_modules', 'dist', '.wrangler', '.vinext', '.next', '.git', '__pycache__'}
-files = [source / 'trading/cycle-config.json']
+files = [source / 'trading/cycle-config.json', source / 'deploy/build-dashboard.py']
 for directory, dirs, names in os.walk(source / 'dashboard'):
     dirs[:] = [name for name in dirs if name not in ignored]
     files.extend(Path(directory) / name for name in names if not name.startswith('.env') and name != 'tsconfig.tsbuildinfo')
 build_env = json.dumps({key: value for key, value in sorted(os.environ.items()) if key.startswith(('VITE_', 'NEXT_PUBLIC_')) or key == 'NODE_ENV'})
-frontend_key = digest('frontend-v1:' + npm_key + build_env, files)
+frontend_key = digest('frontend-v2:' + npm_key + build_env, files)
 print(python_key, npm_key, frontend_key, sep='\n')
 release_files = [source / name for name in ('requirements.txt', 'requirements.lock', 'monitor.py', 'config.json', 'DEPLOYMENT.md', 'install-trading.sh')]
 release_files += files
@@ -392,22 +393,17 @@ if [[ -f $frontend_cache/.complete && -s $frontend_cache/client/index.html ]]; t
   cp -a --reflink=auto "$frontend_cache/client" "$stage/dashboard/dist/client"
   printf '[upgrade] Reuse dashboard build (source unchanged)\n'
 else
-  step 'Prepare npm dependencies'
   npm_cache="$root/cache/npm-${keys[1]}"
-  if [[ -f $npm_cache/.complete && -d $npm_cache/node_modules ]]; then
-    cp -a --reflink=auto "$npm_cache/node_modules" "$stage/dashboard/node_modules"
-    printf '[upgrade] Reuse npm dependencies\n'
+  if [[ -f $npm_cache/.complete && -f $npm_cache/.install-owned &&
+        ( -d $npm_cache/node_modules || -d $npm_cache/dashboard/node_modules ) ]]; then
+    npm_dir=$(readlink -f "$npm_cache")
   else
-    (cd "$stage/dashboard"; npm ci --include=dev --no-audit --no-fund --prefer-offline --cache "$stage/.npm")
-    rm -rf --one-file-system -- "$stage/.npm"
     npm_dir=$(mktemp -d "$root/cache/npm-deps-XXXXXX")
     touch "$npm_dir/.install-owned"
-    cp -a --reflink=auto "$stage/dashboard/node_modules" "$npm_dir/node_modules"
-    touch "$npm_dir/.complete"
-    ln -sfn "$npm_dir" "$npm_cache"
   fi
-  step 'Check and build dashboard'
-  (cd "$stage/dashboard"; npm run typecheck; npm run lint; npm run build)
+  step 'Prepare and build dashboard'
+  python3 -u "$stage/deploy/build-dashboard.py" "$stage" "$npm_dir" "${keys[1]}"
+  if [[ -f $npm_dir/.complete ]]; then ln -sfn "$npm_dir" "$npm_cache"; fi
   test -s "$stage/dashboard/dist/client/index.html"
   frontend_dir=$(mktemp -d "$root/cache/frontend-build-XXXXXX")
   touch "$frontend_dir/.install-owned"

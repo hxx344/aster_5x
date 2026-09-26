@@ -15,4 +15,9 @@ jobs:
       - name: Check standalone installer syntax
         run: bash -n install-trading.sh
       - name: Exercise isolated storage and upgrade fixtures
-        run: sudo python3 -m unittest tests.test_install_storage tests.test_trading_install -v
+        run: sudo python3 -m unittest tests.test_install_storage tests.test_dashboard_build_workspace tests.test_trading_install -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check real cold and incremental dashboard builds
+        run: python3 tests/check_dashboard_workspace.py

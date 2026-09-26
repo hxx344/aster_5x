@@ -89,6 +89,19 @@ class InstallerStorageTests(unittest.TestCase):
         self.assertFalse(failed.exists())
         self.assertFalse(partial.exists())
 
+    def test_workspace_layout_retains_only_complete_cache_and_pressure_can_reclaim_it(self):
+        complete = self.artifact("npm-deps", 1)
+        modules = complete / "dashboard/node_modules"
+        modules.mkdir(parents=True)
+        (modules / "package.js").write_text("dependency")
+        dirty = self.artifact("npm-deps", 2, complete=False)
+        (dirty / "dashboard/node_modules").mkdir(parents=True)
+        self.collect()
+        self.assertTrue(complete.exists())
+        self.assertFalse(dirty.exists())
+        self.collect(pressure=True)
+        self.assertFalse(complete.exists())
+
     def test_failed_health_candidate_is_not_treated_as_legacy_backup(self):
         failed = self.release(1, ready=False)
         for name in (".venv/bin/python", "dashboard/dist/client/index.html"):

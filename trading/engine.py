@@ -19,7 +19,7 @@ import monitor
 from . import monitoring
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
-from .account_cache import HotAccountUnavailable
+from .account_cache import AccountCacheUnavailable, HotAccountUnavailable
 from .account_deletion import deletion_block
 from .execution import Executor
 from .cycle import DEFAULT_CYCLE, CyclePositionError, DailyVolumeLimitError, _state as cycle_record_state, cycle_baseline, cycle_recovery_available, cycle_symbols, cycle_config, plan_cycle, validate_cycle, validate_cycle_positions
@@ -1113,11 +1113,14 @@ class Engine:
             self.check_post_fill_occupancy(account, after)
         return 5
 
-    def cycle_view(self, account, **updates):
+    def cycle_view(self, account, *, account_data_wait=False, **updates):
         saved = self.store.get("cycle:" + account["id"]) or {}
         # A fresh state transition or a different unstructured failure must not
         # leave an older condition's numbers attached to the new reason.
-        self.view(account["id"], cycle_state=cycle_overlay(saved, updates))
+        overlay = cycle_overlay(saved, updates)
+        if account_data_wait:
+            overlay["_account_data_wait"] = dict(account["cycle"])
+        self.view(account["id"], cycle_state=overlay)
 
     def cycle_daily_allowance(self, account, now=None, *, symbol=None, _store=None):
         store = self.store if _store is None else _store
@@ -1345,7 +1348,8 @@ class Engine:
         quota = self.cycle_daily_allowance(account) if isinstance(exc, DailyVolumeLimitError) else {}
         self.cycle_view(account, phase=phase, reason=message,
                         quota_utc_date=quota.get("utc_date"), quota_remaining=quota.get("effective_remaining"),
-                        diagnostic=getattr(exc, "diagnostic", None))
+                        diagnostic=getattr(exc, "diagnostic", None),
+                        account_data_wait=isinstance(exc, AccountCacheUnavailable))
 
     def tick_account(self, account_id, *, cycle_signal=None):
         with self.store.connection_scope():
@@ -1712,7 +1716,7 @@ class Engine:
                 self.view(account_id, status="waiting", reason=str(exc), credential_ready=True)
                 progress = self.store.get("cycle:" + account_id) or {}
                 self.cycle_view(account, phase="waiting_close" if progress.get("opened_at") is not None else "waiting_open",
-                                reason=str(exc))
+                                reason=str(exc), account_data_wait=isinstance(exc, AccountCacheUnavailable))
                 return 1
             except (TradingError, KeyError, ValueError, TypeError) as exc:
                 message = str(exc) if isinstance(exc, TradingError) else "账户响应格式异常，已停止本轮操作"
@@ -2232,8 +2236,9 @@ class Engine:
                             discovery_enabled=monitoring_state["settings"]["discovery_enabled"])
             migration_records = {a["id"]: (reader.get("migration:" + a["id"]) or {}, reader.intent(a["id"])) for a in saved_accounts}
             cycle_records = {a["id"]: reader.get("cycle:" + a["id"]) or {} for a in saved_accounts}
+            post_fill_checks = {a["id"]: reader.get("post_fill_check:" + a["id"]) for a in saved_accounts}
             deletion_blocks = {a["id"]: deletion_block(a, migration_records[a["id"]][1],
-                reader.get("post_fill_check:" + a["id"]), cycle_records[a["id"]]) for a in saved_accounts}
+                post_fill_checks[a["id"]], cycle_records[a["id"]]) for a in saved_accounts}
             cycle_quality = {a["id"]: reader.get("cycle_execution:" + a["id"]) for a in saved_accounts
                              if not compact or a["id"] == history_account}
             cycle_quality_history = {key: reader.cycle_execution_quality_history(key) for key in cycle_quality}
@@ -2269,6 +2274,7 @@ class Engine:
                 # ordinary strategy worker waits for its budgeted turn. Keep
                 # this response-only: execution views and leases are unchanged.
                 broker = self.brokers.get(account["id"])
+                hot_lease = None
                 if account["enabled"] and account.get("cycle", {}).get("enabled") and isinstance(broker, LiveBroker):
                     try:
                         lease = broker.cycle_cache.lease([account["cycle"]["symbol"]])
@@ -2277,6 +2283,7 @@ class Engine:
                             lease.require_fresh()
                             account["snapshot"] = displayed
                             self.display_snapshots[account["id"]] = displayed
+                        hot_lease = lease
                     except (TradingError, KeyError, TypeError, ValueError):
                         # Failed, expired or revoked background data never
                         # renews the timestamp of the last displayed reading.
@@ -2318,7 +2325,28 @@ class Engine:
                 selected_volumes = report["volumes"][cycle_selection[account["id"]]] if report else {}
                 daily, rolling = (selected_volumes.get(key) for key in ("daily_volume", "rolling_volume"))
                 active_cycle = pending and pending["kind"] in ("cycle", "cycle_leverage")
-                cycle = project_cycle_state(account, saved_cycle, account.get("cycle_state", {}), pending,
+                current_cycle = dict(account.get("cycle_state", {}))
+                account_data_wait = current_cycle.pop("_account_data_wait", None)
+                if (hot_lease is not None and hot_refresh and not self.shutdown.is_set()
+                        and not pending and not post_fill_checks[account["id"]] and not account.get("pause_reason")
+                        and account.get("status") not in ("attention", "error", "paused", "reconciling")
+                        and account_data_wait == account.get("cycle")
+                        and current_cycle.get("phase") in ("waiting_open", "waiting_close")
+                        and current_cycle.get("run_id") == saved_cycle.get("run_id")
+                        and current_cycle.get("updated_at", 0) >= saved_cycle.get("updated_at", 0)):
+                    try:
+                        hot_lease.require_fresh()
+                    except HotAccountUnavailable:
+                        pass
+                    else:
+                        # Response-only recovery of a cache-origin wait. A new
+                        # strategy check is still required; no trading state,
+                        # lease lifetime or persisted progress is changed here.
+                        reason = "账户数据已同步，等待循环条件检查"
+                        if account.get("status") == "waiting" and account.get("reason") == current_cycle.get("reason"):
+                            account["reason"] = reason
+                        current_cycle["reason"] = reason
+                cycle = project_cycle_state(account, saved_cycle, current_cycle, pending,
                                             daily, rolling, background_reports=background_reports)
                 if report and active_cycle and pending.get("volume_error"):
                     daily = {**daily, "sync_pending": True, "error": pending["volume_error"]}

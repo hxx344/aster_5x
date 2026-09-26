@@ -26,6 +26,7 @@ class CycleHotEngineTests(unittest.TestCase):
         self.row.update(mode="live", cycle={**DEFAULT_CYCLE, "enabled": True})
         self.f.store.save_account(self.row)
         self.engine = Engine(self.f.store, market=self.f.market)
+        self.addCleanup(self.engine.dashboard_reports.close)
         self.engine.live_allowed = Mock(return_value=True)
         self.api = SimpleNamespace(budget=None, close=Mock(),
             call=Mock(side_effect=AssertionError("Engine test reached a live API")))
@@ -79,6 +80,148 @@ class CycleHotEngineTests(unittest.TestCase):
         self.assertEqual(self.engine.views["test"]["snapshot"], old)
         self.assertEqual(self.broker.refresh_cycle_hot_snapshot.call_count, reads)
         self.assertFalse(self.f.broker.state["orders"])
+        self.api.call.assert_not_called()
+
+    def test_dashboard_clears_reconnect_wait_after_background_sync_without_a_trade_tick(self):
+        self.broker.cycle_cache.set_connected(True)
+        self.assertEqual(self.engine.tick_account("test"), 1)
+        waiting = self.engine.state()["accounts"][0]
+        self.assertEqual(waiting["cycle_state"]["reason"], "账户热数据需要重新同步")
+        self.assertEqual(self.engine.poll_cycle_hot_data("test"), CYCLE_HOT_POLL_INTERVAL)
+        views = deepcopy(self.engine.views)
+        saved = deepcopy(self.f.store.get("cycle:test"))
+        with patch.object(self.engine, "tick_account", side_effect=AssertionError("display must not execute strategy")), \
+             patch.object(self.broker, "cycle_snapshot", side_effect=AssertionError("display must not read REST")):
+            current = self.engine.state(background_reports=True, compact=True)["accounts"][0]
+        self.assertEqual(current["cycle_state"]["reason"], "账户数据已同步，等待循环条件检查")
+        self.assertEqual(current["reason"], current["cycle_state"]["reason"])
+        self.assertEqual((current["status"], current["cycle_state"]["phase"]), ("waiting", "waiting_open"))
+        self.assertEqual(self.engine.views, views)
+        self.assertEqual(self.f.store.get("cycle:test"), saved)
+        self.assertNotIn("_account_data_wait", current["cycle_state"])
+        self.assertFalse(self.f.broker.state["orders"])
+        self.api.call.assert_not_called()
+
+    def test_recovered_cycle_wait_does_not_overwrite_an_unrelated_account_reason(self):
+        self.broker.cycle_cache.set_connected(True)
+        with self.assertRaises(HotAccountUnavailable) as failure:
+            self.broker.cycle_cache.lease([SYMBOL])
+        self.engine.cycle_wait(self.row, failure.exception)
+        self.engine.view("test", status="running", reason="其他品种等待价差")
+        self.assertTrue(self.publish())
+        current = self.engine.state()["accounts"][0]
+        self.assertEqual(current["cycle_state"]["reason"], "账户数据已同步，等待循环条件检查")
+        self.assertEqual((current["status"], current["reason"]), ("running", "其他品种等待价差"))
+        self.api.call.assert_not_called()
+
+    def test_recovery_requires_a_still_valid_account_lease_including_during_projection(self):
+        for invalidation in ("disconnected", "expired", "wrong_symbol", "failed", "during_projection"):
+            with self.subTest(invalidation=invalidation):
+                self.broker.cycle_cache = CycleAccountCache()
+                self.warm()
+                self.broker.cycle_cache.set_connected(True)
+                self.engine.tick_account("test")
+                self.assertTrue(self.publish())
+                if invalidation == "disconnected":
+                    self.broker.cycle_cache.set_connected(False)
+                elif invalidation == "expired":
+                    self.broker.cycle_cache._monotonic = lambda: time.monotonic() + 9
+                elif invalidation == "wrong_symbol":
+                    self.broker.cycle_cache.configure(["CLUSD1"])
+                elif invalidation == "failed":
+                    self.broker.cycle_cache.fail(self.broker.cycle_cache.begin_refresh(), RuntimeError("failed"))
+                original = self.broker.cycle_cache.lease
+                if invalidation == "during_projection":
+                    # Reuse the displayed snapshot so revocation happens at
+                    # the final reason check, after the lease was acquired.
+                    self.engine.view("test", snapshot=snapshot_json(original([SYMBOL]).snapshot, [SYMBOL]))
+                def read(symbols):
+                    lease = original(symbols)
+                    if invalidation == "during_projection":
+                        lease.require_fresh = Mock(side_effect=lambda: self.broker.cycle_cache.set_connected(False) or original(symbols))
+                    return lease
+                with patch.object(self.broker.cycle_cache, "lease", side_effect=read):
+                    current = self.engine.state()["accounts"][0]
+                self.assertEqual(current["cycle_state"]["reason"], "账户热数据需要重新同步")
+                self.assertNotIn("_account_data_wait", current["cycle_state"])
+        self.api.call.assert_not_called()
+
+    def test_public_data_and_quota_waits_are_not_cleared_by_private_account_sync(self):
+        for message in ("公共报价尚未就绪", "公共深度尚未就绪", "当日成交额度无法核实", "账户热数据需要重新同步"):
+            with self.subTest(message=message):
+                # Even identical text from an unclassified source is not enough.
+                failure = HotAccountUnavailable(message)
+                with patch.object(self.engine, "tick_cycle_account", side_effect=failure):
+                    self.engine.tick_account("test")
+                current = self.engine.state()["accounts"][0]
+                self.assertEqual(current["cycle_state"]["reason"], message)
+                self.assertEqual(current["reason"], message)
+        self.api.call.assert_not_called()
+
+    def test_pause_new_config_progress_and_risk_markers_prevent_old_wait_recovery(self):
+        for change in ("paused", "attention", "post_fill", "configuration", "new_run", "new_progress", "shutdown"):
+            with self.subTest(change=change):
+                self.f.store.save_account(deepcopy(self.row))
+                self.f.store.put("post_fill_check:test", None)
+                self.f.store.put("cycle:test", {"run_id": "original", "updated_at": 1, "phase": "holding", "opened_at": 1})
+                self.engine.shutdown.clear()
+                self.broker.cycle_cache.set_connected(True)
+                self.engine.tick_account("test")
+                self.assertTrue(self.publish())
+                row = self.f.store.account("test")
+                if change == "paused":
+                    row["enabled"] = False
+                elif change == "attention":
+                    self.engine.view("test", status="attention", reason="请人工核对账户")
+                elif change == "post_fill":
+                    self.f.store.put("post_fill_check:test", {"intent_id": "verify"})
+                elif change == "configuration":
+                    row["cycle"]["hold_seconds"] += 1
+                elif change in ("new_run", "new_progress"):
+                    self.f.store.put("cycle:test", {"run_id": "new" if change == "new_run" else "original", "updated_at": 2, "phase": "holding", "reason": "等待最短持仓时间", "opened_at": 1})
+                else:
+                    self.engine.shutdown.set()
+                self.f.store.save_account(row)
+                current = self.engine.state()["accounts"][0]
+                self.assertNotEqual(current["cycle_state"]["reason"], "账户数据已同步，等待循环条件检查")
+                self.assertNotIn("_account_data_wait", current["cycle_state"])
+        self.api.call.assert_not_called()
+
+    def test_new_cycle_reason_clears_the_old_source_marker_and_other_accounts_stay_isolated(self):
+        self.broker.cycle_cache.set_connected(True)
+        self.engine.tick_account("test")
+        other = {**self.row, "id": "other"}
+        self.f.store.save_account(other)
+        self.engine.views["other"] = deepcopy(self.engine.views["test"])
+        self.assertTrue(self.publish())
+        current = {row["id"]: row for row in self.engine.state()["accounts"]}
+        self.assertEqual(current["test"]["cycle_state"]["reason"], "账户数据已同步，等待循环条件检查")
+        self.assertEqual(current["other"]["cycle_state"]["reason"], "账户热数据需要重新同步")
+        self.engine.cycle_view(self.row, phase="waiting_open", reason="账户热数据需要重新同步")
+        self.assertEqual(self.engine.state()["accounts"][0]["cycle_state"]["reason"], "账户热数据需要重新同步")
+        self.api.call.assert_not_called()
+
+    def test_holding_cycle_keeps_ownership_and_pending_batches_keep_their_reason(self):
+        saved = {"run_id": "held", "updated_at": 1, "phase": "holding", "opened_at": 1,
+                 "close_eligible_at": 61, "quantities": {"LONG": "1", "SHORT": "1"}}
+        self.f.store.put("cycle:test", saved)
+        self.broker.cycle_cache.set_connected(True)
+        self.engine.tick_account("test")
+        self.assertTrue(self.publish())
+        recovered = self.engine.state()["accounts"][0]["cycle_state"]
+        self.assertEqual(recovered["phase"], "waiting_close")
+        self.assertEqual(recovered["reason"], "账户数据已同步，等待循环条件检查")
+        for key in ("run_id", "opened_at", "close_eligible_at", "quantities"):
+            self.assertEqual(recovered[key], saved[key])
+        pending = {"id": "unconfirmed", "account_id": "test", "kind": "cycle_leverage", "status": "pending",
+                   "symbol": SYMBOL, "last_error": "批次结果待核对"}
+        self.f.store.save_intent(pending)
+        current = self.engine.state()["accounts"][0]
+        self.assertEqual(current["cycle_state"]["phase"], "reconciling")
+        self.assertEqual(current["cycle_state"]["reason"], pending["last_error"])
+        self.assertEqual(current["reason"], "账户热数据需要重新同步")
+        self.assertEqual(self.f.store.get("cycle:test"), saved)
+        self.assertEqual(self.f.store.intent("test"), pending)
         self.api.call.assert_not_called()
 
     def test_dashboard_does_not_replace_a_newer_execution_snapshot(self):

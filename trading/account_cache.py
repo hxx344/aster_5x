@@ -21,6 +21,10 @@ class HotAccountUnavailable(TradingError):
         self.retry_after = retry_after
 
 
+class AccountCacheUnavailable(HotAccountUnavailable):
+    """The private account cache, rather than public quotes or accounting, is unavailable."""
+
+
 @dataclass(frozen=True)
 class _RefreshTicket:
     symbols: tuple[str, ...]
@@ -153,7 +157,7 @@ class CycleAccountCache:
         with self._lock:
             self._pending_notice = False
             if not self._symbols or not self._connected:
-                raise HotAccountUnavailable(self._reason)
+                raise AccountCacheUnavailable(self._reason)
             ticket = _RefreshTicket(self._symbols, self._refresh_modes, self._epoch)
             self._active_ticket = ticket
             return ticket
@@ -171,11 +175,11 @@ class CycleAccountCache:
         age = ticks - published.started_monotonic
         if (not self._number(ticks) or not 0 <= age <= self._MAX_AGE
                 or (published.valid_until_monotonic is not None and ticks >= published.valid_until_monotonic)):
-            raise HotAccountUnavailable("账户热数据已过期")
+            raise AccountCacheUnavailable("账户热数据已过期")
         try:
             published.snapshot.require_fresh(self._now())
         except (TradingError, TypeError, ValueError, AttributeError):
-            raise HotAccountUnavailable("账户热数据已过期") from None
+            raise AccountCacheUnavailable("账户热数据已过期") from None
 
     def publish(self, ticket, snapshot, started_monotonic, *, valid_until_monotonic=None):
         with self._lock:
@@ -221,7 +225,7 @@ class CycleAccountCache:
 
     def _check_current_locked(self, published):
         if not self._connected or published is None or self._published is not published or published.version != self._version:
-            raise HotAccountUnavailable(self._reason)
+            raise AccountCacheUnavailable(self._reason)
         self._require_published_fresh_locked(published)
 
     def _expire_locked(self):
@@ -242,7 +246,7 @@ class CycleAccountCache:
         symbols = self._normalize_symbols(symbols)
         with self._lock:
             if symbols != self._symbols or not symbols:
-                raise HotAccountUnavailable("账户热数据配置不匹配")
+                raise AccountCacheUnavailable("账户热数据配置不匹配")
             try:
                 self._check_current_locked(self._published)
             except HotAccountUnavailable as exc:
@@ -263,4 +267,4 @@ class CycleAccountCache:
             else:
                 return
         self._notify(listener)
-        raise HotAccountUnavailable("账户热数据资格已失效，等待更新")
+        raise AccountCacheUnavailable("账户热数据资格已失效，等待更新")

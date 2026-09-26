@@ -93,9 +93,9 @@ class DashboardAPITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/state").status_code, 401)
 
     def test_demo_rejects_live_accounts(self):
-        store = Store(Path(self.f.directory.name) / "demo.sqlite3")
-        store.bind_runtime_mode(demo=True)
+        store = Store(Path(self.f.directory.name) / "demo.sqlite3", demo=True)
         demo = Engine(store, demo=True, market=self.f.market)
+        self.addCleanup(demo.dashboard_reports.close)
         with TestClient(create_app(demo, start_engine=False)) as client:
             response = client.post("/api/accounts", headers={"origin": "http://testserver"}, json={"id": "live", "name": "live", "mode": "live", "env_prefix": "ASTER_LIVE"})
         self.assertEqual(response.status_code, 409)

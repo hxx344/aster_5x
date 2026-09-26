@@ -2,7 +2,7 @@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { CycleTradesPanel } from '@/components/cycle-trades-panel';
 import { ExecutionEvents } from '@/components/execution-events';
-import { CycleExecutionQualityPanel } from '@/components/cycle-execution-quality';
+import { CycleQualityHistoryPanel } from '@/components/cycle-quality-history';
 import type { Account } from '@/lib/desk-types';
 import type { ExecutionEvent } from '@/lib/cycle-events';
 export function RecordsWorkspace({
@@ -39,14 +39,13 @@ export function RecordsWorkspace({
         </section>
       </TabsContent>
       <TabsContent value="quality">
-        <section className="panel">
-          <CycleExecutionQualityPanel
-            key={account.id}
-            accountName={account.name}
-            quality={account.cycle_state?.execution_quality}
-            stale={stale}
-          />
-        </section>
+        <CycleQualityHistoryPanel
+          key={account.id}
+          accountName={account.name}
+          quality={account.cycle_state?.execution_quality}
+          history={account.cycle_state?.execution_quality_history}
+          stale={stale}
+        />
       </TabsContent>
     </Tabs>
   );

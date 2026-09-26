@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import listing_alerts, monitoring
+from . import cycle_quality_history, listing_alerts, monitoring
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -145,6 +145,7 @@ class Store:
             for statement in schema.split(";"):
                 if statement.strip():
                     db.execute(statement)
+            cycle_quality_history.initialize(db)
             # A revision changes in the same transaction as its fills, including
             # backfills and writes from a different process/Store. Rollbacks
             # cannot publish a new revision. Never infer validity from a TTL.
@@ -561,9 +562,11 @@ class Store:
                 raise TradingError("循环执行观测与持久批次不一致")
             if any(quality.get(key) != saved.get(key) for key in ("symbol", "phase", "quantity", "created_at")):
                 raise TradingError("循环执行观测元数据不一致")
+            quality = cycle_quality_history.merge(db, saved, quality)
             serialized = json.dumps(quality, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
             saved["execution_quality"] = quality
             db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
+            cycle_quality_history.record(db, intent["account_id"], quality)
             key = "cycle_execution:" + intent["account_id"]
             previous = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
             latest = json.loads(previous["data"]) if previous else None
@@ -572,6 +575,10 @@ class Store:
                     and latest.get("created_at", 0) >= quality["created_at"]:
                 return
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, serialized))
+
+    def cycle_execution_quality_history(self, account_id):
+        with self.connect() as db:
+            return cycle_quality_history.summary(db, account_id)
 
     @staticmethod
     def _index_cycle_volume(db, intent, row=None):

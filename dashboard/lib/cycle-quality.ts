@@ -77,6 +77,36 @@ export type CycleExecutionQuality = {
   };
 };
 
+export type CycleQualityHistory = {
+  limit: 100;
+  metric: 'request_to_response_ms';
+  groups: {
+    symbol: string;
+    phase: 'open' | 'close';
+    count: number;
+    comparable_count: number;
+    best: CycleExecutionQuality | null;
+    worst: CycleExecutionQuality | null;
+  }[];
+};
+
+export function cycleQualityHistoryGroup(
+  history: CycleQualityHistory | null | undefined,
+  selection: string,
+  latest?: CycleExecutionQuality | null,
+) {
+  const groups =
+    history?.metric === 'request_to_response_ms' ? history.groups : [];
+  return (
+    groups?.find((group) => `${group.symbol}:${group.phase}` === selection) ??
+    groups?.find(
+      (group) =>
+        group.symbol === latest?.symbol && group.phase === latest.phase,
+    ) ??
+    groups?.[0]
+  );
+}
+
 function text(value: unknown, fallback = '—'): string {
   return typeof value === 'string' && value.trim() ? value : fallback;
 }

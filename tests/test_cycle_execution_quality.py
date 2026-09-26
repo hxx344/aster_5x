@@ -203,6 +203,14 @@ class CycleExecutionQualityTests(unittest.TestCase):
         self.f.store.save_intent(historical)
         with patch.object(broker, "submit", side_effect=AssertionError("never resend")):
             executor.reconcile(self.f.account, historical)
+        # A stale/legacy intent cannot erase clocks already saved in history.
+        self.assertEqual(self.quality()["timing"], before["timing"])
+        with self.f.store.connect() as db:
+            db.execute("DELETE FROM cycle_quality_history")
+        historical.pop("execution_quality")
+        self.f.store.save_intent(historical)
+        with patch.object(broker, "submit", side_effect=AssertionError("never resend")):
+            executor.reconcile(self.f.account, historical)
         self.assertEqual(self.quality()["timing"]["request_status"], "unknown")
         self.assertTrue(all(value is None for key, value in self.quality()["timing"].items()
                             if key not in ("request_status", "pre_submit", "database")))

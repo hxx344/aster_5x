@@ -1075,7 +1075,8 @@ label input,
   max-height: 510px;
   overflow: auto;
 }
-.cycle-execution-quality {
+.cycle-execution-quality,
+.cycle-quality-history {
   padding: 20px 22px;
   border-top: 1px solid var(--border);
   overflow-wrap: anywhere;
@@ -1086,6 +1087,46 @@ label input,
   flex-wrap: wrap;
   align-items: baseline;
   gap: 6px 16px;
+}
+.cycle-quality-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+}
+.cycle-quality-group select {
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+  color: var(--foreground);
+}
+.cycle-quality-extreme {
+  border-top: 1px solid var(--border);
+  padding: 14px 0;
+}
+.cycle-quality-extreme .cycle-execution-quality {
+  padding: 0;
+}
+.cycle-quality-extreme > summary {
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.cycle-quality-extreme > summary > * {
+  margin-right: 16px;
+}
+.cycle-quality-extreme > summary > time {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.cycle-quality-extreme > summary:focus-visible,
+.cycle-quality-group select:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
 }
 .cycle-quality-heading h3 {
   margin: 0;
@@ -1222,7 +1263,8 @@ label input,
   margin: 0 0 14px;
 }
 @media (max-width: 600px) {
-  .cycle-execution-quality {
+  .cycle-execution-quality,
+  .cycle-quality-history {
     padding: 18px 16px;
   }
   .cycle-quality-comparison thead {

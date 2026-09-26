@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   cycleExecutionQualityView,
   cycleQualityTime,
+  cycleQualityHistoryGroup,
 } from '../lib/cycle-quality.ts';
 
 const started = Date.parse('2026-09-14T23:59:59.900Z') / 1000;
@@ -48,6 +49,45 @@ const quality = {
     repairs_present: false,
   },
 };
+
+test('history selection follows the latest group, supports other phases and safely switches accounts', () => {
+  const open = {
+    symbol: 'XAUUSD1',
+    phase: 'open',
+    count: 100,
+    comparable_count: 98,
+    best: quality,
+    worst: quality,
+  };
+  const close = { ...open, phase: 'close' };
+  const history = {
+    limit: 100,
+    metric: 'request_to_response_ms',
+    groups: [close, open],
+  };
+  assert.equal(cycleQualityHistoryGroup(history, '', quality), open);
+  assert.equal(
+    cycleQualityHistoryGroup(history, 'XAUUSD1:close', quality),
+    close,
+  );
+  assert.equal(
+    cycleQualityHistoryGroup(history, 'CLUSD1:close', quality),
+    open,
+  );
+  assert.equal(
+    cycleQualityHistoryGroup(undefined, 'XAUUSD1:close', quality),
+    undefined,
+  );
+  assert.equal(
+    cycleQualityHistoryGroup({ ...history, groups: [] }, '', quality),
+    undefined,
+  );
+  assert.equal(
+    cycleQualityHistoryGroup({ ...history, metric: 'unknown' }, '', quality),
+    undefined,
+  );
+  assert.equal(cycleQualityHistoryGroup(history, '', null), close);
+});
 
 test('transport stages preserve measured zero and distinguish missing or invalid stages', () => {
   const view = cycleExecutionQualityView({

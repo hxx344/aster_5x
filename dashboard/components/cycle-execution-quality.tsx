@@ -1,3 +1,5 @@
+'use client';
+import { useId } from 'react';
 import {
   cycleExecutionQualityView,
   type CycleExecutionQuality,
@@ -7,19 +9,19 @@ export function CycleExecutionQualityPanel({
   quality,
   accountName,
   stale,
+  title = '最近循环成交质量',
 }: {
   quality?: CycleExecutionQuality | null;
   accountName: string;
   stale: boolean;
+  title?: string;
 }) {
+  const headingId = useId();
   const view = cycleExecutionQualityView(quality);
   return (
-    <section
-      className="cycle-execution-quality"
-      aria-labelledby="cycle-execution-quality-heading"
-    >
+    <section className="cycle-execution-quality" aria-labelledby={headingId}>
       <div className="cycle-quality-heading">
-        <h3 id="cycle-execution-quality-heading">最近循环成交质量</h3>
+        <h3 id={headingId}>{title}</h3>
         <span>{accountName}</span>
       </div>
       {view ? (

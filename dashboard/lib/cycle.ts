@@ -1,4 +1,7 @@
-import type { CycleExecutionQuality } from './cycle-quality';
+import type {
+  CycleExecutionQuality,
+  CycleQualityHistory,
+} from './cycle-quality';
 import configuration from '../../trading/cycle-config.json' with { type: 'json' };
 
 export type CycleConfig = {
@@ -47,6 +50,7 @@ export type CycleState = {
   >;
   diagnostic?: CycleDiagnostic | null;
   execution_quality?: CycleExecutionQuality | null;
+  execution_quality_history?: CycleQualityHistory | null;
 };
 
 export type CycleReportStatus = {

@@ -2236,6 +2236,7 @@ class Engine:
                 reader.get("post_fill_check:" + a["id"]), cycle_records[a["id"]]) for a in saved_accounts}
             cycle_quality = {a["id"]: reader.get("cycle_execution:" + a["id"]) for a in saved_accounts
                              if not compact or a["id"] == history_account}
+            cycle_quality_history = {key: reader.cycle_execution_quality_history(key) for key in cycle_quality}
         cycle_selection = {a["id"]: validate_cycle(a.get("cycle"))["symbol"] for a in saved_accounts}
         reports = self.dashboard_reports.read(saved_accounts, state_now,
             history_revisions={history_account: history_revision} if compact else None) if background_reports else {
@@ -2348,6 +2349,7 @@ class Engine:
                         cycle.pop(key, None)
                     account.pop("cycle_trades", None)
                 cycle["execution_quality"] = cycle_quality.get(account["id"])
+                cycle["execution_quality_history"] = cycle_quality_history.get(account["id"])
                 if cycle.get("opened_at") is not None:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle

@@ -1,0 +1,141 @@
+import {
+  pairDataFresh,
+  pairHasPending,
+  pairPhaseLabel,
+  type Pair,
+} from './pairs.ts';
+
+export type PairNotice = {
+  key: string;
+  kind: 'data' | 'execution';
+  text: string;
+};
+export type PairNoticeEntry = PairNotice & {
+  firstSeen: number;
+  lastSeen: number;
+  occurrences: number;
+};
+export type PairNoticeHistory = {
+  activeKeys: string[];
+  entries: PairNoticeEntry[];
+};
+export const PAIR_NOTICE_LIMIT = 8;
+
+export function pairStatusNotices(
+  pair: Pair,
+  now: number,
+  offline = false,
+): PairNotice[] {
+  const notices: PairNotice[] = [];
+  const add = (kind: PairNotice['kind'], text: string) =>
+    notices.push({ key: `${kind}:${text}`, kind, text });
+  const snapshots = pair.state?.snapshots;
+  const fresh =
+    pairDataFresh(pair.state?.updated_at, now, offline) &&
+    pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
+    pairDataFresh(snapshots?.short?.timestamp, now, offline);
+  if (!fresh) {
+    add(
+      'data',
+      (offline
+        ? '连接中断，保留最近记录。'
+        : '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。') +
+        (!pair.enabled && !offline
+          ? ' 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。'
+          : ' 等待有效快照后才能新增开仓。'),
+    );
+  }
+  if (pairHasPending(pair)) {
+    const reason = pair.state?.reason || pair.pause_reason;
+    add(
+      'execution',
+      `${pairPhaseLabel(pair.state?.phase)}${reason ? ` · ${reason}` : ''}`,
+    );
+  }
+  return notices;
+}
+
+export function recordPairNotices(
+  history: PairNoticeHistory | undefined,
+  notices: PairNotice[],
+  now: number,
+): PairNoticeHistory {
+  const previous = history ?? { activeKeys: [], entries: [] };
+  // A missing initial server clock cannot establish an observation or recovery.
+  if (!Number.isFinite(now) || now <= 0) return previous;
+  const unique = [
+    ...new Map(notices.map((notice) => [notice.key, notice])).values(),
+  ];
+  const activeKeys = unique.map((notice) => notice.key);
+  const wasActive = new Set(previous.activeKeys);
+  let entries = previous.entries;
+  for (const notice of unique) {
+    const index = entries.findIndex((entry) => entry.key === notice.key);
+    const old = entries[index];
+    if (old && wasActive.has(notice.key)) {
+      if (now > old.lastSeen) {
+        entries = entries.map((entry, i) =>
+          i === index ? { ...entry, lastSeen: now } : entry,
+        );
+      }
+    } else {
+      const lastSeen = Math.max(now, old?.lastSeen ?? now);
+      const entry = {
+        ...notice,
+        firstSeen: old?.firstSeen ?? now,
+        lastSeen,
+        occurrences: (old?.occurrences ?? 0) + 1,
+      };
+      entries = [entry, ...entries.filter((item) => item.key !== notice.key)];
+    }
+  }
+  // Keep the current data/execution warnings even when many older texts rotate.
+  // Evicting an active entry would turn the next poll into a false recurrence.
+  if (entries.length > PAIR_NOTICE_LIMIT) {
+    const active = new Set(activeKeys);
+    let pastSlots = Math.max(0, PAIR_NOTICE_LIMIT - active.size);
+    entries = entries.filter((entry) => {
+      if (active.has(entry.key)) return true;
+      return pastSlots-- > 0;
+    });
+  }
+  if (
+    entries === previous.entries &&
+    activeKeys.length === previous.activeKeys.length &&
+    activeKeys.every((key, index) => key === previous.activeKeys[index])
+  )
+    return previous;
+  return { activeKeys, entries };
+}
+
+export function updatePairNoticeHistories(
+  previous: ReadonlyMap<string, PairNoticeHistory>,
+  pairs: Pair[],
+  now: number,
+  offline: boolean,
+): ReadonlyMap<string, PairNoticeHistory> {
+  const next = new Map<string, PairNoticeHistory>();
+  let changed = previous.size !== pairs.length;
+  for (const pair of pairs) {
+    const old = previous.get(pair.id);
+    const history = recordPairNotices(
+      old,
+      pairStatusNotices(pair, now, offline),
+      now,
+    );
+    next.set(pair.id, history);
+    if (history !== old) changed = true;
+  }
+  return changed ? next : previous;
+}
+
+export function clearPastPairNotices(
+  history: PairNoticeHistory | undefined,
+): PairNoticeHistory {
+  const previous = history ?? { activeKeys: [], entries: [] };
+  const active = new Set(previous.activeKeys);
+  const entries = previous.entries.filter((entry) => active.has(entry.key));
+  return entries.length === previous.entries.length
+    ? previous
+    : { ...previous, entries };
+}

@@ -19,6 +19,14 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { PairSettings } from '@/components/pair-settings';
+import { PairNotices } from '@/components/pair-notices';
+import {
+  clearPastPairNotices,
+  pairStatusNotices,
+  recordPairNotices,
+  updatePairNoticeHistories,
+  type PairNoticeHistory,
+} from '@/lib/pair-notices';
 import { ExecutionEvents } from '@/components/execution-events';
 import type { Account, DeskAction } from '@/lib/desk-types';
 import type { ExecutionEvent } from '@/lib/cycle-events';
@@ -63,6 +71,33 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
   const [selected, setSelected] = useState('');
   const items = pairs ?? EMPTY_PAIRS;
   const pair = items.find((item) => item.id === selected) ?? items[0];
+  const offline = Boolean(props.connectionError);
+  const [noticeState, setNoticeState] = useState(() => ({
+    items,
+    now: props.now,
+    offline,
+    histories: updatePairNoticeHistories(new Map(), items, props.now, offline),
+  }));
+  // Remember previous observations before rendering children. Unlike an effect,
+  // this cannot briefly paint a new warning alongside the previous history.
+  if (
+    noticeState.items !== items ||
+    !Object.is(noticeState.now, props.now) ||
+    noticeState.offline !== offline
+  ) {
+    setNoticeState({
+      items,
+      now: props.now,
+      offline,
+      histories: updatePairNoticeHistories(
+        noticeState.histories,
+        items,
+        props.now,
+        offline,
+      ),
+    });
+  }
+  const noticeHistories = noticeState.histories;
   return (
     <div className="feature-stack pair-workspace">
       <div className="pair-workspace-heading">
@@ -106,7 +141,28 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
         </div>
       </div>
       {pair ? (
-        <PairDetail {...props} pairs={items} pair={pair} />
+        <PairDetail
+          {...props}
+          pairs={items}
+          pair={pair}
+          noticeHistory={noticeHistories.get(pair.id)}
+          clearNotices={() =>
+            setNoticeState((previous) => {
+              const next = new Map(previous.histories);
+              next.set(
+                pair.id,
+                clearPastPairNotices(
+                  recordPairNotices(
+                    previous.histories.get(pair.id),
+                    pairStatusNotices(pair, props.now, offline),
+                    props.now,
+                  ),
+                ),
+              );
+              return { ...previous, histories: next };
+            })
+          }
+        />
       ) : (
         <section className="panel empty-state">
           <h3>{pairs === undefined ? '等待配对组服务' : '尚未创建配对组'}</h3>
@@ -221,7 +277,14 @@ function PairDetail({
   action,
   setError,
   setNotice,
-}: Omit<Props, 'pairs'> & { pairs: Pair[]; pair: Pair }) {
+  noticeHistory,
+  clearNotices,
+}: Omit<Props, 'pairs'> & {
+  pairs: Pair[];
+  pair: Pair;
+  noticeHistory?: PairNoticeHistory;
+  clearNotices: () => void;
+}) {
   const draft = useAccountDraft(pair.id, pairDraft(pair));
   const [deleteOpen, setDeleteOpen] = useState(false);
   const snapshots = pair.state?.snapshots;
@@ -297,7 +360,9 @@ function PairDetail({
           <div className="account-run-actions">
             <Button
               disabled={busy || offline || Boolean(startBlock)}
-              title={startBlock || '核验并采纳两侧实际仓位为底仓，再按已保存配置启动'}
+              title={
+                startBlock || '核验并采纳两侧实际仓位为底仓，再按已保存配置启动'
+              }
               onClick={() => void action(`/api/pairs/${pair.id}/enable`)}
             >
               <CirclePlay size={16} />
@@ -325,21 +390,18 @@ function PairDetail({
             </Button>
           </div>
         </div>
-        <div className="cycle-live-state" aria-live="polite">
-          <p className={pending || !fresh ? 'amber' : ''}>
+        <div className="cycle-live-state">
+          <p className={pending ? 'amber' : ''} aria-live="polite">
             {pairPhaseLabel(pair.state?.phase)}
             {reason ? ` · ${reason}` : ''}
           </p>
-          {!fresh ? (
-            <p className="amber">
-              {offline
-                ? '连接中断，保留最近记录。'
-                : '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。'}
-              {!pair.enabled && !offline
-                ? ' 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。'
-                : ' 等待有效快照后才能新增开仓。'}
-            </p>
-          ) : null}
+          <PairNotices
+            pair={pair}
+            now={now}
+            offline={offline}
+            history={noticeHistory}
+            clear={clearNotices}
+          />
           {draft.dirty ? (
             <p className="amber">设置有未保存修改，请保存或撤销后启动。</p>
           ) : null}

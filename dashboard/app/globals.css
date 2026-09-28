@@ -1958,6 +1958,43 @@ label input,
   font-size: 13px;
   overflow-wrap: anywhere;
 }
+.pair-notices {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--muted);
+}
+.pair-notices-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-height: 32px;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.pair-notice-item + .pair-notice-item {
+  margin-top: 12px;
+}
+.cycle-live-state .pair-notice-time,
+.cycle-live-state .pair-notice-scope {
+  font-size: 12px;
+}
+.cycle-live-state .pair-notice-scope {
+  margin: 8px 0 0;
+}
+.pair-notices-history > summary {
+  width: fit-content;
+  cursor: pointer;
+  padding: 4px 0;
+  font-size: 13px;
+}
+.pair-notices-history[open] > summary {
+  margin-bottom: 8px;
+}
 .cycle-key-values {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

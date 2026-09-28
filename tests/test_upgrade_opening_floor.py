@@ -54,7 +54,7 @@ class UpgradeOpeningFloorTests(unittest.TestCase):
             self.assertIsNone(self.f.store.intent('test'))
             self.engine.tick_account('test')  # 5x capacity cannot authorize entry below 10x.
             submit.assert_not_called()
-            self.assertIn('低于 10x', self.engine.views['test']['strategies'][CL]['reason'])
+            self.assertIn('低于普通开仓最低 10x', self.engine.views['test']['strategies'][CL]['reason'])
             self.assertEqual([p.qty for p in self.f.broker.snapshot(SYMBOLS).pair(CL)], [dec('1.018')] * 2)
             self.publish({5: 68360, 10: 68360})
             self.engine.tick_account('test')

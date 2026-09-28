@@ -279,7 +279,7 @@ class PriorityCapacityExecutionTests(PriorityCapacityFixture):
             self.take_priority_tick()
             self.take_priority_tick()
             submit.assert_not_called()
-        self.assertIn("低于 20x", self.engine.views["test"]["strategies"][SYMBOL]["reason"])
+        self.assertIn("低于普通开仓最低 20x", self.engine.views["test"]["strategies"][SYMBOL]["reason"])
 
 
 class PriorityCapacitySchedulerTests(PriorityCapacityFixture):

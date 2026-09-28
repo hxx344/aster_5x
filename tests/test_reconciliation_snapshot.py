@@ -107,7 +107,7 @@ class ReconciliationSnapshotTests(unittest.TestCase):
         self.assertIsNone(self.executor.last_snapshot)
         self.executor.last_snapshot = self.f.broker.snapshot([self.symbol])
         self.f.broker.state["leverages"][self.symbol] = 3
-        with self.assertRaisesRegex(TradingError, "低于 5x"):
+        with self.assertRaisesRegex(TradingError, "低于普通开仓最低 5x"):
             self.open()
         self.assertIsNone(self.executor.last_snapshot)
 

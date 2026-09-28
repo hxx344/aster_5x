@@ -221,6 +221,18 @@ class RateBudget:
                 # A timeout is not evidence that the exchange did not count it.
                 self.unreported.append((time.monotonic(), weight))
 
+    def cancel_unstarted(self, ticket):
+        """Refund only local preparation that failed before HTTP dispatch."""
+        with self.lock:
+            self._refresh(time.monotonic())
+            weight = self.inflight.pop(ticket, 0)
+            if weight:
+                # Every reset/observation carries this still-pending ticket, so
+                # its own reservation can be removed without recomputing or
+                # lowering unrelated high-water estimates and IP reports.
+                self.weight = max(self.reported_weight or 0, self.weight - weight)
+                self.local_weight = max(0, self.local_weight - weight)
+
     @staticmethod
     def _response_time(headers):
         try:
@@ -350,9 +362,15 @@ class API:
         with transport_stage("budget_ms"):
             ticket = self.budget.reserve(weight, track=True)
         try:
-            with transport_stage("signing_ms"):
-                params = self.signed_parameters(params or {}) if signed else (params or {})
-                content = urlencode(params) if method != "GET" else None
+            try:
+                with transport_stage("signing_ms"):
+                    params = self.signed_parameters(params or {}) if signed else (params or {})
+                    content = urlencode(params) if method != "GET" else None
+            except BaseException:
+                # No HTTP call has begun. Once request() is entered, failures
+                # retain their reservation because delivery may be unknown.
+                self.budget.cancel_unstarted(ticket)
+                raise
             is_write = signed and method != "GET"
             try:
                 with transport_stage("http_ms"):
@@ -619,17 +637,19 @@ class MarketData:
             if streamed is not None:
                 return streamed
             cached = self.books.get(symbol)
-            if cached is not None and time.monotonic() - cached[0] < 1:
+            if cached is not None and 0 <= time.monotonic() - cached[0] < 1:
                 try:
                     cached[1].require_fresh()
-                    return cached[1]
+                    cached[2].require_fresh()
+                    return replace(cached[1])
                 except TradingError:
                     pass
             self.books.pop(symbol, None)
             started = time.monotonic()
-            book = self._read_book(symbol)
+            book, mark = self._read_book(symbol)
             # Network time is part of cache age; a slow read cannot renew it.
-            self.books[symbol] = (started, book)
+            # Book is mutable; consumers must not alter the shared REST copy.
+            self.books[symbol] = (started, replace(book), mark)
             return book
 
     def cycle_book(self, symbol):
@@ -660,12 +680,17 @@ class MarketData:
         value = self._stream_mark_price(symbol)
         if value is not None:
             return value
+        return self._rest_mark_price(symbol, allow_stream=True)
+
+    def _rest_mark_price(self, symbol, *, allow_stream=False):
+        """Share one REST valuation read without mixing partial WS quotes."""
         with self.mark_guard:
             lock = self.mark_locks.setdefault(symbol, threading.Lock())
         with lock:
-            value = self._stream_mark_price(symbol)
-            if value is not None:
-                return value
+            if allow_stream:
+                value = self._stream_mark_price(symbol)
+                if value is not None:
+                    return value
             cached = self.marks.get(symbol)
             if cached is not None and 0 <= time.monotonic() - cached[0] < 1:
                 try:
@@ -696,22 +721,23 @@ class MarketData:
         return value
 
     def _read_book(self, symbol):
-        # Fetch mark first so the executable BBO is as recent as possible.
+        # Account valuation and quote fallback share the same REST mark. Keep a
+        # partial WS quote out of this complete REST fallback and fetch BBO last.
         started = time.monotonic()
-        mark = self.api.call("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
+        mark = self._rest_mark_price(symbol)
         row = self.api.call("GET", "/fapi/v3/ticker/bookTicker", {"symbol": symbol}, weight=1)
-        if not isinstance(row, dict) or not isinstance(mark, dict):
+        if not isinstance(row, dict):
             raise TradingError("报价响应无效")
-        if row.get("symbol") != symbol or mark.get("symbol") != symbol:
+        if row.get("symbol") != symbol:
             raise TradingError("报价交易代码不匹配")
-        sources = (("盘口（BBO）", row), ("标记价", mark))
-        timestamps = [float(positive(source.get("time"), field=f"{symbol} 备用{label}时间戳（time）")) / 1000
-                      for label, source in sources]
+        labels = ("盘口（BBO）", "标记价")
+        timestamps = [float(positive(row.get("time"), field=f"{symbol} 备用盘口（BBO）时间戳（time）")) / 1000,
+                      mark.timestamp]
         now = time.time()
         ages = [now - stamp for stamp in timestamps]
         if any(not -1 <= age <= 3 for age in ages):
             details = []
-            for (label, _), age in zip(sources, ages):
+            for label, age in zip(labels, ages):
                 direction = "落后" if age >= 0 else "领先"
                 state = "已过期" if age > 3 else "时间超前" if age < -1 else "有效"
                 details.append(f"{label}{direction}程序时间 {abs(age):.3f} 秒（{state}）")
@@ -719,10 +745,12 @@ class MarketData:
             raise TradingError(f"{symbol} 备用行情时间无效：{'；'.join(details)}；"
                                f"允许落后最多 3 秒、领先最多 1 秒；本次查询耗时 {elapsed:.3f} 秒。"
                                "已跳过该报价，等待行情更新；持续发生时检查行情连接与服务器时钟")
+        # BBO I/O may outlive the shared mark, including a wall-clock rollback.
+        mark.require_fresh(now)
         book = Book(positive(row["bidPrice"]), positive(row["askPrice"]), positive(row["bidQty"]),
-                    positive(row["askQty"]), positive(mark["markPrice"]), min(timestamps))
+                    positive(row["askQty"]), mark.price, min(timestamps))
         book.require_fresh(now)
-        return book
+        return book, mark
 
     def depth_weight(self, symbols):
         """Only missing stream seeds may require REST; healthy reads are free."""
@@ -1119,9 +1147,9 @@ class LiveBroker:
         weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
         return weight
 
-    def snapshot(self, symbols, fresh_modes=False):
+    def snapshot(self, symbols, fresh_modes=False, *, reuse_account_mode=False):
         with self._ordinary_read_lock:
-            return self._snapshot(symbols, fresh_modes=fresh_modes)
+            return self._snapshot(symbols, fresh_modes=fresh_modes, reuse_account_mode=reuse_account_mode)
 
     def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
         with self._snapshot_lock:
@@ -1179,11 +1207,19 @@ class LiveBroker:
         if asset != "USD1":
             raise TradingError(f"{symbol} 保证金资产为 {asset}；检测到非 USD1 仓位，需要核对风险范围")
 
-    def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None):
+    def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None, reuse_account_mode=False):
         """Shared parsing; the ordinary path retains its sequential reads."""
         with self._snapshot_lock:
             generation = self._snapshot_generation
             self.leverage_snapshot = None
+            # Only paired ordinary reads opt in. The first read, explicit mode
+            # checks and mode invalidations still require the dedicated GET.
+            # A past positive check is not fresh authority: below, both current
+            # authenticated position responses must prove hedge mode again.
+            previous_dual = self.cached.get("dual")
+            position_mode = (reuse_account_mode and not fresh_modes
+                and isinstance(previous_dual, dict) and previous_dual.get("dualSidePosition") is True
+                and "dual" in self.cached_at and time.monotonic() >= self.cached_at["dual"])
         started = time.time() if started is None else started
         if read is None:
             def read(key, path, params=None, *, ttl=None, weight=1):
@@ -1194,16 +1230,26 @@ class LiveBroker:
             with self._snapshot_lock:
                 self.cached_at.pop("dual", None)
                 self.cached_at.pop("multi", None)
-        dual = read("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
+        dual = None if position_mode else read("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
         multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
-        if (not isinstance(dual, dict) or not isinstance(multi, dict)
-                or type(dual.get("dualSidePosition")) is not bool or type(multi.get("multiAssetsMargin")) is not bool):
+        if (not isinstance(multi, dict) or type(multi.get("multiAssetsMargin")) is not bool
+                or (not position_mode and (not isinstance(dual, dict) or type(dual.get("dualSidePosition")) is not bool))):
             raise TradingError("账户持仓或保证金模式响应无效")
         account = read("account", "/fapi/v3/accountWithJoinMargin", weight=5)
         rows = read("positions", "/fapi/v3/positionRisk", weight=5)
         asset = self._account_asset(account)
         account_positions = self._position_rows(account.get("positions"))
         present = self._position_rows(rows)
+        if position_mode:
+            # As in the cycle reader, LONG/SHORT rows are the current account's
+            # mode evidence. Never infer absent legs as flat or accept BOTH,
+            # including unrelated flat markets; retain all risk cross-checks.
+            if any(side == "BOTH" for _, side in account_positions) or any(side == "BOTH" for _, side in present):
+                raise AccountModeError("账户与持仓的双向模式尚未同步，请核对账户模式")
+            for symbol in symbols:
+                if any((symbol, side) not in account_positions for side in ("LONG", "SHORT")):
+                    raise TradingError(f"{symbol} 缺少双向持仓信息，无法复用账户模式核验")
+            dual = {"dualSidePosition": True}
         # Some V3 responses omit flat symbols; use authenticated account rows for
         # their configured leverage and margin mode, rather than inventing defaults.
         rows = list(rows)

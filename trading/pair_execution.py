@@ -32,6 +32,25 @@ class PairTrader:
     def __init__(self, engine):
         self.engine, self.store, self.market = engine, engine.store, engine.market
         self._ordinary_observations = {}
+        self._margin_observations = {}
+
+    def _margin_wait(self, pair, state, identities, brokers, margin_state):
+        """Delay display-only reads while no balance check can consume them."""
+        if (not pair["enabled"] or pair["ordinary"]["enabled"] or pair["cycle"]["enabled"]
+                or not pair["margin"]["enabled"] or state.get("attention")):
+            return False
+        if time.time() >= max(margin_state.get("next_check_at", 0), margin_state.get("cooldown_until", 0)):
+            return False
+        observed = self._margin_observations.get(pair["id"])
+        if not observed or observed[0] != (pair["revision"], identities):
+            return False
+        generations, started = observed[1:]
+        if not 0 <= time.monotonic() - started < 30:
+            return False
+        # These generations only determine when to refresh the display. No old
+        # snapshot from this observation can authorize a transfer or order.
+        return all(generations[key] == (id(broker), getattr(broker, "_snapshot_generation", None))
+                   for key, broker in brokers.items())
 
     def _ordinary_wait(self, pair, state, identities, margin_state):
         """Reuse recent reads only to reject work, never to authorize a write."""
@@ -112,7 +131,8 @@ class PairTrader:
                     return lease.snapshot, lease.require_fresh
                 # Ordinary polling retains the broker's mode TTL; account events
                 # still revoke these reads and mode changes clear its cache.
-                snapshot = broker.snapshot([SYMBOL], fresh_modes=reconciliation)
+                options = {"reuse_account_mode": True} if isinstance(broker, LiveBroker) else {}
+                snapshot = broker.snapshot([SYMBOL], fresh_modes=reconciliation, **options)
                 guard = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
                 return snapshot, guard
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-read") as pool:
@@ -171,10 +191,33 @@ class PairTrader:
             holding = any(dec(qty) for qty in state["progress"]["quantities"].values())
             if state.get("volume_unknown_until_utc"):
                 state["volume_unknown"] = datetime.now(timezone.utc).date().isoformat() <= state["volume_unknown_until_utc"]
-            margin_state = self.store.get("pair_margin:" + pair["id"]) or {}
-            margin_pending = margin_state.get("pending")
+            margin_state = self.store.get("pair_margin:" + pair["id"], {})
+            if margin_state is None:
+                margin_state = {}
+            margin_invalid = not isinstance(margin_state, dict) or any(
+                field in margin_state and (type(margin_state[field]) not in (int, float)
+                    or not math.isfinite(margin_state[field]))
+                for field in ("checked_at", "next_check_at", "cooldown_until"))
+            margin_pending = margin_state.get("pending") if isinstance(margin_state, dict) else None
+            from .margin_balance import MarginBalancer
+            if not holding and (margin_pending is not None or margin_invalid):
+                # Pending transfers consume only their own reconciliation reads.
+                # Even a completed reconciliation ends this turn: subsequent
+                # trading must obtain a new account read, not an older wait hint.
+                self._ordinary_observations.pop(pair["id"], None)
+                self._margin_observations.pop(pair["id"], None)
+                margin = MarginBalancer(self.engine).tick(pair, {})
+                state.update(margin=margin, phase="margin_wait", reason=margin.get("reason", "划转核对中"))
+                return state
             if not pair["enabled"] and not holding and not margin_pending:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
+                return state
+            if not holding and self._margin_wait(pair, state, identities, brokers, margin_state):
+                # Project the journal without invoking a funds workflow. A
+                # deadline crossing here cannot create a transfer with no read.
+                margin = MarginBalancer.status_view(pair, margin_state, state.get("margin"))
+                state.update(margin=margin, phase="margin_wait" if margin.get("blocks_trading") else "monitoring",
+                             reason=margin.get("reason", "等待下一次保证金检查"))
                 return state
             if not holding and not margin_pending:
                 reason = self._ordinary_wait(pair, state, identities, margin_state)
@@ -191,6 +234,13 @@ class PairTrader:
             snapshots, guards = self._read(brokers, hot=hot, reconciliation=closing_due)
             self._publish_snapshots(state, snapshots)
             held = require_quantities(snapshots, self._expected(state))
+            if not pair["ordinary"]["enabled"] and not pair["cycle"]["enabled"] and not holding:
+                if len(self._margin_observations) >= 16:
+                    self._margin_observations.clear()
+                self._margin_observations[pair["id"]] = (
+                    (pair["revision"], deepcopy(identities)),
+                    {key: (id(broker), getattr(snapshots[key], "account_read_generation", None))
+                     for key, broker in brokers.items()}, time.monotonic())
             if (not hot and not closing_due and pair["ordinary"]["enabled"]
                     and all(isinstance(broker, LiveBroker) for broker in brokers.values())):
                 if len(self._ordinary_observations) >= 16:
@@ -199,7 +249,6 @@ class PairTrader:
                     (pair["revision"], deepcopy(identities)), snapshots, guards, time.monotonic())
             # The independent balancer uses the same ordered account locks. A
             # transfer invalidates both read leases before any following order.
-            from .margin_balance import MarginBalancer
             margin = MarginBalancer(self.engine).tick(pair, snapshots, pending_orders=closing_due)
             state["margin"] = margin
             if margin.get("blocks_trading") and not holding:

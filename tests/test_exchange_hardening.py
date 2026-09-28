@@ -331,16 +331,25 @@ class QuoteHardeningTests(unittest.TestCase):
                      self.assertRaises(TradingError) as caught:
                     market.book("XAUUSD1")
                 message = str(caught.exception)
-                for detail in ("XAUUSD1 备用行情时间无效", bbo_detail, mark_detail,
-                               "允许落后最多 3 秒、领先最多 1 秒", "查询耗时 0.250 秒", "已跳过该报价"):
+                # A rejected shared mark stops before spending another request
+                # on BBO; valid marks still retain both sources in diagnostics.
+                if not 97000 <= mark <= 101000:
+                    details = ("XAUUSD1 备用标记价无效", mark_detail.removeprefix("标记价").split("（")[0],
+                               "允许落后最多 3 秒、领先最多 1 秒", "查询耗时 0.125 秒", "已跳过该标记价")
+                    count = 1
+                else:
+                    details = ("XAUUSD1 备用行情时间无效", bbo_detail, mark_detail,
+                               "允许落后最多 3 秒、领先最多 1 秒", "查询耗时 0.250 秒", "已跳过该报价")
+                    count = 2
+                for detail in details:
                     self.assertIn(detail, message)
-                self.assertEqual(len(market.api.calls), 2)
+                self.assertEqual(len(market.api.calls), count)
                 self.assertNotIn("XAUUSD1", market.books)
 
     def test_malformed_timestamp_identifies_the_affected_source(self):
         for source, label in (("bid", "盘口（BBO）"), ("mark", "标记价")):
             for stamp in (None, "NaN", "Infinity", 0, True):
-                with self.subTest(source=source, stamp=stamp):
+                with self.subTest(source=source, stamp=stamp), patch("trading.exchange.time.time", return_value=100):
                     market = self.market(**{source + "_time": stamp})
                     with self.assertRaises(TradingError) as caught:
                         market.book("XAUUSD1")

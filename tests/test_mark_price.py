@@ -113,7 +113,7 @@ class MarkPriceMarketTests(unittest.TestCase):
             api.responses[BBO] = {"symbol": SYMBOL, "bidPrice": "100", "askPrice": "101",
                                   "bidQty": "2", "askQty": "2", "time": 100000}
             market.book(SYMBOL)
-            self.assertEqual([call[1] for call in api.calls], [PREMIUM, PREMIUM, PREMIUM, BBO])
+            self.assertEqual([call[1] for call in api.calls], [PREMIUM, PREMIUM, BBO])
 
     def test_slow_rest_does_not_receive_a_new_full_cache_second(self):
         market, api, _ = market_fixture()

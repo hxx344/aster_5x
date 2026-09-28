@@ -52,7 +52,7 @@ class EngineRequestBudgetTests(unittest.TestCase):
                      patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("no higher capacity")):
                     self.engine.tick_account("test")
                 self.assertIsNone(self.f.store.intent("test"))
-                self.assertIn("低于 5x", self.engine.state()["accounts"][0]["strategies"]["XAUUSD1"]["reason"])
+                self.assertIn("低于普通开仓最低 5x", self.engine.state()["accounts"][0]["strategies"]["XAUUSD1"]["reason"])
 
     def test_zero_fill_cooldown_survives_restart_and_does_not_resubmit(self):
         with patch.object(self.f.broker, "submit", side_effect=self.expire) as send, \

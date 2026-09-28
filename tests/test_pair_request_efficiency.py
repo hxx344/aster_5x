@@ -41,8 +41,8 @@ class PairRequestEfficiencyTests(TestCase):
                 ticks += 2
             self.assertEqual(self.read_count(), 20)  # Ten rounds, not thirty.
             self.assertEqual(sum(path == fixtures.DUAL for b in self.brokers.values()
-                                 for _, path, _ in b.api.calls), 8)
-            self.assertEqual(used, 1063)
+                                 for _, path, _ in b.api.calls), 2)
+            self.assertEqual(used, 883)  # Includes two initial independent mode checks.
             self.assertLess(used, self.budget.snapshot()["execution_limit"])
             self.assertTrue(all(method == "GET" for b in self.brokers.values() for method, _, _ in b.api.calls))
 
@@ -73,7 +73,10 @@ class PairRequestEfficiencyTests(TestCase):
         self.trader.tick(self.pair)
         self.assertEqual(self.read_count(), 4)
         self.store.put("pair_margin:gold", {"pending": {"status": "unknown"}})
-        self.trader.tick(self.pair)
+        self.assertEqual(self.trader.tick(self.pair)["phase"], "margin_wait")
+        self.assertEqual(self.read_count(), 4)  # Reconciliation has no snapshot consumer.
+        self.store.put("pair_margin:gold", {})
+        self.trader.tick(self.pair)  # The old negative observation was revoked.
         self.assertEqual(self.read_count(), 6)
 
     def test_skipping_private_read_keeps_existing_margin_block_visible(self):

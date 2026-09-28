@@ -148,7 +148,7 @@ class SharedQuoteTests(unittest.TestCase):
         first = self.market.book(SYMBOL)
         self.now = 100.999
         for _ in range(8):
-            self.assertIs(self.market.book(SYMBOL), first)
+            self.assertEqual(self.market.book(SYMBOL), first)
         self.assertEqual(len(self.api.calls), 2)
         self.now = 101
         self.market.book(SYMBOL)
@@ -198,7 +198,7 @@ class SharedQuoteTests(unittest.TestCase):
             release.set()
             quotes = [future.result(2) for future in futures]
         self.assertEqual(len(self.api.calls), 2)
-        self.assertTrue(all(quote is quotes[0] for quote in quotes))
+        self.assertTrue(all(quote == quotes[0] for quote in quotes))
 
 
 class BudgetWaitDisplayTests(unittest.TestCase):

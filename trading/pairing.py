@@ -207,9 +207,9 @@ class PairManager:
         runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
         margin = self.store.get("pair_margin:" + pair["id"]) or {}
         if runtime.get("pending") or has_cycle_quantity(runtime):
-            raise TradingError("配对组仍在核对订单或减回本轮循环持仓")
+            raise TradingError("配对组仍在核对订单或减回本轮循环持仓，暂不能启动、修改设置、核对空仓或删除；请查看配对组当前执行状态")
         if margin.get("pending") or margin.get("status") in ("submitting", "accepted", "unknown"):
-            raise TradingError("保证金划转结果尚未核实")
+            raise TradingError("保证金划转结果尚未核实，暂不能启动、修改设置、核对空仓或删除；请查看保证金平衡中的核对状态")
         if require_flat and any(dec(qty) for qty in (runtime.get("owned") or {}).values()):
             raise TradingError("配对组仍有普通策略底仓，完全平仓并核对后才能解除绑定")
         return runtime
@@ -256,7 +256,7 @@ class PairManager:
                 pair.pop("pause_reason", None)
                 runtime = self.store.get("pair_runtime:" + pair_id) or {}
                 if runtime.pop("attention", None) is not None:
-                    runtime.update(phase="waiting", reason="成员持仓及身份已重新核实", updated_at=time.time())
+                    runtime.update(phase="waiting", reason="成员持仓及身份已重新核实，系统将按当前设置继续检查执行条件", updated_at=time.time())
                 else:
                     runtime = None
             pair["enabled"] = enabled
@@ -264,7 +264,7 @@ class PairManager:
                 saved = self.store.save_pair(pair)
                 if runtime is not None:
                     self.store.put("pair_runtime:" + pair_id, runtime)
-            self.store.event(pair_id, "pair", "配对组已启动" if enabled else "配对组已暂停；已提交订单继续核对，循环新增仓位继续减回")
+            self.store.event(pair_id, "pair", "配对组已启动，系统开始检查所选策略和保证金条件" if enabled else "配对组已暂停，停止新开仓和新划转；已提交订单及划转继续核对，循环新增仓位继续减回，普通底仓保留")
             self._changed(saved)
             return saved
 
@@ -324,7 +324,8 @@ class PairManager:
         rows = []
         for pair in reader.pairs():
             runtime = reader.get("pair_runtime:" + pair["id"]) or {}
-            state = {"phase": "waiting" if pair["enabled"] else "paused", "reason": pair.get("pause_reason") or "等待配对组检查",
+            state = {"phase": "waiting" if pair["enabled"] else "paused",
+                     "reason": pair.get("pause_reason") or ("等待系统首次检查两侧账户与策略条件" if pair["enabled"] else "配对组已暂停；核对设置后需点击启动"),
                      "updated_at": None, "snapshots": {}, "progress": None, "pending": None, **runtime}
             state["margin"] = MarginBalancer.status_view(pair,
                 reader.get("pair_margin:" + pair["id"], {}), state.get("margin"))
@@ -356,7 +357,7 @@ class PairManager:
             except (TradingError, KeyError, ValueError, TypeError) as exc:
                 runtime = self.store.get("pair_runtime:" + pair_id) or {}
                 runtime.update(phase="attention" if isinstance(exc, AccountModeError) else "waiting",
-                               reason=str(exc) if isinstance(exc, TradingError) else "配对数据暂不可用，等待核对", updated_at=time.time())
+                               reason=str(exc) if isinstance(exc, TradingError) else "配对数据暂不可用，系统将重新读取；若持续出现，请检查服务器日志", updated_at=time.time())
                 self.store.put("pair_runtime:" + pair_id, runtime)
                 if isinstance(exc, AccountModeError) and pair["enabled"]:
                     self.store.save_pair({**pair, "enabled": False, "pause_reason": str(exc)})

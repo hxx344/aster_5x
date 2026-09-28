@@ -453,7 +453,7 @@ export const PAIR_PHASES: Record<string, string> = {
   error: '执行异常',
   blocked: '条件阻止执行',
   daily_limit: '等待日额度',
-  monitoring: '保证金监控中',
+  monitoring: '保证金管理中',
   unknown: '结果未知 · 继续查询',
   accepted: '请求已受理 · 等待确认',
   cooldown: '划转冷却中',
@@ -462,7 +462,7 @@ export const PAIR_PHASES: Record<string, string> = {
   refreshed: '交易所回执确认，余额已刷新',
   paper_confirmed: '模拟划转已确认',
   rejected: '划转被拒绝',
-  margin_wait: '等待划转核对',
+  margin_wait: '保证金检查阻止新增',
   submitting: '并行提交两侧市价单',
   leverage: '共同升杠杆核对',
 };
@@ -471,6 +471,7 @@ export function pairPhaseLabel(phase?: string): string {
 }
 
 export function pairTransferStatus(transfer: PairTransfer): string {
+  if (transfer.status === 'submitting') return '划转请求提交中 · 等待回执';
   if (
     transfer.status === 'acknowledged' &&
     typeof transfer.refreshed_at === 'number' &&
@@ -482,6 +483,7 @@ export function pairTransferStatus(transfer: PairTransfer): string {
 }
 
 export function pairMarginStatus(margin?: PairMarginState): string {
+  if (margin?.status === 'submitting') return '划转请求提交中 · 等待回执';
   if (
     margin?.status === 'acknowledged' &&
     !margin.pending &&

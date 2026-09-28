@@ -157,7 +157,7 @@ export function CycleTradesPanel({
                         本笔已计成本 · USD1
                       </span>
                       <strong>{cost.total}</strong>
-                      <small>手续费 {cost.fee}</small>
+                      <small>估算手续费 {cost.fee}</small>
                       <small>本笔计入差价 {cost.spread}</small>
                       {cost.notice ? (
                         <small className="amber">{cost.notice}</small>
@@ -181,7 +181,8 @@ export function CycleTradesPanel({
       <p className="cycle-trades-note">
         最多展示最近 100 条；按 UTC
         日期筛选当前已加载记录。当日累计由交易服务按成交顺序记录，包含开仓、平仓和修复成交，不含手续费。旧记录未提供的金额显示“—”。
-        成本中的手续费按成交金额的 0.0125% 计；同批买卖数量按成交先后配对，
+        成本中的手续费按固定费率 0.0125%
+        估算，并非交易所实际扣费；同批买卖数量按成交先后配对，
         差价只记在较晚成交一笔，负数抵减成本。未配对成交只先计手续费，成本尚未完整。
       </p>
     </section>

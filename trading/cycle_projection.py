@@ -25,7 +25,7 @@ def project_cycle_state(account, saved, current_cycle, pending, daily, rolling, 
         cycle.update(phase="disabled", reason="多空循环未启用", active_batch=None)
     elif not account["enabled"]:
         cycle.update(phase="attention" if account.get("pause_reason") else "paused",
-                     reason=account.get("pause_reason") or "循环已暂停，已有仓位和计时保留", active_batch=None)
+                     reason=account.get("pause_reason") or "循环已暂停，已有仓位保留；暂停期间持仓时长继续累计，恢复后重新检查平仓条件", active_batch=None)
     else:
         cycle.setdefault("phase", "waiting_open")
         cycle.setdefault("reason", "等待多空循环检查")

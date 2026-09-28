@@ -8,6 +8,7 @@ import type { FeatureProps } from '@/lib/desk-types';
 import { draftFields, useAccountDraft } from '@/lib/use-account-draft';
 import { Switch } from '@/components/ui/switch';
 import { fmt } from '@/lib/desk-format';
+import { formatCount } from '@/lib/number-format';
 import { accountConfigurationLock } from '@/lib/account-config';
 import { migrationStatus, type MigrationDraft } from '@/lib/migration';
 import {
@@ -86,7 +87,7 @@ export function MigrationPanel({
               )
             ) {
               clearDraft();
-              setNotice('迁移已停止，账户保持暂停');
+              setNotice('已停止新增迁移批次并暂停账户；已提交批次继续核对。');
             }
           }}
         >
@@ -104,15 +105,15 @@ export function MigrationPanel({
         </div>
         <div>
           <dt>已完成批次</dt>
-          <dd>{migration?.completed_batches ?? 0}</dd>
+          <dd>{formatCount(migration?.completed_batches)}</dd>
         </div>
         <div>
           <dt>单批每边上限 · USD1</dt>
-          <dd>{account.migration?.batch_notional ?? '1000'}</dd>
+          <dd>{account.migration?.batch_notional ?? '—'}</dd>
         </div>
         <div>
           <dt>目标价差上限</dt>
-          <dd>{account.migration?.spread_limit_bp ?? '5'} bp</dd>
+          <dd>{account.migration?.spread_limit_bp ?? '—'} bp</dd>
         </div>
       </dl>
       {configurationLock ? (
@@ -187,8 +188,8 @@ export function MigrationPanel({
           </div>
         </dl>
         <p className="migration-footnote">
-          已完成 {migration?.completed_batches ?? 0} 批 · 金额差为目标开仓减去
-          XAU 平仓，按多空分别累计。
+          已完成 {formatCount(migration?.completed_batches)} 批 ·
+          金额差为目标开仓减去 XAU 平仓，按多空分别累计。
         </p>
       </details>
       <details className="disclosure inset">

@@ -183,11 +183,11 @@ class RateBudget:
         else:
             limit = self.limit if critical else self._execution_limit()
         if self.weight + weight > limit:
-            message = "本地请求预算已用完" if critical else "本地普通请求预算不足，已为订单核对和补偿保留额度"
+            message = "本地 API 请求权重预算不足" if critical else "本地普通 API 请求权重预算不足，已为订单核对和补偿保留请求权重"
             if not critical and not monitoring and self.capacity_reserve:
-                message = "本地执行请求预算不足，已为额度监控、订单核对和补偿保留额度"
+                message = "本地执行 API 请求权重预算不足，已为市场额度监控、订单核对和补偿保留请求权重"
             reported = "未返回" if self.reported_weight is None else str(self.reported_weight)
-            message += f"（估算已用 {self.weight}/{limit}，本轮需 {weight}；本进程计入 {self.local_weight}，Aster 同 IP 回报 {reported}）"
+            message += f"（估算已用权重/本类请求上限 {self.weight}/{limit}，本次需权重 {weight}；本进程计入 {self.local_weight} 权重，Aster 同 IP 回报已用权重 {reported}）"
             raise BudgetWait(message, retry_after=max(0.0, self.deadline - now))
 
     @staticmethod

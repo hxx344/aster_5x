@@ -117,7 +117,7 @@ export function CycleRecovery({
         onClick={() => void readPositions()}
       >
         <CheckCheck size={16} />
-        已核对
+        核对循环持仓
       </Button>
       <Dialog
         open={open}
@@ -201,7 +201,7 @@ export function CycleRecovery({
               disabled={!review || loading || disabled}
               onClick={() => void confirm()}
             >
-              {loading && review ? '正在确认…' : '确认已核对'}
+              {loading && review ? '正在确认…' : '保留现有仓位并结束本轮跟踪'}
             </Button>
           </DialogFooter>
         </DialogContent>

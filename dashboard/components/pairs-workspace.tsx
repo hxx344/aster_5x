@@ -91,7 +91,7 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
               <SelectContent>
                 {items.map((item) => (
                   <SelectItem key={item.id} value={item.id}>
-                    {item.name} · {item.enabled ? '运行中' : '已暂停'}
+                    {item.name} · {item.enabled ? '执行已启用' : '执行已暂停'}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -172,7 +172,7 @@ function CreatePair({
         <DialogHeader>
           <DialogTitle>新建配对组</DialogTitle>
           <DialogDescription>
-            选择两个已暂停的子账户。保存后需单独启动。
+            选择同一主账户下两个已暂停、完全空仓且无挂单的子账户。创建后需单独启动。
           </DialogDescription>
         </DialogHeader>
         {error || connectionError ? (
@@ -244,7 +244,7 @@ function PairDetail({
     ? '普通市价共同开仓'
     : pair.cycle.enabled
       ? '两子账户多空循环'
-      : '仅保证金监控';
+      : '保证金管理（不开仓）';
   const progress =
     pair.cycle.enabled ||
     Object.values(pair.state?.progress?.quantities ?? {}).some(
@@ -259,7 +259,7 @@ function PairDetail({
   const dayVolume = pair.state?.daily_volume?.[utcDate];
   const lastBatch = pair.state?.last_batch;
   const startBlock = pair.enabled
-    ? '配对组已运行'
+    ? '配对组执行已启用；实际进度见下方状态'
     : !ready
       ? '等待服务就绪'
       : draft.dirty
@@ -278,7 +278,7 @@ function PairDetail({
                 className={`run-indicator ${pair.enabled ? 'mint' : 'muted'}`}
               >
                 <i />
-                {pair.enabled ? '配对组运行中' : '配对组已暂停'}
+                {pair.enabled ? '配对组执行已启用' : '配对组执行已暂停'}
               </span>
             </h2>
             <p className="muted">
@@ -290,7 +290,7 @@ function PairDetail({
                   : '环境待确认'}{' '}
               ·{' '}
               {pair.margin.enabled
-                ? '自动保证金平衡已配置'
+                ? '自动保证金平衡已配置，组启用后可按条件划转'
                 : '自动保证金平衡未开启'}
             </p>
           </div>
@@ -391,12 +391,18 @@ function PairDetail({
           </div>
           <div>
             <dt>本轮循环状态</dt>
-            <dd>{progress ? pairPhaseLabel(progress.phase) : '无活动循环'}</dd>
+            <dd>
+              {progress
+                ? pairPhaseLabel(progress.phase)
+                : pair.state
+                  ? '无活动循环'
+                  : '循环状态尚未提供'}
+            </dd>
             <small>
               {progress?.opened_at
                 ? `开仓确认 ${clock(progress.opened_at)}`
                 : pair.cycle.enabled
-                  ? '等待本轮开仓确认'
+                  ? '尚无本轮开仓确认记录，执行进度见上方状态'
                   : '普通底仓不参与循环减回'}
             </small>
           </div>
@@ -446,7 +452,7 @@ function PairDetail({
             <dt>最近批次</dt>
             <dd>
               {lastBatch
-                ? `${lastBatch.kind === 'cycle' ? '循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.completed ? '完成' : '未完成 / 已恢复'} · ${clock(lastBatch.at)}`
+                ? `${lastBatch.kind === 'cycle' ? '循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.completed ? '成交与持仓已核实' : '未完整成交，已减回本批基线'} · ${clock(lastBatch.at)}`
                 : '暂无记录'}
             </dd>
           </div>
@@ -497,7 +503,7 @@ function PairDetail({
               {pairTransferStatus(margin.pending)}：
               <TransferSummary transfer={margin.pending} />
               {margin.pending.status === 'acknowledged'
-                ? '。仅读重试两侧余额刷新，不重新划转或开始新开仓。'
+                ? '。继续读取两侧余额，刷新完成前不重新划转或开始新开仓。'
                 : '。只读核对，缺少可靠结果时保留待确认状态，不重新划转或开始新开仓。'}
             </p>
           ) : null}
@@ -754,7 +760,9 @@ function PairSide({
         ) : null}
         {snapshot && !snapshot.mode_checks?.hedge ? (
           <p className="amber">
-            Hedge Mode 尚未通过核验，程序不会自动切换账户模式。
+            {snapshot.mode_checks?.hedge === false
+              ? '最近快照未通过双向持仓模式（Hedge Mode）核验。请在交易所调整后重新核对，程序不会自动切换。'
+              : '双向持仓模式（Hedge Mode）结果尚未提供，等待账户核验；程序不会自动切换。'}
           </p>
         ) : null}
       </div>

@@ -10,10 +10,25 @@ import {
   pairHasPending,
   pairMarginStatus,
   pairNetQuantity,
+  pairPhaseLabel,
   pairSnapshotStatus,
   pairTransferStatus,
   parsePairDraft,
 } from '../lib/pairs.ts';
+
+test('transfer submission is distinct from order submission and margin checks need no pending transfer', () => {
+  assert.equal(pairPhaseLabel('submitting'), '并行提交两侧市价单');
+  assert.equal(
+    pairTransferStatus({ status: 'submitting' }),
+    '划转请求提交中 · 等待回执',
+  );
+  assert.equal(
+    pairMarginStatus({ status: 'submitting' }),
+    '划转请求提交中 · 等待回执',
+  );
+  assert.equal(pairPhaseLabel('margin_wait'), '保证金检查阻止新增');
+  assert.equal(pairHasPending({ state: { phase: 'margin_wait' } }), false);
+});
 
 const accounts = [
   { id: 'a', name: 'A', mode: 'paper', enabled: false },

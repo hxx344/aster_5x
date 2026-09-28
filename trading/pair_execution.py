@@ -24,7 +24,7 @@ def empty_progress(owned=None, completed=0):
 
 
 def runtime_default():
-    return {"phase": "paused", "reason": "配对组尚未启动", "owned": {"LONG": "0", "SHORT": "0"},
+    return {"phase": "paused", "reason": "配对组尚未启动；核对两侧账户及策略设置后，点击启动才开始执行", "owned": {"LONG": "0", "SHORT": "0"},
             "progress": empty_progress(), "pending": None, "snapshots": {}, "daily_volume": {}}
 
 
@@ -174,7 +174,7 @@ class PairTrader:
             margin_state = self.store.get("pair_margin:" + pair["id"]) or {}
             margin_pending = margin_state.get("pending")
             if not pair["enabled"] and not holding and not margin_pending:
-                state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停")
+                state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
             if not holding and not margin_pending:
                 reason = self._ordinary_wait(pair, state, identities, margin_state)
@@ -206,13 +206,13 @@ class PairTrader:
                 state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
                 return state
             if not pair["enabled"] and not holding:
-                state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停")
+                state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
             if state.get("attention") and not holding:
                 state.update(phase="attention", reason=state["attention"])
                 return state
             if not holding and time.time() < state.get("retry_at", 0):
-                state.update(phase="waiting", reason="上批未完整成交，风险恢复完成后等待退避时间，避免反复产生费用")
+                state.update(phase="waiting", reason="上批未完整成交，已减回原始基线；当前处于开仓冷却期，结束后系统重新检查开仓条件")
                 return state
             book = self.engine.cycle_book(SYMBOL) if pair["cycle"]["enabled"] or holding else self.market.book(SYMBOL)
             rule = self.market.rules[SYMBOL]
@@ -234,7 +234,9 @@ class PairTrader:
                     plan = plan_ordinary(pair, snapshots, book, rule, capacities)
                     self._start(pair, state, brokers, snapshots, guards, plan, kind="ordinary")
             else:
-                state.update(phase="monitoring", reason="仅监控保证金，未启用开仓模式")
+                state.update(phase="monitoring", reason="未启用开仓模式，仅管理保证金；"
+                             + ("自动平衡已开启，满足余额差额及安全可划条件时会划转"
+                                if pair["margin"]["enabled"] else "自动平衡未开启，不发起新划转"))
         except PairPositionError as exc:
             state.update(phase="attention", reason=str(exc), attention=str(exc))
         except TradingError as exc:
@@ -252,7 +254,7 @@ class PairTrader:
         if not limit:
             return None
         if state.get("volume_unknown"):
-            raise TradingError("配对组成交金额尚未核实，暂停新的日额度开仓")
+            raise TradingError("配对组成交时间或金额尚未核实，当日剩余成交额度无法确认；暂停新循环开仓，已有本轮仓位仍可减回")
         date = datetime.now(timezone.utc).date().isoformat()
         used = state.get("daily_volume", {}).get(date, {})
         return {key: wire(max(dec(0), limit - dec(used.get(key, "0")))) for key, _ in SIDES}
@@ -384,7 +386,7 @@ class PairTrader:
         if pending["kind"] == "leverage":
             return self._recover_leverage(pair, state, brokers)
         if not self._query(pair, state, brokers):
-            state.update(phase="reconciling", reason="至少一条市价单结果未确定，禁止重发、新开仓及划转")
+            state.update(phase="reconciling", reason="至少一条市价单结果未确定，系统按原订单编号继续查询；禁止重发、新开仓及划转")
             return
         snapshots, guards = self._read(brokers, reconciliation=True)
         self._publish_snapshots(state, snapshots)
@@ -396,7 +398,7 @@ class PairTrader:
             adding = (order["positionSide"] == "LONG") == (order["side"] == "BUY")
             expected[order["positionSide"]] += dec(row["executedQty"]) * (1 if adding else -1)
         if actual != expected or any(pos.leverage != pending["leverage"] for pos in held.values()):
-            raise PairPositionError("成交回执与两子账户实际仓位或杠杆不一致，保留批次等待核对")
+            raise PairPositionError("成交回执与两子账户实际仓位或杠杆不一致，保留批次并停止新增；请人工核对交易所成交与持仓")
         original_full = all(leg["receipt"]["status"] == "FILLED" for leg in pending["legs"])
         if pending["phase"] == "open" and original_full and not pending["repairs"]:
             limit = cycle_margin_limit(pair["ordinary"]) if pending["kind"] == "cycle" else opening_margin_limit(pair["ordinary"], pending["leverage"])
@@ -405,16 +407,16 @@ class PairTrader:
                 pending["last_error"] = "成交后子账户保证金超限，撤回本批新增量"
         desired = pending["target"] if pending["phase"] == "close" or original_full and not pending["repairs"] else pending["before"]
         if any(actual[side] < dec(desired[side]) for _, side in SIDES):
-            raise PairPositionError("实际仓位低于恢复目标，禁止通过反向加仓修复")
+            raise PairPositionError("实际仓位低于恢复目标，禁止通过反向加仓修复；请人工核对两侧实际仓位与本批成交")
         if all(actual[side] == dec(desired[side]) for _, side in SIDES):
             with self._confirmed(pair, brokers, guards):
                 self._finish(pair, state, pending, completed=original_full and not pending["repairs"]
                              or pending["phase"] == "close")
             return
         if pending["repair_attempts"] >= 3:
-            raise PairPositionError("减仓恢复已尝试三次，仍有本批残余仓位，请核对")
+            raise PairPositionError("减仓恢复已尝试三次，仍有本批残余仓位；系统停止继续自动减仓，请人工核对两侧持仓与成交")
         if time.time() < pending.get("repair_retry_at", 0):
-            state.update(phase="repairing", reason="本地请求预算不足，等待后重试尚未发送的减仓")
+            state.update(phase="repairing", reason="本地请求预算不足，系统等待预算恢复后重试尚未发送的减仓；已发送订单只查询原编号")
             return
         repairs = []
         rule = self.market.rules[SYMBOL]
@@ -428,7 +430,7 @@ class PairTrader:
             repairs.append({"key": key, "order": order, "receipt": None, "dispatch": "prepared"})
         pending["repair_attempts"] += 1
         pending["repairs"].extend(repairs)
-        state.update(phase="repairing", reason="只减仓恢复本轮基线，不追加另一腿")
+        state.update(phase="repairing", reason="系统正在按本批记录的恢复目标继续减仓；不追加另一腿")
         self._save(pair, state)
         self._config_guard(pair, pending["identities"], opening=False)
         self._dispatch(pair, state, brokers, repairs, guards=guards, reconciliation=True)
@@ -522,7 +524,8 @@ class PairTrader:
         pending = {"id": uuid.uuid4().hex, "kind": "leverage", "identities": deepcopy(state["identities"]),
                    "created_at": time.time(), "before": self._expected(state), "target_leverage": target,
                    "previous_leverage": positions(snapshots)["LONG"].leverage, "results": {}}
-        state.update(pending=pending, phase="leverage", reason=f"两个子账户共同升至 {target}x，确认前不下单")
+        state.update(pending=pending, phase="leverage",
+                     reason=f"系统正在将两个子账户从 {pending['previous_leverage']}x 共同升至 {target}x；两侧实际杠杆确认前不下单")
         self._save(pair, state)
         def send(key):
             broker = brokers[key]
@@ -540,7 +543,7 @@ class PairTrader:
             except (RequestNotSent, LeverageRejected) as exc:
                 return {"rejected": True, "reason": str(exc)}
             except Exception:
-                return {"unknown": True, "reason": "杠杆请求结果未知，等待实际设置核对"}
+                return {"unknown": True, "reason": "杠杆请求结果未知，系统继续读取两侧实际杠杆；不重发原请求"}
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-leverage") as pool:
             futures = {key: pool.submit(send, key) for key, _ in SIDES}
             for key, future in futures.items():
@@ -555,10 +558,11 @@ class PairTrader:
         held = require_quantities(snapshots, pending["before"], equal_leverage=False)
         with self._confirmed(pair, brokers, guards):
             if all(p.leverage == pending["target_leverage"] for p in held.values()):
-                state.update(pending=None, phase="waiting", reason=f"两子账户均已确认 {pending['target_leverage']}x")
+                state.update(pending=None, phase="waiting", reason=f"两子账户实际杠杆均已确认 {pending['target_leverage']}x；系统下一轮重新检查额度、余额、价差及风险条件后才开仓")
             elif (all(p.leverage == pending["previous_leverage"] for p in held.values())
                   and all(pending["results"].get(key, {}).get("rejected") for key, _ in SIDES)):
-                state.update(pending=None, phase="waiting", reason="两个升杠杆请求均被明确拒绝，稍后重新评估")
+                state.update(pending=None, phase="waiting", reason=f"两个升杠杆请求均被明确拒绝，实际仍为 {pending['previous_leverage']}x；系统稍后重新评估升档条件")
             else:
-                state.update(phase="reconciling", reason="两子账户升杠杆结果未一致，保留意图且禁止新订单或划转")
+                state.update(phase="reconciling",
+                    reason=f"两子账户升杠杆尚未共同确认至 {pending['target_leverage']}x：做多账户 {held['LONG'].leverage}x、做空账户 {held['SHORT'].leverage}x；系统继续读取实际设置，不重发原请求，禁止新订单或划转")
             self._save(pair, state)

@@ -91,7 +91,7 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
                     self.engine.tick_account("test")
                     state = self.engine.views["test"]
                     self.assertEqual(state["status"], "waiting")
-                    self.assertEqual(state["cycle_state"]["diagnostic"]["checks"][0]["label"], "20x 公共剩余额度")
+                    self.assertEqual(state["cycle_state"]["diagnostic"]["checks"][0]["label"], "20x 公开可用额度")
                     self.assertEqual(self.f.store.get("cycle:test")["phase"], "waiting_open")
             submit.assert_not_called()
             ordinary_leverage.assert_not_called()

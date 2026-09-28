@@ -30,7 +30,8 @@ const categories: {
   {
     key: 'strategy_capacity_alerts',
     title: '策略额度达标',
-    description: 'XAU / SPCX / CL 的 5x、10x、20x 额度超过账户所设阈值时提醒。',
+    description:
+      'XAU / SPCX / CL 的 5x、10x、20x 公开额度超过账户所设门槛时提醒；提醒不代表账户满足开仓条件。',
   },
   {
     key: 'listing_capacity_alerts',
@@ -125,10 +126,12 @@ export function MonitoringPanel({
         <div className="section-head">
           <div>
             <h2>监控与告警</h2>
-            <p>所有账户共用 · 修改即保存 · 关闭网页后仍按设置运行</p>
+            <p>
+              所有账户共用 · 修改即保存 · 服务器运行期间，关闭网页后仍按设置运行
+            </p>
           </div>
           <output className="small-note">
-            {pending ? '保存中…' : `${active} 个币种采样中`}
+            {pending ? '保存中…' : `${active} 个币种已纳入采样计划`}
           </output>
         </div>
         <div className="monitor-master-grid">
@@ -228,7 +231,7 @@ export function MonitoringPanel({
                 <TableHead>独立监控</TableHead>
                 <TableHead>飞书告警</TableHead>
                 <TableHead>最大杠杆额度 &gt; 0</TableHead>
-                <TableHead>实际采样状态</TableHead>
+                <TableHead>采样安排</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -283,9 +286,9 @@ export function MonitoringPanel({
                   <TableCell>
                     <span className={row.effective_monitor ? 'mint' : 'muted'}>
                       {row.required_by.length
-                        ? '交易需要，继续采样'
+                        ? '交易需要，保留采样'
                         : row.effective_monitor && row.status === 'TRADING'
-                          ? '独立监控中'
+                          ? '独立采样已启用'
                           : row.status !== 'TRADING' && row.effective_monitor
                             ? '等待恢复交易'
                             : '已停止独立采样'}
@@ -322,7 +325,8 @@ export function MonitoringPanel({
           </Table>
         </div>
         <p className="monitor-status">
-          关闭监控不会关闭账户或平仓。公共行情连接及账户核对按交易需求保留；已发出的飞书请求无法撤回。
+          此处显示采样安排；采样是否成功及数据时间请查看「普通开仓」或「USD1
+          上新」。关闭监控不会关闭账户或平仓。公共行情连接及账户核对按交易需求保留；已发出的飞书请求无法撤回。
         </p>
       </section>
     </div>

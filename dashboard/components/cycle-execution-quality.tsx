@@ -37,7 +37,7 @@ export function CycleExecutionQualityPanel({
           </p>
           {stale ? (
             <p className="cycle-quality-notice amber">
-              状态同步中断，以下为最近记录。
+              状态数据已过期或连接异常，以下为最近记录。
             </p>
           ) : null}
           <table className="cycle-quality-comparison">

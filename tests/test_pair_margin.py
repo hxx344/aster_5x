@@ -260,6 +260,38 @@ class PairMarginTests(unittest.TestCase):
         self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
         self.assertEqual(self.transfers, [])
 
+    def test_no_transfer_reason_distinguishes_exact_threshold_and_rounded_minimum(self):
+        cases = [
+            ("110", "10", "未超过划转门槛 10 USD1（须严格大于）"),
+            ("101.999999999999999999999999999999", "0", "向下取整为 0.99999999 USD1，低于最小划转额 1 USD1"),
+        ]
+        for available, threshold, expected in cases:
+            with self.subTest(available=available, threshold=threshold):
+                self.ready()
+                self.pair["margin"]["threshold"] = threshold
+                snapshots = {"long": snapshot(100), "short": snapshot(100)}
+                snapshots["long"].available = dec(available)
+                with patch.object(self.balancer, "_plan", side_effect=AssertionError("rejected precheck must not plan")), \
+                        patch.object(self.balancer, "_master", side_effect=AssertionError("display must not read accounts")):
+                    result = self.balancer.tick(self.pair, snapshots)
+                self.assertEqual(result["status"], "waiting", result)
+                self.assertFalse(result["blocks_trading"])
+                self.assertIn(expected, result["reason"])
+                self.assertIsNone(result["pending"])
+
+    def test_no_transfer_reason_keeps_combined_safety_constraints_after_plan(self):
+        snapshots = self.snapshots()
+        snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(15000), dec(15000), 10)]
+        before = {side: self.store.get("paper:" + side)["wallet"] for side in self.members}
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "waiting", result)
+        self.assertIn("两侧可用余额差 2000 USD1", result["reason"])
+        self.assertIn("共同约束", result["reason"])
+        self.assertIn("低于最小划转额 1 USD1", result["reason"])
+        self.assertFalse(result["blocks_trading"])
+        self.assertIsNone(result["pending"])
+        self.assertEqual(before, {side: self.store.get("paper:" + side)["wallet"] for side in self.members})
+
     def test_minimum_candidate_runs_complete_live_validation_after_skipped_check(self):
         snapshots = self.live()
         self.pair["margin"].update(threshold="0", buffer_ratio="0")

@@ -85,7 +85,7 @@ export function ListingsPanel({
             listings?.discovery_enabled === false
               ? '目录扫描已暂停'
               : `每 ${listings?.poll_seconds ?? 60} 秒检查永续交易对`}{' '}
-            · 关闭网页后继续监控
+            · 服务器运行期间按已保存设置扫描
           </p>
         </div>
         <span className="small-note">{rows.length} 个交易对</span>
@@ -96,7 +96,8 @@ export function ListingsPanel({
           = 该最大杠杆的公开剩余额度与档位上限的较小值，单位 USD1。
         </p>
         <p>
-          勾选即保存。最大杠杆可用额度 &gt; 0
+          勾选即保存；监控、飞书总开关、该通知类型及币种告警均开启后，最大杠杆公开可用额度
+          &gt; 0
           时提醒一次，持续有额度不重复；归零后恢复、最大杠杆变化或重新勾选时再次提醒。无需启动账户。
         </p>
         <p className={notification?.error ? 'amber' : 'muted'}>

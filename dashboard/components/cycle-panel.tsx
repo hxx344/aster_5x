@@ -14,6 +14,7 @@ import {
   type CycleSettingsProps,
 } from '@/components/cycle-settings';
 import { CycleVolumeSummary } from '@/components/cycle-volume-summary';
+import { formatCount } from '@/lib/number-format';
 const dateTime = (value?: number) =>
   value && Number.isFinite(value)
     ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false })
@@ -108,11 +109,16 @@ export function CyclePanel(props: Props) {
             <div>
               <dt>已完成循环</dt>
               <dd>
-                {state?.completed_cycles ?? 0}
+                {formatCount(state?.completed_cycles)}
                 <span> 轮</span>
               </dd>
               <small>
-                当前轮次：{ownedPosition ? '有新增仓位' : '无新增仓位'}
+                当前轮次：
+                {!state?.quantities?.LONG || !state?.quantities?.SHORT
+                  ? '新增仓位数据尚未提供'
+                  : ownedPosition
+                    ? '有新增仓位'
+                    : '无新增仓位'}
               </small>
             </div>
           </dl>
@@ -137,7 +143,7 @@ export function CyclePanel(props: Props) {
               </div>
               <div>
                 <dt>已完成循环</dt>
-                <dd>{state?.completed_cycles ?? 0} 轮</dd>
+                <dd>{formatCount(state?.completed_cycles)} 轮</dd>
               </div>
               <div>
                 <dt>本轮新增多头数量</dt>

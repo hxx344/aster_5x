@@ -113,7 +113,7 @@ export function PairSettings({
           value={draft.mode}
           display={
             {
-              monitor: '仅保证金监控',
+              monitor: '保证金管理（不开仓）',
               ordinary: '普通市价共同开仓',
               cycle: '两子账户多空循环',
             }[draft.mode]
@@ -121,7 +121,7 @@ export function PairSettings({
           disabled={locked}
           onValueChange={(value) => field('mode', value as PairDraft['mode'])}
           items={[
-            ['monitor', '仅保证金监控'],
+            ['monitor', '保证金管理（不开仓）'],
             ['ordinary', '普通市价共同开仓'],
             ['cycle', '两子账户多空循环'],
           ]}
@@ -132,15 +132,19 @@ export function PairSettings({
           <legend>普通开仓</legend>
           <ConfigurationField
             id={`${formId}-pair-threshold`}
-            label="公共额度门槛"
+            label="公开额度门槛"
             unit="USD1"
             max="1000000000"
             {...textField('threshold')}
             disabled={locked}
-          />
+          >
+            <small>
+              当前杠杆的市场公开额度须严格大于此值；两侧账户余量和保证金分别核验。
+            </small>
+          </ConfigurationField>
           <ConfigurationField
             id={`${formId}-pair-order`}
-            label="每侧单批名义金额"
+            label="每侧单批名义金额上限"
             unit="USD1"
             min="500"
             max="1000000"
@@ -158,10 +162,16 @@ export function PairSettings({
             ]}
             {...textField('min_open_leverage')}
             disabled={locked}
-          />
+          >
+            <small>
+              这是普通新增开仓的最低门槛，不会在保存时修改交易所杠杆。组启用后，程序在更高的
+              5x / 10x / 20x
+              档位公开额度超过门槛、两侧持仓及账户检查通过时尝试共同升杠杆；确认两侧一致后再检查开仓条件。
+            </small>
+          </ConfigurationField>
           <ConfigurationField
             id={`${formId}-pair-spread`}
-            label="最优买卖价差比例"
+            label="最优买卖价差比例上限"
             max="0.0005"
             {...textField('spread_limit')}
             disabled={locked}
@@ -204,7 +214,7 @@ export function PairSettings({
           />
           <ConfigurationField
             id={`${formId}-pair-cycle-multiplier`}
-            label="公共额度倍数"
+            label="公开额度门槛倍数"
             {...cycleField('capacity_multiplier')}
             disabled={locked}
           />
@@ -241,11 +251,15 @@ export function PairSettings({
           />
           <ConfigurationField
             id={`${formId}-pair-cycle-daily`}
-            label="UTC 每日成交额度"
+            label="每侧 UTC 当日成交量上限"
             unit="USD1 · 0 为不限制"
             {...cycleField('daily_volume_limit')}
             disabled={locked}
-          />
+          >
+            <small>
+              两侧分别累计本组普通、循环和风险恢复成交；此上限限制新循环开仓，减回已有本轮仓位不受限制。
+            </small>
+          </ConfigurationField>
           <p className="muted">
             杠杆按两侧账户的实际设置核验；两侧须一致。每轮减回各自基线，不减原有普通底仓。
           </p>
@@ -350,7 +364,7 @@ export function PairSettings({
           disabled={locked}
         />
         <p className="muted">
-          只填写凭据前缀，密钥由服务器读取。以两侧可用余额差的一半为平衡目标，并受可划金额、单次限额及风险与现金缓冲约束。未知结果只读核对，缺少可靠结果时保留待确认状态，不重复划转。
+          只填写凭据前缀，密钥由服务器读取。组启用且自动平衡开启时，包括「保证金管理（不开仓）」模式在内，均可触发划转。以两侧可用余额差的一半为平衡目标，并受可划金额、单次限额及风险与现金缓冲约束。未知结果只读核对，缺少可靠结果时保留待确认状态，不重复划转。
         </p>
       </fieldset>
       <div className="form-actions">

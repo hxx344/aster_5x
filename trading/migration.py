@@ -350,7 +350,7 @@ def plan_migration(account, snapshot, source_book, target_book, source_depth,
             equity = Fraction(snapshot.equity) - existing_loss - cost
             available = Fraction(snapshot.available) - existing_loss - (baseline_occupied - snapshot_occupied)
             if available < added_margin + cost:
-                return None, "可用余额不足以先开目标仓位并支付四腿成本"
+                return None, "可用余额不足以先开目标仓位并预留迁入及迁出双腿的预估手续费与不利价差"
             occupied = baseline_occupied + added_margin
             if equity <= 0 or occupied > limit * equity:
                 return None, "迁移临时保证金占用超过风险上限，不能预支未平 XAU 的保证金"

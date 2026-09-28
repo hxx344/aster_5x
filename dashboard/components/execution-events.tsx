@@ -7,6 +7,9 @@ export function ExecutionEvents({ events }: { events: ExecutionEvent[] }) {
   const rows = executionEventRows(events).slice(0, 50);
   return (
     <div className="event-list">
+      <p className="muted">
+        最多显示最近 50 条已加载记录；请求受理、成交核实与后续恢复分别记录。
+      </p>
       {rows.length ? (
         rows.map((row) => {
           const event = row.event;
@@ -66,7 +69,7 @@ export function ExecutionEvents({ events }: { events: ExecutionEvent[] }) {
       ) : (
         <div className="empty-state">
           <Activity size={27} />
-          <h3>暂无执行记录</h3>
+          <h3>暂无已加载执行记录</h3>
           <p>开仓、杠杆调整与异常处理都会显示在这里。</p>
         </div>
       )}

@@ -72,6 +72,17 @@ def leverage_candidates(min_open_leverage=MIN_OPEN_LEVERAGE):
     return TIERS
 
 
+def ordinary_leverage_wait(leverage, minimum):
+    """Explain the opening floor without promising an unsupported downgrade."""
+    state = (f"当前 {leverage}x 低于普通开仓最低 {minimum}x" if leverage < minimum else
+             f"当前 {leverage}x 不在普通开仓支持档位（5x、10x、20x）")
+    targets = [f"{tier}x" for tier in TIERS if tier > leverage]
+    if not targets:
+        return state + "；停止新增，程序不会自动降杠杆，请暂停策略后核对实际杠杆设置"
+    return (state + "；暂不新增，程序按公开可用额度和账户持仓上限检查更高档位（" +
+            "、".join(targets) + f"），自动升档并确认达到最低 {minimum}x 后再检查开仓条件")
+
+
 def require_supported_leverage(leverage):
     if type(leverage) is not int or leverage not in TIERS:
         raise TradingError("新增开仓和杠杆调整仅支持 5x、10x、20x")
@@ -377,21 +388,21 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
     book.require_fresh(now)
     minimum = minimum_open_leverage(policy)
     if long.leverage < minimum:
-        return Plan(reason=f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
+        return Plan(reason=ordinary_leverage_wait(long.leverage, minimum))
     if long.leverage not in TIERS:
-        return Plan(reason=f"当前 {long.leverage}x 不在支持档位，禁止新增开仓，等待升杠杆至 5x、10x、20x")
+        return Plan(reason=ordinary_leverage_wait(long.leverage, minimum))
     if dec(policy["order_notional"]) < MIN_BATCH_NOTIONAL:
         return Plan(reason="单批每边上限低于固定最低批次金额 500 USD1，请修改策略设置")
     limit = Fraction(opening_margin_limit(policy, long.leverage))
     if snapshot.margin_exceeds(decimal_value(limit, exact=True), include_equal=True):
         return Plan(reason="保证金占用率已达到上限，等待升杠杆或释放占用")
     if book.spread_exact > Fraction(dec(policy["spread_limit"])):
-        return Plan(reason="BBO 价差超过万 5")
+        return Plan(reason=f"买一卖一价差超过设置上限 {wire(Fraction(dec(policy['spread_limit'])) * 10000)} bp，等待价差回落")
     if not hedge_balanced(long.qty, short.qty):
         return Plan(reason="已有多空数量差超过 0.1%，等待人工核对")
     leverage = long.leverage
     if positive(capacities.get(leverage), True) <= dec(policy["threshold"]):
-        return Plan(reason=f"{leverage}x 额度未超过阈值")
+        return Plan(reason=f"{leverage}x 公开可用额度未严格超过设置门槛 {wire(policy['threshold'])} USD1，等待公开额度恢复")
     brackets = snapshot.brackets.get(rules.symbol)
     fee = snapshot.fees.get(rules.symbol)
     if not brackets or fee is None:
@@ -441,7 +452,7 @@ def plan_pair(snapshot, book, rules, capacities, policy, now=None):
             high = mid - 1
     qty = low * step
     if qty < min_qty or qty == 0:
-        return Plan(reason="风险、余额或额度不足以继续最小一笔（每边至少 500 USD1）")
+        return Plan(reason=f"按余额、持仓上限、保证金占用、公开额度、盘口及配置的单批金额上限计算后，无法满足最小下单量及按标记价计算的每边名义金额至少 {wire(max(rules.min_notional, MIN_BATCH_NOTIONAL))} USD1，暂不新增")
     total_occupied, equity = projected(qty)
     return Plan(decimal_value(qty, exact=True), decimal_value(total_occupied / equity), "可以分批双向开仓")
 

@@ -87,8 +87,8 @@ export function CycleSettings({
           <dd>{account.cycle?.hold_seconds ?? '—'} 秒</dd>
         </div>
         <div>
-          <dt>开仓额度倍数</dt>
-          <dd>{account.cycle?.capacity_multiplier ?? '1'} 倍</dd>
+          <dt>公开额度门槛倍数</dt>
+          <dd>{account.cycle?.capacity_multiplier ?? '—'} 倍</dd>
         </div>
       </dl>
       {locked ? (
@@ -106,7 +106,7 @@ export function CycleSettings({
               throw new Error('请先停止 XAU 迁移，再开启多空循环');
             return { cycle };
           }}
-          success="多空循环设置已保存，账户保持暂停；点击启动后开始执行"
+          success="多空循环设置已保存，账户保持暂停；启动后按已启用功能和交易条件运行"
           errorFallback="多空循环设置无效"
         >
           <fieldset disabled={locked} className="cycle-form-grid">
@@ -193,7 +193,7 @@ export function CycleSettings({
 
             <ConfigurationField
               id="cycle-capacity-multiplier"
-              label="开仓额度倍数"
+              label="公开额度门槛倍数"
               unit="1–100 倍，支持小数"
               min="1"
               max={CYCLE_MAXIMUM.capacity_multiplier}
@@ -218,7 +218,7 @@ export function CycleSettings({
 
             <ConfigurationField
               id="cycle-daily-volume"
-              label="成交额度上限"
+              label="UTC 每日循环成交量上限"
               unit="USD1 · 0 为不限"
               max={CYCLE_MAXIMUM.daily_volume_limit}
               {...fields('daily_volume_limit')}
@@ -269,7 +269,7 @@ export function CycleSettings({
           </p>{' '}
           <p className="muted">
             先检查实际杠杆的公共余量 ≥ 本轮多空合计目标金额 ×
-            倍数，再检查热差价；提交前再次核对。
+            倍数，再检查最新深度价差；提交前再次核对。
             目标金额按上面的名义价值上限计算：每边 10,000 USD1、2
             倍，需要公共余量至少 40,000 USD1。
             减仓不检查额度，只减回本轮新增数量，保留原始多空持仓。

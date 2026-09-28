@@ -79,11 +79,11 @@ export function OrdinaryConditions({
       {!cycleSymbolActive && view.leverageConstraint ? (
         <p className="ordinary-conditions-context amber">
           {view.leverageConstraint === 'unsupported'
-            ? `当前 ${view.currentLeverage}x 不支持普通新增开仓。`
-            : `当前 ${view.currentLeverage}x，需先升至至少 ${view.minimumLeverage}x 才能普通新增开仓。`}
+            ? `当前 ${view.currentLeverage}x 不在普通开仓支持的 5x / 10x / 20x 档位内，当前不能普通新增。可升档位与后续处理请查看执行原因。`
+            : `当前 ${view.currentLeverage}x 低于普通开仓门槛 ${view.minimumLeverage}x，暂不新增。账户启用后，程序会在更高档位公开额度超过门槛并通过账户检查时尝试升杠杆；未满足时继续等待，具体原因见下方。`}
         </p>
       ) : null}
-      <Check label="BBO 价差" value={view.spread} unit="bp" />
+      <Check label="最优买卖价差（BBO）" value={view.spread} unit="bp" />
       {view.tiers.map((tier) => (
         <section
           key={tier.leverage}
@@ -104,7 +104,12 @@ export function OrdinaryConditions({
       ))}
       <details className="disclosure ordinary-precision">
         <summary>精确数值与条件口径</summary>
-        <Check label="BBO 价差" value={view.spread} unit="bp" compact={false} />
+        <Check
+          label="最优买卖价差（BBO）"
+          value={view.spread}
+          unit="bp"
+          compact={false}
+        />
         {view.tiers.map((tier) => (
           <section key={tier.leverage} className="ordinary-tier">
             <h3>{tier.leverage}x</h3>

@@ -7,7 +7,7 @@ from fractions import Fraction
 from .cycle_guard import cycle_add_block_reason, ordinary_add_block_reason
 from .exchange import AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
-from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, positive, require_non_decreasing_leverage, require_supported_leverage, wire
+from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, ordinary_leverage_wait, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
 from .capacity_timing import initial_timing, observe_capacity_submit, capacity_timing_text
 
@@ -30,7 +30,7 @@ class Executor:
         long, short = snapshot.require_ready(symbol)
         minimum = minimum_open_leverage(account["policy"])
         if long.leverage < minimum:
-            raise TradingError(f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓，等待升杠杆")
+            raise TradingError(ordinary_leverage_wait(long.leverage, minimum))
         require_supported_leverage(long.leverage)
         book.require_fresh()
         qty = positive(plan.qty)

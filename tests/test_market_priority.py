@@ -83,7 +83,7 @@ class MarketPriorityTests(unittest.TestCase):
     def test_capacity_at_threshold_does_not_displace_a_usable_market(self):
         self.capacities(SPCX, {5: 10000})
         self.open_tick(CL)
-        self.assertIn("额度未超过阈值", self.engine.views["test"]["strategies"][SPCX]["reason"])
+        self.assertIn("公开可用额度未严格超过设置门槛", self.engine.views["test"]["strategies"][SPCX]["reason"])
 
     def test_cooling_market_is_skipped(self):
         self.f.store.put(f"order_cooldown:test:{SPCX}", {"until": time.time() + 60})
@@ -93,7 +93,7 @@ class MarketPriorityTests(unittest.TestCase):
     def test_lowest_spread_without_depth_for_minimum_order_is_skipped(self):
         self.books[SPCX] = replace(self.f.market.book(SPCX), bid_qty=dec("0.001"))
         self.open_tick(CL)
-        self.assertIn("最小一笔", self.engine.views["test"]["strategies"][SPCX]["reason"])
+        self.assertIn("无法满足最小下单量", self.engine.views["test"]["strategies"][SPCX]["reason"])
 
     def test_stale_quote_is_skipped(self):
         self.books[SPCX] = replace(self.f.market.book(SPCX), timestamp=time.time() - 4)

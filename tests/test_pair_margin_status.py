@@ -58,6 +58,9 @@ class MarginStatusTests(TestCase):
     def test_disabled_paused_and_cooldown_are_derived_from_current_state(self):
         self.journal["cooldown_until"] = 120
         self.assertEqual(self.view()["status"], "cooldown")
+        self.assertIn("剩余约 20 秒", self.view()["reason"])
+        self.journal["cooldown_until"] = 100.01
+        self.assertIn("剩余约 1 秒", self.view()["reason"])
         self.pair["enabled"] = False
         self.assertEqual(self.view()["status"], "paused")
         self.pair["margin"]["enabled"] = False

@@ -353,7 +353,7 @@ export function cycleExecutionQualityView(
     }),
     transport: [
       ['guard_ms', '发单前本地校验'],
-      ['budget_ms', '请求额度检查'],
+      ['budget_ms', 'API 请求权重预算检查'],
       ['signing_ms', '签名与请求编码'],
       ['http_ms', 'HTTP 调用（含连接处理）'],
       ['response_decode_ms', '解析响应'],

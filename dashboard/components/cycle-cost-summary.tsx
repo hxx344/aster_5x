@@ -16,7 +16,7 @@ export function CycleCostSummary({
       <h4>{label} · USD1</h4>
       <dl className="cycle-cost-grid">
         <div>
-          <dt>手续费 · 固定 0.0125%</dt>
+          <dt>估算手续费 · 固定 0.0125%</dt>
           <dd>{view.fee}</dd>
         </div>
         <div>
@@ -24,7 +24,7 @@ export function CycleCostSummary({
           <dd>{view.spread}</dd>
         </div>
         <div className="cycle-cost-total">
-          <dt>已计总成本</dt>
+          <dt>已统计成本 · 含估算手续费</dt>
           <dd>{view.total}</dd>
         </div>
       </dl>

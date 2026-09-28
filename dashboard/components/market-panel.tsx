@@ -33,11 +33,12 @@ export function MarketPanel({
     <section className="panel">
       <div className="section-head">
         <div>
-          <h2>市场额度</h2>
-          <p>市场额度与账户当前杠杆余量 · USD1</p>
+          <h2>公开市场额度与账户余量</h2>
+          <p>5x / 10x / 20x 为市场公开额度；账户余量单独列示 · USD1</p>
         </div>
         <span className="small-note">
-          额度 &gt; {fmt(account?.policy.threshold || 10000, 0)} 才触发
+          公开额度须 &gt; {fmt(account.policy.threshold, 0)}
+          ，其他开仓条件另行核验
         </span>
       </div>
       <section
@@ -87,7 +88,7 @@ export function MarketPanel({
                     <button className="market-name" onClick={() => setFocus(s)}>
                       <strong>{s}</strong>
                       <span>
-                        {names[s]} {!live && '· 等待数据'}
+                        {names[s]} {!live && '· 数据未齐或已过期'}
                       </span>
                     </button>
                     {ordinaryBlock ? (

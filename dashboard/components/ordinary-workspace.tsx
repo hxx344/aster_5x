@@ -128,7 +128,7 @@ export function OrdinaryWorkspace({
               <dd>{minimumLeverage}x</dd>
             </div>
             <div>
-              <dt>额度阈值 · USD1</dt>
+              <dt>公开额度门槛 · USD1</dt>
               <dd>{account.policy.threshold}</dd>
             </div>
             <div>
@@ -154,7 +154,7 @@ export function OrdinaryWorkspace({
             >
               <ConfigurationField
                 id="ordinary-symbol"
-                label="有额度开仓交易对"
+                label="普通开仓交易对"
                 required
                 disabled={locked}
                 display={
@@ -176,11 +176,15 @@ export function OrdinaryWorkspace({
               </ConfigurationField>
               <ConfigurationField
                 id="threshold"
-                label="额度阈值"
+                label="公开额度门槛"
                 unit="USD1"
                 disabled={locked}
                 {...fields('threshold')}
-              />
+              >
+                <span>
+                  所选杠杆的公开额度必须严格大于此值；账户余量、保证金和其他条件另行检查。
+                </span>
+              </ConfigurationField>
               <ConfigurationField
                 id="order-notional"
                 label="单笔每边上限"
@@ -202,7 +206,13 @@ export function OrdinaryWorkspace({
                 value={form.min_open_leverage || null}
                 placeholder="请选择最低开仓杠杆"
                 items={leverageOptions}
-              />
+              >
+                <span>
+                  保存不会直接修改交易所杠杆。账户启用后，程序在更高的 5x / 10x
+                  / 20x
+                  档位公开额度超过门槛并通过账户检查时尝试升级；杠杆确认后再检查开仓条件。
+                </span>
+              </ConfigurationField>
               <p className="muted">
                 暂停账户后可修改。基础风险上限在「账户」页统一设置；实际开仓仍需通过余额、价差和持仓检查。
               </p>

@@ -35,14 +35,14 @@ def require_cycle_capacity(config, leverage, row, *, now, minimum_notional=0):
         except TradingError:
             pass
     if value is None or Fraction(value) < required:
-        title = ("循环公共额度未就绪或已过期，等待对应实际杠杆的热数据" if value is None
-                 else "循环公共额度不足目标名义价值的设定倍数，等待额度释放")
+        title = ("循环公开可用额度未就绪或已过期，等待对应实际杠杆的数据更新" if value is None
+                 else "循环公开可用额度低于本轮开仓检查要求，系统继续自动检查")
         raise diagnostic_error("cycle_market_capacity", title, symbol=config["symbol"], phase="open", checked_at=now,
-            checks=[{"code": "market_capacity", "label": f"{leverage}x 公共剩余额度" if known else "实际杠杆公共剩余额度",
+            checks=[{"code": "market_capacity", "label": f"{leverage}x 公开可用额度" if known else "实际杠杆公开可用额度",
                      "actual": diagnostic_number(value) if value is not None else None,
                      "required": "≥ " + diagnostic_number(required), "unit": "USD1",
                      "passed": False if value is not None else None}],
-            context=[{"label": "本轮目标名义价值（多空合计）", "value": wire(target), "unit": "USD1"},
+            context=[{"label": "配置金额上限（多空合计）", "value": wire(target), "unit": "USD1"},
                      {"label": "额度倍数", "value": config.get("capacity_multiplier", "1"), "unit": "倍"}],
-            note="先检查对应实际杠杆的公共额度，再检查热差价。账户档位、保证金与成交量限制仍需满足；减仓和补救不检查公共额度。")
+            note="公开可用额度取公开剩余额度与对应杠杆档位上限的较小值，不代表账户可开金额。先检查该额度，再检查价差；实际开仓金额还受账户档位、保证金与成交量限制，减仓和补救不检查公开额度。")
     return value

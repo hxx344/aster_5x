@@ -30,7 +30,7 @@ class MinimumOpenLeverageTests(unittest.TestCase):
                     plan = plan_pair(self.f.broker.snapshot([self.symbol]), self.f.market.book(self.symbol),
                                      self.f.market.rules[self.symbol], {leverage: dec(500000)}, self.f.account["policy"])
                     self.assertEqual(plan.qty, 0)
-                    self.assertIn("低于 5x", plan.reason)
+                    self.assertIn("低于普通开仓最低 5x", plan.reason)
                     self.assertEqual(self.f.broker.state, before)
 
     def test_execution_boundary_rejects_a_supplied_plan_below_five_before_creating_intent(self):
@@ -40,7 +40,7 @@ class MinimumOpenLeverageTests(unittest.TestCase):
                     self.position(leverage, qty)
                     before = copy.deepcopy(self.f.broker.state)
                     with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not submit")):
-                        with self.assertRaisesRegex(TradingError, "低于 5x"):
+                        with self.assertRaisesRegex(TradingError, "低于普通开仓最低 5x"):
                             self.executor.open_pair(self.f.account, self.f.broker.snapshot([self.symbol]),
                                                     self.symbol, Plan(dec("0.005")), self.f.market.book(self.symbol))
                     self.assertIsNone(self.f.store.intent("test"))

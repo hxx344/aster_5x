@@ -352,11 +352,15 @@ const PHASES: Record<string, { label: string; reason: string }> = {
     label: '未开启',
     reason: '保存启用设置后，启动账户可运行本品种循环',
   },
-  paused: { label: '已暂停', reason: '已有仓位与持仓计时保留，启动账户后继续' },
+  paused: {
+    label: '已暂停',
+    reason: '已有仓位保留，暂停期间持仓时长继续累计；启动账户后重新检查平仓条件',
+  },
   attention: { label: '需要处理', reason: '请核对当前批次，确认成交后再继续' },
   waiting_open: {
     label: '等待开仓',
-    reason: '先等待公共额度达到目标金额的设定倍数，再检查热差价及风险条件',
+    reason:
+      '先等待公开额度达到目标金额的设定倍数，再检查最新深度价差及风险条件',
   },
   opening: { label: '多空开仓中', reason: '正在提交并核对本轮多空开仓' },
   reconciling: { label: '核对中', reason: '正在核对成交，暂不开始下一步' },

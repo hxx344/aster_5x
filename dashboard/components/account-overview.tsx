@@ -45,7 +45,10 @@ export function AccountOverview({
   const locked = busy || Boolean(configurationLock);
   const positions =
     snapshot?.positions.filter((p) => Number(p.qty) !== 0) ?? [];
-  const ratio = snapshot ? Number(snapshot.ratio ?? 1) : 0;
+  const ratio =
+    snapshot?.ratio == null || pct(snapshot.ratio) === '—'
+      ? null
+      : Number(snapshot.ratio);
   const modeView = accountModeView(snapshot, now, connectionError);
   const snapshotView = accountSnapshotView(
     snapshot,
@@ -81,7 +84,7 @@ export function AccountOverview({
   const upperRiskLimit = cycleMode ? cycleRiskLimit : highMarginLimit;
   const upperRiskPercent = cycleMode ? cycleMarginPercent : highMarginPercent;
   const riskAccent =
-    upperRiskLimit === null
+    ratio === null || upperRiskLimit === null
       ? 'muted'
       : ratio > upperRiskLimit
         ? 'danger'
@@ -211,22 +214,30 @@ export function AccountOverview({
               </small>
             </div>
             <div className="risk-track">
-              <Progress
-                value={Math.min(100, ratio * 100)}
-                aria-label="当前保证金占用率"
-              />
-              <i
-                className="limit-marker"
-                style={{ left: `${marginPercent}%` }}
-                title={`普通 5x 基础上限 ${marginPercent}%`}
-              />
-              {upperRiskLimit !== null && upperRiskLimit > marginLimit && (
-                <i
-                  className="limit-marker high-limit-marker"
-                  style={{ left: `${upperRiskPercent}%` }}
-                  title={`${cycleMode ? '循环全部持仓' : '普通 10x / 20x'}上限 ${upperRiskPercent}%`}
+              {ratio === null ? (
+                <p className="muted">保证金占用率尚未提供</p>
+              ) : (
+                <Progress
+                  value={Math.min(100, ratio * 100)}
+                  aria-label="当前保证金占用率"
                 />
               )}
+              {ratio !== null && (
+                <i
+                  className="limit-marker"
+                  style={{ left: `${marginPercent}%` }}
+                  title={`普通 5x 基础上限 ${marginPercent}%`}
+                />
+              )}
+              {ratio !== null &&
+                upperRiskLimit !== null &&
+                upperRiskLimit > marginLimit && (
+                  <i
+                    className="limit-marker high-limit-marker"
+                    style={{ left: `${upperRiskPercent}%` }}
+                    title={`${cycleMode ? '循环全部持仓' : '普通 10x / 20x'}上限 ${upperRiskPercent}%`}
+                  />
+                )}
             </div>
             <div className="scale">
               <span>0%</span>
@@ -283,7 +294,7 @@ export function AccountOverview({
               )}
             </div>
             <div className="risk-caption">
-              三项账户模式必须满足，仅核验，不自动修改。下单前与成交后均检查风险。
+              三项账户模式必须满足。程序只核验，不自动修改；不符合时请在交易所调整，并等待新快照重新核验。下单前与成交后均检查风险。
             </div>
           </section>
           <details className="disclosure panel settings-panel">

@@ -29,7 +29,7 @@ def positions(snapshots, *, equal_leverage=True):
             raise PairPositionError(f"{key} 子账户存在非本组方向或非 XAU 仓位，请先核对")
         result[side] = selected
     if equal_leverage and result["LONG"].leverage != result["SHORT"].leverage:
-        raise PairPositionError("两个子账户的 XAU 实际杠杆不一致，请核对")
+        raise PairPositionError(f"两个子账户的 XAU 实际杠杆不一致（做多账户 {result['LONG'].leverage}x、做空账户 {result['SHORT'].leverage}x），停止新交易，请核对")
     return result
 
 
@@ -103,19 +103,45 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
     return allowed
 
 
+def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
+    """Describe upgrade blockers from the same inputs, without another API read."""
+    old, policy = held["LONG"].leverage, pair["ordinary"]
+    minimum = policy["min_open_leverage"]
+    state = (f"两账户当前均为 {old}x，低于普通开仓最低 {minimum}x" if old < minimum else
+             f"两账户当前均为 {old}x，不在普通开仓支持档位（5x、10x、20x）")
+    targets = [tier for tier in TIERS if tier > old and tier >= minimum]
+    if not targets:
+        return state + "；停止新增，程序不会自动降杠杆，请暂停配对组后核对实际杠杆设置"
+    threshold = Fraction(dec(policy["threshold"]))
+    details = []
+    for target in targets:
+        if target not in capacities:
+            detail = "缺少公开额度数据"
+        elif Fraction(positive(capacities[target], True)) <= threshold:
+            detail = f"公开额度未严格超过 {wire(threshold)} USD1"
+        else:
+            blocked = ["做多账户" if key == "long" else "做空账户" for key, side in SIDES
+                       if Fraction(held[side].qty) * max(Fraction(held[side].mark), Fraction(book.mark))
+                       > Fraction(leverage_cap(snapshots[key].brackets.get(SYMBOL, []), target))]
+            detail = ("公开额度已满足，但" + "、".join(blocked) + "的现有持仓超过该档账户持仓上限"
+                      if blocked else "公开额度及账户持仓上限已满足，可申请自动升档")
+        details.append(f"{target}x：{detail}")
+    return state + "；" + "；".join(details) + "。程序会自动选择满足条件的更高档位，两账户升档确认后再检查开仓条件"
+
+
 def plan_ordinary(pair, snapshots, book, rule, capacities):
     held = positions(snapshots)
     leverage, policy = held["LONG"].leverage, pair["ordinary"]
     book.require_fresh()
     if leverage not in TIERS or leverage < policy["min_open_leverage"]:
-        raise TradingError("等待两个子账户达到最低普通开仓杠杆")
+        raise TradingError(ordinary_leverage_reason(pair, snapshots, book, capacities, held))
     if held["LONG"].qty != held["SHORT"].qty:
         raise PairPositionError("配对组已有数量不等，停止新增")
     if book.spread_exact > Fraction(dec(policy["spread_limit"])):
-        raise TradingError("XAU BBO 价差超过普通开仓阈值")
+        raise TradingError(f"XAU 买一卖一价差超过普通开仓设置上限 {wire(Fraction(dec(policy['spread_limit'])) * 10000)} bp，等待价差回落")
     capacity = Fraction(positive(capacities.get(leverage), True))
     if capacity <= Fraction(dec(policy["threshold"])):
-        raise TradingError("当前杠杆公共额度未超过普通开仓阈值")
+        raise TradingError(f"当前 {leverage}x 公开可用额度未严格超过普通开仓门槛 {wire(policy['threshold'])} USD1，等待公开额度恢复")
     bid, ask, mark = map(Fraction, (book.bid, book.ask, book.mark))
     high = max(ask, mark)
     upper = min(Fraction(rule.max_qty), Fraction(book.bid_qty), Fraction(book.ask_qty),
@@ -132,7 +158,7 @@ def plan_ordinary(pair, snapshots, book, rule, capacities):
             maximum = mid - 1
     qty = low * step
     if qty < Fraction(rule.min_qty) or qty * mark < max(rule.min_notional, MIN_BATCH_NOTIONAL) or not qty:
-        raise TradingError("较弱子账户的余额、风险额度或盘口不足以开最小一批")
+        raise TradingError(f"按两账户各自余额、持仓上限、保证金占用、公开额度、盘口及配置的单批金额上限计算后，共同可开数量不足以满足最小下单量及按标记价计算的每边名义金额至少 {wire(max(rule.min_notional, MIN_BATCH_NOTIONAL))} USD1，暂不新增")
     return CyclePlan("open", SYMBOL, decimal_value(qty, exact=True), leverage,
                      decimal_value(qty * ask, exact=True), decimal_value(qty * bid, exact=True),
                      decimal_value(book.spread_exact * 10000), capacity_notional=decimal_value(2 * qty * high, exact=True))

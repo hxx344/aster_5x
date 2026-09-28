@@ -37,7 +37,7 @@ from .lock import ProcessLock
 from .listings import ListingMonitor, POLL_SECONDS as LISTING_POLL_SECONDS, STALE_SECONDS as LISTING_STALE_SECONDS
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
-from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, plan_pair, positive, wire
+from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, ordinary_leverage_wait, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
 from .scheduling import AccountWork, OrdinaryRead, PollBackoff
@@ -1268,7 +1268,7 @@ class Engine:
                 self.view(aid, snapshot=snapshot_json(executor.last_snapshot, [symbol]), credential_ready=True)
             return 5
         if not account["enabled"] or self.shutdown.is_set():
-            reason = account.get("pause_reason") or "循环已暂停，已有仓位和持仓计时保留"
+            reason = account.get("pause_reason") or "循环已暂停，已有仓位保留；暂停期间持仓时长继续累计，恢复后重新检查平仓条件"
             phase = "attention" if account.get("pause_reason") else "paused"
             self.view(aid, status=phase, reason=reason)
             self.cycle_view(account, phase=phase, reason=reason)
@@ -1304,7 +1304,7 @@ class Engine:
         config = progress["config"]
         opening_capacity = None
         if not account["enabled"] or self.shutdown.is_set():
-            reason = account.get("pause_reason") or "循环已暂停，已有仓位和持仓计时保留"
+            reason = account.get("pause_reason") or "循环已暂停，已有仓位保留；暂停期间持仓时长继续累计，恢复后重新检查平仓条件"
             phase = "attention" if account.get("pause_reason") else "paused"
             self.view(aid, status=phase, reason=reason)
             self.cycle_view(account, phase=phase, reason=reason)
@@ -1655,7 +1655,7 @@ class Engine:
                             candidates.append(MarketCandidate(symbol, long.leverage, book, target))
                             continue
                         if long.leverage < minimum:
-                            last_reason = f"当前 {long.leverage}x 低于 {minimum}x，禁止新增开仓；等待可用的更高杠杆档位"
+                            last_reason = ordinary_leverage_wait(long.leverage, minimum)
                             self.strategy(account_id, symbol, last_reason)
                             continue
                         cooldown = self.store.get(f"order_cooldown:{account_id}:{symbol}") or {}

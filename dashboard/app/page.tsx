@@ -297,12 +297,12 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                       className={`run-indicator ${account.enabled ? 'mint' : 'muted'}`}
                     >
                       <i />
-                      {account.enabled ? '账户运行中' : '账户已暂停'}
+                      {account.enabled ? '账户执行已启用' : '账户执行已暂停'}
                     </span>
                     <p>
                       {pairBound
                         ? `由配对组「${binding?.name ?? account.pair_id}」统一管理，旧账户交易入口已禁用。`
-                        : `启动范围：${modes}`}
+                        : `已保存的执行范围：${modes}；是否下单以各功能检查结果为准。`}
                     </p>
                   </div>
                   <div className="account-run-actions">
@@ -467,7 +467,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                   ? '飞书告警已关闭'
                   : state?.notification.error ||
                     (state?.notification.configured
-                      ? `飞书已连接${state.notification.pending ? ` · ${state.notification.pending} 条待发送` : ''}`
+                      ? `飞书已配置${state.notification.pending ? ` · ${state.notification.pending} 条待发送` : ''}`
                       : '飞书未配置')}
               </span>
               <span>

@@ -1,4 +1,5 @@
 'use client';
+import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -35,6 +36,7 @@ import { RecordsWorkspace } from '@/components/records-workspace';
 import { AddAccountDialog } from '@/components/add-account-dialog';
 import { ListingsPanel } from '@/components/listings-panel';
 import { MonitoringPanel } from '@/components/monitoring-panel';
+import { PairsWorkspace } from '@/components/pairs-workspace';
 
 export default function Home() {
   const desk = useTradingDesk();
@@ -62,7 +64,32 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     action,
     refresh,
   } = desk;
-  const account = state?.accounts.find((account) => account.id === selected);
+  const [workspace, setWorkspace] = useState('pairs');
+  const selectedAccount = state?.accounts.find(
+    (account) => account.id === selected,
+  );
+  const binding = state?.pairs?.find(
+    (pair) =>
+      pair.long_account_id === selected || pair.short_account_id === selected,
+  );
+  const account =
+    selectedAccount && binding
+      ? { ...selectedAccount, pair_id: binding.id }
+      : selectedAccount;
+  const pairBound = Boolean(account?.pair_id);
+  const pairProps = {
+    pairs: state?.pairs,
+    accounts: state?.accounts ?? [],
+    events: state?.events ?? [],
+    busy,
+    ready: Boolean(state?.ready),
+    now: serverNow,
+    connectionError,
+    error,
+    action,
+    setError,
+    setNotice,
+  };
   const monitoringProps = {
     monitoring: state?.monitoring,
     notification: state?.notification,
@@ -85,6 +112,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
   const separateError = error === accountMessage ? '' : error;
   const canStart = Boolean(
     account &&
+    !pairBound &&
     !account.enabled &&
     state?.ready &&
     !connectionError &&
@@ -104,10 +132,13 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
   const events =
     state?.events.filter(
       (event) =>
-        !selected || event.account_id === selected || !event.account_id,
+        !selected ||
+        event.account_id === selected ||
+        event.account_id === binding?.id ||
+        !event.account_id,
     ) ?? [];
   const featureProps = account
-    ? { account, busy, action, setError, setNotice }
+    ? { account, busy: busy || pairBound, action, setError, setNotice }
     : null;
   const modes = account ? accountRunScope(account) : '';
   const riskLimit = account?.cycle?.enabled
@@ -176,7 +207,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
           </div>
           <div className="account-controls">
             {' '}
-            {account && (
+            {account && workspace !== 'pairs' && (
               <Select
                 value={selected}
                 disabled={busy}
@@ -215,7 +246,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             {separateError || connectionError || notice}
           </output>
         )}
-        {account && accountMessage && (
+        {account && accountMessage && workspace !== 'pairs' && (
           <div className="message message-error cycle-recovery-message">
             <output>{accountMessage}</output>
             {recoveryReason ? (
@@ -223,7 +254,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 key={account.id}
                 accountId={account.id}
                 accountName={account.name}
-                disabled={busy || Boolean(connectionError)}
+                disabled={busy || pairBound || Boolean(connectionError)}
                 action={action}
                 setNotice={setNotice}
               />
@@ -258,98 +289,122 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
 
         {!needsLogin && account && featureProps ? (
           <>
-            <section className="account-bar" aria-label="账户状态与总开关">
-              <div className="account-run-state">
-                <span
-                  className={`run-indicator ${account.enabled ? 'mint' : 'muted'}`}
-                >
-                  <i />
-                  {account.enabled ? '账户运行中' : '账户已暂停'}
-                </span>
-                <p>启动范围：{modes}</p>
-              </div>
-              <div className="account-run-actions">
-                <Button
-                  disabled={busy || !canStart}
-                  title={
-                    cycle.dirty
-                      ? '请先保存或撤销循环草稿'
-                      : '按已保存配置启动账户的全部已启用功能'
-                  }
-                  onClick={() =>
-                    void action(`/api/accounts/${account.id}/enable`)
-                  }
-                >
-                  <CirclePlay size={16} />
-                  启动账户
-                </Button>
-                <Button
-                  variant="outline"
-                  disabled={busy || !account.enabled}
-                  onClick={() =>
-                    void action(`/api/accounts/${account.id}/pause`)
-                  }
-                >
-                  <CirclePause size={16} />
-                  暂停账户
-                </Button>
-                {account.status === 'attention' ? (
-                  <Button
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() =>
-                      void action(`/api/accounts/${account.id}/retry`)
-                    }
+            {workspace !== 'pairs' ? (
+              <>
+                <section className="account-bar" aria-label="账户状态与总开关">
+                  <div className="account-run-state">
+                    <span
+                      className={`run-indicator ${account.enabled ? 'mint' : 'muted'}`}
+                    >
+                      <i />
+                      {account.enabled ? '账户运行中' : '账户已暂停'}
+                    </span>
+                    <p>
+                      {pairBound
+                        ? `由配对组「${binding?.name ?? account.pair_id}」统一管理，旧账户交易入口已禁用。`
+                        : `启动范围：${modes}`}
+                    </p>
+                  </div>
+                  <div className="account-run-actions">
+                    <Button
+                      disabled={busy || !canStart}
+                      title={
+                        pairBound
+                          ? '请到配对组管理此账户'
+                          : cycle.dirty
+                            ? '请先保存或撤销循环草稿'
+                            : '按已保存配置启动账户的全部已启用功能'
+                      }
+                      onClick={() =>
+                        void action(`/api/accounts/${account.id}/enable`)
+                      }
+                    >
+                      <CirclePlay size={16} />
+                      启动账户
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={busy || pairBound || !account.enabled}
+                      onClick={() =>
+                        void action(`/api/accounts/${account.id}/pause`)
+                      }
+                    >
+                      <CirclePause size={16} />
+                      暂停账户
+                    </Button>
+                    {account.status === 'attention' ? (
+                      <Button
+                        variant="outline"
+                        disabled={busy || pairBound}
+                        onClick={() =>
+                          void action(`/api/accounts/${account.id}/retry`)
+                        }
+                      >
+                        核对未完成批次
+                      </Button>
+                    ) : null}
+                  </div>
+                  {cycle.dirty ? (
+                    <p className="draft-notice amber">
+                      循环设置有未保存修改，请到「多空循环」保存或撤销。
+                    </p>
+                  ) : null}
+                </section>
+                <section className="account-strip" aria-label="账户关键数据">
+                  <dl>
+                    <div>
+                      <dt>权益 · USD1</dt>
+                      <dd>{fmt(snapshot?.equity)}</dd>
+                    </div>
+                    <div>
+                      <dt>可用 · USD1</dt>
+                      <dd>{fmt(snapshot?.available)}</dd>
+                    </div>
+                    <div>
+                      <dt>保证金占用率</dt>
+                      <dd className={marginTone}>{pct(snapshot?.ratio)}</dd>
+                    </div>
+                  </dl>
+                  <span
+                    className={`snapshot-stamp ${snapshotView.warning ? 'amber' : ''}`}
+                    title={snapshotView.notice}
                   >
-                    核对未完成批次
-                  </Button>
-                ) : null}
-              </div>
-              {cycle.dirty ? (
-                <p className="draft-notice amber">
-                  循环设置有未保存修改，请到「多空循环」保存或撤销。
-                </p>
-              ) : null}
-            </section>
-            <section className="account-strip" aria-label="账户关键数据">
-              <dl>
-                <div>
-                  <dt>权益 · USD1</dt>
-                  <dd>{fmt(snapshot?.equity)}</dd>
-                </div>
-                <div>
-                  <dt>可用 · USD1</dt>
-                  <dd>{fmt(snapshot?.available)}</dd>
-                </div>
-                <div>
-                  <dt>保证金占用率</dt>
-                  <dd className={marginTone}>{pct(snapshot?.ratio)}</dd>
-                </div>
-              </dl>
-              <span
-                className={`snapshot-stamp ${snapshotView.warning ? 'amber' : ''}`}
-                title={snapshotView.notice}
-              >
-                {snapshot
-                  ? `${snapshotView.label} ${clock(snapshot.timestamp)}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
-                  : '等待账户数据'}
-                {state?.demo ? ' · 模拟环境' : ''}
-              </span>
-            </section>
-            <Tabs defaultValue="cycle" className="workspace-tabs">
+                    {snapshot
+                      ? `${snapshotView.label} ${clock(snapshot.timestamp)}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
+                      : '等待账户数据'}
+                    {state?.demo ? ' · 模拟环境' : ''}
+                  </span>
+                </section>
+              </>
+            ) : null}
+            <Tabs
+              value={workspace}
+              onValueChange={(value) => setWorkspace(String(value))}
+              className="workspace-tabs"
+            >
               <TabsList
                 variant="line"
                 aria-label="工作台功能"
                 className="workspace-navigation"
               >
-                <TabsTrigger value="cycle">多空循环</TabsTrigger>
-                <TabsTrigger value="ordinary">普通开仓</TabsTrigger>
-                <TabsTrigger value="migration">仓位迁移</TabsTrigger>
+                <TabsTrigger value="pairs">配对组</TabsTrigger>
+                <TabsTrigger value="cycle" disabled={pairBound}>
+                  多空循环{pairBound ? ' · 组管理' : ''}
+                </TabsTrigger>
+                <TabsTrigger value="ordinary" disabled={pairBound}>
+                  普通开仓{pairBound ? ' · 组管理' : ''}
+                </TabsTrigger>
+                <TabsTrigger value="migration" disabled={pairBound}>
+                  仓位迁移{pairBound ? ' · 组管理' : ''}
+                </TabsTrigger>
                 <TabsTrigger value="listings">USD1 上新</TabsTrigger>
                 <TabsTrigger value="monitoring">监控与告警</TabsTrigger>
                 <TabsTrigger value="account">账户</TabsTrigger>
                 <TabsTrigger value="records">记录</TabsTrigger>
               </TabsList>
+              <TabsContent value="pairs" keepMounted>
+                <PairsWorkspace {...pairProps} />
+              </TabsContent>
               <TabsContent value="cycle" keepMounted>
                 <CyclePanel
                   {...featureProps}
@@ -423,15 +478,23 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
           </>
         ) : !needsLogin ? (
           <>
-            <Tabs defaultValue="listings" className="workspace-tabs">
+            <Tabs
+              value={workspace}
+              onValueChange={(value) => setWorkspace(String(value))}
+              className="workspace-tabs"
+            >
               <TabsList
                 variant="line"
                 aria-label="监控功能"
                 className="workspace-navigation"
               >
+                <TabsTrigger value="pairs">配对组</TabsTrigger>
                 <TabsTrigger value="listings">USD1 上新</TabsTrigger>
                 <TabsTrigger value="monitoring">监控与告警</TabsTrigger>
               </TabsList>
+              <TabsContent value="pairs" keepMounted>
+                <PairsWorkspace {...pairProps} />
+              </TabsContent>
               <TabsContent value="listings">
                 <ListingsPanel
                   action={action}

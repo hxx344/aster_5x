@@ -285,7 +285,7 @@ def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
 
 
 def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None,
-               market_capacity=None):
+               market_capacity=None, opening_gate=None):
     """Maximize one exact pair, or close precisely the recorded completed pair.
 
     The configured reference amount sweeps each side separately. Its VWAP
@@ -432,6 +432,8 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
         if value > maximum or _spread(buy, sell) > limit_bp:
             return None
         high_price = max(mark, asks.last_price(qty))
+        if opening_gate is not None and not opening_gate(qty, buy, sell, high_price):
+            return None
         gross = 2 * qty * high_price
         if gross > cap:
             return None

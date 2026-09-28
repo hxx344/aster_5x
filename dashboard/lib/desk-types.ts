@@ -3,6 +3,7 @@ import type { MigrationConfig, MigrationState } from './migration';
 import type { ExecutionEvent } from './cycle-events';
 import type { AccountCapacity } from './account-capacity';
 import type { DepthQuote } from './depth';
+import type { Pair } from './pairs';
 export type Position = {
   symbol: string;
   side: string;
@@ -36,6 +37,7 @@ export type Account = {
   mode: string;
   env_prefix: string;
   enabled: boolean;
+  pair_id?: string | null;
   deletion_block?: string | null;
   cycle_recovery_available?: boolean;
   status: string;
@@ -158,6 +160,7 @@ export type State = {
   demo: boolean;
   ready: boolean;
   accounts: Account[];
+  pairs?: Pair[];
   markets: Record<string, Market>;
   listings?: Listings;
   monitoring?: Monitoring;

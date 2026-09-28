@@ -21,13 +21,15 @@ export function DeleteAccountDialog({
   connectionError,
 }: Omit<FeatureProps, 'setError'> & { connectionError: string }) {
   const [open, setOpen] = useState(false);
-  const reason = connectionError
-    ? '连接恢复后可删除账户'
-    : account.enabled
-      ? '请先暂停账户，再删除'
-      : account.deletion_block === undefined
-        ? '服务尚未提供删除状态，请更新服务后重试'
-        : account.deletion_block;
+  const reason = account.pair_id
+    ? `此账户由配对组「${account.pair_id}」管理，请先解除配对组`
+    : connectionError
+      ? '连接恢复后可删除账户'
+      : account.enabled
+        ? '请先暂停账户，再删除'
+        : account.deletion_block === undefined
+          ? '服务尚未提供删除状态，请更新服务后重试'
+          : account.deletion_block;
   const disabled = busy || Boolean(reason);
   return (
     <section className="panel">

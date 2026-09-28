@@ -1,0 +1,773 @@
+'use client';
+import { useState } from 'react';
+import { CirclePause, CirclePlay, Plus, Trash2 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { PairSettings } from '@/components/pair-settings';
+import { ExecutionEvents } from '@/components/execution-events';
+import type { Account, DeskAction } from '@/lib/desk-types';
+import type { ExecutionEvent } from '@/lib/cycle-events';
+import { useAccountDraft } from '@/lib/use-account-draft';
+import { clock, fmt, pct } from '@/lib/desk-format';
+import { migrationMarginLimit } from '@/lib/policy';
+import {
+  availablePairAccounts,
+  pairConfigurationChanges,
+  pairConfigurationLock,
+  pairDataFresh,
+  pairDeletionBlock,
+  pairDraft,
+  pairHasPending,
+  pairMarginStatus,
+  pairNetQuantity,
+  pairPhaseLabel,
+  pairSnapshotStatus,
+  pairTransferStatus,
+  parsePairDraft,
+  type Pair,
+  type PairSnapshot,
+  type PairTransfer,
+} from '@/lib/pairs';
+
+type Props = {
+  pairs?: Pair[];
+  accounts: Account[];
+  events?: ExecutionEvent[];
+  busy: boolean;
+  ready: boolean;
+  now: number;
+  connectionError: string;
+  error?: string;
+  action: DeskAction;
+  setError: (message: string) => void;
+  setNotice: (message: string) => void;
+};
+const EMPTY_PAIRS: Pair[] = [];
+
+export function PairsWorkspace({ pairs, ...props }: Props) {
+  const [selected, setSelected] = useState('');
+  const items = pairs ?? EMPTY_PAIRS;
+  const pair = items.find((item) => item.id === selected) ?? items[0];
+  return (
+    <div className="feature-stack pair-workspace">
+      <div className="pair-workspace-heading">
+        <div>
+          <h2>两子账户配对 · XAUUSD1</h2>
+          <p className="muted">
+            A 固定只多 · B 固定只空 · 共同执行与独立风险核验
+          </p>
+        </div>
+        <div className="account-controls">
+          {pair ? (
+            <Select
+              value={pair.id}
+              disabled={props.busy}
+              onValueChange={(id) => {
+                if (id) {
+                  setSelected(id);
+                  props.setError('');
+                  props.setNotice('');
+                }
+              }}
+            >
+              <SelectTrigger aria-label="选择配对组">
+                <SelectValue>{pair.name}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {items.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.name} · {item.enabled ? '运行中' : '已暂停'}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : null}
+          <CreatePair
+            {...props}
+            pairs={items}
+            supported={pairs !== undefined}
+            selectPair={setSelected}
+          />
+        </div>
+      </div>
+      {pair ? (
+        <PairDetail {...props} pairs={items} pair={pair} />
+      ) : (
+        <section className="panel empty-state">
+          <h3>{pairs === undefined ? '等待配对组服务' : '尚未创建配对组'}</h3>
+          <p>
+            {pairs === undefined
+              ? '连接完成后将显示配对组；旧版服务需先更新。'
+              : '先添加同一主账户下的两个子账户，再创建 A 只多、B 只空的配对组。'}
+          </p>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function CreatePair({
+  accounts,
+  pairs,
+  busy,
+  connectionError,
+  error,
+  action,
+  setError,
+  setNotice,
+  supported,
+  selectPair,
+}: Omit<Props, 'pairs'> & {
+  pairs: Pair[];
+  supported: boolean;
+  selectPair: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(pairDraft);
+  const canCreate =
+    supported && availablePairAccounts(accounts, pairs).length >= 2;
+  const locked = busy || Boolean(connectionError);
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!busy) {
+          setOpen(next);
+          setError('');
+        }
+      }}
+    >
+      <DialogTrigger
+        render={
+          <Button
+            variant="outline"
+            disabled={locked || !canCreate}
+            title={
+              canCreate
+                ? '创建暂停的配对组'
+                : '需要两个未绑定的子账户与配对组服务'
+            }
+          />
+        }
+      >
+        <Plus size={16} />
+        新建配对组
+      </DialogTrigger>
+      <DialogContent className="pair-settings-dialog" showCloseButton={!busy}>
+        <DialogHeader>
+          <DialogTitle>新建配对组</DialogTitle>
+          <DialogDescription>
+            选择两个已暂停的子账户。保存后需单独启动。
+          </DialogDescription>
+        </DialogHeader>
+        {error || connectionError ? (
+          <p className="message message-error" role="alert">
+            {error || connectionError}
+          </p>
+        ) : null}
+        <PairSettings
+          draft={draft}
+          setDraft={setDraft}
+          accounts={accounts}
+          pairs={pairs}
+          editing={false}
+          locked={locked}
+          cancel={() => setDraft(pairDraft())}
+          submit={async () => {
+            try {
+              const config = parsePairDraft(draft, accounts, pairs);
+              if (await action('/api/pairs', config)) {
+                selectPair(config.id);
+                setOpen(false);
+                setDraft(pairDraft());
+                setNotice('配对组已创建并保持暂停；核对两侧数据后可启动。');
+              }
+            } catch (error) {
+              setError(
+                error instanceof Error ? error.message : '配对组设置无效',
+              );
+            }
+          }}
+        />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function PairDetail({
+  pair,
+  pairs,
+  accounts,
+  events,
+  busy,
+  ready,
+  now,
+  connectionError,
+  action,
+  setError,
+  setNotice,
+}: Omit<Props, 'pairs'> & { pairs: Pair[]; pair: Pair }) {
+  const draft = useAccountDraft(pair.id, pairDraft(pair));
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const snapshots = pair.state?.snapshots;
+  const long = accounts.find((account) => account.id === pair.long_account_id);
+  const short = accounts.find(
+    (account) => account.id === pair.short_account_id,
+  );
+  const offline = Boolean(connectionError);
+  const fresh =
+    pairDataFresh(pair.state?.updated_at, now, offline) &&
+    pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
+    pairDataFresh(snapshots?.short?.timestamp, now, offline);
+  const net = pairNetQuantity(snapshots);
+  const pending = pairHasPending(pair);
+  const margin = pair.state?.margin;
+  const configurationLock = pairConfigurationLock(pair);
+  const deletionBlock = pairDeletionBlock(pair, now, offline);
+  const locked = busy || offline || Boolean(configurationLock);
+  const mode = pair.ordinary.enabled
+    ? '普通市价共同开仓'
+    : pair.cycle.enabled
+      ? '两子账户多空循环'
+      : '仅保证金监控';
+  const progress =
+    pair.cycle.enabled ||
+    Object.values(pair.state?.progress?.quantities ?? {}).some(
+      (quantity) => Number(quantity) !== 0,
+    )
+      ? pair.state?.progress
+      : null;
+  const utcDate =
+    now > 0 && Number.isFinite(now)
+      ? new Date(now * 1000).toISOString().slice(0, 10)
+      : '';
+  const dayVolume = pair.state?.daily_volume?.[utcDate];
+  const lastBatch = pair.state?.last_batch;
+  const startBlock = pair.enabled
+    ? '配对组已运行'
+    : !ready
+      ? '等待服务就绪'
+      : draft.dirty
+        ? '请先保存或撤销设置草稿'
+        : pending
+          ? '订单或划转结果仍待确认'
+          : '';
+  const reason = pair.state?.reason || pair.pause_reason;
+  return (
+    <>
+      <section className="panel pair-status-panel" aria-label="配对组运行状态">
+        <div className="section-head">
+          <div>
+            <h2>
+              <span
+                className={`run-indicator ${pair.enabled ? 'mint' : 'muted'}`}
+              >
+                <i />
+                {pair.enabled ? '配对组运行中' : '配对组已暂停'}
+              </span>
+            </h2>
+            <p className="muted">
+              {mode} ·{' '}
+              {long?.mode === 'live'
+                ? '实盘'
+                : long?.mode === 'paper'
+                  ? '模拟'
+                  : '环境待确认'}{' '}
+              ·{' '}
+              {pair.margin.enabled
+                ? '自动保证金平衡已配置'
+                : '自动保证金平衡未开启'}
+            </p>
+          </div>
+          <div className="account-run-actions">
+            <Button
+              disabled={busy || offline || Boolean(startBlock)}
+              title={startBlock || '按已保存的配对配置启动'}
+              onClick={() => void action(`/api/pairs/${pair.id}/enable`)}
+            >
+              <CirclePlay size={16} />
+              启动配对组
+            </Button>
+            <Button
+              variant="outline"
+              disabled={busy || !pair.enabled}
+              onClick={() => void action(`/api/pairs/${pair.id}/pause`)}
+            >
+              <CirclePause size={16} />
+              暂停配对组
+            </Button>
+            <Button
+              variant="outline"
+              disabled={busy || offline || Boolean(configurationLock)}
+              title="手动平仓后核对两侧完全空仓，并清除本组底仓记录"
+              onClick={async () => {
+                if (await action(`/api/pairs/${pair.id}/reconcile-flat`)) {
+                  setNotice('两侧完全空仓已核实，本组底仓记录已清除。');
+                }
+              }}
+            >
+              核对空仓
+            </Button>
+          </div>
+        </div>
+        <div className="cycle-live-state" aria-live="polite">
+          <p className={pending || !fresh ? 'amber' : ''}>
+            {pairPhaseLabel(pair.state?.phase)}
+            {reason ? ` · ${reason}` : ''}
+          </p>
+          {!fresh ? (
+            <p className="amber">
+              {offline
+                ? '连接中断，保留最近记录。'
+                : '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。'}
+              {!pair.enabled && !offline
+                ? ' 启动时服务会重新核验两侧账户、挂单及归属。'
+                : ' 等待有效快照后才能新增开仓。'}
+            </p>
+          ) : null}
+          {draft.dirty ? (
+            <p className="amber">设置有未保存修改，请保存或撤销后启动。</p>
+          ) : null}
+          <p className="muted">
+            组暂停会阻止新开仓和新划转；已成交循环继续减回本轮基线，既有订单与划转请求继续查询。
+          </p>
+          {!pair.enabled ? (
+            <p className="muted">
+              手动平仓后可「核对空仓」，确认两侧完全空仓并清除本组底仓记录。
+            </p>
+          ) : null}
+        </div>
+      </section>
+      <div className="pair-sides">
+        <PairSide
+          side="long"
+          account={long}
+          snapshot={snapshots?.long}
+          now={now}
+          offline={offline}
+          baseLimit={pair.ordinary.margin_limit}
+          cycle={pair.cycle.enabled}
+        />
+        <PairSide
+          side="short"
+          account={short}
+          snapshot={snapshots?.short}
+          now={now}
+          offline={offline}
+          baseLimit={pair.ordinary.margin_limit}
+          cycle={pair.cycle.enabled}
+        />
+      </div>
+      <section className="panel" aria-label="配对数量与执行进度">
+        <div className="section-head">
+          <h2>配对执行</h2>
+          <span className={`small-note ${!fresh ? 'amber' : ''}`}>
+            组状态 {clock(pair.state?.updated_at)}
+            {!fresh ? ' · 过期或不完整' : ''}
+          </span>
+        </div>
+        <dl className="cycle-key-values">
+          <div>
+            <dt>XAU 净数量 · 多 − 空</dt>
+            <dd className={net !== null && Number(net) !== 0 ? 'amber' : ''}>
+              {net ?? '—'}
+            </dd>
+            <small>两子账户 XAUUSD1 实际仓位；缺失不按零计算</small>
+          </div>
+          <div>
+            <dt>本轮循环状态</dt>
+            <dd>{progress ? pairPhaseLabel(progress.phase) : '无活动循环'}</dd>
+            <small>
+              {progress?.opened_at
+                ? `开仓确认 ${clock(progress.opened_at)}`
+                : pair.cycle.enabled
+                  ? '等待本轮开仓确认'
+                  : '普通底仓不参与循环减回'}
+            </small>
+          </div>
+          <div>
+            <dt>订单与风险恢复</dt>
+            <dd className={pending ? 'amber' : ''}>
+              {pending
+                ? '继续查询 / 恢复'
+                : pair.state
+                  ? '无待确认请求'
+                  : '等待状态'}
+            </dd>
+            <small>
+              {pending
+                ? '结果未明时停止新增，等待确认或减回风险暴露'
+                : '单侧异常时由配对组统一处理'}
+            </small>
+          </div>
+        </dl>
+        {progress ? (
+          <dl className="saved-settings">
+            <div>
+              <dt>本轮新增数量 · A 多 / B 空</dt>
+              <dd>
+                {progress.quantities?.LONG ?? '—'} /{' '}
+                {progress.quantities?.SHORT ?? '—'}
+              </dd>
+            </div>
+            <div>
+              <dt>本轮基线数量 · A 多 / B 空</dt>
+              <dd>
+                {progress.baseline?.LONG ?? '—'} /{' '}
+                {progress.baseline?.SHORT ?? '—'}
+              </dd>
+            </div>
+          </dl>
+        ) : null}
+        <dl className="saved-settings">
+          <div>
+            <dt>普通底仓数量 · A 多 / B 空</dt>
+            <dd>
+              {pair.state?.owned?.LONG ?? '—'} /{' '}
+              {pair.state?.owned?.SHORT ?? '—'}
+            </dd>
+          </div>
+          <div>
+            <dt>最近批次</dt>
+            <dd>
+              {lastBatch
+                ? `${lastBatch.kind === 'cycle' ? '循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.completed ? '完成' : '未完成 / 已恢复'} · ${clock(lastBatch.at)}`
+                : '暂无记录'}
+            </dd>
+          </div>
+        </dl>
+      </section>
+      <section className="panel" aria-label="配对组当日成交量">
+        <div className="section-head">
+          <h2>两侧当日成交量</h2>
+          <span className="small-note">{utcDate || '日期待确认'} · UTC</span>
+        </div>
+        <dl className="saved-settings">
+          <div>
+            <dt>A 多账户 · USD1</dt>
+            <dd>{fmt(dayVolume?.long)}</dd>
+          </div>
+          <div>
+            <dt>B 空账户 · USD1</dt>
+            <dd>{fmt(dayVolume?.short)}</dd>
+          </div>
+        </dl>
+        <div className="cycle-live-state">
+          <p className="muted">
+            仅计本组普通、循环及风险恢复的实际成交；两个子账户分别累计。
+          </p>
+          {pair.state?.volume_unknown ? (
+            <p className="amber">
+              部分成交时间或日期归属未知，已显示成交量可能不完整，等待核对。
+            </p>
+          ) : null}
+        </div>
+      </section>
+      <section className="panel" aria-label="保证金平衡状态">
+        <div className="section-head">
+          <h2>保证金平衡</h2>
+          <span
+            className={`small-note ${margin?.blocks_trading ? 'amber' : ''}`}
+          >
+            {pairMarginStatus(margin)}
+          </span>
+        </div>
+        <div className="cycle-live-state" aria-live="polite">
+          <p>
+            {margin?.reason ||
+              (pair.margin.enabled ? '等待平衡检查' : '未开启自动保证金平衡')}
+          </p>
+          {margin?.pending ? (
+            <p className="amber">
+              {pairTransferStatus(margin.pending)}：
+              <TransferSummary transfer={margin.pending} />
+              {margin.pending.status === 'acknowledged'
+                ? '。仅读重试两侧余额刷新，不重新划转或开始新开仓。'
+                : '。只读核对，缺少可靠结果时保留待确认状态，不重新划转或开始新开仓。'}
+            </p>
+          ) : null}
+        </div>
+        <dl className="saved-settings">
+          <div>
+            <dt>最后划转</dt>
+            <dd>
+              {margin?.last_transfer ? (
+                <>
+                  <TransferSummary transfer={margin.last_transfer} />
+                  <small>
+                    {pairTransferStatus(margin.last_transfer)} ·{' '}
+                    {clock(
+                      margin.last_transfer.refreshed_at ??
+                        margin.last_transfer.confirmed_at ??
+                        margin.last_transfer.acknowledged_at ??
+                        margin.last_transfer.created_at,
+                    )}
+                  </small>
+                </>
+              ) : (
+                '暂无已记录划转'
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>最近平衡检查</dt>
+            <dd>
+              {clock(margin?.checked_at)}
+              <small>
+                {pair.margin.check_interval_seconds} 秒检查 ·{' '}
+                {pair.margin.cooldown_seconds} 秒冷却
+                {margin?.cooldown_until && margin.cooldown_until > now
+                  ? ` · 剩余 ${Math.ceil(margin.cooldown_until - now)} 秒`
+                  : ''}
+              </small>
+            </dd>
+          </div>
+          <div>
+            <dt>触发可用余额差额 / 单次划转范围</dt>
+            <dd>
+              {fmt(pair.margin.threshold)} / {fmt(pair.margin.min_transfer)}–
+              {fmt(pair.margin.max_transfer)} USD1
+            </dd>
+          </div>
+          <div>
+            <dt>转出侧风险与现金缓冲</dt>
+            <dd>
+              占用上限扣减 {fmt(Number(pair.margin.buffer_ratio) * 100)}{' '}
+              个百分点
+              <small>
+                可用余额保留 ≥ 当前权益 × {pct(pair.margin.buffer_ratio)}
+              </small>
+            </dd>
+          </div>
+        </dl>
+      </section>
+      <details className="disclosure panel">
+        <summary>配对执行记录</summary>
+        <ExecutionEvents
+          events={(events ?? []).filter(
+            (event) =>
+              event.account_id === pair.id ||
+              event.account_id === pair.long_account_id ||
+              event.account_id === pair.short_account_id,
+          )}
+        />
+      </details>
+      <details className="disclosure panel settings-panel pair-config">
+        <summary>配对组设置{draft.dirty ? ' · 未保存' : ''}</summary>
+        {configurationLock ? (
+          <p className="settings-lock amber">{configurationLock}</p>
+        ) : null}
+        <PairSettings
+          draft={draft.value}
+          setDraft={draft.setValue}
+          accounts={accounts}
+          pairs={pairs}
+          editing
+          locked={locked}
+          cancel={draft.clear}
+          submit={async () => {
+            try {
+              const config = pairConfigurationChanges(
+                parsePairDraft(draft.value, accounts, pairs, pair.id),
+              );
+              if (await action(`/api/pairs/${pair.id}`, config, 'PATCH')) {
+                draft.clear();
+                setNotice('配对组设置已保存并保持暂停。');
+              }
+            } catch (error) {
+              setError(
+                error instanceof Error ? error.message : '配对组设置无效',
+              );
+            }
+          }}
+        />
+      </details>
+      <details className="disclosure panel">
+        <summary>解除配对组</summary>
+        <div className="pair-delete-content">
+          <p className="muted">
+            删除配对组后释放两个账户，保留账户与历史记录。服务会重新读取两侧账户，确认组已暂停、两侧完全空仓，且无待确认订单或划转后才删除。
+          </p>
+          {deletionBlock ? <p className="amber">{deletionBlock}</p> : null}
+          <Button
+            variant="destructive"
+            disabled={busy || Boolean(deletionBlock)}
+            onClick={() => setDeleteOpen(true)}
+          >
+            <Trash2 size={16} />
+            删除配对组
+          </Button>
+        </div>
+      </details>
+      <Dialog
+        open={deleteOpen}
+        onOpenChange={(value) => !busy && setDeleteOpen(value)}
+      >
+        <DialogContent showCloseButton={!busy}>
+          <DialogHeader>
+            <DialogTitle>删除配对组“{pair.name}”？</DialogTitle>
+            <DialogDescription>
+              解除 A 与 B 的配对绑定，保留账户及历史记录。
+            </DialogDescription>
+          </DialogHeader>
+          {deletionBlock ? <p className="amber">{deletionBlock}</p> : null}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => setDeleteOpen(false)}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={busy || Boolean(deletionBlock)}
+              onClick={async () => {
+                if (
+                  await action(`/api/pairs/${pair.id}`, undefined, 'DELETE')
+                ) {
+                  setDeleteOpen(false);
+                  setNotice('配对组已删除，两侧账户已解除绑定。');
+                }
+              }}
+            >
+              确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function PairSide({
+  side,
+  account,
+  snapshot,
+  now,
+  offline,
+  baseLimit,
+  cycle,
+}: {
+  side: 'long' | 'short';
+  account?: Account;
+  snapshot?: PairSnapshot | null;
+  now: number;
+  offline: boolean;
+  baseLimit: string;
+  cycle: boolean;
+}) {
+  const fresh = pairDataFresh(snapshot?.timestamp, now, offline);
+  const positions = snapshot?.positions.filter(
+    (position) => position.symbol === 'XAUUSD1' && Number(position.qty) !== 0,
+  );
+  const reverse = positions?.some(
+    (position) => position.side !== (side === 'long' ? 'LONG' : 'SHORT'),
+  );
+  const highLimit = migrationMarginLimit(baseLimit);
+  const limit =
+    cycle || positions?.some((position) => [10, 20].includes(position.leverage))
+      ? highLimit
+      : baseLimit;
+  return (
+    <section
+      className="panel pair-side"
+      aria-label={side === 'long' ? 'A 多仓账户风险' : 'B 空仓账户风险'}
+    >
+      <div className="section-head">
+        <div>
+          <h2>
+            {side === 'long' ? 'A · 只多' : 'B · 只空'}{' '}
+            <span className="muted">{account?.name ?? '账户待确认'}</span>
+          </h2>
+          <p className={!fresh ? 'amber' : 'muted'}>
+            {pairSnapshotStatus(snapshot, now, offline)} ·{' '}
+            {clock(snapshot?.timestamp)}
+          </p>
+        </div>
+      </div>
+      <dl className="pair-risk-values">
+        <div>
+          <dt>权益 · USD1</dt>
+          <dd>{fmt(snapshot?.equity)}</dd>
+        </div>
+        <div>
+          <dt>可用 · USD1</dt>
+          <dd>{fmt(snapshot?.available)}</dd>
+        </div>
+        <div>
+          <dt>保证金占用率</dt>
+          <dd
+            className={
+              snapshot?.ratio != null && Number(snapshot.ratio) > Number(limit)
+                ? 'danger'
+                : ''
+            }
+          >
+            {pct(snapshot?.ratio)}
+          </dd>
+          <small>
+            {cycle
+              ? `循环上限 ${pct(highLimit)}`
+              : `5x ≤ ${pct(baseLimit)} · 10x / 20x ≤ ${pct(highLimit)}`}
+          </small>
+        </div>
+        <div>
+          <dt>维持保证金率</dt>
+          <dd>{pct(snapshot?.margin_ratio)}</dd>
+          <small>维持保证金 ÷ 本侧权益</small>
+        </div>
+      </dl>
+      <div className="cycle-live-state">
+        <p className="muted">
+          XAU 持仓：
+          {positions === undefined
+            ? '等待数据'
+            : positions.length
+              ? positions
+                  .map(
+                    (position) =>
+                      `${position.side === 'LONG' ? '多' : '空'} ${position.qty} · ${position.leverage}x`,
+                  )
+                  .join(' / ')
+              : '无持仓'}
+        </p>
+        {reverse ? (
+          <p className="danger">
+            检测到旧反向仓位，须先处理，不能开始配对交易。
+          </p>
+        ) : null}
+        {snapshot && !snapshot.mode_checks?.hedge ? (
+          <p className="amber">
+            Hedge Mode 尚未通过核验，程序不会自动切换账户模式。
+          </p>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function TransferSummary({ transfer }: { transfer: PairTransfer }) {
+  return (
+    <>
+      {transfer.source === 'long' ? 'A' : 'B'} →{' '}
+      {transfer.destination === 'long' ? 'A' : 'B'} · {fmt(transfer.amount)}{' '}
+      USD1
+    </>
+  );
+}

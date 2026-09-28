@@ -16,7 +16,8 @@ class SharedConfigurationBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
             files = ["requirements.txt", "requirements.lock", "monitor.py", "config.json", "DEPLOYMENT.md", "install-trading.sh",
-                     "dashboard/package.json", "dashboard/package-lock.json", "dashboard/lib/cycle.ts", "trading/cycle-config.json"]
+                     "dashboard/package.json", "dashboard/package-lock.json", "dashboard/lib/cycle.ts", "trading/cycle-config.json",
+                     "deploy/build-dashboard.py"]
             for name in files:
                 path = source / name
                 path.parent.mkdir(parents=True, exist_ok=True)

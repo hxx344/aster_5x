@@ -82,6 +82,14 @@ class Store:
                 CREATE TABLE IF NOT EXISTS deleted_accounts (
                     id TEXT PRIMARY KEY, data TEXT NOT NULL, deleted_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS pairs (
+                    id TEXT PRIMARY KEY, data TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pair_members (
+                    account_id TEXT PRIMARY KEY, pair_id TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('LONG','SHORT')),
+                    UNIQUE(pair_id,direction)
+                );
                 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS intents (
                     id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
@@ -306,7 +314,8 @@ class Store:
             return
         if demo:
             expected = {"accounts", "deleted_accounts", "kv", "intents", "events", "outbox", "cycle_fills",
-                        "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync", "cycle_fill_versions"}
+                        "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync", "cycle_fill_versions",
+                        "pairs", "pair_members", "cycle_quality_history"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
             if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -351,7 +360,83 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM deleted_accounts WHERE id=?", (account["id"],)).fetchone():
                 raise TradingError("该账户标识已有删除记录，请使用新的账户标识")
+            if account.get("enabled") and db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (account["id"],)).fetchone():
+                raise TradingError("配对组成员不能启用单账户策略")
             db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(account)))
+
+    def pairs(self):
+        with self.connect() as db:
+            return [json.loads(row[0]) for row in db.execute("SELECT data FROM pairs ORDER BY id")]
+
+    def pair(self, pair_id):
+        with self.connect() as db:
+            row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def pair_for_account(self, account_id):
+        with self.connect() as db:
+            row = db.execute("SELECT p.data FROM pairs p JOIN pair_members m ON p.id=m.pair_id WHERE m.account_id=?",
+                             (account_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def save_pair(self, pair, *, create=False):
+        """Reserve both members in one durable transaction, across Store instances."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
+            if create and row:
+                raise TradingError("配对组标识已使用")
+            if not create and not row:
+                raise TradingError("配对组不存在")
+            previous = json.loads(row[0]) if row else None
+            if previous and pair.get("revision") != previous.get("revision"):
+                raise TradingError("配对组配置已变化，请刷新后重试")
+            if previous and any(previous[key] != pair[key] for key in ("long_account_id", "short_account_id", "symbol")):
+                raise TradingError("配对组账户及方向不可变更；空仓解除绑定后重新建组")
+            members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]
+            if members[0][0] == members[1][0]:
+                raise TradingError("配对组需要两个不同账户")
+            for aid, direction in members:
+                saved = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+                if saved is None or json.loads(saved[0]).get("enabled"):
+                    raise TradingError("配对组成员必须存在且已暂停单账户策略")
+                existing = db.execute("SELECT pair_id FROM pair_members WHERE account_id=?", (aid,)).fetchone()
+                if existing and existing[0] != pair["id"]:
+                    raise TradingError("账户已属于其他配对组")
+                if db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone():
+                    raise TradingError("账户旧批次尚未完成，请先核对")
+            revision = (previous or {}).get("revision", 0) + 1
+            saved_pair = {**pair, "revision": revision}
+            db.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                       (pair["id"], dumps(saved_pair)))
+            for aid, direction in members:
+                db.execute("INSERT INTO pair_members VALUES (?,?,?) ON CONFLICT(account_id) DO NOTHING",
+                           (aid, pair["id"], direction))
+            return saved_pair
+
+    def delete_pair(self, pair_id):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
+            if row is None:
+                raise TradingError("配对组不存在")
+            if json.loads(row[0]).get("enabled"):
+                raise TradingError("请先暂停配对组")
+            runtime_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_runtime:" + pair_id,)).fetchone()
+            runtime = json.loads(runtime_row[0]) if runtime_row else {}
+            if runtime.get("pending"):
+                raise TradingError("配对组仍有未完成批次")
+            if any(dec(qty) for qty in (runtime.get("owned") or {}).values()) or any(
+                    dec(qty) for qty in (runtime.get("progress") or {}).get("quantities", {}).values()):
+                raise TradingError("配对组仍有记录持仓")
+            margin_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_margin:" + pair_id,)).fetchone()
+            margin = json.loads(margin_row[0]) if margin_row else {}
+            if margin.get("pending") or margin.get("status") in ("submitting", "accepted", "unknown"):
+                raise TradingError("保证金划转结果尚未核实")
+            db.execute("DELETE FROM pair_members WHERE pair_id=?", (pair_id,))
+            db.execute("DELETE FROM pairs WHERE id=?", (pair_id,))
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("pair_deleted:" + pair_id, dumps({"deleted_at": time.time()})))
 
     def account_id_used(self, account_id):
         with self.connect() as db:
@@ -361,6 +446,8 @@ class Store:
     def delete_account(self, account_id):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (account_id,)).fetchone():
+                raise TradingError("账户属于配对组，请先在配对组解除绑定")
             reader = _StoreSnapshot(self, db)
             account = reader.account(account_id)
             if account is None:
@@ -461,6 +548,9 @@ class Store:
 
     def save_intent(self, intent):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (intent["account_id"],)).fetchone():
+                raise TradingError("配对组成员不能创建单账户批次")
             db.execute("INSERT INTO intents VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data",
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
             self._index_cycle_volume(db, intent)
@@ -539,6 +629,8 @@ class Store:
             raise TradingError("只能创建新的待提交循环批次")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (intent["account_id"],)).fetchone():
+                raise TradingError("配对组成员不能创建单账户循环批次")
             # This is creation, never an upsert of a previously submitted ID.
             db.execute("INSERT INTO intents VALUES (?,?,?,?)",
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))

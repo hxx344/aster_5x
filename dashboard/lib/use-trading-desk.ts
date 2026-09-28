@@ -68,7 +68,8 @@ export function useTradingDesk() {
     const updateActivity = () => {
       clearInterval(timer);
       timer = undefined;
-      const active = document.visibilityState === 'visible' && navigator.onLine && hubActive;
+      const active =
+        document.visibilityState === 'visible' && navigator.onLine && hubActive;
       poller.setActivity(active);
       if (active) {
         tick();
@@ -132,7 +133,10 @@ export function useTradingDesk() {
         resumePolling = false;
       }
       if (!r.ok) throw new Error(data.detail || '操作未完成');
-      if (url.startsWith('/api/accounts') && !url.endsWith('/recovery-preview'))
+      if (
+        (url.startsWith('/api/accounts') || url.startsWith('/api/pairs')) &&
+        !url.endsWith('/recovery-preview')
+      )
         hubBridge.current?.changed();
       if (url === '/api/logout') {
         clearSession();

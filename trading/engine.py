@@ -42,6 +42,7 @@ from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
 from .scheduling import AccountWork, OrdinaryRead, PollBackoff
 from .store import dumps
+from .pairing import PairManager, pair_active
 
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
@@ -156,6 +157,7 @@ class Engine:
         self.registration_lock = threading.Lock()
         self.accounts_generation = 0
         self.account_locks = {}
+        self.pairs = PairManager(self)
         self.budget_wait_events = {}
         self.brokers, self.signers, self.users = {}, {}, {}
         self.deleted_accounts = set()
@@ -255,17 +257,19 @@ class Engine:
     def poll_cycle_hot_data(self, account_id):
         """Refresh independently of the account execution slot and quote trigger."""
         account = self.store.account(account_id)
+        paired = self.pairs.active_for_account(account_id)
         with self.lock:
             existing = self.brokers.get(account_id)
-        active = (account and account["mode"] == "live" and account["enabled"]
-                  and account.get("cycle", {}).get("enabled") and self.live_allowed(account)
+        active = (account and account["mode"] == "live"
+                  and (paired or account["enabled"] and account.get("cycle", {}).get("enabled")) and self.live_allowed(account)
                   and not self.shutdown.is_set())
         if not active:
             if isinstance(existing, LiveBroker):
                 existing.stop_cycle_hot_data()
             return 30
         broker = self.broker(account)
-        broker.start_cycle_hot_data([account["cycle"]["symbol"]],
+        hot_symbol = "XAUUSD1" if paired else account["cycle"]["symbol"]
+        broker.start_cycle_hot_data([hot_symbol],
                                     on_invalidate=lambda: self.wake_cycle_hot_data(account_id))
         if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
             broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
@@ -278,10 +282,13 @@ class Engine:
             budget = getattr(broker.api, "budget", None)
             if budget is not None:
                 budget.require_available(
-                    broker.cycle_snapshot_weight([account["cycle"]["symbol"]], fresh_modes=True) + 5)
+                    broker.cycle_snapshot_weight([hot_symbol], fresh_modes=True) + 5)
             published = broker.refresh_cycle_hot_snapshot()
             latest = self.store.account(account_id)
-            if (self.shutdown.is_set() or not latest or not latest["enabled"] or latest.get("cycle") != account.get("cycle")):
+            latest_pair = self.pairs.active_for_account(account_id) if paired else None
+            if (self.shutdown.is_set() or not latest or
+                    (paired and (not latest_pair or latest_pair["revision"] != paired["revision"])) or
+                    (not paired and (not latest["enabled"] or latest.get("cycle") != account.get("cycle")))):
                 broker.invalidate_cycle_hot_data("账户配置在后台更新期间发生变化", refresh_modes=True)
                 return CYCLE_HOT_POLL_INTERVAL
             if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
@@ -298,6 +305,11 @@ class Engine:
             return CYCLE_HOT_POLL_INTERVAL
         except AccountModeError as exc:
             broker.invalidate_cycle_hot_data("账户模式不符合要求", refresh_modes=True)
+            if paired:
+                # The group worker owns the ordered two-account locks. Let it
+                # observe the invalid snapshot and persist a group-wide pause.
+                self.scheduler_event.set()
+                return 30
             # The network read is over; serialize the persisted pause with
             # account controls without holding the execution lock during I/O.
             with self.account_lock(account_id):
@@ -625,6 +637,13 @@ class Engine:
                 continue
             for symbol in ordinary_add_symbols(account):
                 targets.setdefault(symbol, set()).add(5)
+        for pair in self.store.pairs():
+            if not pair["enabled"]:
+                continue
+            if pair["cycle"]["enabled"]:
+                targets.setdefault("XAUUSD1", set()).add(pair["cycle"]["leverage"])
+            elif pair["ordinary"]["enabled"]:
+                targets.setdefault("XAUUSD1", set()).update(leverage_candidates(pair["ordinary"]["min_open_leverage"]))
         return targets
 
     def capacity_interval(self, symbol):
@@ -657,6 +676,9 @@ class Engine:
                 symbols.add(cycle.get("config", account.get("cycle", {})).get("symbol"))
             for symbol in symbols.intersection(SYMBOLS):
                 required.setdefault(symbol, []).append(account["name"])
+        for pair in reader.pairs():
+            if pair_active(pair, reader.get("pair_runtime:" + pair["id"])):
+                required.setdefault("XAUUSD1", []).append(pair["name"])
         return required
 
     def monitored_market_symbols(self, accounts=None):
@@ -1403,6 +1425,10 @@ class Engine:
 
     def _tick_account(self, account_id, *, cycle_signal=None):
         with self.account_lock(account_id):
+            paired = self.store.pair_for_account(account_id)
+            if paired:
+                self.view(account_id, status="paired", reason="由配对组「" + paired["name"] + "」统一管理")
+                return 30
             worker_started = clock_tick() if cycle_signal is not None else None
             with self.lock:
                 priority = self.work(account_id).active_priority
@@ -1824,6 +1850,7 @@ class Engine:
 
     def configure(self, account_id, changes):
         with self.account_lock(account_id):
+            self.pairs.require_unbound(account_id)
             account = self.store.account(account_id)
             if not account:
                 raise TradingError("账户不存在")
@@ -1891,6 +1918,7 @@ class Engine:
 
     def enable(self, account_id, enabled):
         with self.account_lock(account_id):
+            self.pairs.require_unbound(account_id)
             account = self.store.account(account_id)
             if not account:
                 raise TradingError("账户不存在")
@@ -1952,6 +1980,7 @@ class Engine:
             self.store.event(account_id, "control", "策略已启动" if enabled else "策略已暂停；已提交批次继续核对")
 
     def _cycle_recovery_read(self, account_id):
+        self.pairs.require_unbound(account_id)
         account = self.store.account(account_id)
         if not account:
             raise TradingError("账户不存在")
@@ -2020,6 +2049,7 @@ class Engine:
 
     def retry(self, account_id):
         with self.account_lock(account_id):
+            self.pairs.require_unbound(account_id)
             intent = self.store.intent(account_id)
             if not intent:
                 return
@@ -2224,6 +2254,7 @@ class Engine:
         state_now = time.time()
         with self.store.read_snapshot() as reader:
             saved_accounts = reader.accounts()
+            paired_states = self.pairs.states(reader)
             history_account = next((a["id"] for a in saved_accounts if a["id"] == history_account),
                                    saved_accounts[0]["id"] if saved_accounts else None)
             events = reader.events(account_id=history_account if compact else None)
@@ -2259,6 +2290,15 @@ class Engine:
                 "reason": a.get("pause_reason") or "等待读取账户", "credential_ready": False, "strategies": {}})} for a in saved_accounts]
             for account in accounts:
                 account["deletion_block"] = deletion_blocks[account["id"]]
+                owner = next((pair for pair in paired_states if account["id"] in
+                              (pair["long_account_id"], pair["short_account_id"])), None)
+                if owner:
+                    direction = "long" if account["id"] == owner["long_account_id"] else "short"
+                    account["pair_id"], account["pair_direction"] = owner["id"], direction.upper()
+                    account["deletion_block"] = "账户由配对组管理，请先在配对组解除绑定"
+                    pair_snapshot = owner["state"].get("snapshots", {}).get(direction)
+                    if isinstance(pair_snapshot, dict):
+                        account["snapshot"] = pair_snapshot
                 # Display cadence only; this never extends a snapshot's
                 # eight-second execution authority or starts an exchange read.
                 hot_refresh = (account["mode"] == "live" and account["enabled"]
@@ -2382,7 +2422,7 @@ class Engine:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
-                "accounts": accounts, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
+                "accounts": accounts, "pairs": paired_states, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
@@ -2550,6 +2590,7 @@ class Engine:
                         ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts,
                             aid not in cycle_candidates, aid not in priority_accounts))
                         jobs.update({"account:" + aid: (self.tick_account, aid) for aid in ordered_accounts})
+                        jobs.update({"pair:" + pair["id"]: (self.pairs.tick, pair["id"]) for pair in self.store.pairs()})
                         for key, (function, *args) in jobs.items():
                             is_account = key.startswith("account:")
                             aid = key.removeprefix("account:")

@@ -1773,6 +1773,122 @@ label input,
   min-width: 0;
   gap: 18px;
 }
+.pair-workspace-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.pair-workspace-heading h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.pair-workspace-heading p {
+  margin: 7px 0 0;
+  font-size: 12px;
+}
+.pair-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.pair-side {
+  min-width: 0;
+}
+.pair-side h2 {
+  flex-wrap: wrap;
+}
+.pair-risk-values {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  padding: 0 22px 20px;
+  margin: 0;
+}
+.pair-risk-values dt {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.pair-risk-values dd {
+  margin: 7px 0 4px;
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.pair-risk-values small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.pair-config .pair-settings-form {
+  padding: 0 22px 22px;
+}
+.pair-settings-form {
+  gap: 20px;
+}
+.pair-settings-form fieldset {
+  min-width: 0;
+}
+.pair-settings-form legend {
+  margin-bottom: 14px;
+  padding: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.pair-settings-form small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted-foreground);
+}
+.pair-settings-dialog {
+  max-width: 760px !important;
+  max-height: min(90dvh, 980px);
+  overflow-y: auto;
+}
+.pair-delete-content {
+  padding: 0 22px 22px;
+}
+.pair-delete-content p {
+  line-height: 1.7;
+  margin: 0 0 12px;
+}
+@media (max-width: 640px) {
+  .pair-sides {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pair-workspace-heading .account-controls {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .pair-workspace-heading button {
+    min-height: 44px;
+  }
+  .pair-risk-values {
+    padding: 0 16px 18px;
+    gap: 18px 12px;
+  }
+  .pair-risk-values dd {
+    font-size: 21px;
+  }
+  .pair-config .pair-settings-form {
+    padding: 0 16px 18px;
+  }
+  .pair-settings-form .cycle-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pair-settings-form .form-actions {
+    flex-wrap: wrap;
+  }
+  .pair-settings-form .form-actions > button {
+    min-height: 44px;
+  }
+  .pair-settings-dialog {
+    max-height: 90dvh;
+  }
+  .pair-delete-content {
+    padding: 0 16px 18px;
+  }
+}
 .feature-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.65fr) minmax(320px, 1fr);

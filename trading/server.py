@@ -236,6 +236,56 @@ class PolicyEdit(BaseModel):
         return values
 
 
+class PairOrdinaryEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    threshold: str | None = Field(default=None, max_length=40)
+    order_notional: str | None = Field(default=None, max_length=40)
+    min_open_leverage: StrictInt | None = None
+    margin_limit: str | None = Field(default=None, max_length=128)
+    spread_limit: str | None = Field(default=None, max_length=128)
+
+
+class PairMarginEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    master_env_prefix: str | None = Field(default=None, max_length=41)
+    check_interval_seconds: StrictInt | None = None
+    threshold: str | None = Field(default=None, max_length=40)
+    min_transfer: str | None = Field(default=None, max_length=40)
+    max_transfer: str | None = Field(default=None, max_length=40)
+    buffer_ratio: str | None = Field(default=None, max_length=128)
+    cooldown_seconds: StrictInt | None = None
+
+
+class NewPair(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    id: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=50)
+    long_account_id: str = Field(min_length=1, max_length=32)
+    short_account_id: str = Field(min_length=1, max_length=32)
+    symbol: Literal["XAUUSD1"] = "XAUUSD1"
+    enabled: bool = False
+    ordinary: PairOrdinaryEdit | None = None
+    cycle: CycleEdit | None = None
+    margin: PairMarginEdit | None = None
+
+
+class PairEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str | None = Field(default=None, min_length=1, max_length=50)
+    ordinary: PairOrdinaryEdit | None = None
+    cycle: CycleEdit | None = None
+    margin: PairMarginEdit | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的配对组配置")
+        return values
+
+
 def create_app(engine=None, *, demo=False, start_engine=True):
     if engine is None:
         runtime = Path(os.environ.get("ASTER_TRADING_RUNTIME", ROOT / "runtime" / ("demo" if demo else "trading")))
@@ -361,6 +411,37 @@ def create_app(engine=None, *, demo=False, start_engine=True):
         return hub_summary(engine)
 
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
+
+    @app.get("/api/pairs", dependencies=[Depends(authenticated)])
+    def pairs():
+        with engine.store.read_snapshot() as reader:
+            return {"pairs": engine.pairs.states(reader)}
+
+    @app.post("/api/pairs", dependencies=write_dependencies)
+    def create_pair(body: NewPair):
+        return {"ok": True, "pair": engine.pairs.create(body.model_dump(exclude_unset=True))}
+
+    @app.patch("/api/pairs/{pair_id}", dependencies=write_dependencies)
+    def configure_pair(pair_id: str, body: PairEdit):
+        return {"ok": True, "pair": engine.pairs.configure(pair_id, body.model_dump(exclude_unset=True))}
+
+    @app.post("/api/pairs/{pair_id}/enable", dependencies=write_dependencies)
+    def enable_pair(pair_id: str):
+        return {"ok": True, "pair": engine.pairs.enable(pair_id, True)}
+
+    @app.post("/api/pairs/{pair_id}/pause", dependencies=write_dependencies)
+    def pause_pair(pair_id: str):
+        return {"ok": True, "pair": engine.pairs.enable(pair_id, False)}
+
+    @app.delete("/api/pairs/{pair_id}", dependencies=write_dependencies)
+    def delete_pair(pair_id: str):
+        engine.pairs.delete(pair_id)
+        return {"ok": True}
+
+    @app.post("/api/pairs/{pair_id}/reconcile-flat", dependencies=write_dependencies)
+    def reconcile_pair_flat(pair_id: str):
+        engine.pairs.reconcile_flat(pair_id)
+        return {"ok": True}
 
     @app.get("/api/monitoring", dependencies=[Depends(authenticated)])
     def monitoring_settings():

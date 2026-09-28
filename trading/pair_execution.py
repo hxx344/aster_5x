@@ -31,6 +31,40 @@ def runtime_default():
 class PairTrader:
     def __init__(self, engine):
         self.engine, self.store, self.market = engine, engine.store, engine.market
+        self._ordinary_observations = {}
+
+    def _ordinary_wait(self, pair, state, identities, margin_state):
+        """Reuse recent reads only to reject work, never to authorize a write."""
+        if not pair["enabled"] or not pair["ordinary"]["enabled"] or state.get("attention"):
+            return None
+        if pair["margin"]["enabled"] and time.time() >= max(
+                margin_state.get("next_check_at", 0), margin_state.get("cooldown_until", 0)):
+            return None
+        observed = self._ordinary_observations.get(pair["id"])
+        if not observed or observed[0] != (pair["revision"], identities):
+            return None
+        snapshots, guards, started = observed[1:]
+        interval = min(5, pair["margin"]["check_interval_seconds"]) if pair["margin"]["enabled"] else 5
+        if not 0 <= time.monotonic() - started < interval:
+            return None
+        try:
+            for guard in guards.values():
+                guard()
+            require_quantities(snapshots, self._expected(state))
+        except TradingError:
+            return None
+        try:
+            capacities = self.engine.capacities(SYMBOL)
+            book = self.market.book(SYMBOL)
+            book.require_fresh()
+            if ordinary_upgrade(pair, snapshots, book, capacities) is not None:
+                return None
+            plan_ordinary(pair, snapshots, book, self.market.rules[SYMBOL], capacities)
+        except PairPositionError:
+            return None
+        except TradingError as exc:
+            return str(exc)
+        return None
 
     def _save(self, pair, state):
         state["updated_at"] = time.time()
@@ -137,10 +171,18 @@ class PairTrader:
             holding = any(dec(qty) for qty in state["progress"]["quantities"].values())
             if state.get("volume_unknown_until_utc"):
                 state["volume_unknown"] = datetime.now(timezone.utc).date().isoformat() <= state["volume_unknown_until_utc"]
-            margin_pending = (self.store.get("pair_margin:" + pair["id"]) or {}).get("pending")
+            margin_state = self.store.get("pair_margin:" + pair["id"]) or {}
+            margin_pending = margin_state.get("pending")
             if not pair["enabled"] and not holding and not margin_pending:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停")
                 return state
+            if not holding and not margin_pending:
+                reason = self._ordinary_wait(pair, state, identities, margin_state)
+                if reason:
+                    margin = state.get("margin") or {}
+                    state.update(phase="margin_wait" if margin.get("blocks_trading") else "waiting",
+                                 reason=margin.get("reason", reason) if margin.get("blocks_trading") else reason)
+                    return state
             closing_due = holding and (not pair["enabled"] or time.time() >=
                 state["progress"]["opened_at"] + state["progress"]["config"]["hold_seconds"])
             # A due reduction must not depend on a hot refresh that uses ordinary
@@ -149,6 +191,12 @@ class PairTrader:
             snapshots, guards = self._read(brokers, hot=hot, reconciliation=closing_due)
             self._publish_snapshots(state, snapshots)
             held = require_quantities(snapshots, self._expected(state))
+            if (not hot and not closing_due and pair["ordinary"]["enabled"]
+                    and all(isinstance(broker, LiveBroker) for broker in brokers.values())):
+                if len(self._ordinary_observations) >= 16:
+                    self._ordinary_observations.clear()
+                self._ordinary_observations[pair["id"]] = (
+                    (pair["revision"], deepcopy(identities)), snapshots, guards, time.monotonic())
             # The independent balancer uses the same ordered account locks. A
             # transfer invalidates both read leases before any following order.
             from .margin_balance import MarginBalancer

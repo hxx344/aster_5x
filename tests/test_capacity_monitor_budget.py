@@ -179,7 +179,8 @@ class CapacityMonitorBudgetTests(unittest.TestCase):
         self.assertEqual(budget.weight, 1141)
         with budget.capacity_monitoring():
             budget.reserve(359)
-        with patch.object(client, "request") as sampler:
+        with patch.object(client, "request") as sampler, \
+             patch("trading.exchange.time.monotonic", return_value=time.monotonic() + 1):
             with self.assertRaises(BudgetWait):
                 market.capacities("XAUUSD1", [10, 20])
             sampler.assert_not_called()

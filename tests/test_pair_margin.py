@@ -216,6 +216,110 @@ class PairMarginTests(unittest.TestCase):
         self.assertLessEqual(dec(plan["amount"]), dec("25.92592593"))
         self.assertLessEqual(snapshots["long"].occupied_margin / (dec(100) - dec(plan["amount"])), dec("0.45"))
 
+    def test_transfer_precheck_threshold_and_minimum_boundaries_are_exact(self):
+        cases = [
+            (100, 100, "0", "1", False),
+            (110, 100, "10", "1", False),
+            ("110.00000001", 100, "10", "1", True),
+            ("101.999999999999999999999999999999", 100, "0", "1", False),
+            (102, 100, "0", "1", True),
+            (100, 102, "0", "1", True),
+            ("102.000000002", 100, "0", "1.000000001", False),
+            ("102.00000002", 100, "0", "1.000000001", True),
+            ("100.000000019", 100, "0", "0.00000001", False),
+            ("100.00000002", 100, "0", "0.00000001", True),
+            (-1, -2, "0", "1", False),
+            (-1, -3, "0", "1", True),
+            (0.3, 0.1, 0.2, "0.00000001", False),
+            (0.30000002, 0.1, "0", "0.10000001", True),
+        ]
+        for long, short, threshold, minimum, expected in cases:
+            with self.subTest(long=long, short=short, threshold=threshold, minimum=minimum):
+                config = validate_margin({"threshold": threshold, "min_transfer": minimum})
+                snapshots = {"long": snapshot(100), "short": snapshot(100)}
+                snapshots["long"].available, snapshots["short"].available = long, short
+                self.assertEqual(self.balancer._may_need_transfer(snapshots, config), expected)
+
+    def test_balanced_live_margin_polling_uses_no_prepare_requests(self):
+        self.live()
+        now = [1000.0]
+        with patch("time.time", side_effect=lambda: now[0]), \
+                patch.object(self.balancer, "_live_snapshots", side_effect=AssertionError("unexpected account read")), \
+                patch.object(self.balancer, "_master", side_effect=AssertionError("unexpected master read")):
+            for _ in range(12):
+                # Hot snapshots have no ordinary generation. A fresh negative
+                # precheck must not replace them with two new account reads.
+                result = self.balancer.tick(self.pair, {"long": snapshot(2000), "short": snapshot(2000)})
+                self.assertEqual(result["status"], "waiting", result)
+                self.assertFalse(result["blocks_trading"])
+                self.assertEqual(result["checked_at"], now[0])
+                self.assertEqual(result["next_check_at"], now[0] + 5)
+                now[0] += 5
+        self.assertEqual(self.master_calls, [])
+        self.assertEqual(self.refreshed, [])
+        self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
+        self.assertEqual(self.transfers, [])
+
+    def test_minimum_candidate_runs_complete_live_validation_after_skipped_check(self):
+        snapshots = self.live()
+        self.pair["margin"].update(threshold="0", buffer_ratio="0")
+        snapshots["long"].available = dec("1001.99999999999999999999999999999")
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "waiting", result)
+        self.assertEqual(self.master_calls, [])
+        self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
+        self.ready()
+        snapshots["long"].available = dec("1002")
+        self.brokers["long"].api.account["assets"][0].update(availableBalance="1002", marginBalance="1002")
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertEqual(result["plan"]["amount"], "1.00000000")
+        self.assertEqual(self.master_calls, [("GET", "/fapi/v3/getSubAccountList")])
+        for broker in self.brokers.values():
+            self.assertEqual([path for _, path, _ in broker.api.calls],
+                ["/fapi/v3/accountWithJoinMargin", "/fapi/v3/income", "/fapi/v3/openOrders"])
+        self.assertEqual(len(self.transfers), 1)
+
+    def test_balanced_precheck_still_rejects_stale_invalid_or_revoked_snapshots(self):
+        snapshots = self.live()
+        snapshots["long"].available = snapshots["short"].available
+        cases = [replace(snapshots["long"], timestamp=time.time() - 30),
+                 replace(snapshots["long"], hedge_mode=False),
+                 replace(snapshots["long"], available=dec("1000"), open_orders=[{"orderId": "external"}])]
+        for changed in cases:
+            with self.subTest(changed=changed):
+                self.ready()
+                result = self.balancer.tick(self.pair, {**snapshots, "long": changed})
+                self.assertEqual(result["status"], "blocked", result)
+        self.ready()
+        self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], "blocked")
+        self.assertEqual(self.master_calls, [])
+        self.assertEqual(self.transfers, [])
+
+    def test_balanced_snapshots_do_not_filter_pending_unknown_or_acknowledged(self):
+        for status in ("unknown", "acknowledged"):
+            with self.subTest(status=status):
+                snapshots = self.live()
+                self.store.put("pair_margin:gold", {})
+                if status == "unknown":
+                    self.response = AmbiguousOrder("test uncertain transfer")
+                else:
+                    self.refresh_error = ExchangeError("test post-transfer read failure")
+                self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], status)
+                self.ready()
+                self.refresh_error = None
+                with patch.object(self.balancer, "_may_need_transfer", side_effect=AssertionError("pending was filtered")):
+                    result = self.balancer.tick(self.pair, {"long": snapshot(2000), "short": snapshot(2000)})
+                self.assertEqual(result["status"], status, result)
+                self.assertEqual(len(self.transfers), 1)
+                if status == "unknown":
+                    self.assertIsNotNone(result["pending"])
+                    self.assertTrue(result["blocks_trading"])
+                else:
+                    self.assertIsNone(result["pending"])
+                    self.assertEqual(self.refreshed[-2:], ["long", "short"])
+
     def test_transfer_respects_stricter_pair_and_member_margin_limits(self):
         self.pair["ordinary"] = {"margin_limit": "0.3"}
         snapshots = {"long": snapshot(100), "short": snapshot(0)}
@@ -597,7 +701,7 @@ class PairMarginTests(unittest.TestCase):
         self.assertCountEqual(modes, [("long", False), ("short", False)])
         self.assertEqual(self.transfers, [])
 
-    def test_hot_margin_polling_reuses_mode_ttl_within_default_budget(self):
+    def test_candidate_margin_polling_reuses_mode_ttl_within_default_budget(self):
         self.live()
         now = [1000.0]
         calls = []
@@ -635,7 +739,7 @@ class PairMarginTests(unittest.TestCase):
             master = SimpleNamespace(budget=budget, call=master_call, close=lambda: None)
             with patch("trading.margin_balance.API", return_value=master):
                 for _ in range(12):
-                    result = self.balancer.tick(self.pair, {"long": snapshot(2000), "short": snapshot(2000)})
+                    result = self.balancer.tick(self.pair, {"long": snapshot(3000), "short": snapshot(1000)})
                     self.assertEqual(result["status"], "waiting", result)
                     now[0] += 5
             self.assertEqual(sum(weight for _, weight in calls), 924)

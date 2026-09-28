@@ -1,7 +1,7 @@
 """Aster V3 EIP-712 API adapter. No automatic retries of signed mutations."""
 import json
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from email.utils import parsedate_to_datetime
@@ -30,6 +30,9 @@ from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, Position
 BASE = "https://fapi.asterdex.com"
 PUBLIC_BRACKETS_REFRESH_INTERVAL = 60
 PUBLIC_BRACKETS_MAX_AGE = 300
+# Keep this well below the 200 ms scheduler cadence. The HTTP read starts
+# after that scheduler's clock, so an equal TTL can skip every other sample.
+PUBLIC_OI_SHARE_MAX_AGE = .1
 
 
 class ExchangeError(TradingError):
@@ -447,6 +450,14 @@ def credentials_for(prefix):
     return values
 
 
+class PublicCapacitySample(dict):
+    """Keep the source time when several consumers share one public response."""
+
+    def __init__(self, values, checked_at):
+        super().__init__(values)
+        self.checked_at = checked_at
+
+
 class MarketData:
     def __init__(self, api=None, *, stream=None, depth_stream=None):
         self.api = api or API()
@@ -465,6 +476,8 @@ class MarketData:
         self.public_brackets = {}
         self.public_bracket_guard = threading.Lock()
         self.public_bracket_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
+        self.public_sample_guard = threading.Lock()
+        self.public_samples, self.public_sample_reads = {}, {}
 
     def set_update_listener(self, listener):
         """Forward optional market signals while supporting older injected streams."""
@@ -782,22 +795,80 @@ class MarketData:
 
     def listing_detail(self, symbol):
         from .listings import maximum_leverage
-        started = time.time()
-        brackets = self._public_json(monitor.BRACKETS_PATH, symbol, brackets=True, priority=False)
+        _, brackets_checked_at, brackets = self._public_sample(
+            monitor.BRACKETS_PATH, symbol, brackets=True, priority=False)
         try:
             leverage, cap = maximum_leverage(brackets, symbol)
         except monitor.MonitorError:
             raise ExchangeError("公开杠杆档位数据无效") from None
-        detail = {"max_leverage": leverage, "bracket_cap": str(cap), "brackets_checked_at": started,
+        detail = {"max_leverage": leverage, "bracket_cap": str(cap), "brackets_checked_at": brackets_checked_at,
                   "capacity": None, "remaining": None, "checked_at": None, "error": None}
         try:
-            oi = self._public_json(monitor.OI_PATH, symbol, priority=False)
+            _, checked_at, oi = self._public_sample(monitor.OI_PATH, symbol, priority=False)
             capacity, remaining, cap = monitor.extract_capacity(oi, brackets, symbol, leverage)
         except (monitor.MonitorError, ExchangeError):
             detail["error"] = "最大杠杆对应的公开额度暂不可用，等待重试"
             return detail
-        detail.update(capacity=str(capacity), remaining=str(remaining), checked_at=started)
+        detail.update(capacity=str(capacity), remaining=str(remaining), checked_at=checked_at)
         return detail
+
+    def _public_sample(self, path, symbol, *, brackets=False, priority=True):
+        """Share only unsigned public responses, with one in-flight read per key."""
+        key = path, symbol
+        lifetime = PUBLIC_BRACKETS_REFRESH_INTERVAL if brackets else PUBLIC_OI_SHARE_MAX_AGE
+        while True:
+            with self.public_sample_guard:
+                cached = self.public_samples.get(key)
+                if cached is not None and 0 <= time.monotonic() - cached[0] < lifetime:
+                    return cached
+                pending = self.public_sample_reads.get(key)
+                owner = pending is None
+                if owner:
+                    pending = Future()
+                    self.public_sample_reads[key] = pending
+            if owner:
+                break
+            try:
+                return pending.result()
+            except BudgetWait:
+                if not priority:
+                    raise
+                # A listing owner can exhaust ordinary execution quota while
+                # the monitor still owns reserved headroom. Only that local
+                # admission failure may retry; HTTP/cooldown failures propagate.
+                with self.api.budget.capacity_monitoring():
+                    self.api.budget.require_available(1)
+                with self.public_sample_guard:
+                    if self.public_sample_reads.get(key) is pending:
+                        self.public_sample_reads.pop(key)
+                # Rejoin under the same lock so monitor followers cannot fan out.
+        try:
+            started, checked_at = time.monotonic(), time.time()
+            payload = self._public_json(path, symbol, brackets=brackets, priority=priority)
+            try:
+                if brackets:
+                    from .listings import maximum_leverage
+                    maximum_leverage(payload, symbol)
+                else:
+                    data = monitor.unwrap(payload)
+                    if data.get("symbol") != symbol or not isinstance(data.get("leverageOiRemainingMap"), dict):
+                        raise monitor.MonitorError("Public capacity symbol or leverage map is invalid")
+            except monitor.MonitorError as exc:
+                raise ExchangeError(str(exc)) from None
+            sample = started, checked_at, payload
+            with self.public_sample_guard:
+                self.public_samples[key] = sample
+            pending.set_result(sample)
+            return sample
+        except BaseException as exc:
+            # All concurrent consumers see this failure; a failed request cannot
+            # publish a new timestamp or turn the previous sample fresh again.
+            pending.set_exception(exc)
+            raise
+        finally:
+            with self.public_sample_guard:
+                if self.public_sample_reads.get(key) is pending:
+                    self.public_sample_reads.pop(key)
 
     def _public_json(self, path, symbol, *, brackets=False, priority=True):
         # Reuse the public client's connections; no account signature or data.
@@ -836,8 +907,7 @@ class MarketData:
     def refresh_public_brackets(self, symbol):
         """Background-only refresh; failed reads never renew the last valid data."""
         with self.public_bracket_locks[symbol]:
-            started = time.monotonic()
-            payload = self._public_json(monitor.BRACKETS_PATH, symbol, brackets=True)
+            started, _, payload = self._public_sample(monitor.BRACKETS_PATH, symbol, brackets=True)
             try:
                 caps = {tier: positive(monitor.extract_bracket_cap(payload, symbol, tier), True)
                         for tier in monitor.SUPPORTED_LEVERAGES}
@@ -862,7 +932,7 @@ class MarketData:
             cached = self.public_brackets.get(symbol)
         if cached is None or not 0 <= time.monotonic() - cached[0] < PUBLIC_BRACKETS_MAX_AGE:
             raise PublicBracketsUnavailable("公共风控档位尚未就绪或已过期，等待后台更新")
-        data = self._public_json(monitor.OI_PATH, symbol)
+        _, checked_at, data = self._public_sample(monitor.OI_PATH, symbol)
         try:
             oi = monitor.unwrap(data)
             if oi.get("symbol") != symbol:
@@ -880,7 +950,7 @@ class MarketData:
             raise ExchangeError(str(exc)) from None
         if not 0 <= time.monotonic() - cached[0] < PUBLIC_BRACKETS_MAX_AGE:
             raise PublicBracketsUnavailable("公共风控档位已过期，等待后台更新")
-        return result
+        return PublicCapacitySample(result, checked_at)
 
 
 class LiveBroker:

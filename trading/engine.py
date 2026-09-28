@@ -42,7 +42,7 @@ from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
 from .scheduling import AccountWork, OrdinaryRead, PollBackoff
 from .store import dumps
-from .pairing import PairManager, pair_active
+from .pairing import PairManager, has_cycle_quantity, pair_active
 
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
@@ -271,7 +271,14 @@ class Engine:
         hot_symbol = "XAUUSD1" if paired else account["cycle"]["symbol"]
         broker.start_cycle_hot_data([hot_symbol],
                                     on_invalidate=lambda: self.wake_cycle_hot_data(account_id))
-        if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+        paired_state = (self.store.get("pair_runtime:" + paired["id"]) or {}) if paired else {}
+        if paired and not (paired["cycle"]["enabled"] or has_cycle_quantity(paired_state)):
+            # Ordinary/monitor-only groups read complete snapshots themselves.
+            # Keep private events revoking those reads without a second REST poll.
+            return 30
+        paired_pending = paired and (paired_state.get("pending") or
+            (self.store.get("pair_margin:" + paired["id"]) or {}).get("pending"))
+        if paired_pending or self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
             broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
             with self.lock:
                 self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
@@ -291,7 +298,9 @@ class Engine:
                     (not paired and (not latest["enabled"] or latest.get("cycle") != account.get("cycle")))):
                 broker.invalidate_cycle_hot_data("账户配置在后台更新期间发生变化", refresh_modes=True)
                 return CYCLE_HOT_POLL_INTERVAL
-            if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+            paired_pending = paired and ((self.store.get("pair_runtime:" + paired["id"]) or {}).get("pending") or
+                (self.store.get("pair_margin:" + paired["id"]) or {}).get("pending"))
+            if paired_pending or self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
                 broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
                 with self.lock:
                     self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
@@ -780,7 +789,9 @@ class Engine:
             tiers = set(TIERS) | targets if full or not targets else targets
             # Network latency is part of the capacity snapshot's age.
             checked_at = time.time()
-            capacities = {tier: value for tier, value in self.market.capacities(symbol, tiers).items() if tier in tiers}
+            sample = self.market.capacities(symbol, tiers)
+            checked_at = getattr(sample, "checked_at", checked_at)
+            capacities = {tier: value for tier, value in sample.items() if tier in tiers}
             with self.lock:
                 previous = self.markets.get(symbol, {})
                 values = {k: v for k, v in previous.get("capacities", {}).items() if int(k) not in tiers}

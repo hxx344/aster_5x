@@ -41,6 +41,7 @@ class PublicCapacityCacheTests(unittest.TestCase):
         self.market.refresh_public_brackets(SYMBOL)
         for _ in range(5):
             self.assertEqual(self.market.capacities(SYMBOL, [5, 10, 20]), {5: dec(1000), 10: dec(200), 20: dec(0)})
+            self.now += .21
         self.assertEqual([r.method for r in self.requests], ["POST"] + ["GET"] * 5)
         self.assertEqual(self.api.budget.weight, 6)
         self.assertTrue(all(r.url.host == "www.asterdex.com" and "signature" not in str(r.url) for r in self.requests))
@@ -72,6 +73,7 @@ class PublicCapacityCacheTests(unittest.TestCase):
         self.remaining["data"]["leverageOiRemainingMap"].pop("5")
         self.assertEqual(self.market.capacities(SYMBOL, [5]), {})
         self.remaining["data"]["symbol"] = "CLUSD1"
+        self.now += .21
         with self.assertRaises(ExchangeError):
             self.market.capacities(SYMBOL, [10])
 

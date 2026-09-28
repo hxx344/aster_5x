@@ -27,6 +27,7 @@ DEFAULT_MARGIN = {"enabled": False, "master_env_prefix": "", "check_interval_sec
     "threshold": "10", "min_transfer": "1", "max_transfer": "1000", "buffer_ratio": "0.05",
     "cooldown_seconds": 30}
 TRANSFER_TYPES = frozenset({"TRANSFER", "SUBUSER_ASSET_TRANSFER"})
+TRANSFER_UNIT = Fraction(Decimal("0.00000001"))
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
     -1102, -1103, -1104, -1105, -1106, -1111, -1130, -2014, -2015, -2019})
 
@@ -226,8 +227,22 @@ class MarginBalancer:
                 dec(number)
 
     @staticmethod
+    def _balance_delta(snapshots):
+        return Fraction(dec(snapshots["long"].available)) - Fraction(dec(snapshots["short"].available))
+
+    @staticmethod
+    def _may_need_transfer(snapshots, config):
+        # This upper bound can only skip a new transfer. A candidate still needs
+        # ownership, withdrawal, risk, order and revocable-read checks below.
+        difference = abs(MarginBalancer._balance_delta(snapshots))
+        if difference <= Fraction(dec(config["threshold"])):
+            return False
+        units = difference // (2 * TRANSFER_UNIT)
+        return units * TRANSFER_UNIT >= Fraction(dec(config["min_transfer"]))
+
+    @staticmethod
     def _plan(pair, members, snapshots, config, withdrawable, *, occupied_floors=None):
-        delta = snapshots["long"].available - snapshots["short"].available
+        delta = MarginBalancer._balance_delta(snapshots)
         if abs(delta) <= dec(config["threshold"]):
             return None
         source, destination = ("long", "short") if delta > 0 else ("short", "long")
@@ -248,7 +263,7 @@ class MarginBalancer:
         amount = min(Fraction(abs(delta)) / 2, Fraction(dec(config["max_transfer"])),
             Fraction(positive(withdrawable[source], True)), cash_room, risk_room)
         amount = max(Fraction(0), amount)
-        units = amount // Fraction(Decimal("0.00000001"))
+        units = amount // TRANSFER_UNIT
         rounded = Decimal(int(units)) * Decimal("0.00000001")
         if rounded < dec(config["min_transfer"]):
             return None
@@ -470,6 +485,15 @@ class MarginBalancer:
             state.pop("blocked_reason", None)
             self.store.put("pair_margin:" + pair["id"], state)
             self._check_snapshots(pair, snapshots)
+            if not self._may_need_transfer(snapshots, config):
+                # No extra account read is needed to decline a transfer. Hot
+                # snapshots remain protected by the caller's account leases;
+                # no result from this precheck can authorize a funds write.
+                for side, snapshot in snapshots.items():
+                    if members[side]["mode"] == "live" and type(getattr(snapshot, "account_read_generation", None)) is int:
+                        self.engine.broker(members[side]).require_snapshot_current(snapshot)
+                    snapshot.require_fresh()
+                return self._view(state, config, "waiting", "余额差未达到阈值，或可平衡金额小于最小划转额")
             if members["long"]["mode"] == "paper":
                 plan = self._plan(pair, members, snapshots, config,
                     {side: max(Decimal(0), min(snapshot.available, snapshot.wallet)) for side, snapshot in snapshots.items()})

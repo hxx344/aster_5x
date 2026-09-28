@@ -10,7 +10,7 @@ from tests.helpers import Fixture, account
 from tests.test_cycle_account_snapshot import (ACCOUNT, BRACKET, ORDERS, RISK, SYMBOL,
     LocalQuoteMarket, cycle_account_responses, risk_row)
 from tests.test_exchange_hardening import FixtureAPI
-from trading.engine import Engine
+from trading.engine import Engine, snapshot_json
 from trading.exchange import LiveBroker
 from trading.models import TradingError, dec
 from trading.pairing import validate_pair
@@ -129,7 +129,7 @@ class PairIntegrationTests(unittest.TestCase):
                 release.wait(timeout=3)
                 with guard:
                     concurrent -= 1
-                return {}
+                return {"pending": {"id": "old"}}
 
         self.engine.pairs.trader = Trader()
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -147,9 +147,62 @@ class PairIntegrationTests(unittest.TestCase):
         pair = self.create()
         pair["enabled"] = True
         self.f.store.save_pair(pair)
-        self.assertIn(pair["cycle"]["leverage"], self.engine.fast_capacity_targets(self.f.store.accounts())["XAUUSD1"])
+        self.assertNotIn("XAUUSD1", self.engine.fast_capacity_targets(self.f.store.accounts()))
+        snapshots = {side: snapshot_json(self.engine.broker(self.f.store.account(aid)).snapshot([SYMBOL]), [SYMBOL])
+            for side, aid in (("long", "test"), ("short", "second"))}
+        self.f.store.put("pair_runtime:gold", {"snapshots": snapshots})
+        self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts())["XAUUSD1"], {5})
+        self.assertEqual(pair["cycle"]["leverage"], 2)
+        snapshots["short"]["timestamp"] -= 10
+        self.f.store.put("pair_runtime:gold", {"snapshots": snapshots})
+        self.assertNotIn("XAUUSD1", self.engine.fast_capacity_targets(self.f.store.accounts()))
         self.assertIn("XAUUSD1", self.engine.required_monitoring_symbols())
         self.assertIsNotNone(self.engine.pairs.active_for_account("test"))
+
+    def test_group_polling_keeps_recovery_fast_and_idle_work_bounded(self):
+        pair = self.create()
+        manager = self.engine.pairs
+        self.assertEqual(manager.poll_interval(pair, {}), 30)
+        self.assertEqual(manager.poll_interval(pair, {"pending": {"id": "old"}}), 1)
+        self.assertEqual(manager.poll_interval(pair, {"progress": {"quantities": {"LONG": "1"}}}), 1)
+        self.f.store.put("pair_margin:gold", {"pending": {"id": "transfer"}})
+        self.assertEqual(manager.poll_interval(pair, {}), 1)
+        self.f.store.put("pair_margin:gold", {})
+        pair = {**pair, "enabled": True}
+        self.assertEqual(manager.poll_interval(pair, {}), 1)
+        pair["cycle"]["enabled"] = False
+        pair["ordinary"]["enabled"] = True
+        self.assertEqual(manager.poll_interval(pair, {}), 2)
+        pair["ordinary"]["enabled"] = False
+        self.assertEqual(manager.poll_interval(pair, {}), 5)
+
+    def test_manager_respects_current_worker_retry_after(self):
+        from unittest.mock import Mock
+        self.create()
+        self.engine.pairs.trader = Mock()
+        self.engine.pairs.trader.tick.return_value = {"pending": {"id": "old"}, "retry_after": 60}
+        self.assertEqual(self.engine.pairs.tick("gold"), 60)
+        self.engine.pairs.trader.tick.return_value = {"pending": {"id": "old"}}
+        self.assertEqual(self.engine.pairs.tick("gold"), 1)
+
+    def test_states_preserves_margin_reason_and_newer_durable_pending(self):
+        pair = self.create(margin={"enabled": True})
+        self.f.store.save_pair({**pair, "enabled": True})
+        self.f.store.put("pair_runtime:gold", {"margin": {"enabled": True, "checked_at": 100,
+            "status": "waiting", "reason": "余额差未达到阈值", "pending": None, "last_transfer": None}})
+        self.f.store.put("pair_margin:gold", {"checked_at": 100, "next_check_at": 105})
+        state = self.engine.pairs.states()[0]["state"]["margin"]
+        self.assertEqual(state["status"], "waiting")
+        self.assertEqual(state["reason"], "余额差未达到阈值")
+        self.f.store.put("pair_margin:gold", {"checked_at": 100, "pending": {
+            "status": "unknown", "request_id": "new", "identity": "internal", "before_receipts": {}}})
+        state = self.engine.state()["pairs"][0]["state"]["margin"]
+        self.assertEqual(state["status"], "unknown")
+        self.assertTrue(state["blocks_trading"])
+        self.assertEqual(state["pending"]["request_id"], "new")
+        self.assertNotIn("identity", state["pending"])
+        self.f.store.put("pair_margin:gold", [])
+        self.assertEqual(self.engine.pairs.states()[0]["state"]["margin"]["status"], "blocked")
 
     def test_raw_legacy_intent_cannot_bypass_pair_ownership(self):
         self.create()
@@ -233,6 +286,20 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
 
     def tearDown(self):
         self.assertTrue(all(call[0] == "GET" for broker in self.live.values() for call in broker.api.calls))
+
+    def test_live_capacity_uses_both_current_leases_without_stale_view_fallback(self):
+        self.create()
+        self.engine.pairs.enable("gold", True)
+        self.f.store.put("pair_runtime:gold", {"snapshots": {
+            side: {"timestamp": time.time(), "positions": [{"symbol": SYMBOL, "leverage": 5}]}
+            for side in ("long", "short")}})
+        with patch.object(self.live["test"].cycle_cache, "current_leverage", return_value=10), \
+             patch.object(self.live["second"].cycle_cache, "current_leverage", return_value=10) as second:
+            self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts()), {SYMBOL: {10}})
+            second.return_value = 20
+            self.assertNotIn(SYMBOL, self.engine.fast_capacity_targets(self.f.store.accounts()))
+            second.side_effect = TradingError("热快照已失效")
+            self.assertNotIn(SYMBOL, self.engine.fast_capacity_targets(self.f.store.accounts()))
 
     def revoke_after_reads(self):
         original = self.engine.pairs._read_members

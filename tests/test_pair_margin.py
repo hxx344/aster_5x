@@ -3,6 +3,7 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -570,8 +571,82 @@ class PairMarginTests(unittest.TestCase):
             self.brokers[side]._cycle_account_event("ACCOUNT_UPDATE")
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "acknowledged")
-        self.assertEqual(self.refreshed, ["long", "short", "long", "short"])
+        self.assertCountEqual(self.refreshed[:2], ["long", "short"])
+        self.assertEqual(self.refreshed[2:], ["long", "short"])
         self.assertEqual(len(self.transfers), 1)
+
+    def test_hot_snapshot_reads_are_parallel_and_keep_event_revocation(self):
+        snapshots = self.live()
+        barrier = threading.Barrier(2, timeout=3)
+        modes = []
+        for side, broker in self.brokers.items():
+            del snapshots[side].account_read_generation
+            original = broker.snapshot
+
+            def fresh(symbols, fresh_modes=False, side=side, original=original):
+                modes.append((side, fresh_modes))
+                current = original(symbols, fresh_modes=fresh_modes)
+                barrier.wait()
+                if side == "short":
+                    self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+                return current
+
+            broker.snapshot = fresh
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "blocked")
+        self.assertCountEqual(modes, [("long", False), ("short", False)])
+        self.assertEqual(self.transfers, [])
+
+    def test_hot_margin_polling_reuses_mode_ttl_within_default_budget(self):
+        self.live()
+        now = [1000.0]
+        calls = []
+        with patch("time.time", side_effect=lambda: now[0]), patch("time.monotonic", side_effect=lambda: now[0]):
+            budget = RateBudget()
+            for broker in self.brokers.values():
+                broker.snapshot = LiveBroker.snapshot.__get__(broker, LiveBroker)
+                broker.api.budget = budget
+                broker.api.account["assets"][0].update(availableBalance="2000", marginBalance="2000",
+                    maxWithdrawAmount="2000", crossWalletBalance="2000", crossUnPnl="0")
+                original = broker.api.call
+
+                def call(method, path, params=None, original=original, **kwargs):
+                    weight = kwargs.get("weight", 1)
+                    budget.reserve(weight)
+                    calls.append((path, weight))
+                    if path.endswith("/positionSide/dual"):
+                        return {"dualSidePosition": True}
+                    if path.endswith("/multiAssetsMargin"):
+                        return {"multiAssetsMargin": False}
+                    if path.endswith("/positionRisk"):
+                        return []
+                    if path.endswith("/leverageBracket"):
+                        return {"symbol": "XAUUSD1", "brackets": [{"notionalFloor": "0", "notionalCap": "10000000",
+                            "maintMarginRatio": "0.005", "cum": "0", "initialLeverage": 125}]}
+                    return original(method, path, params, **kwargs)
+
+                broker.api.call = call
+
+            def master_call(method, path, **kwargs):
+                budget.reserve(kwargs["weight"])
+                calls.append((path, kwargs["weight"]))
+                return copy.deepcopy(self.listing)
+
+            master = SimpleNamespace(budget=budget, call=master_call, close=lambda: None)
+            with patch("trading.margin_balance.API", return_value=master):
+                for _ in range(12):
+                    result = self.balancer.tick(self.pair, {"long": snapshot(2000), "short": snapshot(2000)})
+                    self.assertEqual(result["status"], "waiting", result)
+                    now[0] += 5
+            self.assertEqual(sum(weight for _, weight in calls), 924)
+            self.assertEqual(sum(path.endswith("/positionSide/dual") for path, _ in calls), 8)
+            self.assertEqual(sum(path.endswith("/multiAssetsMargin") for path, _ in calls), 8)
+            self.assertEqual(self.transfers, [])
+
+            # A mode-changing event evicts the reused modes before the next read.
+            self.brokers["long"]._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+            self.assertNotIn("dual", self.brokers["long"].cached_at)
+            self.assertNotIn("multi", self.brokers["long"].cached_at)
 
     def test_generationless_replacement_read_cannot_authorize_transfer(self):
         snapshots = self.live()

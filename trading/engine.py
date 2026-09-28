@@ -627,7 +627,7 @@ class Engine:
                     targets.setdefault(symbol, set()).add(leverage)
         return targets
 
-    def fast_capacity_targets(self, accounts):
+    def fast_capacity_targets(self, accounts, pairs=None):
         """Share one feed per symbol across ordinary 5x and cycle leverage tiers."""
         targets = self.cycle_capacity_targets(accounts)
         for account in accounts:
@@ -637,11 +637,36 @@ class Engine:
                 continue
             for symbol in ordinary_add_symbols(account):
                 targets.setdefault(symbol, set()).add(5)
-        for pair in self.store.pairs():
+        owners = {account["id"]: account for account in accounts}
+        for pair in self.store.pairs() if pairs is None else pairs:
             if not pair["enabled"]:
                 continue
+            members = [owners.get(pair[key]) for key in ("long_account_id", "short_account_id")]
+            if any(member is None or not self.live_allowed(member) for member in members):
+                continue
             if pair["cycle"]["enabled"]:
-                targets.setdefault("XAUUSD1", set()).add(pair["cycle"]["leverage"])
+                # The cycle config's leverage is a legacy default. Orders use
+                # both members' actual leverage; sample that same tier only.
+                snapshots = ((self.store.get("pair_runtime:" + pair["id"]) or {}).get("snapshots", {})
+                             if any(member["mode"] == "paper" for member in members) else {})
+                levels = []
+                for side, member in zip(("long", "short"), members):
+                    with self.lock:
+                        broker = self.brokers.get(member["id"])
+                    if member["mode"] == "live":
+                        try:
+                            leverage = broker.cycle_cache.current_leverage("XAUUSD1") if isinstance(broker, LiveBroker) else None
+                        except TradingError:
+                            leverage = None
+                    else:
+                        snapshot = snapshots.get(side, {})
+                        stamp = snapshot.get("timestamp")
+                        actual = {row["leverage"] for row in snapshot.get("positions", []) if row["symbol"] == "XAUUSD1"}
+                        leverage = next(iter(actual)) if (len(actual) == 1 and type(stamp) in (int, float)
+                            and math.isfinite(stamp) and -1 <= time.time() - stamp <= 8) else None
+                    levels.append(leverage)
+                if len(set(levels)) == 1 and type(levels[0]) is int and 1 <= levels[0] <= 125:
+                    targets.setdefault("XAUUSD1", set()).add(levels[0])
             elif pair["ordinary"]["enabled"]:
                 targets.setdefault("XAUUSD1", set()).update(leverage_candidates(pair["ordinary"]["min_open_leverage"]))
         return targets
@@ -2432,7 +2457,7 @@ class Engine:
         cycle_job_due = {}
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
-        saved_accounts = []
+        saved_accounts, saved_pairs, pair_revisions = [], [], {}
         # Account refresh and history never occupy an execution worker's slot.
         try:
             self.dashboard_reports.start(self._dashboard_report_accounts)
@@ -2514,6 +2539,17 @@ class Engine:
                         refresh_schedules = generation != account_generation or time.monotonic() >= accounts_due
                         if refresh_schedules:
                             saved_accounts = self.store.accounts()
+                            saved_pairs = self.store.pairs()
+                            current_pair_revisions = {pair["id"]: pair["revision"] for pair in saved_pairs}
+                            for pair_id, revision in current_pair_revisions.items():
+                                if pair_revisions.get(pair_id) != revision and "pair:" + pair_id not in pending:
+                                    # A control change (especially pause) must
+                                    # wake a group even during a long backoff.
+                                    # Retain changes arriving during a worker
+                                    # until its completion delay is installed.
+                                    due["pair:" + pair_id] = 0
+                                    pair_revisions[pair_id] = revision
+                            pair_revisions = {pair_id: pair_revisions.get(pair_id) for pair_id in current_pair_revisions}
                             account_ids = [a["id"] for a in saved_accounts]
                             for aid in set(account_ids) - known_accounts:
                                 if self.store.intent(aid) or self.store.get("post_fill_check:" + aid):
@@ -2526,7 +2562,7 @@ class Engine:
                                         self.account_work.pop(aid, None)
                             account_generation = generation
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
-                        targets = self.fast_capacity_targets(saved_accounts)
+                        targets = self.fast_capacity_targets(saved_accounts, saved_pairs)
                         intervals, brackets_interval, poll_enabled = self.capacity_poll_schedule(targets)
                         with self.lock:
                             old_targets = self.capacity_targets
@@ -2590,7 +2626,7 @@ class Engine:
                         ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts,
                             aid not in cycle_candidates, aid not in priority_accounts))
                         jobs.update({"account:" + aid: (self.tick_account, aid) for aid in ordered_accounts})
-                        jobs.update({"pair:" + pair["id"]: (self.pairs.tick, pair["id"]) for pair in self.store.pairs()})
+                        jobs.update({"pair:" + pair["id"]: (self.pairs.tick, pair["id"]) for pair in saved_pairs})
                         for key, (function, *args) in jobs.items():
                             is_account = key.startswith("account:")
                             aid = key.removeprefix("account:")

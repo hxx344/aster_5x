@@ -146,29 +146,45 @@ export function pairDraft(pair?: Pair): PairDraft {
   };
 }
 
-function amount(value: string, label: string, allowZero = false): string {
+function amount(
+  value: string,
+  label: string,
+  allowZero = false,
+  maxLength = 40,
+): string {
   const text = value.trim();
+  if (text.length > maxLength)
+    throw new Error(`${label}最多支持 ${maxLength} 个字符`);
+  const parsed = quantityUnits(text);
   if (
-    !/^\d+(?:\.\d+)?$/.test(text) ||
-    text.length > 128 ||
-    !Number.isFinite(Number(text)) ||
-    (allowZero ? Number(text) < 0 : Number(text) <= 0)
+    !/^\d/.test(text) ||
+    !parsed ||
+    (!allowZero && parsed.units === BigInt(0))
   )
     throw new Error(
       `${label}必须是${allowZero ? '非负' : '大于零的'}金额或数值`,
     );
   return text;
 }
-function seconds(value: string, label: string, allowZero = false): number {
+
+// Inputs have already passed amount(); align their decimal places exactly.
+function compareAmounts(left: string, right: string): number {
+  const a = quantityUnits(left)!;
+  const b = quantityUnits(right)!;
+  const scale = Math.max(a.scale, b.scale);
+  const leftUnits = a.units * BigInt(10) ** BigInt(scale - a.scale);
+  const rightUnits = b.units * BigInt(10) ** BigInt(scale - b.scale);
+  return leftUnits < rightUnits ? -1 : leftUnits > rightUnits ? 1 : 0;
+}
+
+function seconds(value: string, label: string, maximum: number): number {
   if (
     !/^\d+$/.test(value) ||
     !Number.isSafeInteger(Number(value)) ||
-    Number(value) < (allowZero ? 0 : 1) ||
-    Number(value) > 86400
+    Number(value) < 1 ||
+    Number(value) > maximum
   )
-    throw new Error(
-      `${label}必须是${allowZero ? '非负' : '正'}整数秒，且不超过 86400 秒`,
-    );
+    throw new Error(`${label}必须是 1 至 ${maximum} 的整数秒`);
   return Number(value);
 }
 
@@ -228,24 +244,34 @@ export function parsePairDraft(
     throw new Error('主账户凭据前缀必须独立，不能使用任一子账户凭据前缀');
   const minTransfer = amount(draft.min_transfer, '最小划转金额');
   const maxTransfer = amount(draft.max_transfer, '最大划转金额');
-  if (Number(minTransfer) > Number(maxTransfer))
+  if (compareAmounts(minTransfer, '0.00000001') < 0)
+    throw new Error('最小划转金额至少为 0.00000001 USD1');
+  if (compareAmounts(minTransfer, maxTransfer) > 0)
     throw new Error('最小划转金额不能大于最大划转金额');
-  if (Number(maxTransfer) > 1000000000)
+  if (compareAmounts(maxTransfer, '1000000000') > 0)
     throw new Error('最大划转金额不能超过 1000000000 USD1');
   const threshold = amount(draft.threshold, '公共额度门槛', true);
   const notional = amount(draft.order_notional, '每侧开仓金额');
-  const spread = amount(draft.spread_limit, '价差比例');
-  const balanceThreshold = amount(draft.balance_threshold, '可用余额差额门槛');
-  if (Number(threshold) > 1000000000)
+  const spread = amount(draft.spread_limit, '价差比例', false, 128);
+  const balanceThreshold = amount(
+    draft.balance_threshold,
+    '可用余额差额门槛',
+    true,
+  );
+  if (compareAmounts(threshold, '1000000000') > 0)
     throw new Error('公共额度门槛不能超过 1000000000 USD1');
-  if (Number(notional) < 500 || Number(notional) > 1000000)
+  if (
+    compareAmounts(notional, '500') < 0 ||
+    compareAmounts(notional, '1000000') > 0
+  )
     throw new Error('每侧开仓金额须为 500–1000000 USD1');
-  if (Number(spread) > 0.0005)
+  if (compareAmounts(spread, '0.0005') > 0)
     throw new Error('普通开仓价差比例不能超过 0.0005');
-  if (Number(balanceThreshold) > 1000000000)
+  if (compareAmounts(balanceThreshold, '1000000000') > 0)
     throw new Error('可用余额差额门槛不能超过 1000000000 USD1');
-  const buffer = amount(draft.buffer_percent, '保留缓冲比例', true);
-  if (Number(buffer) >= 100) throw new Error('保留缓冲比例须小于 100%');
+  const buffer = amount(draft.buffer_percent, '保留缓冲比例', true, 128);
+  if (compareAmounts(buffer, '100') >= 0)
+    throw new Error('保留缓冲比例须小于 100%');
   return {
     id: draft.id,
     name,
@@ -271,12 +297,16 @@ export function parsePairDraft(
       check_interval_seconds: seconds(
         draft.check_interval_seconds,
         '平衡检查间隔',
+        3600,
       ),
       threshold: balanceThreshold,
       min_transfer: minTransfer,
       max_transfer: maxTransfer,
-      buffer_ratio: Number(buffer) === 0 ? '0' : marginLimitFromPercent(buffer),
-      cooldown_seconds: seconds(draft.cooldown_seconds, '划转冷却', true),
+      buffer_ratio:
+        compareAmounts(buffer, '0') === 0
+          ? '0'
+          : marginLimitFromPercent(buffer),
+      cooldown_seconds: seconds(draft.cooldown_seconds, '划转冷却', 86400),
     },
   };
 }

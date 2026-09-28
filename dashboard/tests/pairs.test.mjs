@@ -155,7 +155,7 @@ test('live automatic transfers need a master prefix and meaningful transfer boun
         accounts,
         [],
       ),
-    /86400/,
+    /3600/,
   );
   assert.throws(
     () =>
@@ -174,6 +174,193 @@ test('live automatic transfers need a master prefix and meaningful transfer boun
   );
   assert.equal(config.margin.buffer_ratio, '0');
   assert.equal(config.margin.master_env_prefix, 'ASTER_MASTER');
+});
+
+test('zero balancing threshold survives an edit that only renames the group', () => {
+  const saved = {
+    ...parsePairDraft({ ...draft(), balance_threshold: '0' }, accounts, []),
+    enabled: false,
+  };
+  const renamed = pairConfigurationChanges(
+    parsePairDraft(
+      { ...pairDraft(saved), name: '新组名称' },
+      accounts,
+      [saved],
+      saved.id,
+    ),
+  );
+  assert.equal(renamed.name, '新组名称');
+  assert.deepEqual(renamed.margin, saved.margin);
+  assert.equal(renamed.margin.threshold, '0');
+  assert.deepEqual(renamed.ordinary, saved.ordinary);
+  assert.deepEqual(renamed.cycle, saved.cycle);
+});
+
+test('balancing intervals and cooldowns match their separate server limits', () => {
+  for (const [field, maximum] of [
+    ['check_interval_seconds', 3600],
+    ['cooldown_seconds', 86400],
+  ]) {
+    for (const value of ['0', '-1', '1.5', String(maximum + 1)])
+      assert.throws(
+        () => parsePairDraft({ ...draft(), [field]: value }, accounts, []),
+        new RegExp(`1 至 ${maximum}`),
+      );
+    for (const value of ['1', String(maximum)])
+      assert.equal(
+        parsePairDraft({ ...draft(), [field]: value }, accounts, []).margin[
+          field
+        ],
+        Number(value),
+      );
+  }
+});
+
+test('transfer minimum and maximum compare exact decimals at both boundaries', () => {
+  for (const min_transfer of [
+    '0.000000001',
+    '0.000000009999999999999999999999',
+  ])
+    assert.throws(
+      () => parsePairDraft({ ...draft(), min_transfer }, accounts, []),
+      /至少为 0.00000001/,
+    );
+  for (const value of ['0.00000001', '1000000000']) {
+    const config = parsePairDraft(
+      { ...draft(), min_transfer: value, max_transfer: value },
+      accounts,
+      [],
+    );
+    assert.equal(config.margin.min_transfer, value);
+    assert.equal(config.margin.max_transfer, value);
+  }
+  assert.throws(
+    () =>
+      parsePairDraft(
+        { ...draft(), min_transfer: '1.000000000000000001', max_transfer: '1' },
+        accounts,
+        [],
+      ),
+    /不能大于/,
+  );
+  assert.throws(
+    () =>
+      parsePairDraft(
+        { ...draft(), max_transfer: '1000000000.000000000000000001' },
+        accounts,
+        [],
+      ),
+    /不能超过/,
+  );
+});
+
+test('trading and balancing limits reject decimal overflow without Number rounding', () => {
+  for (const [field, value] of [
+    ['threshold', '1000000000.000000000000000001'],
+    ['balance_threshold', '1000000000.000000000000000001'],
+    ['order_notional', '499.999999999999999999'],
+    ['order_notional', '1000000.000000000000000001'],
+    ['spread_limit', '0.000500000000000000000000000001'],
+    ['buffer_percent', '100.000000000000000001'],
+  ])
+    assert.throws(() =>
+      parsePairDraft({ ...draft(), [field]: value }, accounts, []),
+    );
+
+  const config = parsePairDraft(
+    {
+      ...draft(),
+      threshold: '1000000000',
+      balance_threshold: '1000000000',
+      order_notional: '500',
+      spread_limit: '0.0005',
+      buffer_percent: '99.999999999999999999',
+    },
+    accounts,
+    [],
+  );
+  assert.equal(config.ordinary.order_notional, '500');
+  assert.equal(config.ordinary.spread_limit, '0.0005');
+  assert.equal(config.margin.buffer_ratio, '0.99999999999999999999');
+  assert.equal(
+    parsePairDraft({ ...draft(), order_notional: '1000000' }, accounts, [])
+      .ordinary.order_notional,
+    '1000000',
+  );
+  for (const [field, value] of [
+    ['threshold', '0'],
+    ['balance_threshold', '0'],
+    ['buffer_percent', '0'],
+  ])
+    assert.doesNotThrow(() =>
+      parsePairDraft({ ...draft(), [field]: value }, accounts, []),
+    );
+});
+
+test('pair amounts respect API string lengths while retaining supported precision', () => {
+  for (const field of [
+    'threshold',
+    'order_notional',
+    'balance_threshold',
+    'min_transfer',
+    'max_transfer',
+  ]) {
+    const forty = `1000.${'0'.repeat(35)}`;
+    assert.doesNotThrow(() =>
+      parsePairDraft({ ...draft(), [field]: forty }, accounts, []),
+    );
+    assert.throws(
+      () => parsePairDraft({ ...draft(), [field]: forty + '0' }, accounts, []),
+      /40 个字符/,
+    );
+  }
+  const spread = `0.0005${'0'.repeat(122)}`;
+  assert.equal(
+    parsePairDraft({ ...draft(), spread_limit: spread }, accounts, []).ordinary
+      .spread_limit,
+    spread,
+  );
+  assert.throws(
+    () =>
+      parsePairDraft({ ...draft(), spread_limit: spread + '0' }, accounts, []),
+    /128 个字符/,
+  );
+});
+
+test('buffer conversion rejects expanded precision without rounding positive amounts to zero', () => {
+  for (const buffer_percent of [
+    `0.${'0'.repeat(125)}1`,
+    `0.${'1'.repeat(126)}`,
+  ]) {
+    assert.equal(buffer_percent.length, 128);
+    assert.throws(
+      () => parsePairDraft({ ...draft(), buffer_percent }, accounts, []),
+      /风险约束精度超出范围/,
+    );
+  }
+  const smallest = parsePairDraft(
+    { ...draft(), buffer_percent: `0.${'0'.repeat(97)}1` },
+    accounts,
+    [],
+  ).margin.buffer_ratio;
+  assert.equal(smallest, `0.${'0'.repeat(99)}1`);
+  assert.ok(smallest.length <= 128);
+  assert.throws(
+    () =>
+      parsePairDraft(
+        { ...draft(), buffer_percent: `0.${'0'.repeat(98)}1` },
+        accounts,
+        [],
+      ),
+    /风险约束精度超出范围/,
+  );
+  const padded = `0.1${'0'.repeat(125)}`;
+  assert.equal(padded.length, 128);
+  assert.equal(
+    parsePairDraft({ ...draft(), buffer_percent: padded }, accounts, []).margin
+      .buffer_ratio,
+    '0.001',
+  );
 });
 
 test('every live group requires an independent master prefix on create and edit even when balancing is disabled', () => {

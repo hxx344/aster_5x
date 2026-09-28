@@ -294,6 +294,7 @@ export function PairSettings({
           id={`${formId}-pair-balance-threshold`}
           label="触发可用余额差额"
           unit="USD1"
+          max="1000000000"
           {...textField('balance_threshold')}
           disabled={locked}
         />
@@ -301,6 +302,8 @@ export function PairSettings({
           id={`${formId}-pair-min-transfer`}
           label="最小划转金额"
           unit="USD1"
+          min="0.00000001"
+          max="1000000000"
           {...textField('min_transfer')}
           disabled={locked}
         />
@@ -308,6 +311,8 @@ export function PairSettings({
           id={`${formId}-pair-max-transfer`}
           label="单次最大划转"
           unit="USD1"
+          min="0.00000001"
+          max="1000000000"
           {...textField('max_transfer')}
           disabled={locked}
         />
@@ -315,7 +320,7 @@ export function PairSettings({
           id={`${formId}-pair-buffer`}
           label="转出侧风险与现金缓冲"
           unit="百分点 / %"
-          max="99.99"
+          max="100"
           {...textField('buffer_percent')}
           disabled={locked}
         >
@@ -330,6 +335,7 @@ export function PairSettings({
           unit="秒"
           step="1"
           min="1"
+          max="3600"
           {...textField('check_interval_seconds')}
           disabled={locked}
         />
@@ -338,6 +344,8 @@ export function PairSettings({
           label="划转冷却时间"
           unit="秒"
           step="1"
+          min="1"
+          max="86400"
           {...textField('cooldown_seconds')}
           disabled={locked}
         />

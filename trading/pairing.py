@@ -319,13 +319,15 @@ class PairManager:
             self._changed(pair)
 
     def states(self, reader=None):
+        from .margin_balance import MarginBalancer
         reader = reader or self.store
         rows = []
         for pair in reader.pairs():
             runtime = reader.get("pair_runtime:" + pair["id"]) or {}
             state = {"phase": "waiting" if pair["enabled"] else "paused", "reason": pair.get("pause_reason") or "等待配对组检查",
                      "updated_at": None, "snapshots": {}, "progress": None, "pending": None, **runtime}
-            state["margin"] = reader.get("pair_margin:" + pair["id"]) or state.get("margin") or {}
+            state["margin"] = MarginBalancer.status_view(pair,
+                reader.get("pair_margin:" + pair["id"], {}), state.get("margin"))
             rows.append({**pair, "state": state})
         return rows
 
@@ -348,8 +350,9 @@ class PairManager:
                 if self.trader is None:
                     from .pair_execution import PairTrader
                     self.trader = PairTrader(self.engine)
-                self.trader.tick(pair)
-                return 1
+                state = self.trader.tick(pair)
+                delay = self.poll_interval(pair, state)
+                return max(delay, state.get("retry_after", 0))
             except (TradingError, KeyError, ValueError, TypeError) as exc:
                 runtime = self.store.get("pair_runtime:" + pair_id) or {}
                 runtime.update(phase="attention" if isinstance(exc, AccountModeError) else "waiting",
@@ -359,3 +362,15 @@ class PairManager:
                     self.store.save_pair({**pair, "enabled": False, "pause_reason": str(exc)})
                     self._changed(pair)
                 return max(1, getattr(exc, "retry_after", 0))
+
+    def poll_interval(self, pair, state):
+        margin = self.store.get("pair_margin:" + pair["id"]) or {}
+        if state.get("pending") or has_cycle_quantity(state) or margin.get("pending"):
+            return 1
+        if not pair["enabled"]:
+            return 30
+        if pair["cycle"]["enabled"]:
+            return 1
+        if pair["ordinary"]["enabled"]:
+            return 2
+        return min(5, pair["margin"]["check_interval_seconds"])

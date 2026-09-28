@@ -1,9 +1,10 @@
 """Durable two-subaccount execution. Recovery never repeats an uncertain write."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from fractions import Fraction
+import math
 import time
 import uuid
 
@@ -33,7 +34,18 @@ class PairTrader:
 
     def _save(self, pair, state):
         state["updated_at"] = time.time()
-        self.store.put("pair_runtime:" + pair["id"], state)
+        self.store.put("pair_runtime:" + pair["id"], self._durable(state))
+
+    @staticmethod
+    def _durable(state):
+        # This relative delay belongs to this scheduler turn, not a restarted one.
+        return {key: value for key, value in state.items() if key != "retry_after"}
+
+    @staticmethod
+    def _retry_delay(state, exc):
+        delay = getattr(exc, "retry_after", 0)
+        if type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
+            state["retry_after"] = max(state.get("retry_after", 0), delay)
 
     def _members(self, pair):
         accounts, brokers, identities = {}, {}, {}
@@ -54,16 +66,21 @@ class PairTrader:
             raise PairPositionError("两个方向不能使用同一个真实账户")
         return accounts, brokers, identities
 
-    def _read(self, brokers, *, hot=False):
+    def _read(self, brokers, *, hot=False, reconciliation=False):
         def read(key):
             broker = brokers[key]
-            if hot and isinstance(broker, LiveBroker):
-                lease = broker.cycle_hot_snapshot([SYMBOL])
-                lease.require_fresh()
-                return lease.snapshot, lease.require_fresh
-            snapshot = broker.snapshot([SYMBOL], fresh_modes=True)
-            guard = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
-            return snapshot, guard
+            # Budget priority is thread-local: establish it inside each worker.
+            budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
+            with budget:
+                if hot and isinstance(broker, LiveBroker):
+                    lease = broker.cycle_hot_snapshot([SYMBOL])
+                    lease.require_fresh()
+                    return lease.snapshot, lease.require_fresh
+                # Ordinary polling retains the broker's mode TTL; account events
+                # still revoke these reads and mode changes clear its cache.
+                snapshot = broker.snapshot([SYMBOL], fresh_modes=reconciliation)
+                guard = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
+                return snapshot, guard
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-read") as pool:
             futures = {key: pool.submit(read, key) for key, _ in SIDES}
             rows = {key: future.result() for key, future in futures.items()}
@@ -103,6 +120,7 @@ class PairTrader:
 
     def tick(self, pair):
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
+        state.pop("retry_after", None)
         if not isinstance(state.get("progress"), dict):
             state["progress"] = empty_progress(state["owned"])
         try:
@@ -123,14 +141,17 @@ class PairTrader:
             if not pair["enabled"] and not holding and not margin_pending:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停")
                 return state
-            snapshots, guards = self._read(brokers, hot=bool(pair["enabled"] and pair["cycle"]["enabled"] or holding))
+            closing_due = holding and (not pair["enabled"] or time.time() >=
+                state["progress"]["opened_at"] + state["progress"]["config"]["hold_seconds"])
+            # A due reduction must not depend on a hot refresh that uses ordinary
+            # quota. Read fresh positions with the repair reserve when closing.
+            hot = not closing_due and bool(pair["enabled"] and pair["cycle"]["enabled"] or holding)
+            snapshots, guards = self._read(brokers, hot=hot, reconciliation=closing_due)
             self._publish_snapshots(state, snapshots)
             held = require_quantities(snapshots, self._expected(state))
             # The independent balancer uses the same ordered account locks. A
             # transfer invalidates both read leases before any following order.
             from .margin_balance import MarginBalancer
-            closing_due = holding and (not pair["enabled"] or time.time() >=
-                state["progress"]["opened_at"] + state["progress"]["config"]["hold_seconds"])
             margin = MarginBalancer(self.engine).tick(pair, snapshots, pending_orders=closing_due)
             state["margin"] = margin
             if margin.get("blocks_trading") and not holding:
@@ -169,6 +190,7 @@ class PairTrader:
         except PairPositionError as exc:
             state.update(phase="attention", reason=str(exc), attention=str(exc))
         except TradingError as exc:
+            self._retry_delay(state, exc)
             state.update(phase="reconciling" if state.get("pending") else
                          "holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
                          reason=str(exc))
@@ -229,13 +251,14 @@ class PairTrader:
             for guard in guards.values():
                 guard()
         except TradingError as exc:
+            self._retry_delay(state, exc)
             for leg in legs:
                 leg["receipt"] = self._absent(leg["order"], str(exc))
             pending["last_error"] = str(exc)
             self._save(pair, state)
             self._recover(pair, state, brokers)
             return
-        self._dispatch(pair, state, brokers, legs, guards=guards)
+        self._dispatch(pair, state, brokers, legs, guards=guards, reconciliation=not opening)
         self._recover(pair, state, brokers)
 
     @staticmethod
@@ -243,7 +266,7 @@ class PairTrader:
         return {**order, "clientOrderId": order["newClientOrderId"], "status": "REJECTED", "executedQty": "0",
                 "avgPrice": "0", "reject_reason": reason, "local_not_sent": local}
 
-    def _dispatch(self, pair, state, brokers, legs, *, guards=None):
+    def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False):
         # A crash between this commit and HTTP leaves an uncertain request, not
         # permission to repeat it. Each leg retains its own durable client ID.
         for leg in legs:
@@ -257,7 +280,9 @@ class PairTrader:
                         guards[leg["key"]]()
                     except TradingError as exc:
                         raise RequestNotSent(str(exc)) from None
-                result = broker.submit([order])
+                budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
+                with budget:
+                    result = broker.submit([order])
                 if not isinstance(result, list) or len(result) != 1:
                     raise TradingError("单腿订单回执无效，等待查询")
                 row = result[0]
@@ -300,6 +325,7 @@ class PairTrader:
             except PaperOrderAbsent:
                 leg["receipt"] = self._absent(order, "模拟订单未写入持久账本")
             except TradingError as exc:
+                self._retry_delay(state, exc)
                 leg["error"] = str(exc)
             self._save(pair, state)
         return all(leg.get("receipt") and leg["receipt"]["status"] in TERMINAL
@@ -312,7 +338,7 @@ class PairTrader:
         if not self._query(pair, state, brokers):
             state.update(phase="reconciling", reason="至少一条市价单结果未确定，禁止重发、新开仓及划转")
             return
-        snapshots, guards = self._read(brokers)
+        snapshots, guards = self._read(brokers, reconciliation=True)
         self._publish_snapshots(state, snapshots)
         held = positions(snapshots)
         actual = {side: held[side].qty for _, side in SIDES}
@@ -357,7 +383,7 @@ class PairTrader:
         state.update(phase="repairing", reason="只减仓恢复本轮基线，不追加另一腿")
         self._save(pair, state)
         self._config_guard(pair, pending["identities"], opening=False)
-        self._dispatch(pair, state, brokers, repairs, guards=guards)
+        self._dispatch(pair, state, brokers, repairs, guards=guards, reconciliation=True)
         if all(leg.get("receipt", {}).get("local_not_sent") for leg in repairs if leg.get("receipt")) \
                 and all(leg.get("receipt") for leg in repairs):
             pending["repair_attempts"] -= 1
@@ -395,7 +421,7 @@ class PairTrader:
         # count the batch twice or forget its remaining cycle position.
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            for key, value in (("pair_runtime:" + pair["id"], state),
+            for key, value in (("pair_runtime:" + pair["id"], self._durable(state)),
                                ("pair_batch:" + pending["id"], {**pending, "completed": completed, "finished_at": time.time()})):
                 db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
             for key, _ in SIDES:
@@ -476,7 +502,7 @@ class PairTrader:
 
     def _recover_leverage(self, pair, state, brokers):
         pending = state["pending"]
-        snapshots, guards = self._read(brokers)
+        snapshots, guards = self._read(brokers, reconciliation=True)
         self._publish_snapshots(state, snapshots)
         held = require_quantities(snapshots, pending["before"], equal_leverage=False)
         with self._confirmed(pair, brokers, guards):

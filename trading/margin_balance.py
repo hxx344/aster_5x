@@ -4,6 +4,7 @@ The caller holds the pair lock and both member-account locks. Transfer identity
 comes from authenticated Aster responses, never a locally supplied account name.
 """
 from contextlib import ExitStack, contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
@@ -253,11 +254,54 @@ class MarginBalancer:
             return None
         return {"source": source, "destination": destination, "amount": wire(rounded)}
 
-    def _view(self, state, config, status, reason, *, blocks=False, plan=None):
+    @staticmethod
+    def _view(state, config, status, reason, *, blocks=False, plan=None):
         return {"enabled": config["enabled"], "status": status, "reason": reason,
             "blocks_trading": bool(blocks or state.get("pending")), "checked_at": state.get("checked_at"),
             "pending": _public_record(state.get("pending")), "last_transfer": _public_record(state.get("last_transfer")),
             "plan": plan, "next_check_at": state.get("next_check_at", 0), "cooldown_until": state.get("cooldown_until", 0)}
+
+    @staticmethod
+    def status_view(pair, journal, runtime_view=None):
+        """Project the durable journal without letting an older view hide a write."""
+        config = validate_margin(pair.get("margin", {}))
+        if journal is None:
+            journal = {}
+        if not isinstance(journal, dict):
+            return MarginBalancer._view({}, config, "blocked", "保证金划转日志无效，需要核对", blocks=True)
+        view = lambda status, reason, **kwargs: MarginBalancer._view(journal, config, status, reason, **kwargs)
+        pending = journal.get("pending")
+        if pending is not None:
+            if not isinstance(pending, dict) or pending.get("status") not in {"submitting", "unknown", "accepted", "acknowledged"}:
+                return view("blocked", "保证金划转待核对记录无效", blocks=True)
+            status = "unknown" if pending["status"] == "submitting" else pending["status"]
+            reasons = {"unknown": "划转结果未知，保留记录并暂停新交易，不会重发",
+                "accepted": "等待两侧 USD1 划转流水核实", "acknowledged": "交易所已确认划转，等待两侧余额刷新"}
+            return view(status, journal.get("blocked_reason") or reasons[status], blocks=True)
+        if not config["enabled"]:
+            return view("disabled", "自动保证金平衡未启用")
+        if not pair.get("enabled"):
+            return view("paused", "配对组已暂停，只核对已有划转")
+        if journal.get("blocked_reason"):
+            return view("blocked", journal["blocked_reason"], blocks=True)
+        for field in ("checked_at", "next_check_at", "cooldown_until"):
+            value = journal.get(field)
+            if field in journal and (type(value) not in (int, float) or not math.isfinite(value)):
+                return view("blocked", "保证金划转日志时间无效", blocks=True)
+        if time.time() < journal.get("cooldown_until", 0):
+            return view("cooldown", "划转冷却中")
+        # An execution view can explain a current check, but cannot resurrect a
+        # pending write, reuse an old transfer, or override changed configuration.
+        if (isinstance(runtime_view, dict) and runtime_view.get("enabled") == config["enabled"]
+                and runtime_view.get("checked_at") == journal.get("checked_at")
+                and runtime_view.get("pending") is None
+                and runtime_view.get("last_transfer") == _public_record(journal.get("last_transfer"))
+                and runtime_view.get("status") in {"waiting", "confirmed", "acknowledged", "paper_confirmed", "rejected", "blocked"}
+                and isinstance(runtime_view.get("reason"), str)):
+            plan = runtime_view.get("plan")
+            plan = {key: plan[key] for key in ("source", "destination", "amount") if key in plan} if isinstance(plan, dict) else None
+            return view(runtime_view["status"], runtime_view["reason"], blocks=runtime_view.get("blocks_trading") is True, plan=plan)
+        return view("waiting", "等待保证金检查")
 
     def _income(self, members, start, end):
         result = {}
@@ -473,13 +517,22 @@ class MarginBalancer:
     def _live_snapshots(self, pair, members, snapshots):
         brokers = {side: self.engine.broker(member) for side, member in members.items()}
         originals = dict(snapshots)
+        replacements = []
         for side, broker in brokers.items():
             if not callable(getattr(broker, "require_snapshot_current", None)) or not hasattr(broker, "_snapshot_lock"):
                 raise TradingError("账户缺少可撤销的快照校验，禁止划转")
             # Hot snapshots carry a lease held by PairTrader, not an ordinary
             # generation token. Obtain our own revocable read before planning.
             if type(getattr(originals[side], "account_read_generation", None)) is not int:
-                originals[side] = broker.snapshot([pair.get("symbol", "XAUUSD1")], fresh_modes=True)
+                replacements.append(side)
+        if replacements:
+            # Reuse the ordinary 15s mode cache; account events still invalidate
+            # it. Every read gets a new generation-checked balance/position view.
+            with ThreadPoolExecutor(max_workers=len(replacements), thread_name_prefix="margin-read") as pool:
+                reads = {side: pool.submit(brokers[side].snapshot, [pair.get("symbol", "XAUUSD1")], fresh_modes=False)
+                         for side in replacements}
+                originals.update({side: future.result() for side, future in reads.items()})
+        for side in brokers:
             if type(getattr(originals[side], "account_read_generation", None)) is not int:
                 raise TradingError("账户快照缺少有效代次，禁止划转")
 

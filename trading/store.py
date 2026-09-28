@@ -383,36 +383,65 @@ class Store:
         """Reserve both members in one durable transaction, across Store instances."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            return self._save_pair(db, pair, create=create)
+
+    def activate_pair(self, pair, runtime, *, expected_runtime, expected_margin, accounts, check_current, message):
+        """Commit an explicitly paused start and its verified baseline together."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
-            if create and row:
-                raise TradingError("配对组标识已使用")
-            if not create and not row:
-                raise TradingError("配对组不存在")
-            previous = json.loads(row[0]) if row else None
-            if previous and pair.get("revision") != previous.get("revision"):
-                raise TradingError("配对组配置已变化，请刷新后重试")
-            if previous and any(previous[key] != pair[key] for key in ("long_account_id", "short_account_id", "symbol")):
-                raise TradingError("配对组账户及方向不可变更；空仓解除绑定后重新建组")
-            members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]
-            if members[0][0] == members[1][0]:
-                raise TradingError("配对组需要两个不同账户")
-            for aid, direction in members:
-                saved = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-                if saved is None or json.loads(saved[0]).get("enabled"):
-                    raise TradingError("配对组成员必须存在且已暂停单账户策略")
-                existing = db.execute("SELECT pair_id FROM pair_members WHERE account_id=?", (aid,)).fetchone()
-                if existing and existing[0] != pair["id"]:
-                    raise TradingError("账户已属于其他配对组")
-                if db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone():
-                    raise TradingError("账户旧批次尚未完成，请先核对")
-            revision = (previous or {}).get("revision", 0) + 1
-            saved_pair = {**pair, "revision": revision}
-            db.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-                       (pair["id"], dumps(saved_pair)))
-            for aid, direction in members:
-                db.execute("INSERT INTO pair_members VALUES (?,?,?) ON CONFLICT(account_id) DO NOTHING",
-                           (aid, pair["id"], direction))
-            return saved_pair
+            if not row or json.loads(row[0]).get("enabled") is not False or pair.get("enabled") is not True:
+                raise TradingError("配对组已变化，仅暂停状态可以重新核验并启动")
+            for key, expected in (("pair_runtime:" + pair["id"], expected_runtime),
+                                  ("pair_margin:" + pair["id"], expected_margin)):
+                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                if (json.loads(row[0]) if row else {}) != expected:
+                    raise TradingError("启动核验期间运行或划转记录已变化，请重新核对")
+            for account in accounts:
+                row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
+                if not row or json.loads(row[0]) != account:
+                    raise TradingError("启动核验期间子账户配置已变化，请重新核对")
+            # Acquiring the database writer lock may itself outlive the reads.
+            # The caller holds both generation locks until this commit finishes.
+            check_current()
+            saved = self._save_pair(db, pair)
+            db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("pair_runtime:" + pair["id"], dumps(runtime)))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                       (pair["id"], "pair", message, time.time()))
+            return saved
+
+    def _save_pair(self, db, pair, *, create=False):
+        row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
+        if create and row:
+            raise TradingError("配对组标识已使用")
+        if not create and not row:
+            raise TradingError("配对组不存在")
+        previous = json.loads(row[0]) if row else None
+        if previous and pair.get("revision") != previous.get("revision"):
+            raise TradingError("配对组配置已变化，请刷新后重试")
+        if previous and any(previous[key] != pair[key] for key in ("long_account_id", "short_account_id", "symbol")):
+            raise TradingError("配对组账户及方向不可变更；空仓解除绑定后重新建组")
+        members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]
+        if members[0][0] == members[1][0]:
+            raise TradingError("配对组需要两个不同账户")
+        for aid, direction in members:
+            saved = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+            if saved is None or json.loads(saved[0]).get("enabled"):
+                raise TradingError("配对组成员必须存在且已暂停单账户策略")
+            existing = db.execute("SELECT pair_id FROM pair_members WHERE account_id=?", (aid,)).fetchone()
+            if existing and existing[0] != pair["id"]:
+                raise TradingError("账户已属于其他配对组")
+            if db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone():
+                raise TradingError("账户旧批次尚未完成，请先核对")
+        revision = (previous or {}).get("revision", 0) + 1
+        saved_pair = {**pair, "revision": revision}
+        db.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                   (pair["id"], dumps(saved_pair)))
+        for aid, direction in members:
+            db.execute("INSERT INTO pair_members VALUES (?,?,?) ON CONFLICT(account_id) DO NOTHING",
+                       (aid, pair["id"], direction))
+        return saved_pair
 
     def delete_pair(self, pair_id):
         with self.connect() as db:

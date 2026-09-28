@@ -297,7 +297,7 @@ function PairDetail({
           <div className="account-run-actions">
             <Button
               disabled={busy || offline || Boolean(startBlock)}
-              title={startBlock || '按已保存的配对配置启动'}
+              title={startBlock || '核验并采纳两侧实际仓位为底仓，再按已保存配置启动'}
               onClick={() => void action(`/api/pairs/${pair.id}/enable`)}
             >
               <CirclePlay size={16} />
@@ -336,7 +336,7 @@ function PairDetail({
                 ? '连接中断，保留最近记录。'
                 : '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。'}
               {!pair.enabled && !offline
-                ? ' 启动时服务会重新核验两侧账户、挂单及归属。'
+                ? ' 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。'
                 : ' 等待有效快照后才能新增开仓。'}
             </p>
           ) : null}
@@ -348,7 +348,7 @@ function PairDetail({
           </p>
           {!pair.enabled ? (
             <p className="muted">
-              手动平仓后可「核对空仓」，确认两侧完全空仓并清除本组底仓记录。
+              无未完成订单、划转或循环新增仓位时，启动会核验并采纳两侧实际仓位为底仓，后续循环仅处理新增部分。手动全部平仓后也可「核对空仓」清除底仓记录。
             </p>
           ) : null}
         </div>

@@ -117,7 +117,7 @@ class PairManager:
                 raise TradingError("原账户循环仍有新增持仓，请先完成原循环")
         return accounts
 
-    def _read_members(self, pair, *, flat=False):
+    def _read_members(self, pair, *, flat=False, adopt=False):
         accounts = self._members(pair)
 
         def read(account):
@@ -156,7 +156,7 @@ class PairManager:
                     raise TradingError("每个配对子账户只能持有 XAUUSD1 的指定方向，请先处理原有仓位")
                 if position.symbol == SYMBOL and position.side == side:
                     expected = dec("0") if flat else dec(owned.get(side, "0"))
-                    if position.qty != expected:
+                    if position.qty != expected and (flat or not adopt):
                         raise TradingError("子账户实际仓位与配对组记录不一致，禁止自动采纳外部持仓")
         if snapshots[0].pair(SYMBOL)[0].leverage != snapshots[1].pair(SYMBOL)[0].leverage:
             raise TradingError("两个子账户的 XAUUSD1 实际杠杆必须相同")
@@ -204,11 +204,13 @@ class PairManager:
     def _idle(self, pair, *, require_flat=False):
         if pair["enabled"]:
             raise TradingError("请先暂停配对组")
-        runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
-        margin = self.store.get("pair_margin:" + pair["id"]) or {}
-        if runtime.get("pending") or has_cycle_quantity(runtime):
+        runtime = self.store.get("pair_runtime:" + pair["id"], {})
+        margin = self.store.get("pair_margin:" + pair["id"], {})
+        if not isinstance(runtime, dict) or not isinstance(margin, dict):
+            raise TradingError("配对组或保证金日志无效，请先核对，不能重新采纳持仓")
+        if runtime.get("pending") is not None or has_cycle_quantity(runtime):
             raise TradingError("配对组仍在核对订单或减回本轮循环持仓，暂不能启动、修改设置、核对空仓或删除；请查看配对组当前执行状态")
-        if margin.get("pending") or margin.get("status") in ("submitting", "accepted", "unknown"):
+        if margin.get("pending") is not None or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown"):
             raise TradingError("保证金划转结果尚未核实，暂不能启动、修改设置、核对空仓或删除；请查看保证金平衡中的核对状态")
         if require_flat and any(dec(qty) for qty in (runtime.get("owned") or {}).values()):
             raise TradingError("配对组仍有普通策略底仓，完全平仓并核对后才能解除绑定")
@@ -243,28 +245,56 @@ class PairManager:
             raise TradingError("配对组不存在")
         with self.locked(original):
             pair = self.store.pair(pair_id)
-            guards, runtime = {}, None
             if enabled:
-                self._idle(pair)
+                from .engine import snapshot_json
+                from .pair_execution import PairTrader, empty_progress
+                margin = self.store.get("pair_margin:" + pair_id, {})
+                original_runtime = self._idle(pair)
                 if not any(pair[key]["enabled"] for key in ("ordinary", "cycle", "margin")):
                     raise TradingError("请先选择普通策略、独立循环或保证金均衡")
-                if any(not self.engine.live_allowed(a) for a in self._members(pair)):
+                accounts = self._members(pair)
+                if any(not self.engine.live_allowed(a) for a in accounts):
                     raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
-                _, guards = self._read_members(pair)
+                trader = PairTrader(self.engine)
+                _, _, identities = trader._members(pair)
+                if original_runtime.get("identities") and original_runtime["identities"] != identities:
+                    raise TradingError("配对组凭据指向的真实账户发生变化，不能采纳持仓，请先核对账户身份")
+                snapshots, guards = self._read_members(pair, adopt=True)
                 from .margin_balance import MarginBalancer
                 MarginBalancer(self.engine).verify_members(pair)
+                if trader._members(pair)[2] != identities:
+                    raise TradingError("启动核验期间账户身份已变化，请重新核对")
+                owned = {side: wire(snapshots[key].pair(SYMBOL)[index].qty)
+                         for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1))}
+                runtime = deepcopy(original_runtime)
+                previous_owned = runtime.get("owned") or {"LONG": "0", "SHORT": "0"}
+                changed = any(dec(previous_owned.get(side, "0")) != dec(qty) for side, qty in owned.items())
+                reason = (f"启动时已核验并采纳实际底仓：多 {owned['LONG']}、空 {owned['SHORT']} XAU；后续循环仅处理本轮新增仓位"
+                          if changed else "两侧实际底仓与账户身份已核验，系统开始检查所选策略和保证金条件")
+                runtime.update(owned=owned, pending=None,
+                    progress=empty_progress(owned, (runtime.get("progress") or {}).get("completed_cycles", 0)),
+                    identities=identities, phase="waiting", reason=reason,
+                    snapshots={side: snapshot_json(snapshot, [SYMBOL]) for side, snapshot in snapshots.items()},
+                    updated_at=time.time())
+                runtime.pop("attention", None)
+                runtime.pop("retry_after", None)
                 pair.pop("pause_reason", None)
-                runtime = self.store.get("pair_runtime:" + pair_id) or {}
-                if runtime.pop("attention", None) is not None:
-                    runtime.update(phase="waiting", reason="成员持仓及身份已重新核实，系统将按当前设置继续检查执行条件", updated_at=time.time())
-                else:
-                    runtime = None
-            pair["enabled"] = enabled
-            with self._current_members(guards):
+                pair["enabled"] = True
+                message = (f"配对组已启动；实际持仓已采纳为底仓：多 {previous_owned.get('LONG', '0')} → {owned['LONG']}，"
+                           f"空 {previous_owned.get('SHORT', '0')} → {owned['SHORT']} XAU；采纳本身未下单或划转"
+                           if changed else "配对组已启动，系统开始检查所选策略和保证金条件")
+                def check_current():
+                    for _, current in guards.values():
+                        current()
+                    if any(not self.engine.live_allowed(a) for a in accounts):
+                        raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
+                with self._current_members(guards):
+                    saved = self.store.activate_pair(pair, runtime, expected_runtime=original_runtime,
+                        expected_margin=margin, accounts=accounts, check_current=check_current, message=message)
+            else:
+                pair["enabled"] = False
                 saved = self.store.save_pair(pair)
-                if runtime is not None:
-                    self.store.put("pair_runtime:" + pair_id, runtime)
-            self.store.event(pair_id, "pair", "配对组已启动，系统开始检查所选策略和保证金条件" if enabled else "配对组已暂停，停止新开仓和新划转；已提交订单及划转继续核对，循环新增仓位继续减回，普通底仓保留")
+                self.store.event(pair_id, "pair", "配对组已暂停，停止新开仓和新划转；已提交订单及划转继续核对，循环新增仓位继续减回，普通底仓保留")
             self._changed(saved)
             return saved
 

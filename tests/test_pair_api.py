@@ -66,3 +66,18 @@ class PairApiTests(unittest.TestCase):
         response = self.client.post("/api/pairs", json=pair_config(enabled=True))
         self.assertEqual(response.status_code, 409, response.text)
         self.assertIsNone(self.f.store.pair("gold"))
+
+    def test_paused_start_adopts_actual_positions_without_an_extra_request_flag(self):
+        self.login()
+        self.assertEqual(self.client.post("/api/pairs", json=pair_config()).status_code, 200)
+        for aid, side, qty in (("test", "LONG", "0.25"), ("second", "SHORT", "0.5")):
+            broker = self.engine.broker(self.f.store.account(aid))
+            broker.state["positions"]["XAUUSD1:" + side].update(qty=qty, entry="4412.015")
+            broker.save()
+        response = self.client.post("/api/pairs/gold/enable")
+        self.assertEqual(response.status_code, 200, response.text)
+        state = self.f.store.get("pair_runtime:gold")
+        self.assertEqual(state["owned"], {"LONG": "0.25", "SHORT": "0.5"})
+        self.assertEqual(state["progress"]["baseline"], state["owned"])
+        self.assertEqual(self.client.post("/api/pairs/gold/enable").status_code, 409)
+        self.assertEqual(self.f.store.get("pair_runtime:gold"), state)

@@ -276,6 +276,8 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
             responses[BRACKET] = {"symbol": SYMBOL, "brackets": PAPER_BRACKETS}
             responses[ORDERS] = []
             broker = LiveBroker({}, LocalQuoteMarket(), api=FixtureAPI(responses))
+            digit = "1" if aid == "test" else "2"
+            broker.api.credentials = {"user": "0x" + digit * 40, "signer": "0x" + digit * 39 + "f"}
             self.live[aid] = self.engine.brokers[aid] = broker
         patcher = patch.object(self.engine, "live_allowed", return_value=True)
         patcher.start()

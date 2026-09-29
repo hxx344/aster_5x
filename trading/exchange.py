@@ -1012,6 +1012,7 @@ class LiveBroker:
         self._cycle_lifecycle_lock = threading.Lock()
         self._cycle_stream_callback_lock = threading.RLock()
         self._cycle_stream_token = None
+        self._cycle_stream_connected = None
         self._cycle_hot_closed = False
         self.cycle_cache = CycleAccountCache()
         self.cycle_stream = None
@@ -1032,6 +1033,7 @@ class LiveBroker:
                     on_event=lambda kind: self._cycle_stream_event(token, kind))
                 with self._cycle_stream_callback_lock:
                     self._cycle_stream_token = token
+                    self._cycle_stream_connected = None
                 self.cycle_stream = stream
             self.cycle_stream.start()
 
@@ -1040,7 +1042,10 @@ class LiveBroker:
         with self._cycle_lifecycle_lock:
             stream, self.cycle_stream = self.cycle_stream, None
             with self._cycle_stream_callback_lock:
+                if self._cycle_stream_token is not None:
+                    self._invalidate_snapshot_reads(refresh_modes=True)
                 self._cycle_stream_token = None
+                self._cycle_stream_connected = None
                 self.cycle_cache.set_listener(None)
                 self.cycle_cache.set_connected(False)
             if stream is not None:
@@ -1050,6 +1055,11 @@ class LiveBroker:
         # A stopped stream may finish after a replacement has connected.
         with self._cycle_stream_callback_lock:
             if token is self._cycle_stream_token:
+                # A stream gap may hide a mode change. Invalidate once per state
+                # transition, not on every disconnected retry callback.
+                if connected is not self._cycle_stream_connected:
+                    self._cycle_stream_connected = connected
+                    self._invalidate_snapshot_reads(refresh_modes=True)
                 self.cycle_cache.set_connected(connected)
 
     def _cycle_stream_event(self, token, kind):

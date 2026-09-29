@@ -124,14 +124,17 @@ class PairTrader:
             raise PairPositionError("两个方向不能使用同一个真实账户")
         return accounts, brokers, identities
 
-    def _read(self, brokers, *, hot=False, reconciliation=False):
+    def _read(self, brokers, *, hot=False, reconciliation=False, fresh_modes=False):
+        # Recovery priority does not require reloading unchanged account modes.
+        # Recovery uses their normal TTL; configuration confirmation can force GETs.
+        reuse_account_mode = not reconciliation and not fresh_modes
         if not hot:
             budgets = {}
             for broker in brokers.values():
                 if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
                     budget = broker.api.budget
                     budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight(
-                        [SYMBOL], fresh_modes=reconciliation, reuse_account_mode=not reconciliation)
+                        [SYMBOL], fresh_modes=fresh_modes, reuse_account_mode=reuse_account_mode)
             # Check the complete shared-budget read before either worker starts;
             # actual requests still perform their own atomic admission checks.
             for budget, weight in budgets.items():
@@ -148,8 +151,8 @@ class PairTrader:
                     return lease.snapshot, lease.require_fresh
                 # Ordinary polling retains the broker's mode TTL; account events
                 # still revoke these reads and mode changes clear its cache.
-                options = {"reuse_account_mode": True} if isinstance(broker, LiveBroker) else {}
-                snapshot = broker.snapshot([SYMBOL], fresh_modes=reconciliation, **options)
+                options = {"reuse_account_mode": reuse_account_mode} if isinstance(broker, LiveBroker) else {}
+                snapshot = broker.snapshot([SYMBOL], fresh_modes=fresh_modes, **options)
                 guard = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
                 return snapshot, guard
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-read") as pool:
@@ -679,7 +682,7 @@ class PairTrader:
 
     def _recover_leverage(self, pair, state, brokers):
         pending = state["pending"]
-        snapshots, guards = self._read(brokers, reconciliation=True)
+        snapshots, guards = self._read(brokers, reconciliation=True, fresh_modes=True)
         self._publish_snapshots(state, snapshots)
         held = require_quantities(snapshots, pending["before"], equal_leverage=False)
         with self._confirmed(pair, brokers, guards):

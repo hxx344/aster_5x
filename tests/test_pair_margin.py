@@ -309,7 +309,7 @@ class PairMarginTests(unittest.TestCase):
         self.assertEqual(self.master_calls, [("GET", "/fapi/v3/getSubAccountList")])
         for broker in self.brokers.values():
             self.assertEqual([path for _, path, _ in broker.api.calls],
-                ["/fapi/v3/accountWithJoinMargin", "/fapi/v3/income", "/fapi/v3/openOrders"])
+                ["/fapi/v3/accountWithJoinMargin", "/fapi/v3/income"])
         self.assertEqual(len(self.transfers), 1)
 
     def test_balanced_precheck_still_rejects_stale_invalid_or_revoked_snapshots(self):
@@ -635,18 +635,16 @@ class PairMarginTests(unittest.TestCase):
         with patch.object(self.store, "get", side_effect=OSError("read failed")):
             self.assertTrue(self.balancer.tick(self.pair, {})["blocks_trading"])
 
-    def test_external_open_order_is_checked_before_live_transfer(self):
+    def test_market_pair_uses_current_withdrawal_limit_without_scanning_orders(self):
         snapshots = self.live()
-        original = self.brokers["short"].api.call
-
-        def with_external(method, path, *args, **kwargs):
-            return [{"orderId": "external"}] if path.endswith("/openOrders") else original(method, path, *args, **kwargs)
-
-        self.brokers["short"].api.call = with_external
-        snapshots = {side: replace(value, open_orders=None) for side, value in snapshots.items()}
+        for current in snapshots.values():
+            current.open_orders = None  # Unknown is not represented as empty.
+        self.brokers["long"].api.account["assets"][0]["maxWithdrawAmount"] = "17"
         result = self.balancer.tick(self.pair, snapshots)
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(self.transfers, [])
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertEqual(self.transfers[0][2]["amount"], "17.00000000")
+        self.assertTrue(all(not path.endswith("/openOrders") for broker in self.brokers.values()
+                            for _, path, _ in broker.api.calls))
 
     def test_fresh_balance_movement_uses_lower_equity_and_new_available(self):
         snapshots = self.live()
@@ -674,7 +672,7 @@ class PairMarginTests(unittest.TestCase):
 
     def test_account_events_during_each_http_stage_prevent_transfer(self):
         for side in ("long", "short"):
-            for endpoint in ("accountWithJoinMargin", "income", "openOrders"):
+            for endpoint in ("accountWithJoinMargin", "income"):
                 with self.subTest(side=side, endpoint=endpoint):
                     snapshots = self.live()
                     self.store.put("pair_margin:gold", {})

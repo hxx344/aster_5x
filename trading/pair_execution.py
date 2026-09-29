@@ -290,7 +290,7 @@ class PairTrader:
                 # Publish the completed read before potentially slow transfer
                 # preparation; this never changes the original snapshot time.
                 self._save(pair, state)
-            margin = MarginBalancer(self.engine).tick(pair, snapshots, pending_orders=closing_due)
+            margin = MarginBalancer(self.engine).tick(pair, snapshots, pending_orders=closing_due, snapshot_guards=guards)
             state["margin"] = margin
             if margin.get("blocks_trading") and not holding:
                 state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))

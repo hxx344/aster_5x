@@ -95,14 +95,14 @@ class PairMarginBudgetWaitTests(TestCase):
         self.store.put("pair_margin:gold", {"pending": record, "last_transfer": deepcopy(record)})
         return record
 
-    def test_new_transfer_admission_rejects_whole_160_weight_group_without_requests(self):
-        self.budget.reserve(1000)  # 137 ordinary weight remains, less than 160.
+    def test_new_transfer_admission_rejects_whole_80_weight_group_without_requests(self):
+        self.budget.reserve(1060)  # 77 ordinary weight remains, less than 80.
         result = self.tick()
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["api_notice"]["kind"], "budget")
-        self.assertIn("160", result["api_notice"]["text"])
+        self.assertIn("80", result["api_notice"]["text"])
         self.assertEqual(self.requests, [])
-        self.assertEqual(self.budget.snapshot()["used"], 1000)
+        self.assertEqual(self.budget.snapshot()["used"], 1060)
         self.assertEqual(self.transfers, [])
         self.assertNotIn("retry_after", self.state())
         self.assertEqual(result["retry_after"], 60)
@@ -115,26 +115,26 @@ class PairMarginBudgetWaitTests(TestCase):
     def test_preflight_includes_replacement_snapshots_before_reading_anything(self):
         for current in self.snapshots.values():
             del current.account_read_generation
-        self.budget.reserve(900)  # 237 remains; 160+72+72 cannot fit.
+        self.budget.reserve(914)  # 223 remains; 80+72+72 cannot fit.
         result = self.tick()
         self.assertEqual(result["api_notice"]["kind"], "budget")
-        self.assertIn("304", result["api_notice"]["text"])
+        self.assertIn("224", result["api_notice"]["text"])
         self.assertEqual(self.requests, [])
         self.assertEqual(self.refreshed, [])
 
     def test_preflight_includes_archived_order_checks(self):
         self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": [{"legs": [
             {"key": "long"}, {"key": "short"}]}]}})
-        self.budget.reserve(976)  # 161 remains; two watch queries need 162.
+        self.budget.reserve(1056)  # 81 remains; two watch queries need 82.
         result = self.tick()
         self.assertEqual(result["api_notice"]["kind"], "budget")
-        self.assertIn("162", result["api_notice"]["text"])
+        self.assertIn("82", result["api_notice"]["text"])
         self.assertEqual(self.requests, [])
 
     def test_archived_order_query_cannot_borrow_recovery_reserve_for_new_transfer(self):
         self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": [{"legs": [
             {"key": "long"}, {"key": "short"}]}]}})
-        self.budget.reserve(975)  # The complete 162-weight preparation fits.
+        self.budget.reserve(1055)  # The complete 82-weight preparation fits.
 
         def guard(engine, pair):
             self.budget.reserve(7)  # Other work fills the limit after preparation.
@@ -145,20 +145,20 @@ class PairMarginBudgetWaitTests(TestCase):
             result = self.tick()
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["api_notice"]["kind"], "budget")
-        self.assertEqual(sum(request[2] for request in self.requests), 155)
+        self.assertEqual(sum(request[2] for request in self.requests), 75)
         self.assertFalse(any(path == "archived-order-query" for _, path, _, _ in self.requests))
         self.assertEqual(self.budget.snapshot()["used"], 1137)
         self.assertEqual(self.transfers, [])
 
     def test_new_transfer_uses_ordinary_budget_then_confirmation_uses_reserve(self):
-        self.budget.reserve(977)  # Exactly 160 ordinary weight remains.
+        self.budget.reserve(1057)  # Exactly 80 ordinary weight remains.
         result = self.tick()
         self.assertEqual(result["status"], "acknowledged", result)
         self.assertIsNone(result["pending"])
         self.assertIsNone(result["api_notice"])
         ordinary = [request for request in self.requests if request[1] != "snapshot"]
         recovery = [request for request in self.requests if request[1] == "snapshot"]
-        self.assertEqual(sum(request[2] for request in ordinary), 160)
+        self.assertEqual(sum(request[2] for request in ordinary), 80)
         self.assertEqual(len(recovery), 2)
         self.assertTrue(all(flags[1] and not flags[0] for *_, flags in ordinary))
         self.assertTrue(all(flags[0] and not flags[1] for *_, flags in recovery))
@@ -241,19 +241,19 @@ class PairMarginBudgetWaitTests(TestCase):
 
     def test_post_budget_denial_is_not_sent_and_preserves_deadline_and_notice(self):
         def other_work_used_budget():
-            self.budget.reserve(982)  # Preparation spent 155; fill ordinary 1137.
+            self.budget.reserve(1062)  # Preparation spent 75; fill ordinary 1137.
         self.before_transfer = other_work_used_budget
         result = self.tick()
         self.assertEqual(result["status"], "rejected", result)
         self.assertIsNone(result["pending"])
         self.assertEqual(result["api_notice"]["kind"], "budget")
         self.assertEqual(result["retry_after"], 60)
-        self.assertEqual(sum(row[2] for row in self.requests), 155)
+        self.assertEqual(sum(row[2] for row in self.requests), 75)
         self.assertEqual(self.transfers, [])
         self.assertEqual(self.state()["last_transfer"]["status"], "rejected")
         self.advance(31)  # Ordinary transfer cooldown ends, API wait does not.
         self.assertEqual(self.tick()["retry_after"], 29)
-        self.assertEqual(sum(row[2] for row in self.requests), 155)
+        self.assertEqual(sum(row[2] for row in self.requests), 75)
 
     def test_unknown_rate_limited_post_stays_pending_and_is_never_repeated(self):
         self.response = AmbiguousOrder("rate limited", retry_after=90, http_status=429)

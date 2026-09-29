@@ -161,12 +161,13 @@ class MarginBalancer:
             with priority:
                 budget.require_available(weight)
 
-    def _live_budget_weights(self, pair, members, snapshots):
+    def _live_budget_weights(self, pair, members, snapshots, snapshot_guards=None):
         # Listing and POST use the long member's shared budget. Each member
-        # additionally needs its account, income, and ALL open orders (5+30+40).
-        weights = {"long": 85, "short": 75}
+        # additionally needs its account and transfer income baseline (5+30).
+        weights = {"long": 45, "short": 35}
         for side, member in members.items():
-            if type(getattr(snapshots[side], "account_read_generation", None)) is not int:
+            if (type(getattr(snapshots[side], "account_read_generation", None)) is not int
+                    and not callable((snapshot_guards or {}).get(side))):
                 weights[side] += self.engine.broker(member).snapshot_weight([pair.get("symbol", "XAUUSD1")])
         watch = (self.store.get("pair_runtime:" + pair["id"], {}) or {}).get("recovery_watch")
         if watch is not None:
@@ -589,7 +590,7 @@ class MarginBalancer:
         for member in members.values():
             self.engine.broker(member).reload()
 
-    def tick(self, pair, snapshots, pending_orders=False):
+    def tick(self, pair, snapshots, pending_orders=False, *, snapshot_guards=None):
         """Return display state; the caller must obey ``blocks_trading``."""
         config = validate_margin(pair.get("margin", {}))
         try:
@@ -675,7 +676,7 @@ class MarginBalancer:
                 self._paper(pair, members, snapshots, state, pending)
                 self._record_success(pair, state)
                 return self._view(state, config, "paper_confirmed", "模拟 USD1 划转已原子入账，系统重新读取两侧余额；取得新快照前不开始新开仓或新划转", blocks=True, plan=plan)
-            return self._live(pair, members, snapshots, state, config)
+            return self._live(pair, members, snapshots, state, config, snapshot_guards)
         except TradingError as exc:
             # Local validation messages are fixed strings; remote error bodies
             # and credential values never enter durable state or the dashboard.
@@ -747,17 +748,22 @@ class MarginBalancer:
         self._apply_api_wait(state, exc)
         return state
 
-    def _live_snapshots(self, pair, members, snapshots):
+    def _live_snapshots(self, pair, members, snapshots, snapshot_guards=None):
         brokers = {side: self.engine.broker(member) for side, member in members.items()}
         originals = dict(snapshots)
+        guards = {}
         replacements = []
         for side, broker in brokers.items():
             if not callable(getattr(broker, "require_snapshot_current", None)) or not hasattr(broker, "_snapshot_lock"):
                 raise TradingError("账户缺少可撤销的快照校验，禁止划转")
-            # Hot snapshots carry a lease held by PairTrader, not an ordinary
-            # generation token. Obtain our own revocable read before planning.
+            # PairTrader can lend its revocable hot lease for this synchronous
+            # call under the same account locks. A bare snapshot is insufficient.
             if type(getattr(originals[side], "account_read_generation", None)) is not int:
-                replacements.append(side)
+                guard = (snapshot_guards or {}).get(side)
+                if callable(guard):
+                    guards[side] = guard
+                else:
+                    replacements.append(side)
         if replacements:
             # Reuse the ordinary 15s mode cache; account events still invalidate
             # it. Every read gets a new generation-checked balance/position view.
@@ -766,8 +772,11 @@ class MarginBalancer:
                          for side in replacements}
                 originals.update({side: future.result() for side, future in reads.items()})
         for side in brokers:
+            if side in guards:
+                continue
             if type(getattr(originals[side], "account_read_generation", None)) is not int:
                 raise TradingError("账户快照缺少有效代次，禁止划转")
+            guards[side] = lambda side=side: brokers[side].require_snapshot_current(originals[side])
 
         def require_current():
             # Check both generations at one local admission boundary. Holding
@@ -776,8 +785,8 @@ class MarginBalancer:
             with ExitStack() as locks:
                 for side in sorted(brokers, key=lambda value: members[value]["id"]):
                     locks.enter_context(brokers[side]._snapshot_lock)
-                for side, broker in brokers.items():
-                    broker.require_snapshot_current(originals[side])
+                for guard in guards.values():
+                    guard()
                 if any(not self.engine.live_allowed(member) for member in members.values()):
                     raise TradingError("实盘全局开关已关闭，禁止划转")
 
@@ -822,7 +831,7 @@ class MarginBalancer:
                 occupied = max(occupied, Fraction(positive(asset[field], True)))
         return occupied
 
-    def _live(self, pair, members, snapshots, state, config):
+    def _live(self, pair, members, snapshots, state, config, snapshot_guards=None):
         # New transfers, including archived-order guards whose query method
         # requests recovery priority, may never spend the recovery reserve.
         with ExitStack() as ordinary:
@@ -832,17 +841,17 @@ class MarginBalancer:
                 if budget is not None and id(budget) not in seen:
                     ordinary.enter_context(budget.cycle_accounting())
                     seen.add(id(budget))
-            self._require_budget(members, self._live_budget_weights(pair, members, snapshots))
-            result = self._submit_live(pair, members, snapshots, state, config)
+            self._require_budget(members, self._live_budget_weights(pair, members, snapshots, snapshot_guards))
+            result = self._submit_live(pair, members, snapshots, state, config, snapshot_guards)
         # Only an already accepted write may use the recovery reserve. Leave
         # the ordinary context before its one confirmation refresh.
         if isinstance(state.get("pending"), dict) and state["pending"].get("status") == "acknowledged":
             return self._refresh_acknowledged(pair, members, state, config)
         return result
 
-    def _submit_live(self, pair, members, snapshots, state, config):
+    def _submit_live(self, pair, members, snapshots, state, config, snapshot_guards=None):
         key = "pair_margin:" + pair["id"]
-        snapshots, require_current = self._live_snapshots(pair, members, snapshots)
+        snapshots, require_current = self._live_snapshots(pair, members, snapshots, snapshot_guards)
         with self._master(pair, members) as (api, master, children):
             listing = api.call("GET", "/fapi/v3/getSubAccountList", signed=True, weight=5)
             accounts = self._account_rows(members)
@@ -879,12 +888,9 @@ class MarginBalancer:
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
             before_at = time.time()
             before = self._income(members, int((before_at - 90) * 1000), int(before_at * 1000))
-            for side, member in members.items():
-                orders = self.engine.broker(member).api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
-                if not isinstance(orders, list):
-                    raise TradingError("账户未完成委托响应无效，禁止划转")
-                snapshots = {**snapshots, side: replace(snapshots[side], open_orders=orders)}
-            self._check_snapshots(pair, snapshots, require_orders=True)
+            # This pair submits market orders. Pending batches are gated by
+            # PairTrader; archived orders are checked by their original IDs.
+            # Fresh account availability/withdrawal limits include reserved funds.
             from .pair_recovery import require_archived_orders_clear
             require_archived_orders_clear(self.engine, pair)
             require_current()
@@ -905,12 +911,15 @@ class MarginBalancer:
             state.pop("api_notice", None)
             state.pop("blocked_reason", None)
             self.store.put(key, state)  # Must commit before any signed mutation.
-            transfer = TransferAPI(master, budget=api.budget, before_submit=require_current)
-            try:
-                # Revoke published hot leases now, but do not revoke the very
-                # ordinary generations needed for the final pre-send check.
+            def before_submit():
+                # Validate borrowed leases after signing, then revoke them just
+                # before transport. Earlier revocation would reject our own read.
+                require_current()
                 for member in members.values():
                     self.engine.broker(member).discard_cycle_hot_snapshot("子账户保证金划转，重新读取余额")
+
+            transfer = TransferAPI(master, budget=api.budget, before_submit=before_submit)
+            try:
                 response = transfer.call("POST", "/fapi/v3/subAccountTransfer", {
                     "toAccountAddress": children[plan["destination"]]["user"], "asset": "USD1", "amount": plan["amount"],
                     "kindType": "FUTURE_FUTURE", "fromAccountAddress": children[plan["source"]]["user"]}, signed=True, weight=5)

@@ -18,8 +18,9 @@ DEFAULTS = {
     "hourly_summary_alerts": True,
     "hourly_summary_interval_minutes": 60,
     "relay_health_alerts": True,
+    "position_imbalance_alerts": True,
 }
-CATEGORIES = {"new_listing", "strategy_capacity", "listing_capacity", "trade_summary", "hourly_summary", "relay_health"}
+CATEGORIES = {"new_listing", "strategy_capacity", "listing_capacity", "trade_summary", "hourly_summary", "relay_health", "position_imbalance"}
 
 
 def read(db):
@@ -48,7 +49,7 @@ def allowed(config, category, symbols):
         return True
     if not all(symbol_options(config, symbol)["alerts"] for symbol in symbols):
         return False
-    if category != "trade_summary" and not all(monitored(config, symbol) for symbol in symbols):
+    if category not in ("trade_summary", "position_imbalance") and not all(monitored(config, symbol) for symbol in symbols):
         return False
     return category != "new_listing" or config["discovery_enabled"]
 

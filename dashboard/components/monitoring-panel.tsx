@@ -23,7 +23,8 @@ const categories: {
     | 'new_listing_alerts'
     | 'strategy_capacity_alerts'
     | 'listing_capacity_alerts'
-    | 'trade_summary_alerts';
+    | 'trade_summary_alerts'
+    | 'position_imbalance_alerts';
   title: string;
   description: string;
 }[] = [
@@ -47,6 +48,12 @@ const categories: {
     key: 'trade_summary_alerts',
     title: '普通开仓成交汇总',
     description: '普通开仓结束后按币种汇总成交；循环与迁移目前只记录本地历史。',
+  },
+  {
+    key: 'position_imbalance_alerts',
+    title: '仓位不平衡',
+    description:
+      '实盘同币种多空数量差超过 0.1%，且新快照持续确认 60 秒后提醒；交易、核对或回退中暂缓。恢复稳定 30 秒后通知一次。',
   },
 ];
 
@@ -311,7 +318,7 @@ export function MonitoringPanel({
         <div className="section-head">
           <div>
             <h2>币种范围</h2>
-            <p>公开额度提醒需要开启监控；成交汇总只遵循告警开关。</p>
+            <p>公开额度提醒需要开启监控；成交汇总和仓位不平衡只遵循告警开关。</p>
           </div>
         </div>
         <div className="monitor-master-grid">

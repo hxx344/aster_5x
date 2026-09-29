@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications
+from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -153,6 +153,7 @@ class Store:
             for statement in schema.split(";"):
                 if statement.strip():
                     db.execute(statement)
+            position_observations.initialize(db)
             cycle_quality_history.initialize(db)
             # A revision changes in the same transaction as its fills, including
             # backfills and writes from a different process/Store. Rollbacks
@@ -570,6 +571,8 @@ class Store:
                                      for key in ("feishu_enabled", "hourly_summary_alerts", "hourly_summary_interval_minutes"))
                 relay_changed = any(key in changes and config[key] != changes[key]
                                     for key in ("feishu_enabled", "relay_health_alerts"))
+                position_changed = any(key in changes and config[key] != changes[key]
+                                       for key in ("feishu_enabled", "position_imbalance_alerts"))
                 config.update(changes)
             config["revision"] += 1
             monitoring.write(db, config)
@@ -580,7 +583,19 @@ class Store:
                 hourly_notifications.reset(db, time.time(), monitoring.allowed(config, "hourly_summary", []))
             if symbol is None and relay_changed:
                 relay_health_notifications.reset(db)
+            if symbol is None and position_changed:
+                position_imbalance_notifications.reset(db)
+            elif symbol is not None and "alerts" in changes:
+                position_imbalance_notifications.reset(db, symbol=symbol)
             return config
+
+    def observe_position_imbalance(self, observations, *, available, revision, instance_id, now=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            observations = [{**row, "suppressed": True} if not position_observations.current(db, row) else row
+                            for row in observations]
+            return position_imbalance_notifications.observe(db, observations, available=available,
+                revision=revision, instance_id=instance_id, now=time.time() if now is None else now)
 
     def observe_relay_health(self, status, *, available, revision, now=None):
         with self.connect() as db:
@@ -1414,6 +1429,11 @@ class Store:
             return None
         if item.get("category") == "relay_health" and not relay_health_notifications.deliverable(db, item):
             return None
+        if item.get("category") == "position_imbalance":
+            capture = position_imbalance_notifications.delivery_observation(db, item)
+            if (not position_imbalance_notifications.deliverable(db, item) or not capture
+                    or not position_observations.current(db, capture)):
+                return None
         if item["id"].startswith(listing_alerts.MESSAGE_PREFIX) and not listing_alerts.deliverable(db, item, time.time()):
             return None
         if item["capacity_key"]:
@@ -1476,6 +1496,8 @@ class Store:
                     hourly_notifications.delivered(db, now)
                 if row["category"] == "relay_health":
                     relay_health_notifications.delivered(db, dict(row))
+                if row["category"] == "position_imbalance":
+                    position_imbalance_notifications.delivered(db, dict(row))
                 if item["id"].startswith(listing_alerts.MESSAGE_PREFIX):
                     listing_alerts.delivered(db, item)
                 if row["capacity_key"]:

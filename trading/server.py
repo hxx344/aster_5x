@@ -185,6 +185,7 @@ class MonitoringEdit(BaseModel):
     hourly_summary_alerts: bool | None = None
     hourly_summary_interval_minutes: StrictInt | None = Field(default=None, ge=1, le=1440)
     relay_health_alerts: bool | None = None
+    position_imbalance_alerts: bool | None = None
 
     @model_validator(mode="after")
     def nonempty_settings(self):

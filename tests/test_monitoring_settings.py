@@ -343,6 +343,14 @@ class MonitoringAPITests(unittest.TestCase):
         self.assertEqual(self.client.patch("/api/monitoring", json={"relay_health_alerts": True}).status_code, 200)
         self.assertTrue(Store(self.store.path).monitoring_settings()["relay_health_alerts"])
 
+    def test_position_imbalance_setting_is_strict_and_persists(self):
+        self.login()
+        self.assertTrue(self.client.get("/api/monitoring").json()["settings"]["position_imbalance_alerts"])
+        for value in ("false", 1, None):
+            self.assertEqual(self.client.patch("/api/monitoring", json={"position_imbalance_alerts": value}).status_code, 422)
+        self.assertEqual(self.client.patch("/api/monitoring", json={"position_imbalance_alerts": False}).status_code, 200)
+        self.assertFalse(Store(self.store.path).monitoring_settings()["position_imbalance_alerts"])
+
     def test_summary_interval_strict_validation_and_persistence(self):
         self.login()
         self.assertEqual(self.client.get("/api/monitoring").json()["settings"]["hourly_summary_interval_minutes"], 60)

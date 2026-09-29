@@ -140,6 +140,7 @@ export type MonitoringSettings = {
   hourly_summary_alerts: boolean;
   hourly_summary_interval_minutes: number;
   relay_health_alerts: boolean;
+  position_imbalance_alerts: boolean;
 };
 export type MonitoredSymbol = {
   symbol: string;

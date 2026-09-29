@@ -16,7 +16,7 @@ import time
 import uuid
 
 import monitor
-from . import monitoring, notification_channels
+from . import monitoring, notification_channels, position_observations
 from .hourly_summary import format_hourly_summary
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
@@ -174,6 +174,8 @@ class Engine:
         self.notification_channel_errors = dict.fromkeys(notification_channels.CHANNELS)
         self.hourly_summary_error = None
         self.relay_health_error = None
+        self.position_imbalance_error = None
+        self.position_observation_instance = uuid.uuid4().hex
         self.capacity_notification_errors = {}
         self.capacity_targets, self.capacity_accounts = {}, []
         self.capacity_intervals = {}
@@ -2297,11 +2299,26 @@ class Engine:
             LOG.error("Relay health notification observation failed")
             return False
 
+    def observe_position_imbalance(self, config):
+        try:
+            revision = self.store.monitoring_settings()["revision"]
+            active = bool(config) and not self.demo and not self.shutdown.is_set()
+            observations = position_observations.collect(self) if active else []
+            accepted = self.store.observe_position_imbalance(observations, available=active,
+                revision=revision, instance_id=self.position_observation_instance)
+            self.position_imbalance_error = None
+            return accepted and active
+        except Exception:
+            self.position_imbalance_error = "仓位不平衡提醒检查失败，等待重试"
+            LOG.error("Position imbalance notification observation failed")
+            return False
+
     def notify(self):
         if self.demo or self.shutdown.is_set():
             return 5
         configs = self.notification_configs()
         self.observe_relay_health(configs["event"])
+        self.observe_position_imbalance(configs["event"])
         try:
             now = time.time()
             token = self.store.hourly_summary_due(available=bool(configs["scheduled"]), now=now)
@@ -2327,6 +2344,8 @@ class Engine:
             if not config or config != configs[channel]:
                 continue
             if item.get("category") == "relay_health" and not self.observe_relay_health(config):
+                continue
+            if item.get("category") == "position_imbalance" and not self.observe_position_imbalance(config):
                 continue
             # Re-read validity after preceding network calls and setting changes.
             item = self.store.notification_for_delivery(item["id"])
@@ -2407,7 +2426,7 @@ class Engine:
         state_now = time.time()
         channels = notification_channels.public_status({
             "scheduled": self.notification_channel_errors["scheduled"] or self.hourly_summary_error,
-            "event": self.notification_channel_errors["event"] or self.relay_health_error
+            "event": self.notification_channel_errors["event"] or self.relay_health_error or self.position_imbalance_error
                 or next(iter(self.capacity_notification_errors.values()), None)})
         with self.store.read_snapshot() as reader:
             saved_accounts = reader.accounts()
@@ -2591,7 +2610,7 @@ class Engine:
                                  "channels": channels, "routing_mode": notification_channels.routing_mode(),
                                  "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "hourly_summary": hourly_summary,
-                                 "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or next(iter(self.capacity_notification_errors.values()), None)}}))
+                                 "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or self.position_imbalance_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
     def run(self):
         pending, due = {}, {}

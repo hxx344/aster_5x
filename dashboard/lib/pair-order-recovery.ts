@@ -20,6 +20,85 @@ export type PairOrderRecoveryReview = {
 };
 type ReceiptsFound = { status: 'receipts_found'; message: string };
 
+export type PairOrderRecoveryCheck = {
+  status: 'checked';
+  pair_id: string;
+  batch_id: string;
+  checked_at: number;
+  completed: boolean;
+  message: string;
+  archive_available: boolean;
+  archive_reason: string;
+  orders: {
+    side: 'LONG' | 'SHORT';
+    client_order_id: string;
+    status: string;
+    executed_qty: string | null;
+    error: string;
+  }[];
+};
+
+export function parsePairOrderRecoveryCheck(
+  data: unknown,
+  pair: Pair,
+): PairOrderRecoveryCheck {
+  if (!record(data)) throw new Error('核对响应不完整，请重新核对');
+  if (data.pair_id !== pair.id || data.batch_id !== pair.state?.pending?.id)
+    throw new Error('核对响应与请求的配对组或批次不符，请重新核对');
+  if (
+    data.status !== 'checked' ||
+    typeof data.message !== 'string' ||
+    typeof data.checked_at !== 'number' ||
+    !Number.isFinite(data.checked_at) ||
+    data.checked_at <= 0 ||
+    typeof data.completed !== 'boolean' ||
+    typeof data.archive_available !== 'boolean' ||
+    typeof data.archive_reason !== 'string' ||
+    (data.completed && data.archive_available) ||
+    !Array.isArray(data.orders) ||
+    data.orders.length < 2 ||
+    !data.orders.every(
+      (order) =>
+        record(order) &&
+        (order.side === 'LONG' || order.side === 'SHORT') &&
+        typeof order.client_order_id === 'string' &&
+        Boolean(order.client_order_id) &&
+        typeof order.status === 'string' &&
+        [
+          'UNKNOWN',
+          'NEW',
+          'PARTIALLY_FILLED',
+          'PENDING_CANCEL',
+          'FILLED',
+          'CANCELED',
+          'REJECTED',
+          'EXPIRED',
+          'EXPIRED_IN_MATCH',
+        ].includes(order.status) &&
+        (order.executed_qty === null ||
+          (typeof order.executed_qty === 'string' &&
+            /^\d+(?:\.\d+)?$/.test(order.executed_qty))) &&
+        typeof order.error === 'string',
+    ) ||
+    new Set(data.orders.map((order) => order.side)).size !== 2 ||
+    new Set(data.orders.map((order) => order.client_order_id)).size !==
+      data.orders.length
+  )
+    throw new Error('核对响应不完整，请重新核对');
+  // A check result can never supply an archive token, even if the server sends one.
+  return {
+    status: 'checked',
+    pair_id: data.pair_id as string,
+    batch_id: data.batch_id as string,
+    checked_at: data.checked_at,
+    completed: data.completed,
+    message: data.message,
+    archive_available: data.archive_available,
+    archive_reason: data.archive_reason,
+    orders: data.orders as PairOrderRecoveryCheck['orders'],
+  };
+}
+
 export function pairOrderRecoveryBlock(pair: Pair): string {
   if (pair.enabled) return '请先暂停配对组，再核对订单与持仓';
   const pending = pair.state?.pending;

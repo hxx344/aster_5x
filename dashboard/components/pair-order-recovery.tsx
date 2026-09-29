@@ -25,6 +25,8 @@ import {
   pairOrderRecoveryBlock,
   pairOrderRecoveryReviewBlock,
   parsePairOrderRecovery,
+  parsePairOrderRecoveryCheck,
+  type PairOrderRecoveryCheck,
   type PairOrderRecoveryReview,
 } from '@/lib/pair-order-recovery';
 
@@ -41,13 +43,9 @@ function dateTime(seconds: number): string {
 }
 
 export function PairOrderRecovery(props: Props) {
-  // Changing pair or batch must discard the old token and abort its preview.
-  return (
-    <PairOrderRecoveryDialog
-      key={JSON.stringify([props.pair.id, props.pair.state?.pending?.id])}
-      {...props}
-    />
-  );
+  // Keep completion visible when reconciliation clears the pending batch.
+  // Archive confirmation separately checks the current pair and batch identity.
+  return <PairOrderRecoveryDialog key={props.pair.id} {...props} />;
 }
 
 function PairOrderRecoveryDialog({
@@ -60,6 +58,7 @@ function PairOrderRecoveryDialog({
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [review, setReview] = useState<PairOrderRecoveryReview | null>(null);
+  const [checked, setChecked] = useState<PairOrderRecoveryCheck | null>(null);
   const [receiptsFound, setReceiptsFound] = useState('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [error, setError] = useState('');
@@ -71,12 +70,13 @@ function PairOrderRecoveryDialog({
     ? pairOrderRecoveryReviewBlock(review, pair, now)
     : '';
 
-  async function readOrdersAndPositions() {
+  async function readOrdersAndPositions(archive = false) {
     if (locked || loading) return;
     request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
     setReview(null);
+    setChecked(null);
     setReceiptsFound('');
     setAcknowledged(false);
     setError('');
@@ -84,10 +84,13 @@ function PairOrderRecoveryDialog({
     setLoading(true);
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
-      const response = await fetch(`/api/pairs/${pair.id}/recovery-preview`, {
-        method: 'POST',
-        signal: controller.signal,
-      });
+      const response = await fetch(
+        `/api/pairs/${pair.id}/${archive ? 'recovery-preview' : 'recovery-check'}`,
+        {
+          method: 'POST',
+          signal: controller.signal,
+        },
+      );
       const data: unknown = await response.json();
       if (!response.ok) {
         const detail =
@@ -103,9 +106,14 @@ function PairOrderRecoveryDialog({
         );
       }
       if (controller.signal.aborted || request.current !== controller) return;
-      const result = parsePairOrderRecovery(data, pair);
-      if (result.status === 'receipts_found') setReceiptsFound(result.message);
-      else setReview(result);
+      if (archive) {
+        const result = parsePairOrderRecovery(data, pair);
+        if (result.status === 'receipts_found')
+          setReceiptsFound(result.message);
+        else setReview(result);
+      } else {
+        setChecked(parsePairOrderRecoveryCheck(data, pair));
+      }
     } catch (cause) {
       if (request.current === controller) {
         setError(
@@ -166,12 +174,11 @@ function PairOrderRecoveryDialog({
           <DialogHeader>
             <DialogTitle>核对订单与持仓 · {pair.name}</DialogTitle>
             <DialogDescription>
-              查不到不等于从未受理。仅在两侧实际仓位等于本批前底仓、无挂单等条件全部满足时允许人工归档。
-              保留旧批次，之后若发现迟到成交将阻止新开仓和划转。
+              按原订单编号查询未确认回执，并按成交记录核对两侧实际持仓。已有回执会继续参与核对。
             </DialogDescription>
           </DialogHeader>
           <p className="muted">
-            核对不会提交新订单或划转。确认归档后仍保持暂停，需手动启动配对组。
+            本次手动核对不会提交新订单或划转。核对完成后仍保持暂停，需手动启动配对组；已有批次的后台减仓恢复仍会继续。
           </p>
           {loading && !review ? (
             <output>正在查询原订单并读取交易所最新持仓…</output>
@@ -182,9 +189,40 @@ function PairOrderRecoveryDialog({
             </p>
           ) : null}
           {receiptsFound ? <output>{receiptsFound}</output> : null}
+          {checked ? (
+            <div className="grid gap-3">
+              <output>{checked.message}</output>
+              <p className="muted">核对时间：{dateTime(checked.checked_at)}</p>
+              {checked.orders.map((order) => (
+                <div key={order.client_order_id}>
+                  <p>
+                    {order.side === 'LONG' ? 'A · 只多' : 'B · 只空'} ·
+                    {order.status === 'UNKNOWN'
+                      ? '尚无有效回执'
+                      : `回执状态 ${order.status}`}{' '}
+                    · 累计成交 {order.executed_qty ?? '未知'}
+                  </p>
+                  <p className="muted break-all">
+                    CID：<code>{order.client_order_id}</code>
+                  </p>
+                  {order.error ? (
+                    <p className="amber">本单反馈：{order.error}</p>
+                  ) : null}
+                </div>
+              ))}
+              <p className="muted">{checked.archive_reason}</p>
+              {checked.completed ? (
+                <p>本批跟踪已完成，配对组仍保持暂停。关闭后可启动配对组。</p>
+              ) : null}
+            </div>
+          ) : null}
           {review ? (
             <>
               {review.message ? <p>{review.message}</p> : null}
+              <p className="muted">
+                查不到不等于从未受理。仅在两侧实际仓位等于本批前底仓、无挂单等条件全部满足时允许人工归档。
+                保留旧批次，之后若发现迟到成交将阻止新开仓和划转。
+              </p>
               <p className="muted break-all">原批次：{review.batch_id}</p>
               <p className="muted">创建时间：{dateTime(review.created_at)}</p>
               <div className="grid gap-3">
@@ -250,15 +288,28 @@ function PairOrderRecoveryDialog({
               disabled={loading}
               onClick={() => setOpen(false)}
             >
-              {receiptsFound ? '关闭' : '取消'}
+              关闭
             </Button>
-            {!receiptsFound ? (
+            {!checked?.completed ? (
               <Button
                 variant="outline"
                 disabled={loading || locked}
                 onClick={() => void readOrdersAndPositions()}
               >
-                重新读取
+                重新核对
+              </Button>
+            ) : null}
+            {checked?.archive_available ? (
+              <Button
+                variant="outline"
+                disabled={
+                  loading ||
+                  locked ||
+                  checked.batch_id !== pair.state?.pending?.id
+                }
+                onClick={() => void readOrdersAndPositions(true)}
+              >
+                检查人工归档条件
               </Button>
             ) : null}
             {review ? (

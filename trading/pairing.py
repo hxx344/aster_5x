@@ -318,6 +318,13 @@ class PairManager:
         with self.locked(pair), self.store.connection_scope():
             return self.recovery.preview(pair_id)
 
+    def check_recovery(self, pair_id):
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            return self.recovery.check(pair_id)
+
     def confirm_recovery(self, pair_id, token, acknowledge_unknown=False):
         pair = self.store.pair(pair_id)
         if pair is None:

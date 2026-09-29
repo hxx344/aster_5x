@@ -7,7 +7,8 @@ import re
 import time
 import uuid
 
-from .exchange import AmbiguousOrder, ExchangeError, LiveBroker
+from .exchange import AmbiguousOrder, ExchangeError, LiveBroker, api_wait_notice
+from .exchange_messages import exchange_reason
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
@@ -78,7 +79,7 @@ class PairOrderRecovery:
         return {"pair": pair, "state": value, "margin": margin, "accounts": accounts}
 
     @staticmethod
-    def _eligible(pair, state, margin):
+    def _eligible(pair, state, margin, *, archive=True):
         from .pairing import has_cycle_quantity
         if pair.get("enabled") is not False:
             raise TradingError("请先暂停配对组，再核对遗留订单与持仓")
@@ -92,7 +93,10 @@ class PairOrderRecovery:
         if (not isinstance(progress, dict) or not isinstance(progress.get("quantities"), dict)
                 or set(progress["quantities"]) != {"LONG", "SHORT"}):
             raise TradingError("循环新增仓位记录不完整，不能人工归档")
-        if (pending.get("repairs") != [] or pending.get("repair_attempts") != 0 or has_cycle_quantity(state)
+        if (not isinstance(pending.get("repairs"), list)
+                or type(pending.get("repair_attempts")) is not int or not 0 <= pending["repair_attempts"] <= 3):
+            raise TradingError("原批次补偿记录无效，无法核对")
+        if ((archive and (pending["repairs"] or pending["repair_attempts"])) or has_cycle_quantity(state)
                 or margin.get("pending") is not None
                 or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
             raise TradingError("仍有补偿减仓、循环新增仓位或未决划转，不能人工归档")
@@ -100,9 +104,11 @@ class PairOrderRecovery:
         if type(created) not in (int, float) or not math.isfinite(created) or created <= 0:
             raise TradingError("原批次缺少有效创建时间，不能核对历史订单")
         age = time.time() - created
-        if age < MIN_AGE:
+        if age < 0:
+            raise TradingError("原批次创建时间晚于当前时间，无法核对")
+        if archive and age < MIN_AGE:
             raise TradingError("原批次创建未满 120 秒，请等待自动查询后再核对")
-        if age + 60 >= 7 * 86400:
+        if archive and age + 60 >= 7 * 86400:
             raise TradingError("原批次超出完整历史核对窗口，不能使用此恢复入口")
         if not isinstance(pending.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pending["id"]):
             raise TradingError("原批次编号无效")
@@ -118,12 +124,28 @@ class PairOrderRecovery:
         cids = set()
         for leg in legs:
             side = leg["key"].upper()
+            label = "A · 只多" if side == "LONG" else "B · 只空"
             order = leg.get("order")
-            if (leg.get("receipt") is not None or leg.get("dispatch") != "sending"
-                    or not isinstance(order, dict) or order.get("symbol") != SYMBOL
-                    or order.get("positionSide") != side or order.get("side") != ("BUY" if side == "LONG" else "SELL")
-                    or order.get("type") != "MARKET" or positive(order.get("quantity")) != qty):
-                raise TradingError("原订单已有回执或委托字段无效，请继续原订单核对流程")
+            if not isinstance(order, dict):
+                raise TradingError(f"{label}：原委托记录缺失，无法核对")
+            expected = {"symbol": SYMBOL, "positionSide": side,
+                        "side": "BUY" if side == "LONG" else "SELL", "type": "MARKET"}
+            for field, value in expected.items():
+                if order.get(field) != value:
+                    raise TradingError(f"{label}：原委托 {field} 字段不符合本批开仓记录，无法核对")
+            if positive(order.get("quantity")) != qty:
+                raise TradingError(f"{label}：原委托数量与批次数量不符，无法核对")
+            if leg.get("dispatch") not in {"prepared", "sending"}:
+                raise TradingError(f"{label}：原订单发送状态无效，无法核对")
+            if leg.get("receipt") is not None:
+                try:
+                    Executor.validate_receipt(order, leg["receipt"])
+                except TradingError as exc:
+                    raise TradingError(f"{label}：已保存回执无效；{exchange_reason(str(exc))}") from None
+                if archive:
+                    raise TradingError(f"{label}已有有效回执，不适用未知订单人工归档；可继续重新核对")
+            if archive and leg["dispatch"] != "sending":
+                raise TradingError(f"{label}记录为尚未发送，不适用未知订单人工归档；可继续重新核对")
             cid = order.get("newClientOrderId")
             if not isinstance(cid, str) or not re.fullmatch(r"[.A-Za-z0-9_:/-]{1,36}", cid) or cid in cids:
                 raise TradingError("原客户端订单编号缺失或重复")
@@ -133,7 +155,74 @@ class PairOrderRecovery:
             target = positive((pending.get("target") or {}).get(side), True)
             if before != owned or Fraction(target) != Fraction(before) + Fraction(qty):
                 raise TradingError("原批次基线或目标与底仓记录不一致，不能人工归档")
+        # Budget-rejected repair records do not consume an attempt; legitimate
+        # journals may therefore contain more than two legs per attempt.
+        for leg in pending["repairs"]:
+            if not isinstance(leg, dict) or leg.get("key") not in {"long", "short"}:
+                raise TradingError("补偿订单账户方向无效，无法核对")
+            order, side = leg.get("order"), leg["key"].upper()
+            if (not isinstance(order, dict) or order.get("symbol") != SYMBOL
+                    or order.get("positionSide") != side or order.get("side") != ("SELL" if side == "LONG" else "BUY")
+                    or order.get("type") != "MARKET" or leg.get("dispatch") not in {"prepared", "sending"}
+                    or not 0 < positive(order.get("quantity")) <= qty):
+                raise TradingError("补偿委托字段与本批减仓记录不符，无法核对")
+            cid = order.get("newClientOrderId")
+            if not isinstance(cid, str) or not re.fullmatch(r"[.A-Za-z0-9_:/-]{1,36}", cid) or cid in cids:
+                raise TradingError("补偿客户端订单编号缺失或重复")
+            cids.add(cid)
+            if leg.get("receipt") is not None:
+                Executor.validate_receipt(order, leg["receipt"])
         return pending
+
+    def check(self, pair_id):
+        """Run the ordinary recovery state machine without sending repair orders."""
+        from .pair_execution import PairTrader, PairPositionError
+        self.previews.pop(pair_id, None)
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        state = self.store.get("pair_runtime:" + pair_id, {})
+        margin = self.store.get("pair_margin:" + pair_id, {})
+        if isinstance(state, dict) and state.get("pending") is None:
+            raise TradingError("当前没有待核对批次，可能已由后台完成；请刷新配对组查看结果")
+        pending = self._eligible(pair, state, margin, archive=False)
+        # Keep the queried batch even if _finish removes it from runtime.
+        original = pending
+        self.manager._members(pair)
+        trader = self.manager.trader or PairTrader(self.engine)
+        _, brokers, identities = trader._members(pair)
+        if pending.get("identities") != identities or state.get("identities") != identities:
+            raise TradingError("原批次与当前真实账户身份不一致，无法核对")
+        state.pop("retry_after", None)
+        state["api_notice"] = None
+        try:
+            trader._recover(pair, state, brokers, read_only=True)
+        except TradingError as exc:
+            trader._retry_delay(state, exc)
+            state.update(reason=exchange_reason(str(exc)), api_notice=api_wait_notice(exc))
+            if isinstance(exc, PairPositionError):
+                state.update(phase="attention", attention=state["reason"])
+        finally:
+            trader._save(pair, state)
+        self.manager._changed(pair)
+        current = state.get("pending")
+        archive_available, archive_reason = False, "本批已完成核对，无需人工归档"
+        if current:
+            try:
+                self._eligible(pair, state, self.store.get("pair_margin:" + pair_id, {}))
+                archive_available, archive_reason = True, "两笔原订单仍无回执；可继续检查历史订单、实际底仓与挂单是否满足人工归档条件"
+            except TradingError as exc:
+                archive_reason = str(exc)
+        rows = []
+        for leg in (current or original)["legs"] + (current or original)["repairs"]:
+            receipt = leg.get("receipt") or {}
+            rows.append({"side": leg["key"].upper(), "client_order_id": leg["order"]["newClientOrderId"],
+                         "status": receipt.get("status", "UNKNOWN"), "executed_qty": receipt.get("executedQty"),
+                         "error": exchange_reason(receipt.get("reject_reason") or
+                                                  (leg.get("error") if receipt.get("status") not in TERMINAL else None))})
+        return {"status": "checked", "pair_id": pair_id, "batch_id": original["id"], "checked_at": time.time(),
+                "completed": current is None, "message": state.get("reason", "本次核对结束"), "orders": rows,
+                "archive_available": archive_available, "archive_reason": archive_reason}
 
     def _history(self, broker, pending):
         start, end = int((pending["created_at"] - 60) * 1000), int(time.time() * 1000)

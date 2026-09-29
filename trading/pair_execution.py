@@ -505,7 +505,7 @@ class PairTrader:
         return all(leg.get("receipt") and leg["receipt"]["status"] in TERMINAL
                    for leg in pending["legs"] + pending["repairs"])
 
-    def _recover(self, pair, state, brokers):
+    def _recover(self, pair, state, brokers, *, read_only=False):
         pending = state["pending"]
         if pending["kind"] == "leverage":
             return self._recover_leverage(pair, state, brokers)
@@ -539,6 +539,9 @@ class PairTrader:
             return
         if pending["repair_attempts"] >= 3:
             raise PairPositionError("减仓恢复已尝试三次，仍有本批残余仓位；系统停止继续自动减仓，请人工核对两侧持仓与成交")
+        if read_only:
+            state.update(phase="repairing", reason="原订单与持仓已核对，本批仍需减仓回到恢复目标；本次手动核对未发单，后台继续原减仓恢复流程")
+            return
         if time.time() < pending.get("repair_retry_at", 0):
             state.update(phase="repairing", reason="本地请求预算不足，系统等待预算恢复后重试尚未发送的减仓；已发送订单只查询原编号")
             return

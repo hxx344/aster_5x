@@ -4,6 +4,7 @@ import {
   pairOrderRecoveryBlock,
   pairOrderRecoveryReviewBlock,
   parsePairOrderRecovery,
+  parsePairOrderRecoveryCheck,
 } from '../lib/pair-order-recovery.ts';
 
 const pair = {
@@ -56,6 +57,107 @@ test('only paused ordinary opening batches allow the recovery entry', () => {
     }),
     '',
     'server preview must report the detailed transfer conflict',
+  );
+});
+
+function checkResult(changes = {}) {
+  return {
+    status: 'checked',
+    pair_id: 'pair-a',
+    batch_id: 'batch-a',
+    checked_at: 1000,
+    completed: false,
+    message: '一笔仍待核对',
+    archive_available: false,
+    archive_reason: '已有一笔回执',
+    orders: [
+      {
+        side: 'LONG',
+        client_order_id: 'original-a',
+        status: 'EXPIRED',
+        executed_qty: '0',
+        error: '',
+      },
+      {
+        side: 'SHORT',
+        client_order_id: 'original-b',
+        status: 'UNKNOWN',
+        executed_qty: null,
+        error: '本地 API 请求权重预算不足',
+      },
+    ],
+    ...changes,
+  };
+}
+
+test('manual check supports mixed receipts and displays budget feedback without an archive token', () => {
+  const data = checkResult();
+  assert.deepEqual(
+    parsePairOrderRecoveryCheck({ ...data, token: 'never-confirm-this' }, pair),
+    data,
+  );
+  assert.equal(
+    parsePairOrderRecoveryCheck(data, pair).orders[1].error,
+    '本地 API 请求权重预算不足',
+  );
+  assert.throws(() => parsePairOrderRecovery(data, pair), /状态无效/);
+});
+
+test('manual check validates batch binding, completion flags and receipt rows', () => {
+  const valid = checkResult();
+  assert.equal(
+    parsePairOrderRecoveryCheck(checkResult({ completed: true }), pair)
+      .completed,
+    true,
+  );
+  for (const data of [
+    null,
+    {},
+    checkResult({ pair_id: 'other' }),
+    checkResult({ batch_id: 'other' }),
+    checkResult({ completed: 'true' }),
+    checkResult({ completed: true, archive_available: true }),
+    checkResult({ checked_at: NaN }),
+    checkResult({ checked_at: 0 }),
+    checkResult({ orders: [] }),
+    checkResult({ orders: [valid.orders[0], valid.orders[0]] }),
+    checkResult({
+      orders: [valid.orders[0], { ...valid.orders[1], status: 'MISSING' }],
+    }),
+    checkResult({
+      orders: [valid.orders[0], { ...valid.orders[1], executed_qty: 'NaN' }],
+    }),
+    checkResult({
+      orders: [valid.orders[0], { ...valid.orders[1], executed_qty: 0 }],
+    }),
+    checkResult({
+      orders: [valid.orders[0], { ...valid.orders[1], error: null }],
+    }),
+  ])
+    assert.throws(() => parsePairOrderRecoveryCheck(data, pair));
+});
+
+test('an existing repair order can be displayed without merging it with the original order', () => {
+  const valid = checkResult();
+  const data = checkResult({
+    orders: [
+      ...valid.orders,
+      { ...valid.orders[0], client_order_id: 'repair-a' },
+    ],
+  });
+  assert.equal(parsePairOrderRecoveryCheck(data, pair).orders.length, 3);
+  const repeatedBudgetRejections = checkResult({
+    orders: [
+      ...valid.orders,
+      ...Array.from({ length: 9 }, (_, index) => ({
+        ...valid.orders[0],
+        client_order_id: `budget-repair-${index}`,
+      })),
+    ],
+  });
+  assert.equal(
+    parsePairOrderRecoveryCheck(repeatedBudgetRejections, pair).orders.length,
+    11,
   );
 });
 

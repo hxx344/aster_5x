@@ -83,7 +83,7 @@ class PairApiTests(unittest.TestCase):
         self.assertEqual(self.f.store.get("pair_runtime:gold"), state)
 
     def test_order_recovery_requires_authentication_and_same_origin(self):
-        endpoints = ("/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm")
+        endpoints = ("/api/pairs/gold/recovery-check", "/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm")
         body = {"token": "a" * 32, "acknowledge_unknown": True}
         for endpoint in endpoints:
             self.assertEqual(self.client.post(endpoint, json=body).status_code, 401)
@@ -108,6 +108,20 @@ class PairApiTests(unittest.TestCase):
         response = self.client.post("/api/pairs/gold/recovery-confirm", json={"token": token, "acknowledge_unknown": False})
         self.assertIn(response.status_code, (409, 422), response.text)
         self.assertIsNotNone(self.f.store.get("pair_runtime:gold")["pending"])
+
+    def test_order_check_finishes_known_batch_and_remains_paused(self):
+        from tests.test_pair_order_recovery import seed_pending, receipt_for
+        self.login()
+        state = seed_pending(self.engine)
+        for leg in state["pending"]["legs"]:
+            leg["receipt"] = receipt_for(leg)
+        self.f.store.put("pair_runtime:gold", state)
+        response = self.client.post("/api/pairs/gold/recovery-check")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["completed"])
+        self.assertNotIn("token", response.json())
+        self.assertFalse(self.f.store.pair("gold")["enabled"])
+        self.assertIsNone(self.f.store.get("pair_runtime:gold")["pending"])
 
     def test_order_recovery_routes_archive_and_leave_start_as_a_separate_action(self):
         from tests.test_pair_order_recovery import seed_pending

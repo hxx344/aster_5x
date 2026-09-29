@@ -448,6 +448,10 @@ def create_app(engine=None, *, demo=False, start_engine=True):
     def preview_pair_recovery(pair_id: str):
         return engine.pairs.preview_recovery(pair_id)
 
+    @app.post("/api/pairs/{pair_id}/recovery-check", dependencies=write_dependencies)
+    def check_pair_recovery(pair_id: str):
+        return engine.pairs.check_recovery(pair_id)
+
     @app.post("/api/pairs/{pair_id}/recovery-confirm", dependencies=write_dependencies)
     def confirm_pair_recovery(pair_id: str, body: PairRecoveryConfirmation):
         return engine.pairs.confirm_recovery(pair_id, body.token, body.acknowledge_unknown)

@@ -526,7 +526,7 @@ function PairDetail({
             <dt>最近批次</dt>
             <dd>
               {lastBatch
-                ? `${lastBatch.kind === 'cycle' ? '循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.completed ? '成交与持仓已核实' : '本批跟踪已结束，实际底仓已核实'} · ${clock(lastBatch.at)}`
+                ? `${lastBatch.kind === 'cycle' ? '循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.resolution === 'manual_skip' ? '已手动跳过，启动时核实底仓' : lastBatch.completed ? '成交与持仓已核实' : '本批跟踪已结束，实际底仓已核实'} · ${clock(lastBatch.at)}`
                 : '暂无记录'}
             </dd>
           </div>

@@ -412,7 +412,7 @@ class Store:
             return saved
 
     def commit_pair_recovery(self, pair, runtime, *, expected_runtime, expected_margin,
-                             accounts, check_current, message, audit=None):
+                             accounts, check_current, message, audit=None, batch=None):
         """A reviewed local recovery is atomic with its unchanged paused ownership."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -435,6 +435,8 @@ class Store:
             if audit is not None:
                 db.execute("INSERT INTO kv(key,data) VALUES (?,?)", (
                     "pair_order_recovery:" + pair["id"] + ":" + audit["pending"]["id"], dumps(audit)))
+            if batch is not None:
+                db.execute("INSERT INTO kv(key,data) VALUES (?,?)", ("pair_batch:" + batch["id"], dumps(batch)))
             db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                        ("pair_runtime:" + pair["id"], dumps(runtime)))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",

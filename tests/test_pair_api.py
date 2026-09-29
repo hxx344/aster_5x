@@ -83,7 +83,7 @@ class PairApiTests(unittest.TestCase):
         self.assertEqual(self.f.store.get("pair_runtime:gold"), state)
 
     def test_order_recovery_requires_authentication_and_same_origin(self):
-        endpoints = ("/api/pairs/gold/recovery-check", "/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm")
+        endpoints = ("/api/pairs/gold/recovery-check", "/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm", "/api/pairs/gold/recovery-skip")
         body = {"token": "a" * 32, "acknowledge_unknown": True}
         for endpoint in endpoints:
             self.assertEqual(self.client.post(endpoint, json=body).status_code, 401)
@@ -122,6 +122,27 @@ class PairApiTests(unittest.TestCase):
         self.assertNotIn("token", response.json())
         self.assertFalse(self.f.store.pair("gold")["enabled"])
         self.assertIsNone(self.f.store.get("pair_runtime:gold")["pending"])
+
+    def test_skip_requires_strict_batch_ack_and_rejects_stale_or_unknown_orders(self):
+        from tests.test_pair_order_recovery import seed_pending, receipt_for, BATCH_ID
+        self.login()
+        state = seed_pending(self.engine)
+        path = '/api/pairs/gold/recovery-skip'
+        body = {'batch_id': BATCH_ID, 'acknowledge_skip': True}
+        for bad in ({}, {'batch_id': BATCH_ID}, {**body, 'acknowledge_skip': 1},
+                    {**body, 'acknowledge_skip': 'true'}, {**body, 'acknowledge_skip': False},
+                    {**body, 'force': True}, {**body, 'batch_id': '../bad'}):
+            self.assertEqual(self.client.post(path, json=bad).status_code, 422)
+        self.assertEqual(self.client.post(path, json=body).status_code, 409)
+        for leg in state['pending']['legs']:
+            leg['receipt'] = receipt_for(leg)
+        self.f.store.put('pair_runtime:gold', state)
+        self.assertEqual(self.client.post(path, json={**body, 'batch_id': 'old'}).status_code, 409)
+        response = self.client.post(path, json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()['positions_verified'])
+        self.assertFalse(self.f.store.pair('gold')['enabled'])
+        self.assertIsNone(self.f.store.get('pair_runtime:gold')['pending'])
 
     def test_order_recovery_routes_archive_and_leave_start_as_a_separate_action(self):
         from tests.test_pair_order_recovery import seed_pending

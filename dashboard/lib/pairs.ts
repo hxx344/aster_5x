@@ -94,6 +94,8 @@ export type Pair = {
       phase: 'open' | 'close';
       quantity: string;
       completed: boolean;
+      resolution?: 'manual_skip';
+      positions_verified?: boolean;
       at: number;
     };
     daily_volume?: Record<string, { long?: string; short?: string }>;

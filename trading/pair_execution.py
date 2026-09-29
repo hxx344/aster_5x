@@ -538,7 +538,13 @@ class PairTrader:
                         state["api_notice"] = notice
                     state["reason"] += "；账户仓位刷新暂未完成：" + exchange_reason(str(exc))
             return
-        snapshots, guards = self._read(brokers, reconciliation=True)
+        member_read = None
+        if pending["kind"] == "ordinary" and pending["phase"] == "open" and pending.get("position_review"):
+            member_read = self.engine.pairs._read_members(pair, adopt=True, reconciliation=True)
+            snapshots, member_guards = member_read
+            guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
+        else:
+            snapshots, guards = self._read(brokers, reconciliation=True)
         self._publish_snapshots(state, snapshots)
         held = positions(snapshots)
         actual = {side: held[side].qty for _, side in SIDES}
@@ -556,7 +562,7 @@ class PairTrader:
                      and actual != {side: dec(pending["before"][side]) for _, side in SIDES}
                      and (not original_full or pending["repairs"])))
                 and self.engine.pairs.recovery.reconcile_positions(
-                    self, pair, state, source=recovery_source or "automatic_positions")):
+                    self, pair, state, source=recovery_source or "automatic_positions", member_read=member_read)):
             return
         if actual != expected or any(pos.leverage != pending["leverage"] for pos in held.values()):
             detail = "；".join(
@@ -569,7 +575,7 @@ class PairTrader:
             if any(s.equity <= 0 or s.margin_exceeds(limit) for s in snapshots.values()):
                 if (pending["kind"] == "ordinary" and actual["LONG"] == actual["SHORT"]
                         and self.engine.pairs.recovery.reconcile_positions(
-                            self, pair, state, source=recovery_source or "automatic_positions")):
+                            self, pair, state, source=recovery_source or "automatic_positions", member_read=member_read)):
                     return
                 original_full = False
                 pending["last_error"] = "成交后子账户保证金超限，撤回本批新增量"

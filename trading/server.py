@@ -146,6 +146,19 @@ class PairRecoveryConfirmation(CycleRecoveryConfirmation):
         return values
 
 
+class PairRecoverySkip(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    batch_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    acknowledge_skip: Literal[True]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_acknowledgement(cls, values):
+        if not isinstance(values, dict) or values.get("acknowledge_skip") is not True:
+            raise ValueError("请明确确认跳过本批持仓核对")
+        return values
+
+
 class NewAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
@@ -455,6 +468,10 @@ def create_app(engine=None, *, demo=False, start_engine=True):
     @app.post("/api/pairs/{pair_id}/recovery-confirm", dependencies=write_dependencies)
     def confirm_pair_recovery(pair_id: str, body: PairRecoveryConfirmation):
         return engine.pairs.confirm_recovery(pair_id, body.token, body.acknowledge_unknown)
+
+    @app.post("/api/pairs/{pair_id}/recovery-skip", dependencies=write_dependencies)
+    def skip_pair_recovery(pair_id: str, body: PairRecoverySkip):
+        return engine.pairs.skip_recovery(pair_id, body.batch_id, body.acknowledge_skip)
 
     @app.delete("/api/pairs/{pair_id}", dependencies=write_dependencies)
     def delete_pair(pair_id: str):

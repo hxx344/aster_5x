@@ -235,7 +235,53 @@ class PairOrderRecovery:
                 "completed": current is None, "message": state.get("reason", "本次核对结束"), "orders": rows,
                 "archive_available": archive_available, "archive_reason": archive_reason}
 
-    def reconcile_positions(self, trader, pair, state, *, source):
+    def skip_positions(self, pair_id, batch_id, acknowledge_skip):
+        """End a terminal batch locally; activation must still read the real baseline."""
+        from .pair_execution import PairTrader
+        if acknowledge_skip is not True:
+            raise TradingError("请明确确认跳过本批持仓核对")
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        original = self.store.get("pair_runtime:" + pair_id, {})
+        margin = self.store.get("pair_margin:" + pair_id, {})
+        pending = self._eligible(pair, original, margin, archive=False)
+        if pending["id"] != batch_id:
+            raise TradingError("待核对批次已变化，请刷新后重试")
+        for leg in pending["legs"] + pending["repairs"]:
+            receipt = leg.get("receipt")
+            if receipt is None or receipt["status"] not in TERMINAL:
+                raise TradingError("仍有未知或活动订单，不能跳过订单结果；请继续按原订单编号核对")
+        accounts = self.manager._members(pair)
+        trader = self.manager.trader or PairTrader(self.engine)
+        _, _, identities = trader._members(pair)
+        if pending.get("identities") != identities or original.get("identities") != identities:
+            raise TradingError("原批次与当前真实账户身份不一致，不能跳过")
+        now = time.time()
+        audit = {"status": "manual_position_check_skipped", "positions_verified": False,
+                 "at": now, "pending": deepcopy(pending), "identities": identities}
+        batch = {**deepcopy(pending), "completed": False, "finished_at": now,
+                 "resolution": "manual_skip", "positions_verified": False}
+        state = deepcopy(original)
+        trader._account_volume(state, pending)
+        reason = "已手动跳过本批持仓核对，实际仓位未改动；下次启动重新读取并采纳实际底仓"
+        state.update(pending=None, phase="paused", reason=reason, updated_at=now,
+                     last_batch={"id": batch_id, "kind": pending["kind"], "phase": pending["phase"],
+                                 "quantity": pending["quantity"], "completed": False, "at": now,
+                                 "resolution": "manual_skip", "positions_verified": False})
+        for key in ("attention", "retry_after", "retry_at", "failure_count", "api_notice"):
+            state.pop(key, None)
+        def check_current():
+            if trader._members(pair)[2] != identities:
+                raise TradingError("跳过核对期间账户身份已变化，请重试")
+        self.store.commit_pair_recovery(pair, state, expected_runtime=original, expected_margin=margin,
+            accounts=accounts, check_current=check_current, message=reason, audit=audit, batch=batch)
+        self.previews.pop(pair_id, None)
+        self.manager._changed(pair)
+        return {"ok": True, "status": "skipped", "pair_id": pair_id, "batch_id": batch_id,
+                "positions_verified": False, "message": reason}
+
+    def reconcile_positions(self, trader, pair, state, *, source, member_read=None):
         """Preserve verified balanced ordinary positions without inventing receipts."""
         from .pair_execution import empty_progress
         from .pair_planning import PairRecoveryConflict, PairPositionError, positions
@@ -277,8 +323,14 @@ class PairOrderRecovery:
         if any(persisted.get(key) != state.get(key) for key in
                ("pending", "owned", "progress", "recovery_watch", "daily_volume", "last_batch")):
             raise PairRecoveryConflict("核对期间批次或底仓记录已变化，已保留最新记录；请重试启动")
+        if not pending.get("position_review"):
+            # The outer recovery save persists this stage on a budget wait.
+            # Keep it in memory during a successful read so a concurrent CAS
+            # conflict leaves the original durable business state untouched.
+            pending["position_review"] = True
         accounts = self.manager._members(pair)
-        snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True)
+        snapshots, guards = member_read if member_read is not None else self.manager._read_members(
+            pair, adopt=True, reconciliation=True)
         held = positions(snapshots)
         actual = {side: Fraction(held[side].qty) for _, side in SIDES}
         if not acceptable(actual) or any(pos.leverage != pending["leverage"] for pos in held.values()):

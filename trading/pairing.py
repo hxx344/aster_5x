@@ -121,9 +121,20 @@ class PairManager:
 
     def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False):
         accounts = self._members(pair)
+        brokers = {account["id"]: self.engine.broker(account) for account in accounts}
+        budgets = {}
+        for broker in brokers.values():
+            if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
+                budget = broker.api.budget
+                budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight([SYMBOL], fresh_modes=True) + 40
+        # Admit both fresh account reads and full-account open orders before
+        # starting either worker. Each request still reserves its own weight.
+        for budget, weight in budgets.items():
+            with budget.reconciliation() if reconciliation else budget.cycle_accounting():
+                budget.require_available(weight)
 
         def read(account):
-            broker = self.engine.broker(account)
+            broker = brokers[account["id"]]
             budget = broker.reconciliation_budget() if reconciliation and isinstance(broker, LiveBroker) else nullcontext()
             with budget:
                 return read_broker(broker)
@@ -339,6 +350,13 @@ class PairManager:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
             return self.recovery.confirm(pair_id, token, acknowledge_unknown)
+
+    def skip_recovery(self, pair_id, batch_id, acknowledge_skip=False):
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            return self.recovery.skip_positions(pair_id, batch_id, acknowledge_skip)
 
     def delete(self, pair_id):
         pair = self.store.pair(pair_id)

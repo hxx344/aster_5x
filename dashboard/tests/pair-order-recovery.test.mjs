@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   pairOrderRecoveryBlock,
   pairOrderRecoveryReviewBlock,
+  pairOrderRecoverySkipBlock,
   parsePairOrderRecovery,
   parsePairOrderRecoveryCheck,
 } from '../lib/pair-order-recovery.ts';
@@ -245,4 +246,61 @@ test('incomplete or non-missing order evidence cannot render an archive review',
   ]) {
     assert.throws(() => parsePairOrderRecovery(data, pair));
   }
+});
+
+test('local skip is available without a preview and despite budget errors', () => {
+  const terminal = {
+    ...pair,
+    state: {
+      api_notice: { kind: 'budget', text: '1788/1800' },
+      pending: {
+        ...pair.state.pending,
+        legs: [
+          { key: 'long', receipt: { status: 'REJECTED' } },
+          { key: 'short', receipt: { status: 'FILLED' } },
+        ],
+        repairs: [{ receipt: { status: 'EXPIRED' } }],
+      },
+      progress: { quantities: { LONG: '0', SHORT: '0' } },
+    },
+  };
+  assert.equal(pairOrderRecoverySkipBlock(terminal), '');
+  for (const receipt of [
+    null,
+    {},
+    { status: 'NEW' },
+    { status: 'PARTIALLY_FILLED' },
+  ]) {
+    assert.match(
+      pairOrderRecoverySkipBlock({
+        ...terminal,
+        state: {
+          ...terminal.state,
+          pending: { ...terminal.state.pending, repairs: [{ receipt }] },
+        },
+      }),
+      /未知或活动/,
+    );
+  }
+  assert.match(
+    pairOrderRecoverySkipBlock({ ...terminal, enabled: true }),
+    /暂停/,
+  );
+  assert.match(
+    pairOrderRecoverySkipBlock({
+      ...terminal,
+      state: { ...terminal.state, margin: { status: 'unknown' } },
+    }),
+    /划转/,
+  );
+  assert.match(
+    pairOrderRecoverySkipBlock({
+      ...terminal,
+      state: {
+        ...terminal.state,
+        progress: { quantities: { LONG: '0.1', SHORT: '0' } },
+      },
+    }),
+    /循环/,
+  );
 });

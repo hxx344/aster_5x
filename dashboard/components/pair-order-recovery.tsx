@@ -21,9 +21,11 @@ import {
 } from '@/components/ui/table';
 import type { DeskAction } from '@/lib/desk-types';
 import type { Pair } from '@/lib/pairs';
+import { pendingOrderDiagnostics } from '@/lib/pair-order-diagnostics';
 import {
   pairOrderRecoveryBlock,
   pairOrderRecoveryReviewBlock,
+  pairOrderRecoverySkipBlock,
   parsePairOrderRecovery,
   parsePairOrderRecoveryCheck,
   type PairOrderRecoveryCheck,
@@ -66,6 +68,7 @@ function PairOrderRecoveryDialog({
   useEffect(() => () => request.current?.abort(), []);
   const block = pairOrderRecoveryBlock(pair);
   const locked = disabled || Boolean(block);
+  const skipBlock = pairOrderRecoverySkipBlock(pair);
   const reviewBlock = review
     ? pairOrderRecoveryReviewBlock(review, pair, now)
     : '';
@@ -130,6 +133,27 @@ function PairOrderRecoveryDialog({
     }
   }
 
+  async function skipPositions() {
+    if (locked || loading || skipBlock) return;
+    setLoading(true);
+    try {
+      const ok = await action(`/api/pairs/${pair.id}/recovery-skip`, {
+        batch_id: pair.state?.pending?.id,
+        acknowledge_skip: true,
+      });
+      if (ok) {
+        setReview(null);
+        setChecked(null);
+        setOpen(false);
+        setNotice(
+          '已跳过本批持仓核对，仓位未改动；点击“启动配对组”重新读取并采纳实际底仓。',
+        );
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function confirm() {
     if (!review || !acknowledged || loading || locked || reviewBlock) return;
     setLoading(true);
@@ -156,7 +180,14 @@ function PairOrderRecoveryDialog({
         variant="outline"
         disabled={locked || loading}
         title={block || '核对普通开仓待确认订单与两侧实际持仓'}
-        onClick={() => void readOrdersAndPositions()}
+        onClick={() => {
+          setReview(null);
+          setChecked(null);
+          setReceiptsFound('');
+          setAcknowledged(false);
+          setError('');
+          setOpen(true);
+        }}
       >
         <CheckCheck size={16} />
         核对订单与持仓
@@ -180,6 +211,23 @@ function PairOrderRecoveryDialog({
           <p className="muted">
             本次手动核对不会提交新订单或划转。核对完成后仍保持暂停，需手动启动配对组。
           </p>
+          {!checked?.completed ? (
+            <div className="grid gap-2">
+              <p>
+                原订单和补偿订单均已结束时，可直接跳过剩余持仓核对，不消耗交易所
+                API 预算。
+                只结束本批跟踪，保留实际仓位和成交记录；下次启动重新读取并采纳实际底仓。
+              </p>
+              {skipBlock ? <p className="amber">{skipBlock}</p> : null}
+              <Button
+                variant="outline"
+                disabled={loading || locked || Boolean(skipBlock)}
+                onClick={() => void skipPositions()}
+              >
+                跳过持仓核对，保留仓位
+              </Button>
+            </div>
+          ) : null}
           <p className="muted">
             普通开仓原订单与补偿订单均结束、账户核验通过后，两侧数量一致则保留为底仓，包括手动增加的仓位；数量不一致且与本批回执吻合时，后台才回退本批新增量。
           </p>
@@ -195,6 +243,21 @@ function PairOrderRecoveryDialog({
             </p>
           ) : null}
           {receiptsFound ? <output>{receiptsFound}</output> : null}
+          {!checked && !review ? (
+            <div className="grid gap-2" aria-label="已保存的订单回执">
+              {pendingOrderDiagnostics(pair).map((order) => (
+                <div key={order.id}>
+                  <p>
+                    {order.sideLabel} · {order.stageLabel} · {order.statusLabel}{' '}
+                    · 成交 {order.executedQty}
+                  </p>
+                  <p className="muted break-all">
+                    CID：<code>{order.clientOrderId}</code>
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {checked ? (
             <div className="grid gap-3">
               <output>{checked.message}</output>

@@ -125,6 +125,51 @@ export function pairOrderRecoveryReviewBlock(
   return '';
 }
 
+export function pairOrderRecoverySkipBlock(pair: Pair): string {
+  const block = pairOrderRecoveryBlock(pair);
+  if (block) return block;
+  const pending = pair.state?.pending;
+  if (
+    !pending ||
+    !Array.isArray(pending.legs) ||
+    pending.legs.length !== 2 ||
+    !Array.isArray(pending.repairs)
+  )
+    return '订单记录不完整，无法跳过';
+  const terminal = [
+    'FILLED',
+    'CANCELED',
+    'REJECTED',
+    'EXPIRED',
+    'EXPIRED_IN_MATCH',
+  ];
+  if (
+    ![...pending.legs, ...pending.repairs].every(
+      (leg) =>
+        record(leg) &&
+        record(leg.receipt) &&
+        typeof leg.receipt.status === 'string' &&
+        terminal.includes(leg.receipt.status),
+    )
+  )
+    return '仍有未知或活动订单，请继续按原订单编号核对';
+  if (
+    pair.state?.margin?.pending ||
+    pair.state?.margin?.blocks_trading ||
+    ['submitting', 'acknowledged', 'accepted', 'unknown'].includes(
+      pair.state?.margin?.status ?? '',
+    )
+  )
+    return '仍有未决划转，请先完成划转核对';
+  if (
+    Object.values(pair.state?.progress?.quantities ?? {}).some(
+      (qty) => Number(qty) !== 0,
+    )
+  )
+    return '仍有循环新增仓位，请继续原恢复流程';
+  return '';
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }

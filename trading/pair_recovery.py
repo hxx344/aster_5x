@@ -196,7 +196,11 @@ class PairOrderRecovery:
         state.pop("retry_after", None)
         state["api_notice"] = None
         try:
-            trader._recover(pair, state, brokers, read_only=True)
+            try:
+                trader._recover(pair, state, brokers, read_only=True)
+            except PairPositionError:
+                if not self._reconcile_manual_baseline(trader, pair, state):
+                    raise
         except TradingError as exc:
             trader._retry_delay(state, exc)
             state.update(reason=exchange_reason(str(exc)), api_notice=api_wait_notice(exc))
@@ -223,6 +227,62 @@ class PairOrderRecovery:
         return {"status": "checked", "pair_id": pair_id, "batch_id": original["id"], "checked_at": time.time(),
                 "completed": current is None, "message": state.get("reason", "本次核对结束"), "orders": rows,
                 "archive_available": archive_available, "archive_reason": archive_reason}
+
+    def _reconcile_manual_baseline(self, trader, pair, state):
+        """Confirm restored quantities, without inventing external fill receipts."""
+        from .pair_planning import positions
+        pending = self._eligible(pair, state, self.store.get("pair_margin:" + pair["id"], {}), archive=False)
+        before = {side: Fraction(positive(pending["before"][side], True)) for _, side in SIDES}
+        expected = dict(before)
+        for leg in pending["legs"] + pending["repairs"]:
+            receipt = leg.get("receipt")
+            if receipt is None or receipt["status"] not in TERMINAL:
+                return False
+            # _eligible validates every original and repair receipt. Never treat
+            # a missing/active repair as a completed manual rollback.
+            order = leg["order"]
+            adding = (order["positionSide"] == "LONG") == (order["side"] == "BUY")
+            expected[order["positionSide"]] += Fraction(dec(receipt["executedQty"])) * (1 if adding else -1)
+        if any(expected[side] < before[side] for _, side in SIDES) or expected == before:
+            return False
+        # Use the just-published position quantities only as a cheap rejection
+        # filter. They cannot authorize completion; the fresh checks below do.
+        for key, side in SIDES:
+            observed = [row for row in state.get("snapshots", {}).get(key, {}).get("positions", [])
+                        if row.get("symbol") == SYMBOL and row.get("side") == side]
+            if len(observed) != 1 or Fraction(dec(observed[0].get("qty"))) != before[side]:
+                return False
+        # A manual action may resolve a known terminal batch, but background
+        # recovery must never silently adopt external position changes. Read
+        # fresh modes and ALL open orders on both accounts before accepting it.
+        snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True)
+        held = positions(snapshots)
+        actual = {side: Fraction(held[side].qty) for _, side in SIDES}
+        if actual != before or any(pos.leverage != pending["leverage"] for pos in held.values()):
+            from .pair_planning import PairPositionError
+            raise PairPositionError("手动回退核对未通过：两侧实际仓位须分别等于本批开仓前底仓，且杠杆不变；"
+                + "；".join(f"{'A 多侧' if key == 'long' else 'B 空侧'}实际 {wire(actual[side])}，底仓 {wire(before[side])}"
+                            for key, side in SIDES))
+        reconciled = deepcopy(state)
+        reconciled["pending"]["manual_position_reconciliation"] = {
+            "source": "paused_manual_check", "checked_at": time.time(),
+            "identities": deepcopy(pending["identities"]),
+            "before": {side: wire(value) for side, value in before.items()},
+            "known_expected": {side: wire(value) for side, value in expected.items()},
+            "actual": {side: wire(value) for side, value in actual.items()},
+            "external_reduction": {side: wire(expected[side] - actual[side]) for _, side in SIDES},
+        }
+        trader._publish_snapshots(reconciled, snapshots)
+        with self.manager._current_members(guards):
+            trader._config_guard(pair, pending["identities"], opening=False)
+            self._eligible(self.store.pair(pair["id"]), state,
+                           self.store.get("pair_margin:" + pair["id"], {}), archive=False)
+            # _finish commits batch history, original fill accounting and pending
+            # clearance together. Failed checks/commits leave the original state.
+            trader._finish(pair, reconciled, reconciled["pending"], completed=False)
+        state.clear()
+        state.update(reconciled)
+        return True
 
     def _history(self, broker, pending):
         start, end = int((pending["created_at"] - 60) * 1000), int(time.time() * 1000)

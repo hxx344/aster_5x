@@ -180,6 +180,9 @@ function PairOrderRecoveryDialog({
           <p className="muted">
             本次手动核对不会提交新订单或划转。核对完成后仍保持暂停，需手动启动配对组；已有批次的后台减仓恢复仍会继续。
           </p>
+          <p className="muted">
+            若已手动减掉本批新增仓位，重新核对会检查原订单与补偿订单均已结束、两侧无挂单，且各自回到本批开仓前底仓；通过后结束本批跟踪，保留原成交记录。
+          </p>
           {loading && !review ? (
             <output>正在查询原订单并读取交易所最新持仓…</output>
           ) : null}

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from tests import test_pair_integration as integration
 from tests import test_pair_order_recovery as recovery_tests
 from tests.test_pair_order_recovery import seed_pending, receipt_for
-from trading.exchange import ExchangeError, RateBudget, RequestNotSent
+from trading.exchange import BudgetWait, ExchangeError, RateBudget, RequestNotSent
 from trading.models import TradingError
 
 
@@ -156,6 +156,34 @@ class PairRecoveryCheckTests(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertTrue(all("预算不足" in row["error"] for row in result["orders"]))
         self.assertIsNotNone(self.state()["pending"])
+
+    def test_order_query_api_wait_reaches_history_for_manual_and_background_checks(self):
+        failures = (
+            ("budget", BudgetWait("本地执行 API 请求权重预算不足", retry_after=12)),
+            ("rate_limit", ExchangeError("Aster HTTP 429", http_status=429, retry_after=12)),
+            ("cooldown", RequestNotSent("接口冷却中：HTTP 429", retry_after=12)),
+        )
+        for manual in (True, False):
+            for kind, error in failures:
+                with self.subTest(manual=manual, kind=kind):
+                    self.seed()
+                    with self.no_writes(), \
+                         patch.object(self.broker("long"), "query", side_effect=error), \
+                         patch.object(self.broker("short"), "query", side_effect=ExchangeError("not found", code=-2013)):
+                        if manual:
+                            self.engine.pairs.check_recovery("gold")
+                        else:
+                            self.engine.pairs.tick("gold")
+                    state = self.state()
+                    self.assertEqual(state["api_notice"], {"kind": kind, "text": str(error)})
+                    self.assertIsNotNone(state["pending"])
+                    self.assertEqual(state["pending"]["legs"][0]["error"], str(error))
+                    # A later non-API failure must not erase the API wait, but a
+                    # later successful check must clear it and finish normally.
+                    self.receipts()
+                    result = self.check()
+                    self.assertTrue(result["completed"])
+                    self.assertIsNone(self.state()["api_notice"])
 
     def test_malformed_order_names_side_and_field_without_any_query(self):
         self.seed()

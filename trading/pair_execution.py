@@ -500,6 +500,9 @@ class PairTrader:
             except TradingError as exc:
                 self._retry_delay(state, exc)
                 leg["error"] = str(exc)
+                notice = api_wait_notice(exc)
+                if notice is not None:
+                    state["api_notice"] = notice
                 restored = self._legacy_notional_rejection(pending, leg, exc)
                 if restored is not None:
                     leg["receipt"] = restored
@@ -524,7 +527,11 @@ class PairTrader:
             adding = (order["positionSide"] == "LONG") == (order["side"] == "BUY")
             expected[order["positionSide"]] += dec(row["executedQty"]) * (1 if adding else -1)
         if actual != expected or any(pos.leverage != pending["leverage"] for pos in held.values()):
-            raise PairPositionError("成交回执与两子账户实际仓位或杠杆不一致，保留批次并停止新增；请人工核对交易所成交与持仓")
+            detail = "；".join(
+                f"{'A 多侧' if key == 'long' else 'B 空侧'}实际 {wire(actual[side])} / {held[side].leverage}x，"
+                f"按回执应为 {wire(expected[side])} / {pending['leverage']}x，本批前底仓 {pending['before'][side]}"
+                for key, side in SIDES)
+            raise PairPositionError("成交回执与两子账户实际仓位或杠杆不一致，保留批次并停止新增；" + detail)
         original_full = all(leg["receipt"]["status"] == "FILLED" for leg in pending["legs"])
         if pending["phase"] == "open" and original_full and not pending["repairs"]:
             limit = cycle_margin_limit(pair["ordinary"]) if pending["kind"] == "cycle" else opening_margin_limit(pair["ordinary"], pending["leverage"])
@@ -597,6 +604,9 @@ class PairTrader:
         state.update(phase="holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
                      reason="两个子账户本批成交与持仓核对完成" if completed else
                             "本批未完整成交，已减回原始基线" if any_fill else "本批未成交，底仓保持不变")
+        if pending.get("manual_position_reconciliation"):
+            state.update(phase="paused", reason="手动核对确认两侧实际仓位已回到本批开仓前底仓；"
+                         "原成交回执保留，本批已结束，配对组仍暂停。未将外部减仓计入程序成交量")
         rejection_notes = [f"{'A 多侧' if leg['key'] == 'long' else 'B 空侧'}：{exchange_reason(leg['receipt']['reject_reason'])}"
                            for leg in pending["legs"] + pending["repairs"] if leg["receipt"].get("reject_reason")]
         rejection_text = "；拒单反馈：" + "；".join(rejection_notes) if rejection_notes else ""

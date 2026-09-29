@@ -28,6 +28,7 @@ DEFAULT_MARGIN = {"enabled": False, "master_env_prefix": "", "check_interval_sec
     "cooldown_seconds": 30}
 TRANSFER_TYPES = frozenset({"TRANSFER", "SUBUSER_ASSET_TRANSFER"})
 TRANSFER_UNIT = Fraction(Decimal("0.00000001"))
+TRANSFER_WS_GRACE_SECONDS = 2
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
     -1102, -1103, -1104, -1105, -1106, -1111, -1130, -2014, -2015, -2019})
 
@@ -111,7 +112,7 @@ def _public_record(record):
     if not isinstance(record, dict) or not record:
         return None
     return {key: record[key] for key in ("request_id", "source", "destination", "amount", "created_at",
-        "status", "confirmed_at", "acknowledged_at", "refreshed_at", "transaction_id", "income_type") if key in record}
+        "status", "confirmed_at", "acknowledged_at", "refreshed_at", "refresh_source", "transaction_id", "income_type") if key in record}
 
 
 def _display_amount(value):
@@ -477,6 +478,26 @@ class MarginBalancer:
             raise TradingError("划转成功回执缺少有效时间，保留待核对状态")
         symbols = [pair.get("symbol", "XAUUSD1")]
         brokers = {side: self.engine.broker(member) for side, member in members.items()}
+        done = self._refresh_acknowledged_ws(pair, members, brokers, state)
+        if done is not None:
+            self._invalidate(members)
+            return self._view(state, config, "acknowledged", "交易所回执确认，两侧 WebSocket 余额已核对；等待下一轮账户快照",
+                blocks=True, plan={key: done[key] for key in ("source", "destination", "amount")})
+        # Give an already connected pair one bounded, non-blocking opportunity
+        # to deliver events. The deadline never moves on retries; disconnected
+        # or restarted sessions immediately use the ordinary REST fallback.
+        checkpoints = pending.get("ws_checkpoints")
+        deadline = acknowledged_at + TRANSFER_WS_GRACE_SECONDS
+        now = time.time()
+        if (pending.get("acknowledgement_code") == 200 and now < deadline
+                and isinstance(checkpoints, dict) and set(checkpoints) == set(brokers)
+                and all(callable(getattr(broker, "transfer_ws_checkpoint_current", None))
+                        and broker.transfer_ws_checkpoint_current(checkpoints[side])
+                        for side, broker in brokers.items())):
+            state["next_check_at"] = min(now + 1, deadline)
+            self._record_success(pair, state)
+            return self._view(state, config, "acknowledged", "交易所已确认划转，等待两侧 WebSocket 余额；最多 2 秒后改用 REST 刷新",
+                blocks=True)
         self._require_budget(members, {side: broker.snapshot_weight(symbols, fresh_modes=True)
                                      for side, broker in brokers.items()}, reconciliation=True)
         snapshots = {}
@@ -493,12 +514,47 @@ class MarginBalancer:
                 locks.enter_context(brokers[side]._snapshot_lock)
             for side, broker in brokers.items():
                 broker.require_snapshot_current(snapshots[side])
-            done = {**pending, "refreshed_at": time.time()}
+            done = {**pending, "refreshed_at": time.time(), "refresh_source": "rest"}
             state.update(pending=None, last_transfer=done)
             self._record_success(pair, state)
         self._invalidate(members)
         return self._view(state, config, "acknowledged", "交易所回执确认，余额已刷新；等待下一轮账户快照", blocks=True,
             plan={key: done[key] for key in ("source", "destination", "amount")})
+
+    def _refresh_acknowledged_ws(self, pair, members, brokers, state):
+        """Balance evidence only refreshes an explicit REST success receipt."""
+        pending = state["pending"]
+        checkpoints = pending.get("ws_checkpoints")
+        if (pending.get("status") != "acknowledged" or pending.get("acknowledgement_code") != 200
+                or not isinstance(checkpoints, dict)
+                or set(checkpoints) != set(brokers)):
+            return None
+        balances = {}
+        for side, broker in brokers.items():
+            read = getattr(broker, "transfer_ws_balance", None)
+            if not callable(read):
+                return None
+            sign = -1 if side == pending["source"] else 1
+            result = read(checkpoints[side], dec(pending["amount"]) * sign, pending["created_at"])
+            if result is None:
+                return None
+            balances[side] = result
+        with ExitStack() as locks:
+            for side in sorted(brokers, key=lambda value: members[value]["id"]):
+                locks.enter_context(brokers[side]._snapshot_lock)
+            try:
+                for _, require_current in balances.values():
+                    require_current()
+            except TradingError:
+                return None
+            # Session tokens remain in the private checkpoint only. Store a
+            # small, credential-free audit, never a raw private account event.
+            evidence = {side: {key: value[key] for key in ("event_cursor", "event_time", "transaction_time",
+                "reason", "asset", "delta", "wallet") if key in value} for side, (value, _) in balances.items()}
+            done = {**pending, "refreshed_at": time.time(), "refresh_source": "websocket", "balance_evidence": evidence}
+            state.update(pending=None, last_transfer=done)
+            self._record_success(pair, state)
+        return done
 
     def _invalidate(self, members):
         for member in members.values():
@@ -791,13 +847,20 @@ class MarginBalancer:
             listing = api.call("GET", "/fapi/v3/getSubAccountList", signed=True, weight=5)
             accounts = self._account_rows(members)
             self._verify(listing, children, accounts)
-            available, occupied = {}, {}
+            available, occupied, wallets = {}, {}, {}
             for side, payload in accounts.items():
                 rows = payload.get("assets")
                 assets = [row for row in rows if isinstance(row, dict) and row.get("asset") == "USD1"] if isinstance(rows, list) else []
                 if len(assets) != 1 or payload.get("canTrade") is not True:
                     raise TradingError("账户缺少唯一的 USD1 资产或交易权限")
                 asset = assets[0]
+                # ACCOUNT_UPDATE.wb is total wallet balance, not available or
+                # cross-wallet balance. Missing/invalid REST values disable
+                # this optional evidence path without inventing a baseline.
+                try:
+                    wallets[side] = dec(asset.get("walletBalance"))
+                except TradingError:
+                    pass
                 available[side] = positive(asset.get("maxWithdrawAmount"), True)
                 occupied[side] = self._newer_occupied(snapshots[side], payload, asset)
                 # Prices can move between two reads. Use the newer cash balance
@@ -830,6 +893,14 @@ class MarginBalancer:
                 "identity": self._fingerprint(pair, members, children, master),
                 "before_receipts": {side: [[row["incomeType"], _identifier(row.get("tranId"))] for row in rows
                     if row.get("incomeType") in TRANSFER_TYPES and _identifier(row.get("tranId"))] for side, rows in before.items()}}
+            checkpoints = {}
+            for side, wallet in wallets.items():
+                checkpoint = getattr(self.engine.broker(members[side]), "transfer_ws_checkpoint", None)
+                value = checkpoint(wallet) if callable(checkpoint) else None
+                if value is not None:
+                    checkpoints[side] = value
+            if set(checkpoints) == set(members):
+                pending["ws_checkpoints"] = checkpoints
             state.update(pending=pending, last_transfer=pending, cooldown_until=created + config["cooldown_seconds"])
             state.pop("api_notice", None)
             state.pop("blocked_reason", None)
@@ -847,7 +918,7 @@ class MarginBalancer:
                         or response.get("code") not in (0, 200, "0", "200")
                         or not isinstance(response.get("msg"), str) or response["msg"].strip().lower() != "success"):
                     raise AmbiguousOrder("划转没有明确的接受回执")
-                pending.update(status="acknowledged", acknowledged_at=time.time())
+                pending.update(status="acknowledged", acknowledged_at=time.time(), acknowledgement_code=int(response["code"]))
                 if _identifier(response.get("tranId")):
                     pending["transaction_id"] = _identifier(response["tranId"])
             except Exception as exc:

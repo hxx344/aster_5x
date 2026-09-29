@@ -259,6 +259,12 @@ class Engine:
         """Refresh independently of the account execution slot and quote trigger."""
         account = self.store.account(account_id)
         paired = self.pairs.active_for_account(account_id)
+        if paired is None:
+            candidate = self.store.pair_for_account(account_id)
+            if candidate and (self.store.get("pair_margin:" + candidate["id"]) or {}).get("pending"):
+                # A paused group still needs its private stream to finish an
+                # already acknowledged transfer. This never enables trading.
+                paired = candidate
         with self.lock:
             existing = self.brokers.get(account_id)
         active = (account and account["mode"] == "live"

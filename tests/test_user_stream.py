@@ -119,6 +119,30 @@ class PrivateAccountStreamTests(unittest.TestCase):
         self.assertTrue(second.receiving.wait(1))
         self.assertTrue(state.call_args.args[0])
 
+    def test_optional_payload_preserves_full_event_after_legacy_kind_callback(self):
+        calls = []
+        payload = {"e": "ORDER_TRADE_UPDATE", "E": 100, "T": 99,
+                   "o": {"s": "XAUUSD1", "c": "test", "z": "2", "extra": [1, {"a": "b"}]}}
+        stream, _, _, socket, _, event = self.make_stream(on_payload=lambda value: calls.append(("payload", value)))
+        event.side_effect = lambda kind: calls.append(("kind", kind))
+        stream.start()
+        self.assertTrue(socket.receiving.wait(1))
+        socket.messages.put(json.dumps(payload))
+        wait_for(lambda: len(calls) == 2)
+        self.assertEqual(calls, [("kind", "ORDER_TRADE_UPDATE"), ("payload", payload)])
+
+    def test_payload_callback_failure_disconnects_after_legacy_invalidation(self):
+        payload = Mock(side_effect=RuntimeError("private data"))
+        stream, _, _, socket, state, event = self.make_stream(on_payload=payload)
+        stream._RETRY_INITIAL = 30
+        stream.start()
+        self.assertTrue(socket.receiving.wait(1))
+        socket.messages.put('{"e":"ACCOUNT_UPDATE"}')
+        wait_for(socket.closed.is_set)
+        event.assert_called_once_with("ACCOUNT_UPDATE")
+        payload.assert_called_once_with({"e": "ACCOUNT_UPDATE"})
+        self.assertFalse(state.call_args.args[0])
+
     def test_malformed_event_fails_closed_instead_of_retaining_authority(self):
         for message in ("{", "null", "[]", "{}", '{"e":null}', '{"e":1}', '{"e":""}', '{"e":"BAD?EVENT"}'):
             with self.subTest(message=message):

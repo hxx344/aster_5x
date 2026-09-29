@@ -380,8 +380,8 @@ class CycleHotBrokerTests(unittest.TestCase):
     def test_restarted_private_stream_ignores_previous_stream_callbacks(self):
         broker, api, _ = self.make_broker()
         streams = []
-        def make_stream(api, *, on_state, on_event):
-            stream = SimpleNamespace(on_state=on_state, on_event=on_event,
+        def make_stream(api, *, on_state, on_event, on_payload=None):
+            stream = SimpleNamespace(on_state=on_state, on_event=on_event, on_payload=on_payload,
                 start=Mock(side_effect=lambda: on_state(True)),
                 close=Mock(side_effect=lambda: on_state(False)))
             streams.append(stream)

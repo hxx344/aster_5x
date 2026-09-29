@@ -25,6 +25,10 @@ class AccountCacheUnavailable(HotAccountUnavailable):
     """The private account cache, rather than public quotes or accounting, is unavailable."""
 
 
+class AccountCacheReplaced(AccountCacheUnavailable):
+    """A newer valid REST read replaced this lease without an intervening event."""
+
+
 @dataclass(frozen=True)
 class _RefreshTicket:
     symbols: tuple[str, ...]
@@ -38,6 +42,7 @@ class _Published:
     started_monotonic: float
     valid_until_monotonic: float | None
     version: int
+    epoch: int
 
 
 class CycleAccountLease:
@@ -197,7 +202,7 @@ class CycleAccountCache:
         with self._lock:
             if not self._current_ticket_locked(ticket):
                 return False
-            published = _Published(saved, started_monotonic, valid_until_monotonic, self._version + 1)
+            published = _Published(saved, started_monotonic, valid_until_monotonic, self._version + 1, self._epoch)
             try:
                 self._require_published_fresh_locked(published)
             except HotAccountUnavailable:
@@ -259,11 +264,23 @@ class CycleAccountCache:
 
     def _require_lease(self, lease):
         with self._lock:
+            current = self._published
+            if current is not None and current is not lease._published:
+                try:
+                    self._check_current_locked(current)
+                except HotAccountUnavailable:
+                    pass
+                else:
+                    # An old reader must not schedule another REST refresh of
+                    # an already valid replacement (and revoke its new readers).
+                    if current.epoch == lease._published.epoch:
+                        raise AccountCacheReplaced("账户热数据已更新，需要使用新快照重新核验")
+                    raise AccountCacheUnavailable("账户状态已变化，需要使用新快照重新核验")
             try:
                 self._check_current_locked(lease._published)
                 lease.snapshot.require_fresh(self._now())
             except (TradingError, TypeError, ValueError, AttributeError):
-                listener = self._expire_locked() if self._published is lease._published else self._notice_locked()
+                listener = self._expire_locked() if current is not None else self._notice_locked()
             else:
                 return
         self._notify(listener)

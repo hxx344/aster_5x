@@ -5,7 +5,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from trading.account_cache import CycleAccountCache, HotAccountUnavailable
+from trading.account_cache import AccountCacheReplaced, CycleAccountCache, HotAccountUnavailable
 from trading.models import AccountSnapshot
 
 
@@ -33,6 +33,45 @@ def ready_cache(**kwargs):
 
 
 class CycleAccountCacheTests(unittest.TestCase):
+    def test_replaced_reader_does_not_request_another_refresh(self):
+        wake = Mock()
+        cache, _, _ = ready_cache(on_invalidate=wake)
+        old = cache.lease(SYMBOLS)
+        self.assertTrue(cache.publish(cache.begin_refresh(), snapshot(available=Decimal("20")), 100))
+        wake.reset_mock()
+        for _ in range(3):
+            with self.assertRaises(AccountCacheReplaced):
+                old.require_fresh()
+        wake.assert_not_called()
+        current = cache.lease(SYMBOLS)
+        current.require_fresh()
+        self.assertEqual(current.snapshot.available, Decimal("20"))
+
+    def test_real_event_followed_by_refresh_does_not_qualify_as_replacement(self):
+        wake = Mock()
+        cache, _, _ = ready_cache(on_invalidate=wake)
+        old = cache.lease(SYMBOLS)
+        cache.invalidate("账户发生真实变更")
+        self.assertTrue(cache.publish(cache.begin_refresh(), snapshot(), 100))
+        wake.reset_mock()
+        with self.assertRaises(HotAccountUnavailable) as failure:
+            old.require_fresh()
+        self.assertNotIsInstance(failure.exception, AccountCacheReplaced)
+        wake.assert_not_called()
+
+    def test_expired_replacement_is_revoked_and_refresh_wakes_only_once(self):
+        wake = Mock()
+        cache, _, ticks = ready_cache(on_invalidate=wake)
+        old = cache.lease(SYMBOLS)
+        self.assertTrue(cache.publish(cache.begin_refresh(), snapshot(), 100))
+        wake.reset_mock()
+        ticks.return_value = 109
+        for _ in range(2):
+            with self.assertRaises(HotAccountUnavailable) as failure:
+                old.require_fresh()
+            self.assertNotIsInstance(failure.exception, AccountCacheReplaced)
+        wake.assert_called_once()
+
     def test_initial_configuration_and_private_connection_are_required(self):
         cache = CycleAccountCache()
         with self.assertRaises(HotAccountUnavailable):

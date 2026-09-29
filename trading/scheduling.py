@@ -51,6 +51,7 @@ class AccountWork:
     cycle: CycleWake = field(default_factory=CycleWake)
     hot_wake: bool = False
     hot_backoff: float = 0
+    hot_listener: object = None
     ordinary_read: OrdinaryRead | None = None
 
     def take_priority(self):

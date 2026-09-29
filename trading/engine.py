@@ -276,8 +276,12 @@ class Engine:
             return 30
         broker = self.broker(account)
         hot_symbol = "XAUUSD1" if paired else account["cycle"]["symbol"]
-        broker.start_cycle_hot_data([hot_symbol],
-                                    on_invalidate=lambda: self.wake_cycle_hot_data(account_id))
+        with self.lock:
+            work = self.work(account_id)
+            if work.hot_listener is None:
+                work.hot_listener = lambda: self.wake_cycle_hot_data(account_id)
+            listener = work.hot_listener
+        broker.start_cycle_hot_data([hot_symbol], on_invalidate=listener)
         paired_state = (self.store.get("pair_runtime:" + paired["id"]) or {}) if paired else {}
         if paired and not (paired["cycle"]["enabled"] or has_cycle_quantity(paired_state)):
             # Ordinary/monitor-only groups read complete snapshots themselves.
@@ -285,10 +289,16 @@ class Engine:
             return 30
         paired_pending = paired and (paired_state.get("pending") or
             (self.store.get("pair_margin:" + paired["id"]) or {}).get("pending"))
-        if paired_pending or self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+        if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
             broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
             with self.lock:
                 self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
+            return CYCLE_HOT_POLL_INTERVAL
+        if paired_pending:
+            # Durable preparation is not an account mutation. Actual writes,
+            # private events and the original expiry still revoke these leases.
+            # Do not turn this local wait into an API cooldown: completion wakes
+            # the worker and must not be blocked by a stale pending observation.
             return CYCLE_HOT_POLL_INTERVAL
         try:
             # A hot refresh spends ordinary quota only. Keep room for one
@@ -307,10 +317,12 @@ class Engine:
                 return CYCLE_HOT_POLL_INTERVAL
             paired_pending = paired and ((self.store.get("pair_runtime:" + paired["id"]) or {}).get("pending") or
                 (self.store.get("pair_margin:" + paired["id"]) or {}).get("pending"))
-            if paired_pending or self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
+            if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
                 broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
                 with self.lock:
                     self.work(account_id).hot_backoff = time.monotonic() + CYCLE_HOT_POLL_INTERVAL
+                return CYCLE_HOT_POLL_INTERVAL
+            if paired_pending:
                 return CYCLE_HOT_POLL_INTERVAL
             if published:
                 self.cycle_hot_ready(account_id)

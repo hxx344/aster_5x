@@ -8,6 +8,7 @@ import math
 import time
 import uuid
 
+from .account_cache import AccountCacheReplaced
 from .exchange import (AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent,
                        LeverageRejected, LEVERAGE_REJECTION_CODES, ORDER_REJECTION_CODES, api_wait_notice)
 from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
@@ -199,6 +200,8 @@ class PairTrader:
 
     def tick(self, pair):
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
+        pending_at_entry = state.get("pending")
+        margin_waiting = False
         state.pop("retry_after", None)
         state["api_notice"] = None
         save_state = True
@@ -226,6 +229,7 @@ class PairTrader:
                     or not math.isfinite(margin_state[field]))
                 for field in ("checked_at", "next_check_at", "cooldown_until"))
             margin_pending = margin_state.get("pending") if isinstance(margin_state, dict) else None
+            margin_waiting = bool(margin_pending)
             from .margin_balance import MarginBalancer
             if (not holding and margin_pending is None and not margin_invalid
                     and margin_state.get("api_notice")
@@ -345,7 +349,16 @@ class PairTrader:
         finally:
             if save_state:
                 self._save(pair, state)
+                if ((pending_at_entry and pending_at_entry.get("kind") == "leverage" and not state.get("pending"))
+                        or (margin_waiting and not (self.store.get("pair_margin:" + pair["id"]) or {}).get("pending"))):
+                    self._wake_hot_data(pair)
         return state
+
+    def _wake_hot_data(self, pair):
+        # Queue local maintenance after the durable completion. Existing API
+        # cooldowns remain intact; a pending batch itself adds no API backoff.
+        for key, _ in SIDES:
+            self.engine.wake_cycle_hot_data(pair[key + "_account_id"])
 
     @staticmethod
     def _daily_remaining(pair, state):
@@ -383,25 +396,42 @@ class PairTrader:
         state.update(pending=pending, phase="submitting", reason="并行提交两个子账户的市价单")
         self._save(pair, state)
         try:
-            # Persistent intent precedes the final age/config/capacity checks.
-            self._config_guard(pair, identities, opening=opening)
-            for guard in guards.values():
-                guard()
-            book = self.engine.cycle_book(SYMBOL) if kind == "cycle" else self.market.book(SYMBOL)
-            if kind == "cycle":
-                capacity = self.engine.require_cycle_open_capacity(pair["cycle"], plan.leverage,
-                    minimum_notional=plan.capacity_notional or 0) if opening else None
-                depth = self.engine.cycle_depth(SYMBOL)
-                latest = plan_paired_cycle(pair, snapshots, book, depth, self.market.rules[SYMBOL],
-                                           state["progress"], capacity=capacity, daily_remaining=self._daily_remaining(pair, state) if opening else None,
-                                           paused=not pair["enabled"])
-                pair_quality.prepare(pending, pair["id"], depth, final=True)
-            else:
-                latest = plan_ordinary(pair, snapshots, book, self.market.rules[SYMBOL], self.engine.capacities(SYMBOL))
-            if latest.phase != plan.phase or latest.qty < plan.qty or latest.leverage != plan.leverage:
-                raise RequestNotSent("发单前两账户风险、盘口或额度已变化")
-            for guard in guards.values():
-                guard()
+            for attempt in range(2):
+                try:
+                    # Persistent intent precedes the final age/config/capacity checks.
+                    self._config_guard(pair, identities, opening=opening)
+                    for guard in guards.values():
+                        guard()
+                    require_quantities(snapshots, before)
+                    book = self.engine.cycle_book(SYMBOL) if kind == "cycle" else self.market.book(SYMBOL)
+                    if kind == "cycle":
+                        capacity = self.engine.require_cycle_open_capacity(pair["cycle"], plan.leverage,
+                            minimum_notional=plan.capacity_notional or 0) if opening else None
+                        depth = self.engine.cycle_depth(SYMBOL)
+                        latest = plan_paired_cycle(pair, snapshots, book, depth, self.market.rules[SYMBOL],
+                                                   state["progress"], capacity=capacity, daily_remaining=self._daily_remaining(pair, state) if opening else None,
+                                                   paused=not pair["enabled"])
+                        pair_quality.prepare(pending, pair["id"], depth, final=True)
+                    else:
+                        latest = plan_ordinary(pair, snapshots, book, self.market.rules[SYMBOL], self.engine.capacities(SYMBOL))
+                    if latest.phase != plan.phase or latest.qty < plan.qty or latest.leverage != plan.leverage:
+                        raise RequestNotSent("发单前两账户风险、盘口或额度已变化")
+                    for guard in guards.values():
+                        guard()
+                    break
+                except AccountCacheReplaced:
+                    if attempt or kind != "cycle" or not opening:
+                        raise
+                    for guard in guards.values():
+                        try:
+                            guard()
+                        except AccountCacheReplaced:
+                            pass
+                    # One complete local re-read/replan, before either send.
+                    # Keep the durable client IDs and quantity; a real event,
+                    # disconnect or expired read never qualifies for this retry.
+                    snapshots, guards = self._read(brokers, hot=True)
+                    self._publish_snapshots(state, snapshots)
         except TradingError as exc:
             self._retry_delay(state, exc)
             for leg in legs:
@@ -419,7 +449,8 @@ class PairTrader:
                 "avgPrice": "0", "reject_reason": reason, "local_not_sent": local}
 
     def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False):
-        observe = state["pending"]["kind"] == "cycle" and legs is state["pending"]["legs"]
+        pending = state.get("pending") or {}
+        observe = pending.get("kind") == "cycle" and legs is pending.get("legs")
         quality_clocks = {}
         # Workers observe separate objects so a runtime commit cannot serialize
         # a leg while another thread is adding its timing metadata.
@@ -690,6 +721,7 @@ class PairTrader:
         published.clear()
         published.update(state)
         pair_quality.record(self.store, pair["id"], pending)
+        self._wake_hot_data(pair)
 
     @staticmethod
     def _account_volume(state, pending):

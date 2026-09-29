@@ -16,20 +16,20 @@ from trading.models import dec
 class CapacityMonitorBudgetTests(unittest.TestCase):
     def test_execution_leaves_monitor_headroom_and_reports_its_actual_limit(self):
         budget = RateBudget(capacity_reserve=CAPACITY_MONITOR_RESERVE)
-        budget.require_available(1407)
+        budget.require_available(1469)
         self.assertEqual(budget.weight, 0)
-        budget.reserve(1407)
+        budget.reserve(1469)
         for check in (budget.require_available, budget.reserve):
-            with self.assertRaisesRegex(BudgetWait, "1407/1407"):
+            with self.assertRaisesRegex(BudgetWait, "1469/1469"):
                 check(1)
         state = budget.snapshot()
         self.assertEqual((state["ordinary_limit"], state["execution_limit"], state["capacity_reserve"]),
-                         (1500, 1407, 93))
-        self.assertEqual((state["remaining"], state["ordinary_remaining"]), (393, 0))
+                         (1500, 1469, 31))
+        self.assertEqual((state["remaining"], state["ordinary_remaining"]), (331, 0))
         self.assertGreater(state["retry_after"], 0)
         with budget.capacity_monitoring():
-            budget.require_available(93)
-            budget.reserve(93)
+            budget.require_available(31)
+            budget.reserve(31)
         self.assertEqual(budget.weight, 1500)
 
     def test_monitoring_cannot_spend_reconciliation_quota(self):

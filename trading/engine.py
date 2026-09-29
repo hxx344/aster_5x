@@ -53,7 +53,7 @@ CYCLE_HOT_POLL_INTERVAL = 2
 ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
 FAST_CAPACITY_POLL_INTERVAL = .2
-CAPACITY_MONITOR_RESERVE = len(SYMBOLS) * (60 // CAPACITY_POLL_INTERVAL + 1)
+CAPACITY_MONITOR_RESERVE = 60 // CAPACITY_POLL_INTERVAL + 1
 PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_RESYNC_INTERVAL
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
@@ -176,6 +176,7 @@ class Engine:
         self.capacity_brackets_interval = PUBLIC_BRACKETS_REFRESH_INTERVAL
         self.capacity_poll_enabled = True
         self.capacity_full_checked = {}
+        self.capacity_sample_started = {}
         self.listing_monitor = ListingMonitor(store, self.market, self.shutdown) if not demo and isinstance(self.market, MarketData) else None
         if demo and not store.accounts() and not store.account_id_used("demo"):
             account = {"id": "demo", "name": "示例子账户", "mode": "paper", "env_prefix": "ASTER_DEMO", "enabled": False, "policy": {**DEFAULT_POLICY}}
@@ -501,8 +502,9 @@ class Engine:
         budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else {"ordinary_limit": 1500}
         # Reserve the capacity feed and ordinary quote fallback. Use cold
         # round costs; no private position or balance cache crosses a mutation.
-        public_capacity_cost = (sum(60 / self.capacity_interval(symbol) for symbol in SYMBOLS)
-                                + len(SYMBOLS) * 60 / self.capacity_brackets_interval) if self.capacity_poll_enabled else 0
+        capacity_symbols = self.capacity_market_symbols(accounts)
+        public_capacity_cost = (sum(60 / self.capacity_interval(symbol) for symbol in capacity_symbols)
+                                + len(capacity_symbols) * 60 / self.capacity_brackets_interval) if self.capacity_poll_enabled else 0
         extra_capacity = public_capacity_cost - CAPACITY_MONITOR_RESERVE
         capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE - extra_capacity)
         with self.lock:
@@ -650,13 +652,18 @@ class Engine:
         for pair in self.store.pairs() if pairs is None else pairs:
             if not pair["enabled"]:
                 continue
+            runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
+            # The durable intent precedes dispatch and survives unknown results,
+            # repairs and restarts. Only this consumer yields its fast feed.
+            if runtime.get("pending"):
+                continue
             members = [owners.get(pair[key]) for key in ("long_account_id", "short_account_id")]
             if any(member is None or not self.live_allowed(member) for member in members):
                 continue
             if pair["cycle"]["enabled"]:
                 # The cycle config's leverage is a legacy default. Orders use
                 # both members' actual leverage; sample that same tier only.
-                snapshots = ((self.store.get("pair_runtime:" + pair["id"]) or {}).get("snapshots", {})
+                snapshots = (runtime.get("snapshots", {})
                              if any(member["mode"] == "paper" for member in members) else {})
                 levels = []
                 for side, member in zip(("long", "short"), members):
@@ -723,6 +730,13 @@ class Engine:
                 return selected
             return selected | self.required_monitoring_symbols(reader, accounts).keys()
 
+    def capacity_market_symbols(self, accounts=None):
+        """Sample XAU by default, plus markets needed by actual strategy work."""
+        with self.store.read_snapshot() as reader:
+            config = reader.monitoring_settings()
+            required = self.required_monitoring_symbols(reader, accounts)
+            return set(required) | ({"XAUUSD1"} if monitoring.monitored(config, "XAUUSD1") else set())
+
     def edit_monitoring(self, changes, *, symbol=None):
         if self.demo:
             raise TradingError("模拟环境不运行监控或飞书告警")
@@ -749,25 +763,28 @@ class Engine:
                     "status": listings.get("rows", {}).get(symbol, {}).get("status", "TRADING")}
                     for symbol in sorted(symbols)]}
 
-    def capacity_poll_schedule(self, targets):
+    def capacity_poll_schedule(self, targets, symbols=None):
         """Fit all public quota samples, including brackets, into their real reserve."""
+        symbols = self.capacity_market_symbols() if symbols is None else set(symbols)
+        targets = {symbol: tiers for symbol, tiers in targets.items() if symbol in symbols}
         count = len(targets)
-        allowance = CAPACITY_MONITOR_RESERVE + count * (60 / FAST_CAPACITY_POLL_INTERVAL - 60 / CAPACITY_POLL_INTERVAL)
+        baseline = len(symbols) * CAPACITY_MONITOR_RESERVE
+        allowance = baseline + count * (60 / FAST_CAPACITY_POLL_INTERVAL - 60 / CAPACITY_POLL_INTERVAL)
         if isinstance(self.market, MarketData) and isinstance(self.market.api.budget, RateBudget):
             self.market.api.budget.configure_capacity_reserve(math.ceil(allowance))
             allowance = self.market.api.budget.snapshot()["capacity_reserve"]
         if allowance <= 0:
             return dict.fromkeys(SYMBOLS, 60), 60, False
-        scale = max(1, CAPACITY_MONITOR_RESERVE / allowance)
+        scale = max(1, baseline / allowance)
         intervals = dict.fromkeys(SYMBOLS, CAPACITY_POLL_INTERVAL * scale)
         if count and scale == 1:
-            remaining = allowance - CAPACITY_MONITOR_RESERVE + count * 60 / CAPACITY_POLL_INTERVAL
+            remaining = allowance - baseline + count * 60 / CAPACITY_POLL_INTERVAL
             interval = max(FAST_CAPACITY_POLL_INTERVAL, 60 / math.floor(remaining / count))
             intervals.update(dict.fromkeys(targets, interval))
         return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL * scale, True
 
     def poll_public_brackets(self, symbol):
-        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.monitored_market_symbols():
+        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.capacity_market_symbols():
             return self.capacity_brackets_interval
         try:
             self.market.refresh_public_brackets(symbol)
@@ -776,7 +793,7 @@ class Engine:
             return max(10, getattr(exc, "retry_after", 0))
 
     def poll_market(self, symbol):
-        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.monitored_market_symbols():
+        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.capacity_market_symbols():
             return self.capacity_interval(symbol)
         try:
             with self.lock:
@@ -785,6 +802,17 @@ class Engine:
             if accounts is None:
                 accounts = self.store.accounts()
             interval = self.capacity_interval(symbol)
+            pairs = self.store.pairs()
+            if pairs:
+                # A worker may have been queued before a pair persisted its
+                # intent. Recheck before HTTP; never cancel an in-flight sample.
+                accounts = self.store.accounts()
+                targets = self.fast_capacity_targets(accounts, pairs).get(symbol, set())
+                if not targets:
+                    interval = max(interval, CAPACITY_POLL_INTERVAL)
+                    if time.monotonic() - self.capacity_sample_started.get(symbol, -math.inf) < interval:
+                        return interval
+            self.capacity_sample_started[symbol] = time.monotonic()
             full = time.monotonic() - self.capacity_full_checked.get(symbol, -math.inf) >= CAPACITY_POLL_INTERVAL
             tiers = set(TIERS) | targets if full or not targets else targets
             # Network latency is part of the capacity snapshot's age.
@@ -2574,7 +2602,8 @@ class Engine:
                             account_generation = generation
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
                         targets = self.fast_capacity_targets(saved_accounts, saved_pairs)
-                        intervals, brackets_interval, poll_enabled = self.capacity_poll_schedule(targets)
+                        capacity_symbols = self.capacity_market_symbols(saved_accounts)
+                        intervals, brackets_interval, poll_enabled = self.capacity_poll_schedule(targets, capacity_symbols)
                         with self.lock:
                             old_targets = self.capacity_targets
                             old_intervals = self.capacity_intervals
@@ -2623,9 +2652,9 @@ class Engine:
                                     if time.monotonic() < work.ordinary_priority_after:
                                         priority_accounts.discard(aid)
                         monitored_symbols = self.monitored_market_symbols(saved_accounts)
-                        jobs = {"market:" + s: (self.poll_market, s) for s in monitored_symbols}
+                        jobs = {"market:" + s: (self.poll_market, s) for s in capacity_symbols}
                         if isinstance(self.market, MarketData):
-                            jobs.update({"brackets:" + s: (self.poll_public_brackets, s) for s in monitored_symbols})
+                            jobs.update({"brackets:" + s: (self.poll_public_brackets, s) for s in capacity_symbols})
                         jobs.update({"book:" + s: (self.poll_book, s) for s in monitored_symbols})
                         jobs.update({"depth:" + s: (self.poll_depth, s) for s in monitored_symbols})
                         jobs["notify"] = (self.notify,)

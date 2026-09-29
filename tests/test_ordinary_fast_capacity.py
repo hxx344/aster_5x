@@ -264,7 +264,7 @@ class OrdinaryFastSchedulerTests(unittest.TestCase):
 
         self.run_sampling(poll, control)
         self.assertEqual([round(t, 3) for s, t in starts if s == XAU], [100, 100.201])
-        self.assertEqual(len([s for s, _ in starts if s != XAU]), 2)
+        self.assertEqual(len([s for s, _ in starts if s != XAU]), 0)
 
     def test_slow_ordinary_sample_does_not_overlap_or_catch_up(self):
         h, starts, held = self.h, [], _Future(.2, done=False)

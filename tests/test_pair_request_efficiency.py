@@ -29,9 +29,9 @@ class PairRequestEfficiencyTests(TestCase):
         wall, ticks = time.time(), time.monotonic()
         with patch("time.time", side_effect=lambda: wall), patch("time.monotonic", side_effect=lambda: ticks):
             self.ordinary()
-            self.budget.configure_capacity_reserve(363)
+            self.budget.configure_capacity_reserve(301)
             with self.budget.capacity_monitoring():
-                self.budget.reserve(363)
+                self.budget.reserve(301)
             for _ in range(30):
                 state = self.trader.tick(self.pair)
                 self.assertNotIn("请求预算", state["reason"])
@@ -42,7 +42,7 @@ class PairRequestEfficiencyTests(TestCase):
             self.assertEqual(self.read_count(), 20)  # Ten rounds, not thirty.
             self.assertEqual(sum(path == fixtures.DUAL for b in self.brokers.values()
                                  for _, path, _ in b.api.calls), 2)
-            self.assertEqual(used, 883)  # Includes two initial independent mode checks.
+            self.assertEqual(used, 821)  # Includes two initial independent mode checks.
             self.assertLess(used, self.budget.snapshot()["execution_limit"])
             self.assertTrue(all(method == "GET" for b in self.brokers.values() for method, _, _ in b.api.calls))
 

@@ -26,7 +26,7 @@ class PublicSamplingBudgetTests(unittest.TestCase):
 
     def configure(self, count):
         self.engine.capacity_targets = dict.fromkeys(SYMBOLS[:count], {5})
-        intervals, brackets, enabled = self.engine.capacity_poll_schedule(self.engine.capacity_targets)
+        intervals, brackets, enabled = self.engine.capacity_poll_schedule(self.engine.capacity_targets, SYMBOLS)
         self.engine.capacity_intervals = intervals
         self.engine.capacity_brackets_interval = brackets
         self.engine.capacity_poll_enabled = enabled
@@ -49,8 +49,10 @@ class PublicSamplingBudgetTests(unittest.TestCase):
         intervals, brackets, _ = self.configure(3)
         owners = [account("a" + str(i), mode="live") for i in range(8)]
         for owner in owners:
+            owner["policy"]["symbols"] = list(SYMBOLS)
             self.engine.view(owner["id"], snapshot={"positions": [
-                {"symbol": XAU, "side": side, "leverage": 5, "qty": "0"} for side in ("LONG", "SHORT")]})
+                {"symbol": symbol, "side": side, "leverage": 5, "qty": "0"}
+                for symbol in SYMBOLS for side in ("LONG", "SHORT")]})
         schedules = self.engine.scheduling(owners)
         public = PUBLIC_POLL_ALLOWANCE - CAPACITY_MONITOR_RESERVE + sum(60 / v for v in intervals.values()) + 180 / brackets
         total = public + sum(120 * 60 / schedules[o["id"]]["interval"] for o in owners)

@@ -151,7 +151,8 @@ class CapacitySelectionTests(unittest.TestCase):
                 h.engine.shutdown.set()
         self.run_scheduler(poll, control)
         self.assertEqual([round(t, 3) for s, t in starts if s == SYMBOL], [100, 100.201])
-        self.assertEqual(len([s for s, _ in starts if s != SYMBOL]), 2)
+        # SPCX has an independent ordinary strategy; unused CL is omitted.
+        self.assertEqual([s for s, _ in starts if s != SYMBOL], ["SPCXUSD1"])
 
     def test_slow_request_has_one_inflight_and_no_catch_up_burst(self):
         h, starts, held = self.h, [], _Future(.2, done=False)

@@ -102,6 +102,22 @@ test('pending execution and stale data remain two independent complete notices',
   );
 });
 
+test('paused unresolved orders or transfers explain the start block before adoption', () => {
+  for (const pendingState of [
+    { pending: { kind: 'ordinary', id: 'demo-order' } },
+    { margin: { pending: { request_id: 'demo-transfer' } } },
+  ]) {
+    const notices = pairStatusNotices(
+      pair({ phase: 'reconciling', ...pendingState }, { enabled: false }),
+      108,
+    );
+    const data = notices.find(({ kind }) => kind === 'data');
+    assert.match(data.text, /仍有订单或划转待核对/);
+    assert.match(data.text, /完成后才能启动/);
+    assert.ok(!data.text.includes('再采纳实际仓位'));
+  }
+});
+
 test('unknown order or transfer outcomes stay pending and use the available reason', () => {
   for (const pendingState of [
     { pending: { id: 'demo-order' } },

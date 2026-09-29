@@ -1979,6 +1979,21 @@ label input,
 .pair-notice-item + .pair-notice-item {
   margin-top: 12px;
 }
+.pair-order-diagnostics-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+.pair-order-diagnostic {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--background);
+}
+.pair-order-diagnostic .small-note {
+  text-align: left;
+}
 .cycle-live-state .pair-notice-time,
 .cycle-live-state .pair-notice-scope {
   font-size: 12px;

@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/dialog';
 import { PairSettings } from '@/components/pair-settings';
 import { PairNotices } from '@/components/pair-notices';
+import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
 import {
   clearPastPairNotices,
   pairStatusNotices,
@@ -395,6 +396,7 @@ function PairDetail({
             {pairPhaseLabel(pair.state?.phase)}
             {reason ? ` · ${reason}` : ''}
           </p>
+          <PairOrderDiagnostics pair={pair} />
           <PairNotices
             pair={pair}
             now={now}

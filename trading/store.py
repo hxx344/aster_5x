@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring
+from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, relay_health_notifications
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -568,6 +568,8 @@ class Store:
                     return config
                 hourly_changed = any(key in changes and config[key] != changes[key]
                                      for key in ("feishu_enabled", "hourly_summary_alerts"))
+                relay_changed = any(key in changes and config[key] != changes[key]
+                                    for key in ("feishu_enabled", "relay_health_alerts"))
                 config.update(changes)
             config["revision"] += 1
             monitoring.write(db, config)
@@ -576,7 +578,15 @@ class Store:
             monitoring.cancel_disabled(db, config)
             if symbol is None and hourly_changed:
                 hourly_notifications.reset(db, time.time(), monitoring.allowed(config, "hourly_summary", []))
+            if symbol is None and relay_changed:
+                relay_health_notifications.reset(db)
             return config
+
+    def observe_relay_health(self, status, *, available, revision, now=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return relay_health_notifications.observe(db, status, available=available,
+                revision=revision, now=time.time() if now is None else now)
 
     def hourly_summary_due(self, *, available, now=None):
         """Read only the persisted timer and settings on ordinary notification ticks."""
@@ -1402,6 +1412,8 @@ class Store:
         item = dict(row)
         if not monitoring.message_allowed(db, item):
             return None
+        if item.get("category") == "relay_health" and not relay_health_notifications.deliverable(db, item):
+            return None
         if item["id"].startswith(listing_alerts.MESSAGE_PREFIX) and not listing_alerts.deliverable(db, item, time.time()):
             return None
         if item["capacity_key"]:
@@ -1448,6 +1460,8 @@ class Store:
                 db.execute("UPDATE outbox SET delivered_at=? WHERE id=?", (now, item["id"]))
                 if row["category"] == "hourly_summary":
                     hourly_notifications.delivered(db, now)
+                if row["category"] == "relay_health":
+                    relay_health_notifications.delivered(db, dict(row))
                 if item["id"].startswith(listing_alerts.MESSAGE_PREFIX):
                     listing_alerts.delivered(db, item)
                 if row["capacity_key"]:

@@ -13,7 +13,7 @@ import ssl
 import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from websockets.sync.client import connect as websocket_connect
@@ -89,6 +89,12 @@ class PublicCapacityRelayClient:
         self._stop = threading.Event()
         self._thread = None
         self._connected = False
+        self._instance_id = str(uuid4())
+        self._ws_connected_ticks = None
+        self._ws_disconnected_ticks = self._monotonic()
+        self._ws_oi_ticks = None
+        self._ws_last_oi_sample_at = None
+        self._ws_failure_count = 0
         self._connection_generation = 0
         self._epoch = None
         self._epoch_serial = 0
@@ -148,7 +154,9 @@ class PublicCapacityRelayClient:
             self._stop.set()
             if self._connected:
                 self._ws_disconnected_at = self._clock()
+                self._ws_disconnected_ticks = self._monotonic()
             self._connected = False
+            self._ws_connected_ticks = self._ws_oi_ticks = None
             self._ws_retry_at = None
             self._connection_generation += 1
             self._cache.clear()
@@ -172,7 +180,8 @@ class PublicCapacityRelayClient:
                                 "age_seconds": age if math.isfinite(age) else None,
                                 "max_age_seconds": self._MAX_AGE[kind],
                                 "received_at": value.received_at})
-            return {"enabled": True, "running": self._thread is not None and self._thread.is_alive(),
+            return {"enabled": True, "instance_id": self._instance_id,
+                    "running": self._thread is not None and self._thread.is_alive(),
                     "connected": self._connected, "closed": self._stop.is_set(),
                     "cached_samples": len(self._cache), "last_error": self._last_error,
                     "observed_at": wall,
@@ -180,6 +189,16 @@ class PublicCapacityRelayClient:
                            "disconnected_at": self._ws_disconnected_at,
                            "last_message_at": self._ws_last_message_at,
                            "last_sample_at": self._ws_last_sample_at,
+                           "last_oi_sample_at": self._ws_last_oi_sample_at,
+                           "failure_count": self._ws_failure_count,
+                           "connected_age_seconds": (max(0.0, ticks - self._ws_connected_ticks)
+                               if self._connected and self._ws_connected_ticks is not None else None),
+                           "disconnected_age_seconds": (max(0.0, ticks - self._ws_disconnected_ticks)
+                               if not self._connected and self._ws_disconnected_ticks is not None else None),
+                           "oi_idle_seconds": (max(0.0, ticks - (self._ws_oi_ticks
+                               if self._ws_oi_ticks is not None else self._ws_connected_ticks))
+                               if self._connected and self._ws_connected_ticks is not None else None),
+                           "has_oi_sample": self._connected and self._ws_oi_ticks is not None,
                            "connection_attempts": self._ws_connection_attempts,
                            "retry_in_seconds": (max(0.0, self._ws_retry_at - ticks)
                                                 if self._ws_retry_at is not None else None),
@@ -365,6 +384,10 @@ class PublicCapacityRelayClient:
             self._cache[key] = _Sample(ticks - age, wall - age, deepcopy(payload), source, wall)
             if source == "ws":
                 self._ws_last_sample_at = wall
+                if key[0] == "oi":
+                    self._ws_last_oi_sample_at = wall
+                    if self._connected:
+                        self._ws_oi_ticks = ticks
             self._last_error = None
             listener = self._update_listener
         if listener is not None and not self._stop.is_set():
@@ -397,6 +420,8 @@ class PublicCapacityRelayClient:
                         self._connection_generation += 1
                         generation = self._connection_generation
                         self._connected = True
+                        self._ws_connected_ticks = self._monotonic()
+                        self._ws_disconnected_ticks = self._ws_oi_ticks = None
                         self._ws_connected_at = self._clock()
                         self._ws_last_error = None
                         self._last_error = None
@@ -421,9 +446,13 @@ class PublicCapacityRelayClient:
             finally:
                 with self._lock:
                     if generation is None or generation == self._connection_generation:
+                        if not self._stop.is_set():
+                            self._ws_failure_count += 1
                         if self._connected:
                             self._ws_disconnected_at = self._clock()
+                            self._ws_disconnected_ticks = self._monotonic()
                         self._connected = False
+                        self._ws_connected_ticks = self._ws_oi_ticks = None
             if self._monotonic() - connected_at >= 30:
                 retry = self._RETRY_INITIAL
             with self._lock:

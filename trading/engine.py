@@ -172,6 +172,7 @@ class Engine:
         self.error = "正在连接行情服务"
         self.notification_error = None
         self.hourly_summary_error = None
+        self.relay_health_error = None
         self.capacity_notification_errors = {}
         self.capacity_targets, self.capacity_accounts = {}, []
         self.capacity_intervals = {}
@@ -2269,11 +2270,26 @@ class Engine:
             with self.lock:
                 self.capacity_notification_errors[symbol] = "额度提醒状态保存失败，等待重试"
 
+    def observe_relay_health(self, config):
+        try:
+            revision = self.store.monitoring_settings()["revision"]
+            active = (bool(config) and not self.demo and not self.shutdown.is_set()
+                      and isinstance(self.market, MarketData) and self.market.remote_capacity is True)
+            status = self.market.capacity_relay.status() if active else None
+            accepted = self.store.observe_relay_health(status, available=active, revision=revision)
+            self.relay_health_error = None
+            return accepted and active
+        except Exception:
+            self.relay_health_error = "副服务器状态提醒检查失败，等待重试"
+            LOG.error("Relay health notification observation failed")
+            return False
+
     def notify(self):
         if self.demo or self.shutdown.is_set():
             return 5
         try:
             config = self.notification_config()
+            self.observe_relay_health(config)
             try:
                 now = time.time()
                 token = self.store.hourly_summary_due(available=bool(config), now=now)
@@ -2300,6 +2316,10 @@ class Engine:
             for item in self.store.due_notifications():
                 if self.shutdown.is_set():
                     break
+                if item.get("category") == "relay_health":
+                    current_config = self.notification_config()
+                    if not self.observe_relay_health(current_config) or current_config != config:
+                        continue
                 # Re-read after earlier sends: a capacity value may have changed
                 # or expired while another webhook request was in flight.
                 item = self.store.notification_for_delivery(item["id"])
@@ -2555,7 +2575,7 @@ class Engine:
                 "accounts": accounts, "pairs": paired_states, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "hourly_summary": hourly_summary,
-                                 "error": self.notification_error or self.hourly_summary_error or next(iter(self.capacity_notification_errors.values()), None)}}))
+                                 "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
     def run(self):
         pending, due = {}, {}

@@ -138,6 +138,7 @@ export type MonitoringSettings = {
   listing_capacity_alerts: boolean;
   trade_summary_alerts: boolean;
   hourly_summary_alerts: boolean;
+  relay_health_alerts: boolean;
 };
 export type MonitoredSymbol = {
   symbol: string;
@@ -167,6 +168,7 @@ export type CapacityRelaySample = {
 };
 export type CapacityRelayStatus = {
   enabled: boolean;
+  instance_id?: string;
   running: boolean;
   connected: boolean;
   closed: boolean;
@@ -178,6 +180,12 @@ export type CapacityRelayStatus = {
     disconnected_at: number | null;
     last_message_at: number | null;
     last_sample_at: number | null;
+    last_oi_sample_at?: number | null;
+    failure_count?: number;
+    connected_age_seconds?: number | null;
+    disconnected_age_seconds?: number | null;
+    oi_idle_seconds?: number | null;
+    has_oi_sample?: boolean;
     connection_attempts: number;
     retry_in_seconds: number | null;
     last_error: string | null;

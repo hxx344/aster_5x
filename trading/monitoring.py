@@ -16,8 +16,9 @@ DEFAULTS = {
     "listing_capacity_alerts": True,
     "trade_summary_alerts": True,
     "hourly_summary_alerts": True,
+    "relay_health_alerts": True,
 }
-CATEGORIES = {"new_listing", "strategy_capacity", "listing_capacity", "trade_summary", "hourly_summary"}
+CATEGORIES = {"new_listing", "strategy_capacity", "listing_capacity", "trade_summary", "hourly_summary", "relay_health"}
 
 
 def read(db):
@@ -42,7 +43,7 @@ def monitored(config, symbol):
 def allowed(config, category, symbols):
     if category not in CATEGORIES or not config["feishu_enabled"] or not config[category + "_alerts"]:
         return False
-    if category == "hourly_summary":
+    if category in ("hourly_summary", "relay_health"):
         return True
     if not all(symbol_options(config, symbol)["alerts"] for symbol in symbols):
         return False

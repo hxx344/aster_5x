@@ -183,6 +183,7 @@ class MonitoringEdit(BaseModel):
     listing_capacity_alerts: bool | None = None
     trade_summary_alerts: bool | None = None
     hourly_summary_alerts: bool | None = None
+    relay_health_alerts: bool | None = None
 
     @model_validator(mode="after")
     def nonempty_booleans(self):

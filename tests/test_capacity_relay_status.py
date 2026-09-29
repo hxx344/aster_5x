@@ -52,6 +52,9 @@ class RelayStatusTests(unittest.TestCase):
             self.assertEqual(status["ws"], {
                 "connected_at": None, "disconnected_at": None, "last_message_at": None,
                 "last_sample_at": None, "connection_attempts": 0,
+                "last_oi_sample_at": None, "failure_count": 0,
+                "connected_age_seconds": None, "disconnected_age_seconds": 0,
+                "oi_idle_seconds": None, "has_oi_sample": False,
                 "retry_in_seconds": None, "last_error": None})
             self.assertEqual(status["http"], {
                 "inflight": 0, "requests": 0, "failures": 0, "last_attempt_at": None,

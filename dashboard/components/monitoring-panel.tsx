@@ -221,6 +221,19 @@ export function MonitoringPanel({
         </output>
       </section>
       <section className="panel">
+        <SettingSwitch
+          title="副服务器 WS 异常告警"
+          description="连续失败 3 次、断连持续 60 秒，或连接后 2 分钟没有新的有效额度样本时提醒。仅遵循飞书总开关与本开关，不受币种选择影响。"
+          checked={settings.relay_health_alerts}
+          disabled={disabled}
+          onChange={(value) => void save({ relay_health_alerts: value })}
+        />
+        <p className="monitor-status">
+          每次故障只提醒一次；故障通知送达后，稳定恢复 30 秒再通知恢复。 HTTP
+          补取成功不代表 WS 恢复，单次样本超过 1 秒不会触发此告警。
+        </p>
+      </section>
+      <section className="panel">
         <div className="section-head">
           <div>
             <h2>飞书通知类型</h2>

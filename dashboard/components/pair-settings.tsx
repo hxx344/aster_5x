@@ -339,8 +339,10 @@ export function PairSettings({
           disabled={locked}
         >
           <small>
-            占用上限减去所填百分点，同时保留不少于转出侧当前权益 ×
-            此比例的可用余额。
+            划转取账户与编组中较低的基础占用上限，再扣所填百分点；不含普通 10x /
+            20x 或循环额外的 5 个百分点。同时保留不少于转出侧当前权益 ×
+            此比例的可用余额。例如基础上限 90%、缓冲 5%，划转后占用率须不超过
+            85%。
           </small>
         </ConfigurationField>
         <ConfigurationField

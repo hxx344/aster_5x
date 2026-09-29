@@ -299,7 +299,7 @@ class MarginBalancer:
         return units * TRANSFER_UNIT >= Fraction(dec(config["min_transfer"]))
 
     @staticmethod
-    def _no_transfer_reason(snapshots, config):
+    def _no_transfer_reason(snapshots, config, diagnostics=None):
         """Explain a rejected plan using the same already-validated read only."""
         difference = abs(MarginBalancer._balance_delta(snapshots))
         threshold = Fraction(dec(config["threshold"]))
@@ -312,13 +312,15 @@ class MarginBalancer:
             if rounded_half < minimum:
                 detail += (f"；差额一半按划转精度向下取整为 {_display_amount(rounded_half)} USD1，"
                            f"低于最小划转额 {_display_amount(minimum)} USD1")
+            elif diagnostics:
+                detail += "；" + diagnostics["reason"]
             else:
                 detail += (f"；来源账户按可划余额、单次限额、现金与风险缓冲共同约束后，"
                            f"按划转精度取整后的安全可划金额低于最小划转额 {_display_amount(minimum)} USD1")
         return detail + "；本次不划转，后续按检查间隔重新评估"
 
     @staticmethod
-    def _plan(pair, members, snapshots, config, withdrawable, *, occupied_floors=None):
+    def _plan(pair, members, snapshots, config, withdrawable, *, occupied_floors=None, diagnostics=None):
         delta = MarginBalancer._balance_delta(snapshots)
         if abs(delta) <= dec(config["threshold"]):
             return None
@@ -337,12 +339,34 @@ class MarginBalancer:
         occupied = max(snapshot.occupied_margin_exact, (occupied_floors or {}).get(source, Fraction(0)))
         risk_room = equity - max(occupied, Fraction(snapshot.maintenance)) / limit
         cash_room = Fraction(snapshot.available) - equity * buffer
-        amount = min(Fraction(abs(delta)) / 2, Fraction(dec(config["max_transfer"])),
-            Fraction(positive(withdrawable[source], True)), cash_room, risk_room)
+        constraints = {"余额差的一半": Fraction(abs(delta)) / 2,
+            "单次上限": Fraction(dec(config["max_transfer"])),
+            "来源账户可划余额": Fraction(positive(withdrawable[source], True)),
+            "现金保留": cash_room, "风险缓冲": risk_room}
+        amount = min(constraints.values())
         amount = max(Fraction(0), amount)
         units = amount // TRANSFER_UNIT
         rounded = Decimal(int(units)) * Decimal("0.00000001")
         if rounded < dec(config["min_transfer"]):
+            if diagnostics is not None:
+                def percent(value):
+                    return wire(Decimal(int(Fraction(value) * 10000)) * Decimal("0.01"))
+                def cash(value):
+                    return wire(Decimal(int(max(Fraction(0), value) // TRANSFER_UNIT)) * Decimal("0.00000001"))
+                bases = f"账户基础 {percent(limits[0])}%"
+                if len(limits) > 1:
+                    bases += f"、编组基础 {percent(limits[1])}%，取较低值"
+                limited = "、".join(f"{name}（可划 {cash(value)} USD1）" for name, value in constraints.items()
+                    if max(Fraction(0), value) // TRANSFER_UNIT * TRANSFER_UNIT < dec(config["min_transfer"]))
+                side = "A 多侧" if source == "long" else "B 空侧"
+                maintenance = (f"，维持保证金率约 {percent(Fraction(snapshot.maintenance) / equity)}%"
+                    if Fraction(snapshot.maintenance) > occupied else "")
+                diagnostics["reason"] = (
+                    f"转出侧 {side}占用率约 {percent(occupied / equity)}%{maintenance}，"
+                    f"划转后占用上限 {percent(limit)}%（{bases}，再扣 {percent(buffer)} 个百分点；"
+                    "不含普通高杠杆或循环额外的 5 个百分点）；"
+                    f"限制项：{limited}；共同约束后的安全可划金额 {wire(rounded)} USD1，"
+                    f"低于最小划转额 {_display_amount(Fraction(dec(config['min_transfer'])))} USD1")
             return None
         return {"source": source, "destination": destination, "amount": wire(rounded)}
 
@@ -664,11 +688,13 @@ class MarginBalancer:
                 self._record_success(pair, state)
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
             if members["long"]["mode"] == "paper":
+                diagnostics = {}
                 plan = self._plan(pair, members, snapshots, config,
-                    {side: max(Decimal(0), min(snapshot.available, snapshot.wallet)) for side, snapshot in snapshots.items()})
+                    {side: max(Decimal(0), min(snapshot.available, snapshot.wallet)) for side, snapshot in snapshots.items()},
+                    diagnostics=diagnostics)
                 if plan is None:
                     self._record_success(pair, state)
-                    return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
+                    return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
                 from .pair_recovery import require_archived_orders_clear
                 require_archived_orders_clear(self.engine, pair)
                 pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": now, "status": "submitting"}
@@ -882,10 +908,12 @@ class MarginBalancer:
                     maintenance=max(snapshots[side].maintenance, positive(asset.get("maintMargin"), True)))}
             self._check_snapshots(pair, snapshots)
             require_current()
-            plan = self._plan(pair, members, snapshots, config, available, occupied_floors=occupied)
+            diagnostics = {}
+            plan = self._plan(pair, members, snapshots, config, available,
+                occupied_floors=occupied, diagnostics=diagnostics)
             if plan is None:
                 self._record_success(pair, state)
-                return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
+                return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
             before_at = time.time()
             before = self._income(members, int((before_at - 90) * 1000), int(before_at * 1000))
             # This pair submits market orders. Pending batches are gated by

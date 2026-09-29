@@ -639,10 +639,11 @@ function PairDetail({
           <div>
             <dt>转出侧风险与现金缓冲</dt>
             <dd>
-              占用上限扣减 {fmt(Number(pair.margin.buffer_ratio) * 100)}{' '}
-              个百分点
+              较低的账户／编组基础上限扣减{' '}
+              {fmt(Number(pair.margin.buffer_ratio) * 100)} 个百分点
               <small>
-                可用余额保留 ≥ 当前权益 × {pct(pair.margin.buffer_ratio)}
+                不含普通高杠杆或循环额外的 5 个百分点； 可用余额保留 ≥ 当前权益
+                × {pct(pair.margin.buffer_ratio)}
               </small>
             </dd>
           </div>

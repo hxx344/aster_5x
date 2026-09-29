@@ -458,6 +458,40 @@ class PairMarginTests(unittest.TestCase):
         self.assertIsNone(final["pending"])
         self.assertEqual(len(self.transfers), 1)
 
+    def test_acknowledged_refresh_preserves_safe_error_metadata_without_resending(self):
+        snapshots = self.live()
+        self.refresh_error = ExchangeError("remote secret=never-display", code=-1021, http_status=400)
+        first = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(first["status"], "acknowledged")
+        self.assertIn("HTTP 400", first["reason"])
+        self.assertIn("错误码 -1021", first["reason"])
+        self.assertNotIn("never-display", str(first))
+        journal = self.state()
+        self.assertIn("HTTP 400", journal["blocked_reason"])
+        self.assertNotIn("never-display", str(journal))
+        projected = MarginBalancer.status_view(self.pair, journal)
+        self.assertIn("错误码 -1021", projected["reason"])
+        self.ready()
+        restarted = MarginBalancer(self.engine).tick(self.pair, snapshots)
+        self.assertIn("HTTP 400", restarted["reason"])
+        self.assertEqual(len(self.transfers), 1)
+        self.refresh_error = None
+        self.ready()
+        final = self.balancer.tick(self.pair, snapshots)
+        self.assertIsNone(final["pending"])
+        self.assertEqual(len(self.transfers), 1)
+        self.assertNotIn("blocked_reason", self.state())
+
+    def test_read_error_detail_identifies_safe_categories_and_ignores_raw_content(self):
+        for error, expected in (
+            (ExchangeError("Aster 网络连接失败"), "网络连接失败"),
+            (ExchangeError("Aster 返回无法识别的响应", http_status=502), "响应格式无法识别；HTTP 502"),
+            (ExchangeError("remote credentials", code="secret", http_status=True),
+             "未返回可识别的错误类别或错误码"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(MarginBalancer._read_error_detail(error), expected)
+
     def test_acknowledged_requires_both_post_response_snapshots(self):
         snapshots = self.live()
         original = self.brokers["short"].snapshot

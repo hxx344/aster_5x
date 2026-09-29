@@ -624,17 +624,33 @@ class MarginBalancer:
             # Local validation messages are fixed strings; remote error bodies
             # and credential values never enter durable state or the dashboard.
             notice = api_wait_notice(exc)
+            detail = self._read_error_detail(exc) if isinstance(exc, ExchangeError) else None
             reason = (notice["text"] if notice else
-                "Aster 划转只读检查失败，系统将重试账户或流水查询；核实前不开始新开仓或新划转" if isinstance(exc, ExchangeError) else str(exc))
+                f"Aster 划转只读检查失败（{detail}），系统将重试账户或流水查询；核实前不开始新开仓或新划转"
+                if isinstance(exc, ExchangeError) else str(exc))
             state = self._record_failure(pair, state, reason, exc=exc)
             if (isinstance(exc, ExchangeError) and isinstance(state.get("pending"), dict)
                     and state["pending"].get("status") == "acknowledged"):
                 reason = "交易所已确认划转，但两侧余额尚未完成刷新；继续只读重试，不重新划转" + (
-                    "；" + notice["text"] if notice else "")
+                    "；最近反馈：" + (notice["text"] if notice else detail))
             return self._view(state, config, self._failure_status(state), reason, blocks=True)
         except Exception:
             state = self._record_failure(pair, state, "保证金日志或账户读取失败，禁止新划转")
             return self._view(state, config, self._failure_status(state), "保证金日志或账户读取失败，禁止新划转", blocks=True)
+
+    @staticmethod
+    def _read_error_detail(exc):
+        """Keep useful read diagnostics without publishing remote response text."""
+        details = []
+        if str(exc) == "Aster 网络连接失败":
+            details.append("网络连接失败")
+        elif str(exc).startswith("Aster 返回无法识别的响应"):
+            details.append("响应格式无法识别")
+        if type(exc.http_status) is int and 100 <= exc.http_status <= 599:
+            details.append(f"HTTP {exc.http_status}")
+        if type(exc.code) is int and -1000000 <= exc.code < 0:
+            details.append(f"错误码 {exc.code}")
+        return "；".join(details) or "未返回可识别的错误类别或错误码"
 
     @staticmethod
     def _failure_status(state):

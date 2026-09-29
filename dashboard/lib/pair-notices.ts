@@ -2,6 +2,7 @@ import {
   pairDataFresh,
   pairHasPending,
   pairPhaseLabel,
+  pairTransferStatus,
   type PairApiNotice,
   type Pair,
 } from './pairs.ts';
@@ -78,13 +79,39 @@ export function pairStatusNotices(
     );
   }
   if (pairHasPending(pair)) {
-    const reason = pair.state?.reason || pair.pause_reason;
+    const pendingOrder = pair.state?.pending;
+    const transfer = pair.state?.margin?.pending;
+    const trackedTransfer =
+      !(pendingOrder && Object.keys(pendingOrder).length) &&
+      transfer &&
+      typeof transfer.request_id === 'string' &&
+      transfer.request_id.trim() &&
+      ['submitting', 'accepted', 'acknowledged', 'unknown'].includes(
+        transfer.status,
+      )
+        ? transfer
+        : null;
+    const reason =
+      (trackedTransfer ? pair.state?.margin?.reason : undefined) ||
+      pair.state?.reason ||
+      pair.pause_reason;
     const apiReason =
       reason === pairApiNotice?.text || reason === marginApiNotice?.text;
-    add(
-      'execution',
-      `${pairPhaseLabel(pair.state?.phase)}${reason && !apiReason ? ` · ${reason}` : ''}`,
-    );
+    const label = trackedTransfer
+      ? pairTransferStatus(trackedTransfer)
+      : pairPhaseLabel(pair.state?.phase);
+    const text = `${label}${reason && !apiReason ? ` · ${reason}` : ''}`;
+    if (trackedTransfer) {
+      // A retry countdown is still the same transfer and stage. Its current
+      // text may change without creating another event or hiding other intents.
+      notices.push({
+        key: `execution:margin:${JSON.stringify([trackedTransfer.request_id, trackedTransfer.status])}`,
+        kind: 'execution',
+        text,
+      });
+    } else {
+      add('execution', text);
+    }
   }
   for (const [source, notice] of [
     ['pair', pairApiNotice],

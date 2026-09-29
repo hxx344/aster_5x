@@ -317,6 +317,101 @@ test('API countdown updates keep one full latest message and count only real rea
   );
 });
 
+test('one transfer stage retains a single notice through countdown and retry changes', () => {
+  let history;
+  const reasons = [
+    '等待下一次划转只读核对（本次检查时剩余约 4 秒）',
+    '等待下一次划转只读核对（本次检查时剩余约 3 秒）',
+    '交易所已确认划转，但余额刷新失败（HTTP 502）',
+    '等待下一次划转只读核对（本次检查时剩余约 2 秒）',
+    '等待下一次划转只读核对（本次检查时剩余约 1 秒）',
+  ];
+  for (let index = 0; index < reasons.length; index++) {
+    const notices = pairStatusNotices(
+      pair({
+        phase: 'margin_wait',
+        reason: '旧的普通开仓条件，不应覆盖划转诊断',
+        margin: {
+          pending: { request_id: 'transfer-one', status: 'acknowledged' },
+          reason: reasons[index],
+        },
+      }),
+      100 + index,
+    );
+    history = recordPairNotices(history, notices, 100 + index);
+    assert.equal(history.entries.length, 1);
+    assert.equal(history.entries[0].occurrences, 1);
+    assert.equal(history.entries[0].firstSeen, 100);
+    assert.equal(history.entries[0].lastSeen, 100 + index);
+    assert.equal(
+      history.entries[0].text,
+      `交易所已确认 · 等待余额刷新 · ${reasons[index]}`,
+    );
+  }
+  const recovered = recordPairNotices(history, [], 105);
+  assert.equal(recovered.entries.length, 1);
+  assert.deepEqual(recovered.activeKeys, []);
+});
+
+test('different transfers and stages remain distinct and recurrence increments once', () => {
+  const observe = (request_id, status) =>
+    pairStatusNotices(
+      pair({
+        phase: 'margin_wait',
+        margin: { pending: { request_id, status }, reason: '同一段核对说明' },
+      }),
+      100,
+    );
+  const first = observe('transfer-one', 'accepted');
+  const refreshed = observe('transfer-one', 'acknowledged');
+  const second = observe('transfer-two', 'acknowledged');
+  let history = recordPairNotices(undefined, first, 100);
+  history = recordPairNotices(history, refreshed, 101);
+  history = recordPairNotices(history, second, 102);
+  assert.equal(history.entries.length, 3);
+  assert.equal(new Set(history.entries.map(({ key }) => key)).size, 3);
+  history = recordPairNotices(history, [], 103);
+  history = recordPairNotices(history, second, 104);
+  assert.equal(history.entries[0].occurrences, 2);
+  assert.equal(history.entries[0].firstSeen, 102);
+});
+
+test('a pending order keeps its own reason when a transfer is also present', () => {
+  const notices = pairStatusNotices(
+    pair({
+      phase: 'reconciling',
+      reason: '订单查询尚未完成',
+      pending: { id: 'order-one' },
+      margin: {
+        pending: { request_id: 'transfer-one', status: 'acknowledged' },
+        reason: '划转余额刷新等待',
+      },
+    }),
+    100,
+  );
+  assert.equal(notices[0].text, '订单结果核对中 · 订单查询尚未完成');
+  assert.ok(!notices[0].key.startsWith('execution:margin:'));
+});
+
+test('transfer API waits remain separate from the stable transfer stage', () => {
+  const text = '本地执行 API 请求权重预算不足';
+  const notices = pairStatusNotices(
+    pair({
+      phase: 'margin_wait',
+      margin: {
+        pending: { request_id: 'transfer-one', status: 'acknowledged' },
+        reason: text,
+        api_notice: { kind: 'budget', text },
+      },
+    }),
+    100,
+  );
+  assert.equal(notices.length, 2);
+  assert.equal(notices[0].text, '交易所已确认 · 等待余额刷新');
+  assert.equal(notices[1].key, 'api:margin:budget');
+  assert.equal(notices[1].text, text);
+});
+
 test('continuous polling and repeated StrictMode updates count one occurrence', () => {
   const warning = notice('虚构结果待核对');
   const first = recordPairNotices(undefined, [warning], 100);

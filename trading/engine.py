@@ -644,6 +644,22 @@ class Engine:
                     targets.setdefault(symbol, set()).add(leverage)
         return targets
 
+    @staticmethod
+    def _pair_cycle_daily_target_reached(pair, runtime):
+        """Yield this consumer's fast feed only for confirmed two-sided totals."""
+        if runtime.get("volume_unknown"):
+            return False
+        try:
+            limit = positive(pair["cycle"]["daily_volume_limit"], True)
+            if not limit:
+                return False
+            # Recompute from the durable ledger: midnight, corrected totals or
+            # a larger/disabled limit must restore demand without a saved latch.
+            used = runtime.get("daily_volume", {}).get(utc_day()[0], {})
+            return all(positive(used.get(side), True) >= limit for side in ("long", "short"))
+        except (TradingError, AttributeError, KeyError, TypeError):
+            return False
+
     def fast_capacity_targets(self, accounts, pairs=None):
         """Share one feed per symbol across ordinary 5x and cycle leverage tiers."""
         targets = self.cycle_capacity_targets(accounts)
@@ -667,6 +683,8 @@ class Engine:
             if any(member is None or not self.live_allowed(member) for member in members):
                 continue
             if pair["cycle"]["enabled"]:
+                if self._pair_cycle_daily_target_reached(pair, runtime):
+                    continue
                 # The cycle config's leverage is a legacy default. Orders use
                 # both members' actual leverage; sample that same tier only.
                 snapshots = (runtime.get("snapshots", {})

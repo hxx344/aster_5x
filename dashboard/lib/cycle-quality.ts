@@ -12,6 +12,8 @@ export type CycleExecutionEstimate = {
 
 export type CycleExecutionQuality = {
   version: 1;
+  scope?: 'pair';
+  pair_id?: string;
   intent_id: string;
   symbol: string;
   phase: 'open' | 'close';
@@ -31,6 +33,19 @@ export type CycleExecutionQuality = {
     final_check_to_request_ms: number | null;
     request_to_response_ms: number | null;
     request_status: 'returned' | 'failed' | 'not_sent' | 'unknown';
+    legs?: Partial<
+      Record<
+        'long' | 'short',
+        {
+          account_id?: string;
+          request_status?: 'returned' | 'failed' | 'not_sent' | 'unknown';
+          request_started_at?: number | null;
+          response_received_at?: number | null;
+          request_to_response_ms?: number | null;
+          transport?: { http_ms?: number | null };
+        }
+      >
+    >;
     database?: {
       lock_wait_ms: number | null;
       connection_ms: number | null;
@@ -265,6 +280,7 @@ export function cycleExecutionQualityView(
   const knownTrigger = wsTrigger || triggerSource === 'poll';
   const timing = quality.timing;
   return {
+    paired: quality.scope === 'pair',
     intentId: text(quality.intent_id),
     symbol: text(quality.symbol, '品种未记录'),
     phase:
@@ -322,7 +338,10 @@ export function cycleExecutionQualityView(
         ),
       },
       {
-        label: '请求开始 → 收到响应',
+        label:
+          quality.scope === 'pair'
+            ? '首个请求开始 → 双侧调用返回'
+            : '请求开始 → 收到响应',
         value:
           timing?.request_status === 'returned'
             ? duration(
@@ -333,6 +352,32 @@ export function cycleExecutionQualityView(
             : '—',
       },
     ],
+    legs:
+      quality.scope === 'pair'
+        ? (['long', 'short'] as const).map((key) => {
+            const leg = timing?.legs?.[key];
+            return {
+              key,
+              label: key === 'long' ? 'A 多账户' : 'B 空账户',
+              accountId: text(leg?.account_id),
+              status: mappedText(REQUEST_STATUS, leg?.request_status, '未记录'),
+              duration:
+                leg?.request_status === 'returned'
+                  ? duration(
+                      leg.request_to_response_ms,
+                      leg.request_started_at,
+                      leg.response_received_at,
+                    )
+                  : '—',
+              http: observedDuration(leg?.transport?.http_ms),
+              startedAt: cycleQualityTime(leg?.request_started_at),
+              finishedAt:
+                leg?.request_status === 'returned'
+                  ? cycleQualityTime(leg.response_received_at)
+                  : '—',
+            };
+          })
+        : [],
     preSubmit: PRE_SUBMIT_STAGES.map(([key, label]) => {
       const value = timing?.pre_submit?.[key];
       return {

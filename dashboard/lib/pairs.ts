@@ -1,4 +1,8 @@
 import type { Account } from './desk-types';
+import type {
+  CycleExecutionQuality,
+  CycleQualityHistory,
+} from './cycle-quality';
 import {
   cycleDraft,
   parseCycleDraft,
@@ -70,6 +74,8 @@ export type Pair = {
     cooldown_seconds: number;
   };
   state?: {
+    execution_quality?: CycleExecutionQuality | null;
+    execution_quality_history?: CycleQualityHistory | null;
     phase?: string;
     reason?: string;
     api_notice?: PairApiNotice | null;

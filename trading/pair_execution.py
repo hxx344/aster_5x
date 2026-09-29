@@ -17,6 +17,7 @@ from .paper import PaperOrderAbsent
 from .pair_planning import (SYMBOL, SIDES, PairPositionError, PairRecoveryConflict, positions, require_quantities,
                             plan_ordinary, plan_paired_cycle, ordinary_upgrade)
 from .store import dumps
+from . import pair_quality
 
 
 def empty_progress(owned=None, completed=0):
@@ -93,6 +94,7 @@ class PairTrader:
     def _save(self, pair, state):
         state["updated_at"] = time.time()
         self.store.put("pair_runtime:" + pair["id"], self._durable(state))
+        pair_quality.record(self.store, pair["id"], state.get("pending"))
 
     @staticmethod
     def _durable(state):
@@ -316,7 +318,7 @@ class PairTrader:
                 remaining = self._daily_remaining(pair, state) if not holding else None
                 plan = plan_paired_cycle(pair, snapshots, book, depth, rule, state["progress"],
                                          capacity=capacity, daily_remaining=remaining, paused=not pair["enabled"])
-                self._start(pair, state, brokers, snapshots, guards, plan, kind="cycle")
+                self._start(pair, state, brokers, snapshots, guards, plan, kind="cycle", quality_depth=depth)
             elif pair["ordinary"]["enabled"]:
                 capacities = self.engine.capacities(SYMBOL)
                 target = ordinary_upgrade(pair, snapshots, book, capacities)
@@ -356,7 +358,7 @@ class PairTrader:
         used = state.get("daily_volume", {}).get(date, {})
         return {key: wire(max(dec(0), limit - dec(used.get(key, "0")))) for key, _ in SIDES}
 
-    def _start(self, pair, state, brokers, snapshots, guards, plan, *, kind):
+    def _start(self, pair, state, brokers, snapshots, guards, plan, *, kind, quality_depth=None):
         opening = plan.phase == "open"
         identities = state["identities"]
         self._config_guard(pair, identities, opening=opening)
@@ -377,6 +379,7 @@ class PairTrader:
                    "identities": deepcopy(identities), "created_at": time.time(), "quantity": wire(plan.qty),
                    "before": before, "target": target, "leverage": plan.leverage, "legs": legs,
                    "repairs": [], "repair_attempts": 0, "config": {**pair["cycle"], "leverage": plan.leverage}}
+        pair_quality.prepare(pending, pair["id"], quality_depth)
         state.update(pending=pending, phase="submitting", reason="并行提交两个子账户的市价单")
         self._save(pair, state)
         try:
@@ -388,9 +391,11 @@ class PairTrader:
             if kind == "cycle":
                 capacity = self.engine.require_cycle_open_capacity(pair["cycle"], plan.leverage,
                     minimum_notional=plan.capacity_notional or 0) if opening else None
-                latest = plan_paired_cycle(pair, snapshots, book, self.engine.cycle_depth(SYMBOL), self.market.rules[SYMBOL],
+                depth = self.engine.cycle_depth(SYMBOL)
+                latest = plan_paired_cycle(pair, snapshots, book, depth, self.market.rules[SYMBOL],
                                            state["progress"], capacity=capacity, daily_remaining=self._daily_remaining(pair, state) if opening else None,
                                            paused=not pair["enabled"])
+                pair_quality.prepare(pending, pair["id"], depth, final=True)
             else:
                 latest = plan_ordinary(pair, snapshots, book, self.market.rules[SYMBOL], self.engine.capacities(SYMBOL))
             if latest.phase != plan.phase or latest.qty < plan.qty or latest.leverage != plan.leverage:
@@ -414,6 +419,11 @@ class PairTrader:
                 "avgPrice": "0", "reject_reason": reason, "local_not_sent": local}
 
     def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False):
+        observe = state["pending"]["kind"] == "cycle" and legs is state["pending"]["legs"]
+        quality_clocks = {}
+        # Workers observe separate objects so a runtime commit cannot serialize
+        # a leg while another thread is adding its timing metadata.
+        observations = {leg["key"]: {"key": leg["key"]} for leg in legs} if observe else {}
         # A crash between this commit and HTTP leaves an uncertain request, not
         # permission to repeat it. Each leg retains its own durable client ID.
         for leg in legs:
@@ -431,7 +441,7 @@ class PairTrader:
                     except TradingError as exc:
                         raise RequestNotSent(str(exc)) from None
                 budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
-                with budget:
+                with budget, pair_quality.observe(observations.get(leg["key"]), quality_clocks, observe):
                     result = (broker.submit([order], timeout=3) if isinstance(broker, LiveBroker)
                               else broker.submit([order]))
                 if not isinstance(result, list) or len(result) != 1:
@@ -453,10 +463,14 @@ class PairTrader:
                 return None, str(exc) if isinstance(exc, TradingError) else "订单结果未知，继续按客户端订单号核对"
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
             futures = [(leg, pool.submit(send, leg)) for leg in legs]
-            for leg, future in futures:
+            for index, (leg, future) in enumerate(futures):
                 receipt, error = future.result()
                 leg["receipt"], leg["error"] = receipt, error
                 leg["submit_error"] = error or (receipt or {}).get("reject_reason")
+                if observe and "execution_timing" in observations[leg["key"]]:
+                    leg["execution_timing"] = observations[leg["key"]]["execution_timing"]
+                if observe and index == len(futures) - 1:
+                    pair_quality.complete(state["pending"], quality_clocks)
                 self._save(pair, state)
 
     def _legacy_notional_rejection(self, pending, leg, exc):
@@ -675,6 +689,7 @@ class PairTrader:
         # Publish only after the history and lifecycle transaction commits.
         published.clear()
         published.update(state)
+        pair_quality.record(self.store, pair["id"], pending)
 
     @staticmethod
     def _account_volume(state, pending):

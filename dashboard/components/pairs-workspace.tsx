@@ -23,6 +23,7 @@ import { PairNotices } from '@/components/pair-notices';
 import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
 import { PairOrderRecovery } from '@/components/pair-order-recovery';
 import { PairBaselineRecovery } from '@/components/pair-baseline-recovery';
+import { CycleQualityHistoryPanel } from '@/components/cycle-quality-history';
 import {
   clearPastPairNotices,
   pairScheduledMarginWait,
@@ -659,6 +660,17 @@ function PairDetail({
           </div>
         </dl>
       </section>
+      <details className="disclosure panel">
+        <summary>配对循环成交质量</summary>
+        <CycleQualityHistoryPanel
+          key={pair.id}
+          scope="pair"
+          accountName={`配对组 · ${pair.name}`}
+          quality={pair.state?.execution_quality}
+          history={pair.state?.execution_quality_history}
+          stale={!pairDataFresh(pair.state?.updated_at, now, offline)}
+        />
+      </details>
       <details className="disclosure panel">
         <summary>配对执行记录</summary>
         <ExecutionEvents

@@ -13,11 +13,13 @@ export function CycleQualityHistoryPanel({
   quality,
   accountName,
   stale,
+  scope,
 }: {
   history?: CycleQualityHistory | null;
   quality?: CycleExecutionQuality | null;
   accountName: string;
   stale: boolean;
+  scope?: 'pair';
 }) {
   const [selection, setSelection] = useState('');
   const group = cycleQualityHistoryGroup(history, selection, quality);
@@ -29,9 +31,16 @@ export function CycleQualityHistoryPanel({
           <span>{accountName}</span>
         </div>
         <p className="cycle-quality-note">
-          按“请求开始 →
-          收到响应”耗时排名，最短为最佳、最长为最差。每个品种的开仓、平仓分别统计，排名不代表成交价差优劣。
+          {scope === 'pair'
+            ? '按“首个请求开始 → 双侧调用返回”耗时排名；两侧并行耗时不相加。'
+            : '按“请求开始 → 收到响应”耗时排名。'}
+          最短为最佳、最长为最差。每个品种的开仓、平仓分别统计，排名不代表成交价差优劣。
         </p>
+        {scope === 'pair' ? (
+          <p className="cycle-quality-note">
+            仅统计当前配对组的原始循环批次。旧批次可显示已保存的成交回执，未采集的请求耗时和盘口估计显示“—”，不补造排名。
+          </p>
+        ) : null}
         {stale ? (
           <p className="cycle-quality-notice amber">
             状态数据已过期或连接异常，以下为最近记录。

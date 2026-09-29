@@ -98,6 +98,26 @@ export function CycleExecutionQualityPanel({
           <p className="cycle-quality-note">
             请求开始为本地调用边界；耗时包含本地处理与网络往返，不代表交易所撮合延迟。
           </p>
+          {view.paired ? (
+            <section
+              className="cycle-quality-stage"
+              aria-label="配对组双侧请求耗时"
+            >
+              <h4>A / B 两侧请求</h4>
+              <dl className="cycle-quality-fields">
+                {view.legs.map((leg) => (
+                  <div key={leg.key}>
+                    <dt>
+                      {leg.label} · {leg.accountId}
+                    </dt>
+                    <dd>
+                      {leg.duration} ms · {leg.status}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          ) : null}
           <details className="cycle-quality-details">
             <summary>盘口、成交与响应明细</summary>
             <div className="cycle-quality-detail-body">
@@ -235,6 +255,27 @@ export function CycleExecutionQualityPanel({
                     <dd>{view.responseReceivedAt}</dd>
                   </div>
                 </dl>
+                {view.legs.map((leg) => (
+                  <section className="cycle-quality-stage" key={leg.key}>
+                    <h4>
+                      {leg.label} · {leg.accountId}
+                    </h4>
+                    <dl className="cycle-quality-fields">
+                      <div>
+                        <dt>请求开始</dt>
+                        <dd>{leg.startedAt}</dd>
+                      </div>
+                      <div>
+                        <dt>收到响应</dt>
+                        <dd>{leg.finishedAt}</dd>
+                      </div>
+                      <div>
+                        <dt>HTTP 调用（含连接处理）</dt>
+                        <dd>{leg.http} ms</dd>
+                      </div>
+                    </dl>
+                  </section>
+                ))}
               </section>
             </div>
           </details>

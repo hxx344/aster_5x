@@ -464,6 +464,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
               <TabsContent value="records">
                 <RecordsWorkspace
                   account={account}
+                  pair={binding}
                   events={events}
                   now={serverNow}
                   stale={stale}

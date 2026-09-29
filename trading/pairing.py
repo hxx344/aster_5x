@@ -442,6 +442,7 @@ class PairManager:
             self._changed(pair)
 
     def states(self, reader=None):
+        from .pair_quality import read as read_quality
         from .margin_balance import MarginBalancer
         reader = reader or self.store
         rows = []
@@ -452,6 +453,7 @@ class PairManager:
                      "updated_at": None, "snapshots": {}, "progress": None, "pending": None, **runtime}
             state["margin"] = MarginBalancer.status_view(pair,
                 reader.get("pair_margin:" + pair["id"], {}), state.get("margin"))
+            state.update(read_quality(reader, pair["id"], runtime))
             rows.append({**pair, "state": state})
         return rows
 

@@ -5,13 +5,16 @@ import { ExecutionEvents } from '@/components/execution-events';
 import { CycleQualityHistoryPanel } from '@/components/cycle-quality-history';
 import type { Account } from '@/lib/desk-types';
 import type { ExecutionEvent } from '@/lib/cycle-events';
+import type { Pair } from '@/lib/pairs';
 export function RecordsWorkspace({
   account,
+  pair,
   events,
   now,
   stale,
 }: {
   account: Account;
+  pair?: Pair;
   events: ExecutionEvent[];
   now: number;
   stale: boolean;
@@ -40,10 +43,19 @@ export function RecordsWorkspace({
       </TabsContent>
       <TabsContent value="quality">
         <CycleQualityHistoryPanel
-          key={account.id}
-          accountName={account.name}
-          quality={account.cycle_state?.execution_quality}
-          history={account.cycle_state?.execution_quality_history}
+          key={pair ? `pair:${pair.id}` : account.id}
+          accountName={pair ? `配对组 ${pair.name}` : account.name}
+          scope={pair ? 'pair' : undefined}
+          quality={
+            pair
+              ? pair.state?.execution_quality
+              : account.cycle_state?.execution_quality
+          }
+          history={
+            pair
+              ? pair.state?.execution_quality_history
+              : account.cycle_state?.execution_quality_history
+          }
           stale={stale}
         />
       </TabsContent>

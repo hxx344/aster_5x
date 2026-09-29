@@ -50,6 +50,55 @@ const quality = {
   },
 };
 
+test('paired quality uses the measured parallel span and preserves per-side clocks', () => {
+  const paired = {
+    ...quality,
+    scope: 'pair',
+    pair_id: 'gold',
+    timing: {
+      ...quality.timing,
+      legs: {
+        long: {
+          ...quality.timing,
+          account_id: 'a',
+          request_to_response_ms: 80,
+          transport: { http_ms: 65 },
+        },
+        short: {
+          ...quality.timing,
+          account_id: 'b',
+          request_to_response_ms: 90,
+        },
+      },
+    },
+  };
+  const view = cycleExecutionQualityView(paired);
+  assert.equal(view.paired, true);
+  assert.equal(view.timing[2].value, '100.003');
+  assert.equal(view.timing[2].label, '首个请求开始 → 双侧调用返回');
+  assert.deepEqual(
+    view.legs.map((leg) => [leg.accountId, leg.duration, leg.http]),
+    [
+      ['a', '80', '65'],
+      ['b', '90', '—'],
+    ],
+  );
+  paired.timing.legs.long.request_status = 'failed';
+  paired.timing.legs.short.response_received_at = started - 1;
+  assert.deepEqual(
+    cycleExecutionQualityView(paired).legs.map((leg) => leg.duration),
+    ['—', '—'],
+  );
+  assert.deepEqual(
+    cycleExecutionQualityView({ ...quality, scope: 'pair' }).legs.map(
+      (leg) => leg.duration,
+    ),
+    ['—', '—'],
+  );
+  assert.equal(cycleExecutionQualityView(quality).paired, false);
+  assert.deepEqual(cycleExecutionQualityView(quality).legs, []);
+});
+
 test('history selection follows the latest group, supports other phases and safely switches accounts', () => {
   const open = {
     symbol: 'XAUUSD1',

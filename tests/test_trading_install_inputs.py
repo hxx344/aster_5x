@@ -71,6 +71,17 @@ class TradingInstallInputTests(unittest.TestCase):
         self.assertEqual(service[:3], asset[:3])
         self.assertNotEqual(service[3], asset[3])
 
+    def test_feishu_configuration_helper_changes_only_the_release(self):
+        before = self.keys()
+        self.write('deploy/configure-feishu.py', 'configuration helper')
+        added = self.keys()
+        self.assertEqual(added[:3], before[:3])
+        self.assertNotEqual(added[3], before[3])
+        self.write('deploy/configure-feishu.py', 'updated configuration helper')
+        changed = self.keys()
+        self.assertEqual(changed[:3], added[:3])
+        self.assertNotEqual(changed[3], added[3])
+
 
 if __name__ == '__main__':
     unittest.main()

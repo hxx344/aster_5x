@@ -2,6 +2,7 @@
 import { useState } from 'react';
 import type { DeskAction, Listings, State } from '@/lib/desk-types';
 import { fmt } from '@/lib/desk-format';
+import { notificationChannel } from '@/lib/notification-channels';
 import {
   Table,
   TableBody,
@@ -75,6 +76,7 @@ export function ListingsPanel({
     (listings?.discovery_enabled !== false && catalogStale);
   const watched = new Set(listings?.watched_symbols ?? []);
   const controls = new Map(monitoring?.symbols.map((row) => [row.symbol, row]));
+  const eventChannel = notificationChannel(notification, 'event');
   return (
     <section className="panel listings-panel">
       <div className="section-head">
@@ -100,13 +102,13 @@ export function ListingsPanel({
           &gt; 0
           时提醒一次，持续有额度不重复；归零后恢复、最大杠杆变化或重新勾选时再次提醒。无需启动账户。
         </p>
-        <p className={notification?.error ? 'amber' : 'muted'}>
+        <p className={eventChannel.error ? 'amber' : 'muted'}>
           {notification?.enabled === false
             ? '飞书告警已关闭，可在「监控与告警」开启'
-            : notification?.error ||
-              (notification?.configured
-                ? `飞书已配置${notification.pending ? ` · ${notification.pending} 条通知待发送` : ''}`
-                : '飞书未配置，请在服务器配置 FEISHU_WEBHOOK_URL')}{' '}
+            : eventChannel.error ||
+              (eventChannel.configured
+                ? `事件机器人已配置${eventChannel.pending ? ` · ${eventChannel.pending} 条事件待发送` : ''}`
+                : '事件机器人未配置，请在「监控与告警」查看配置说明')}{' '}
           · 公开额度随市场变化，不代表账户实际可开额度。
         </p>
         <p className={catalogStale ? 'amber' : 'muted'}>

@@ -11,6 +11,7 @@ import logging
 import math
 from logging.handlers import RotatingFileHandler
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -141,7 +142,26 @@ def load_config():
     return validate_config(config)
 
 
-def validate_config(config):
+def validate_feishu_webhook(webhook):
+    try:
+        u = urlparse(webhook)
+        valid = (isinstance(webhook, str) and u.scheme == "https" and u.netloc == "open.feishu.cn"
+                 and re.fullmatch(r"/open-apis/bot/v2/hook/[A-Za-z0-9_-]{1,256}", u.path)
+                 and not any(ord(char) < 33 or ord(char) == 127 for char in webhook)
+                 and not u.query and not u.fragment)
+    except (TypeError, ValueError, AttributeError):
+        valid = False
+    if not valid:
+        raise MonitorError("A valid Feishu webhook is required when enabled")
+
+
+def validate_feishu_secret(secret):
+    if (not isinstance(secret, str) or len(secret) > 256
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 or char in "\u2028\u2029" for char in secret)):
+        raise MonitorError("Invalid Feishu signing secret")
+
+
+def validate_config(config, *, environ=None):
     config = config.copy()
     # Old installations could persist the original single-symbol default.
     # Keep their notification settings while adopting the expanded default list.
@@ -168,12 +188,12 @@ def validate_config(config):
         config[key] = float(value)
     if not isinstance(config.get("feishu_enabled"), bool):
         raise MonitorError("feishu_enabled must be true or false")
-    config["webhook"] = os.environ.get("FEISHU_WEBHOOK_URL", config.get("feishu_webhook", ""))
-    config["secret"] = os.environ.get("FEISHU_SIGN_SECRET", config.get("feishu_sign_secret", ""))
+    environ = os.environ if environ is None else environ
+    config["webhook"] = environ.get("FEISHU_WEBHOOK_URL", config.get("feishu_webhook", ""))
+    config["secret"] = environ.get("FEISHU_SIGN_SECRET", config.get("feishu_sign_secret", ""))
     if config["feishu_enabled"]:
-        u = urlparse(config["webhook"])
-        if u.scheme != "https" or u.netloc != "open.feishu.cn" or not u.path.startswith("/open-apis/bot/v2/hook/") or not u.path.rsplit("/", 1)[-1] or u.query or u.fragment:
-            raise MonitorError("A valid Feishu webhook is required when enabled")
+        validate_feishu_webhook(config["webhook"])
+        validate_feishu_secret(config["secret"])
     return config
 
 

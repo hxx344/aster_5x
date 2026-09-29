@@ -4,8 +4,11 @@ case "${1:-status}" in
   status) systemctl --no-pager status aster-desk; curl -fsS http://127.0.0.1:8765/api/health; printf '\n' ;;
   logs) journalctl -u aster-desk -f --no-hostname ;;
   start|stop|restart) systemctl "$1" aster-desk ;;
+  feishu-configure)
+    shift
+    exec /opt/aster-desk/current/.venv/bin/python /opt/aster-desk/current/deploy/configure-feishu.py "$@" ;;
   relay-connect|relay-disconnect)
     action=${1#relay-}; shift
     exec /opt/aster-desk/current/.venv/bin/python /opt/aster-desk/current/deploy/configure-capacity-relay.py "$action" "$@" ;;
-  *) printf 'Usage: sudo aster-desk {status|logs|start|stop|restart|relay-connect|relay-disconnect}\n' >&2; exit 2 ;;
+  *) printf 'Usage: sudo aster-desk {status|logs|start|stop|restart|feishu-configure|relay-connect|relay-disconnect}\n' >&2; exit 2 ;;
 esac

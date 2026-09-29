@@ -38,6 +38,7 @@ import { ListingsPanel } from '@/components/listings-panel';
 import { MonitoringPanel } from '@/components/monitoring-panel';
 import { PairsWorkspace } from '@/components/pairs-workspace';
 import { CapacityRelayPanel } from '@/components/capacity-relay-panel';
+import { notificationOverview } from '@/lib/notification-channels';
 
 export default function Home() {
   const desk = useTradingDesk();
@@ -473,13 +474,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             </Tabs>
             <footer className="footer">
               <span>
-                <Bell size={13} />{' '}
-                {state?.notification.enabled === false
-                  ? '飞书告警已关闭'
-                  : state?.notification.error ||
-                    (state?.notification.configured
-                      ? `飞书已配置${state.notification.pending ? ` · ${state.notification.pending} 条待发送` : ''}`
-                      : '飞书未配置')}
+                <Bell size={13} /> {notificationOverview(state?.notification)}
               </span>
               <span>
                 {state?.accounts.length} 个账户 · 更新{' '}

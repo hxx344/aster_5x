@@ -200,6 +200,12 @@ export type CapacityRelayStatus = {
   };
   samples?: CapacityRelaySample[];
 };
+export type NotificationChannel = {
+  configured: boolean;
+  source: 'dedicated' | 'legacy' | 'none';
+  pending?: number;
+  error?: string | null;
+};
 export type State = {
   demo: boolean;
   ready: boolean;
@@ -216,6 +222,8 @@ export type State = {
     enabled?: boolean;
     pending: number;
     error?: string;
+    routing_mode?: 'legacy' | 'split';
+    channels?: Record<'scheduled' | 'event', NotificationChannel>;
     hourly_summary?: {
       interval_seconds: number;
       next_due_at: number | null;

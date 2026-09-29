@@ -7,6 +7,10 @@ import type {
   State,
 } from '@/lib/desk-types';
 import { isDisplayTimestamp } from '@/lib/display-time';
+import {
+  notificationChannel,
+  notificationOverview,
+} from '@/lib/notification-channels';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -105,21 +109,22 @@ export function MonitoringPanel({
     );
   const settings = monitoring.settings;
   const summary = notification?.hourly_summary;
+  const scheduledChannel = notificationChannel(notification, 'scheduled');
   const summaryAvailable =
     !demo &&
     settings.feishu_enabled &&
     settings.hourly_summary_alerts &&
-    notification?.configured;
+    scheduledChannel.configured;
   const summaryStatus = demo
     ? '模拟环境不发送每小时摘要。'
     : !settings.feishu_enabled
       ? '飞书总开关已关闭，每小时摘要暂停发送。'
       : !settings.hourly_summary_alerts
         ? '每小时摘要已关闭。'
-        : !notification?.configured
-          ? '飞书未配置，每小时摘要不会发送。请在服务器设置 FEISHU_WEBHOOK_URL。'
+        : !scheduledChannel.configured
+          ? '定时机器人未配置或配置无效，每小时摘要暂停发送。'
           : summary?.pending
-            ? notification.error
+            ? scheduledChannel.error
               ? '本小时摘要待发送，通知服务等待重试。'
               : '本小时摘要待发送。'
             : summary?.next_due_at != null
@@ -182,17 +187,50 @@ export function MonitoringPanel({
             ? '模拟环境仅展示设置，不运行独立监控或发送飞书。'
             : !settings.feishu_enabled
               ? '飞书告警已关闭；下方类别和币种选择仍会保存。'
-              : notification?.error ||
-                (notification?.configured
-                  ? `飞书已配置 · ${notification.pending} 条待发送`
-                  : '飞书未配置，请在服务器设置 FEISHU_WEBHOOK_URL。')}
+              : notificationOverview(notification)}
         </output>
+        <div className="monitor-master-grid">
+          {(['scheduled', 'event'] as const).map((key) => {
+            const channel = notificationChannel(notification, key);
+            return (
+              <div className="monitor-setting" key={key}>
+                <div>
+                  <strong>
+                    {key === 'scheduled'
+                      ? '常态化定时机器人'
+                      : '突发事件机器人'}
+                  </strong>
+                  <p>
+                    {key === 'scheduled'
+                      ? '每小时运行摘要'
+                      : 'WS 故障与恢复、上新、额度达标、成交汇总'}
+                  </p>
+                  <p className={channel.error ? 'amber' : 'muted'}>
+                    {channel.error ||
+                      (channel.configured ? '已配置' : '未配置，暂停发送')}
+                    {channel.source === 'legacy' ? ' · 沿用旧机器人' : ''}
+                    {channel.pending != null
+                      ? ` · ${channel.pending} 条待发送`
+                      : ''}
+                  </p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <p className="monitor-status">
+          在主服务器运行 <code>sudo aster-desk feishu-configure</code>{' '}
+          绑定两个机器人。 启用双通道后，未配置的通道不会转发到另一机器人。
+        </p>
       </section>
       <section className="panel">
         <div className="section-head">
           <div>
             <h2>每小时运行摘要</h2>
-            <p>覆盖所有账户与配对组，仅遵循飞书总开关与本摘要开关</p>
+            <p>
+              发送到定时机器人 ·
+              覆盖所有账户与配对组，仅遵循飞书总开关与本摘要开关
+            </p>
           </div>
         </div>
         <div className="monitor-master-grid">
@@ -229,15 +267,16 @@ export function MonitoringPanel({
           onChange={(value) => void save({ relay_health_alerts: value })}
         />
         <p className="monitor-status">
-          每次故障只提醒一次；故障通知送达后，稳定恢复 30 秒再通知恢复。 HTTP
-          补取成功不代表 WS 恢复，单次样本超过 1 秒不会触发此告警。
+          发送到事件机器人。每次故障只提醒一次；故障通知送达后，稳定恢复 30
+          秒再通知恢复。 HTTP 补取成功不代表 WS 恢复，单次样本超过 1
+          秒不会触发此告警。
         </p>
       </section>
       <section className="panel">
         <div className="section-head">
           <div>
-            <h2>飞书通知类型</h2>
-            <p>同时遵循飞书总开关与下方各币种的告警选择</p>
+            <h2>事件通知类型</h2>
+            <p>发送到事件机器人 · 同时遵循飞书总开关与下方各币种的告警选择</p>
           </div>
         </div>
         <div className="monitor-category-grid">

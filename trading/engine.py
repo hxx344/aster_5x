@@ -16,7 +16,7 @@ import time
 import uuid
 
 import monitor
-from . import monitoring
+from . import monitoring, notification_channels
 from .hourly_summary import format_hourly_summary
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
@@ -171,6 +171,7 @@ class Engine:
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
+        self.notification_channel_errors = dict.fromkeys(notification_channels.CHANNELS)
         self.hourly_summary_error = None
         self.relay_health_error = None
         self.capacity_notification_errors = {}
@@ -2180,15 +2181,27 @@ class Engine:
                 self.work(account_id).wake = True
             self.store.event(account_id, "control", "重新核对未完成批次；不重复提交原开仓订单")
 
-    def notification_config(self):
+    def notification_config(self, channel="event"):
         if not self.store.monitoring_settings()["feishu_enabled"]:
             return None
-        webhook = os.environ.get("FEISHU_WEBHOOK_URL", "")
-        if not webhook:
+        selected = notification_channels.credentials(channel)
+        if not selected["webhook"]:
             return None
         base = json.loads((monitor.ROOT / "config.json").read_text(encoding="utf-8"))
-        return monitor.validate_config({**base, "feishu_enabled": True, "feishu_webhook": webhook,
-                                       "feishu_sign_secret": os.environ.get("FEISHU_SIGN_SECRET", "")})
+        return monitor.validate_config({**base, "feishu_enabled": True, "feishu_webhook": selected["webhook"],
+                                       "feishu_sign_secret": selected["secret"]}, environ={})
+
+    def notification_configs(self):
+        configs = {}
+        for channel in notification_channels.CHANNELS:
+            try:
+                configs[channel] = self.notification_config(channel)
+                if configs[channel] is None or self.notification_channel_errors[channel] == "飞书配置无效":
+                    self.notification_channel_errors[channel] = None
+            except (monitor.MonitorError, OSError, ValueError, TypeError, KeyError):
+                configs[channel] = None
+                self.notification_channel_errors[channel] = "飞书配置无效"
+        return configs
 
     def capacity_alert_config(self, notification=None):
         if self.demo:
@@ -2287,66 +2300,60 @@ class Engine:
     def notify(self):
         if self.demo or self.shutdown.is_set():
             return 5
+        configs = self.notification_configs()
+        self.observe_relay_health(configs["event"])
         try:
-            config = self.notification_config()
-            self.observe_relay_health(config)
+            now = time.time()
+            token = self.store.hourly_summary_due(available=bool(configs["scheduled"]), now=now)
+            if token is not None:
+                message = format_hourly_summary(self.state(background_reports=True, compact=True), now)
+                if not self.shutdown.is_set() and self.notification_config("scheduled") == configs["scheduled"]:
+                    self.store.enqueue_hourly_summary(token, message)
+            self.hourly_summary_error = None
+        except Exception:
+            self.hourly_summary_error = "每小时摘要生成失败，等待重试"
+            LOG.exception("Hourly summary generation failed")
+        capacity_sent = 0
+        available = {channel for channel, config in configs.items() if config is not None}
+        for item in self.store.due_notifications(channels=available):
+            if self.shutdown.is_set():
+                break
+            channel = notification_channels.for_item(item)
             try:
-                now = time.time()
-                token = self.store.hourly_summary_due(available=bool(config), now=now)
-                if token is not None:
-                    message = format_hourly_summary(self.state(background_reports=True, compact=True), now)
-                    if not self.shutdown.is_set() and self.notification_config() == config:
-                        self.store.enqueue_hourly_summary(token, message)
-                self.hourly_summary_error = None
-            except Exception:
-                # A failed local report must not delay unrelated outbox delivery.
-                self.hourly_summary_error = "每小时摘要生成失败，等待重试"
-                LOG.exception("Hourly summary generation failed")
-            if not config:
-                return 5
-            try:
-                capacity_policy = self.capacity_alert_config(config)
-                with self.lock:
-                    self.capacity_notification_errors.pop("config", None)
-            except (TradingError, ValueError, TypeError):
-                capacity_policy = None
-                with self.lock:
-                    self.capacity_notification_errors["config"] = "额度提醒配置无效；成交汇总继续发送"
-            capacity_sent = 0
-            for item in self.store.due_notifications():
-                if self.shutdown.is_set():
-                    break
-                if item.get("category") == "relay_health":
-                    current_config = self.notification_config()
-                    if not self.observe_relay_health(current_config) or current_config != config:
-                        continue
-                # Re-read after earlier sends: a capacity value may have changed
-                # or expired while another webhook request was in flight.
-                item = self.store.notification_for_delivery(item["id"])
-                if item is None:
-                    continue
-                if item.get("capacity_key"):
-                    # Settings may change while an earlier Feishu request is in flight.
-                    try:
-                        capacity_policy = self.capacity_alert_config(config)
-                    except (TradingError, ValueError, TypeError):
-                        capacity_policy = None
-                        with self.lock:
-                            self.capacity_notification_errors["config"] = "额度提醒配置无效；成交汇总继续发送"
-                    symbol = item["capacity_key"].split(":")[1]
-                    market_policy = capacity_policy["markets"].get(symbol) if capacity_policy else None
-                    if market_policy is None or item.get("capacity_identity") != market_policy["identity"] or capacity_sent >= 2:
-                        continue
-                    capacity_sent += 1
+                config = self.notification_config(channel)
+            except (monitor.MonitorError, OSError, ValueError, TypeError, KeyError):
+                self.notification_channel_errors[channel] = "飞书配置无效"
+                continue
+            if not config or config != configs[channel]:
+                continue
+            if item.get("category") == "relay_health" and not self.observe_relay_health(config):
+                continue
+            # Re-read validity after preceding network calls and setting changes.
+            item = self.store.notification_for_delivery(item["id"])
+            if item is None:
+                continue
+            if item.get("capacity_key"):
                 try:
-                    monitor.send_feishu(config, item["message"])
-                    self.store.notification_result(item, True)
-                    self.notification_error = None
-                except monitor.MonitorError:
-                    self.store.notification_result(item, False)
-                    self.notification_error = "飞书发送失败，等待重试"
-        except monitor.MonitorError:
-            self.notification_error = "飞书配置无效"
+                    capacity_policy = self.capacity_alert_config(config)
+                    with self.lock:
+                        self.capacity_notification_errors.pop("config", None)
+                except (TradingError, ValueError, TypeError):
+                    capacity_policy = None
+                    with self.lock:
+                        self.capacity_notification_errors["config"] = "额度提醒配置无效；成交汇总继续发送"
+                symbol = item["capacity_key"].split(":")[1]
+                market_policy = capacity_policy["markets"].get(symbol) if capacity_policy else None
+                if market_policy is None or item.get("capacity_identity") != market_policy["identity"] or capacity_sent >= 2:
+                    continue
+                capacity_sent += 1
+            try:
+                monitor.send_feishu(config, item["message"])
+                self.store.notification_result(item, True)
+                self.notification_channel_errors[channel] = None
+            except monitor.MonitorError:
+                self.store.notification_result(item, False)
+                self.notification_channel_errors[channel] = "飞书发送失败，等待重试"
+        self.notification_error = next((error for error in self.notification_channel_errors.values() if error), None)
         return 5
 
     def _cycle_report(self, store, account, now):
@@ -2398,15 +2405,22 @@ class Engine:
         # HTTP reads neither wait on the execution writer lock nor calculate
         # history. Synchronous reports remain available to local diagnostics.
         state_now = time.time()
+        channels = notification_channels.public_status({
+            "scheduled": self.notification_channel_errors["scheduled"] or self.hourly_summary_error,
+            "event": self.notification_channel_errors["event"] or self.relay_health_error
+                or next(iter(self.capacity_notification_errors.values()), None)})
         with self.store.read_snapshot() as reader:
             saved_accounts = reader.accounts()
             paired_states = self.pairs.states(reader)
             history_account = next((a["id"] for a in saved_accounts if a["id"] == history_account),
                                    saved_accounts[0]["id"] if saved_accounts else None)
             events = reader.events(account_id=history_account if compact else None)
-            pending_notifications = reader.pending_notifications()
+            pending_channels = reader.pending_notification_channels()
+            pending_notifications = sum(pending_channels.values())
+            for channel, count in pending_channels.items():
+                channels[channel]["pending"] = count
             hourly_summary = reader.hourly_summary_status(
-                available=not self.demo and bool(os.environ.get("FEISHU_WEBHOOK_URL")), now=state_now)
+                available=not self.demo and channels["scheduled"]["configured"], now=state_now)
             listings = reader.get("usd1_listings") or {"initialized": False, "checked_at": None, "rows": {}}
             listings.update(enabled=self.listing_monitor is not None, poll_seconds=LISTING_POLL_SECONDS,
                             stale_seconds=LISTING_STALE_SECONDS, watched_symbols=reader.listing_watch_symbols())
@@ -2573,7 +2587,9 @@ class Engine:
                 "capacity_relay": (self.market.capacity_relay.status() if isinstance(self.market, MarketData)
                                    and self.market.remote_capacity is True else None),
                 "accounts": accounts, "pairs": paired_states, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
-                "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
+                "notification": {"configured": any(channel["configured"] for channel in channels.values()),
+                                 "channels": channels, "routing_mode": notification_channels.routing_mode(),
+                                 "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "hourly_summary": hourly_summary,
                                  "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 

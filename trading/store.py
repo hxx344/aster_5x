@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, relay_health_notifications
+from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -1427,18 +1427,32 @@ class Store:
             item["capacity_generation"] = gate.get("fall_generation", 0)
         return item
 
-    def due_notifications(self):
+    def due_notifications(self, *, channels=None):
+        if channels is not None and not channels:
+            return []
         with self.connect() as db:
             now = time.time()
             rows = db.execute("""SELECT * FROM outbox WHERE delivered_at IS NULL AND due_at<=?
                 AND (expires_at IS NULL OR expires_at>?)
                 ORDER BY (capacity_key IS NOT NULL),due_at,id""", (now, now))
             result = []
+            buckets = {channel: [] for channel in notification_channels.CHANNELS if channels is not None and channel in channels}
             for row in rows:
+                channel = notification_channels.for_item(dict(row)) if channels is not None else None
+                if channels is not None and (channel not in buckets or len(buckets[channel]) >= 5):
+                    continue
                 if (item := self._notification_item(db, row)) is not None:
-                    result.append(item)
-                    if len(result) == 5:
-                        break
+                    if channels is None:
+                        result.append(item)
+                        if len(result) == 5:
+                            break
+                    else:
+                        buckets[channel].append(item)
+                        if all(len(items) >= 5 for items in buckets.values()):
+                            break
+            if channels is not None:
+                # Interleave destinations: a backlog on one cannot starve the other.
+                result = [items[index] for index in range(5) for items in buckets.values() if len(items) > index]
             return result
 
     def notification_for_delivery(self, notification_id):
@@ -1480,10 +1494,18 @@ class Store:
                 db.execute("UPDATE outbox SET attempts=?,due_at=? WHERE id=?", (attempts, now + min(3600, 5 * 2 ** min(attempts, 10)), item["id"]))
 
     def pending_notifications(self):
+        return sum(self.pending_notification_channels().values())
+
+    def pending_notification_channels(self):
         with self.connect() as db:
             config = monitoring.read(db)
             rows = db.execute("SELECT * FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>?)", (time.time(),))
-            return sum(monitoring.message_allowed(db, dict(row), config) for row in rows)
+            counts = dict.fromkeys(notification_channels.CHANNELS, 0)
+            for row in rows:
+                item = dict(row)
+                if monitoring.message_allowed(db, item, config):
+                    counts[notification_channels.for_item(item)] += 1
+            return counts
 
 
 class _StoreSnapshot(Store):

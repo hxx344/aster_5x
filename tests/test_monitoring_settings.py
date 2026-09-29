@@ -319,7 +319,7 @@ class MonitoringAPITests(unittest.TestCase):
         self.login()
         self.assertTrue(self.client.get("/api/monitoring").json()["settings"]["hourly_summary_alerts"])
         with patch("trading.store.time.time", return_value=3500), \
-             patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": "secret-sentinel"}):
+             patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": "https://open.feishu.cn/open-apis/bot/v2/hook/secret-sentinel"}):
             self.store.hourly_summary_due(available=True)
             status = self.client.get("/api/state").json()["notification"]["hourly_summary"]
             self.assertEqual(status, {"interval_seconds": 3600, "next_due_at": 3600, "last_sent_at": None, "pending": False})

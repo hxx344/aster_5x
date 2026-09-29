@@ -849,9 +849,9 @@ class PairMarginTests(unittest.TestCase):
                     result = self.balancer.tick(self.pair, {"long": snapshot(3000), "short": snapshot(1000)})
                     self.assertEqual(result["status"], "waiting", result)
                     now[0] += 5
-            self.assertEqual(sum(weight for _, weight in calls), 924)
+            self.assertEqual(sum(weight for _, weight in calls), 744)
             self.assertEqual(sum(path.endswith("/positionSide/dual") for path, _ in calls), 8)
-            self.assertEqual(sum(path.endswith("/multiAssetsMargin") for path, _ in calls), 8)
+            self.assertEqual(sum(path.endswith("/multiAssetsMargin") for path, _ in calls), 2)
             self.assertEqual(self.transfers, [])
 
             # A mode-changing event evicts the reused modes before the next read.

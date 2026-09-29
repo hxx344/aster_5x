@@ -679,16 +679,27 @@ class MarginBalancer:
             state.update(checked_at=now, next_check_at=now + config["check_interval_seconds"])
             self.store.put("pair_margin:" + pair["id"], state)
             self._check_snapshots(pair, snapshots)
-            if not self._may_need_transfer(snapshots, config):
+            diagnostics = {}
+            may_transfer = self._may_need_transfer(snapshots, config)
+            if may_transfer and members["long"]["mode"] == "live":
+                # An optimistic withdrawal ceiling cannot tighten the existing
+                # per-transfer cap. This local preview can only decline work;
+                # it never authorizes a transfer or substitutes for live limits.
+                may_transfer = self._plan(pair, members, snapshots, config,
+                    dict.fromkeys(members, config["max_transfer"]), diagnostics=diagnostics) is not None
+            if not may_transfer:
                 # No extra account read is needed to decline a transfer. Hot
                 # snapshots remain protected by the caller's account leases;
                 # no result from this precheck can authorize a funds write.
                 for side, snapshot in snapshots.items():
-                    if members[side]["mode"] == "live" and type(getattr(snapshot, "account_read_generation", None)) is int:
+                    guard = (snapshot_guards or {}).get(side)
+                    if callable(guard):
+                        guard()
+                    elif members[side]["mode"] == "live" and type(getattr(snapshot, "account_read_generation", None)) is int:
                         self.engine.broker(members[side]).require_snapshot_current(snapshot)
                     snapshot.require_fresh()
                 self._record_success(pair, state)
-                return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
+                return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
             if members["long"]["mode"] == "paper":
                 diagnostics = {}
                 plan = self._plan(pair, members, snapshots, config,

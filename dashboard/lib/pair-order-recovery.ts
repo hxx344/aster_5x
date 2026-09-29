@@ -184,6 +184,89 @@ function quantities(value: unknown): value is Quantities {
   );
 }
 
+export type PairBaselineReview = {
+  status: 'baseline_review';
+  token: string;
+  pair_id: string;
+  checked_at: number;
+  before: Quantities;
+  actual: Quantities;
+  leverage: number;
+  orders: {
+    batch_id: string;
+    side: 'LONG' | 'SHORT';
+    client_order_id: string;
+    status: string;
+    executed_qty: string | null;
+  }[];
+};
+
+export function pairBaselineRecoveryBlock(pair: Pair): string {
+  if (pair.enabled) return '请先暂停配对组';
+  if (pair.state?.pending) return '请先完成当前待核对批次';
+  if (!pair.state?.recovery_watch) return '当前没有人工归档订单';
+  if (
+    Object.values(pair.state?.progress?.quantities ?? {}).some(
+      (qty) => Number(qty) !== 0,
+    )
+  )
+    return '仍有循环新增仓位，请继续原恢复流程';
+  if (
+    pair.state?.margin?.pending ||
+    ['submitting', 'acknowledged', 'accepted', 'unknown'].includes(
+      pair.state?.margin?.status ?? '',
+    )
+  )
+    return '仍有未决划转，请先完成划转核对';
+  return '';
+}
+
+export function parsePairBaselineReview(
+  data: unknown,
+  pair: Pair,
+): PairBaselineReview {
+  if (
+    !record(data) ||
+    data.status !== 'baseline_review' ||
+    data.pair_id !== pair.id ||
+    typeof data.token !== 'string' ||
+    !/^[a-f0-9]{32}$/.test(data.token) ||
+    typeof data.checked_at !== 'number' ||
+    !Number.isFinite(data.checked_at) ||
+    data.checked_at <= 0 ||
+    typeof data.leverage !== 'number' ||
+    !Number.isInteger(data.leverage) ||
+    data.leverage <= 0 ||
+    !quantities(data.before) ||
+    !quantities(data.actual) ||
+    !Array.isArray(data.orders) ||
+    data.orders.length < 2 ||
+    data.orders.length > 16 ||
+    !data.orders.every(
+      (order) =>
+        record(order) &&
+        typeof order.batch_id === 'string' &&
+        Boolean(order.batch_id) &&
+        (order.side === 'LONG' || order.side === 'SHORT') &&
+        typeof order.client_order_id === 'string' &&
+        Boolean(order.client_order_id) &&
+        ((order.status === 'UNKNOWN' && order.executed_qty === null) ||
+          ([
+            'FILLED',
+            'CANCELED',
+            'REJECTED',
+            'EXPIRED',
+            'EXPIRED_IN_MATCH',
+          ].includes(String(order.status)) &&
+            typeof order.executed_qty === 'string' &&
+            /^0(?:\.0+)?$/.test(order.executed_qty))),
+    ) ||
+    new Set(data.orders.map((order) => order.side)).size !== 2
+  )
+    throw new Error('底仓预览响应不完整或包含未解决成交，请重新核对');
+  return data as PairBaselineReview;
+}
+
 export function parsePairOrderRecovery(
   data: unknown,
   pair: Pair,

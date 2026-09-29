@@ -51,6 +51,7 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
         raise TradingError("人工归档订单跟踪记录无效，禁止新开仓与划转")
     _, current_brokers, identities = PairTrader(engine)._members(pair)
     brokers = current_brokers if brokers is None else brokers
+    evidence = []
     for batch in batches:
         if not isinstance(batch, dict) or batch.get("identities") != identities:
             raise TradingError("人工归档订单的账户身份已变化，禁止新开仓与划转")
@@ -63,12 +64,101 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
             row = _query(brokers[leg["key"]], leg["order"])
             if row is not None and (row["status"] not in TERMINAL or dec(row["executedQty"]) != 0):
                 raise TradingError("已人工归档的原订单出现成交或活动回执，停止新开仓与划转；请核对原订单和实际仓位")
+            evidence.append({"batch_id": batch.get("id"), "side": leg["key"].upper(),
+                "client_order_id": leg["order"]["newClientOrderId"],
+                "status": row["status"] if row is not None else "UNKNOWN",
+                "executed_qty": wire(dec(row["executedQty"])) if row is not None else None})
+    return evidence
 
 
 class PairOrderRecovery:
     def __init__(self, manager):
         self.manager, self.engine, self.store = manager, manager.engine, manager.store
         self.previews = {}
+        self.baseline_previews = {}
+
+    @staticmethod
+    def _baseline_fingerprint(pair, state, margin, accounts):
+        value = deepcopy(state)
+        for key in ("updated_at", "reason", "phase", "attention", "retry_after", "api_notice", "snapshots", "margin"):
+            value.pop(key, None)
+        return {"pair": pair, "state": value, "margin": margin, "accounts": accounts}
+
+    def _read_baseline(self, pair_id):
+        from .engine import snapshot_json
+        from .margin_balance import MarginBalancer
+        from .pair_execution import PairTrader
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        state = self.manager._idle(pair)
+        if state.get("recovery_watch") is None:
+            raise TradingError("当前没有人工归档订单，无需重新确认底仓")
+        progress = state.get("progress")
+        if (not isinstance(state.get("owned"), dict) or set(state["owned"]) != {"LONG", "SHORT"}
+                or not isinstance(progress, dict) or not isinstance(progress.get("quantities"), dict)
+                or set(progress["quantities"]) != {"LONG", "SHORT"}):
+            raise TradingError("底仓或循环记录不完整，不能采纳")
+        margin = self.store.get("pair_margin:" + pair_id, {})
+        accounts = self.manager._members(pair)
+        _, brokers, identities = PairTrader(self.engine)._members(pair)
+        if state.get("identities") != identities:
+            raise TradingError("归档后的账户身份已变化，不能采纳底仓")
+        snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True, startup=True)
+        orders = require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers)
+        with ExitStack() as budget:
+            for broker in brokers.values():
+                if isinstance(broker, LiveBroker):
+                    budget.enter_context(broker.reconciliation_budget())
+            MarginBalancer(self.engine).verify_members(pair)
+        actual = {side: wire(snapshots[key].pair(SYMBOL)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
+        leverage = snapshots["long"].pair(SYMBOL)[0].leverage
+        with self.manager._current_members(guards):
+            if PairTrader(self.engine)._members(pair)[2] != identities:
+                raise TradingError("核对期间账户身份变化，请重新核对")
+        return {"pair": pair, "state": state, "margin": margin, "accounts": accounts,
+            "identities": identities, "guards": guards, "snapshots": snapshots,
+            "view_snapshots": {key: snapshot_json(snapshot, [SYMBOL]) for key, snapshot in snapshots.items()},
+            "actual": actual, "leverage": leverage, "orders": orders,
+            "fingerprint": self._baseline_fingerprint(pair, state, margin, accounts)}
+
+    def preview_baseline(self, pair_id):
+        read = self._read_baseline(pair_id)
+        token = uuid.uuid4().hex
+        review = {"status": "baseline_review", "token": token, "pair_id": pair_id,
+            "checked_at": time.time(), "before": deepcopy(read["state"]["owned"]),
+            "actual": read["actual"], "leverage": read["leverage"], "orders": read["orders"]}
+        self.baseline_previews[pair_id] = {"token": token, "expires": time.monotonic() + PREVIEW_TTL,
+            "fingerprint": read["fingerprint"], "review": deepcopy(review)}
+        return review
+
+    def confirm_baseline(self, pair_id, token, acknowledge_unknown=False):
+        preview = self.baseline_previews.get(pair_id)
+        if acknowledge_unknown is not True:
+            raise TradingError("请明确确认采纳当前底仓，并保留未知旧订单跟踪")
+        if not preview or preview["token"] != token or time.monotonic() >= preview["expires"]:
+            raise TradingError("底仓预览已失效，请重新核对")
+        read = self._read_baseline(pair_id)
+        if (read["fingerprint"] != preview["fingerprint"] or read["actual"] != preview["review"]["actual"]
+                or read["leverage"] != preview["review"]["leverage"]):
+            self.baseline_previews.pop(pair_id, None)
+            raise TradingError("持仓、杠杆、订单或配置已变化，请重新核对底仓")
+        from .pair_execution import empty_progress
+        runtime = deepcopy(read["state"])
+        message = "已按确认采纳当前实际底仓，未知旧订单继续跟踪；配对组仍暂停，可重新启动"
+        runtime.update(owned=read["actual"], pending=None, phase="paused", reason=message,
+            progress=empty_progress(read["actual"], (runtime.get("progress") or {}).get("completed_cycles", 0)),
+            snapshots=read["view_snapshots"], updated_at=time.time(), api_notice=None)
+        runtime.pop("attention", None)
+        runtime.pop("retry_after", None)
+        # A distinct audit key preserves every original unknown-order archive.
+        audit = {"status": "manual_archived_baseline_adopted", "pending": {"id": "baseline-" + token},
+            "confirmed_at": time.time(), "preview": deepcopy(preview["review"]),
+            "confirmation": read["orders"], "actual": read["actual"],
+            "recovery_watch": deepcopy(runtime["recovery_watch"])}
+        self._commit(read, runtime, message, audit=audit, expires=preview["expires"])
+        self.baseline_previews.pop(pair_id, None)
+        return {"ok": True, "message": message}
 
     @staticmethod
     def _fingerprint(pair, state, margin, accounts):

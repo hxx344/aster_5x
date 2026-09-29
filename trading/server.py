@@ -473,6 +473,14 @@ def create_app(engine=None, *, demo=False, start_engine=True):
     def skip_pair_recovery(pair_id: str, body: PairRecoverySkip):
         return engine.pairs.skip_recovery(pair_id, body.batch_id, body.acknowledge_skip)
 
+    @app.post("/api/pairs/{pair_id}/baseline-preview", dependencies=write_dependencies)
+    def preview_pair_baseline(pair_id: str):
+        return engine.pairs.preview_baseline(pair_id)
+
+    @app.post("/api/pairs/{pair_id}/baseline-confirm", dependencies=write_dependencies)
+    def confirm_pair_baseline(pair_id: str, body: PairRecoveryConfirmation):
+        return engine.pairs.confirm_baseline(pair_id, body.token, body.acknowledge_unknown)
+
     @app.delete("/api/pairs/{pair_id}", dependencies=write_dependencies)
     def delete_pair(pair_id: str):
         engine.pairs.delete(pair_id)

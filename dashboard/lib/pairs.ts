@@ -87,6 +87,7 @@ export type Pair = {
       completed_cycles?: number;
     } | null;
     pending?: Record<string, unknown> | null;
+    recovery_watch?: { batches: { id: string }[] } | null;
     margin?: PairMarginState;
     last_batch?: {
       id: string;

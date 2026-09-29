@@ -119,7 +119,7 @@ class PairManager:
                 raise TradingError("原账户循环仍有新增持仓，请先完成原循环")
         return accounts
 
-    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False):
+    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False):
         accounts = self._members(pair)
         brokers = {account["id"]: self.engine.broker(account) for account in accounts}
         budgets = {}
@@ -127,6 +127,23 @@ class PairManager:
             if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
                 budget = broker.api.budget
                 budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight([SYMBOL], fresh_modes=True) + 40
+                if startup:
+                    # Ownership verification rereads each child account.
+                    budgets[budget] += 5
+        if startup:
+            watch = (self.store.get("pair_runtime:" + pair["id"], {}) or {}).get("recovery_watch")
+            batches = watch.get("batches", []) if isinstance(watch, dict) else []
+            for batch in batches if isinstance(batches, list) else []:
+                for leg in batch.get("legs", []) if isinstance(batch, dict) else []:
+                    if isinstance(leg, dict) and leg.get("key") in ("long", "short"):
+                        broker = brokers[pair[leg["key"] + "_account_id"]]
+                        budget = getattr(getattr(broker, "api", None), "budget", None)
+                        if budget in budgets:
+                            budgets[budget] += 1
+            # The master uses the shared IP budget. Reserve its listing cost
+            # conservatively for each distinct budget in injected adapters.
+            for budget in budgets:
+                budgets[budget] += 5
         # Admit both fresh account reads and full-account open orders before
         # starting either worker. Each request still reserves its own weight.
         for budget, weight in budgets.items():
@@ -285,13 +302,13 @@ class PairManager:
                 _, _, identities = trader._members(pair)
                 if original_runtime.get("identities") and original_runtime["identities"] != identities:
                     raise TradingError("配对组凭据指向的真实账户发生变化，不能采纳持仓，请先核对账户身份")
-                snapshots, guards = self._read_members(pair, adopt=True)
+                snapshots, guards = self._read_members(pair, adopt=True, startup=True)
                 if original_runtime.get("recovery_watch") is not None:
                     from .pair_recovery import require_archived_orders_clear
                     require_archived_orders_clear(self.engine, pair, state=original_runtime)
                     for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1)):
                         if snapshots[key].pair(SYMBOL)[index].qty != dec(original_runtime["owned"][side]):
-                            raise TradingError("人工归档后实际仓位发生变化，不能自动采纳；请先核对原订单是否迟到成交")
+                            raise TradingError("人工归档后实际仓位发生变化；请点击“核对并采纳当前底仓”，核对旧订单后确认当前持仓，再启动")
                 from .margin_balance import MarginBalancer
                 MarginBalancer(self.engine).verify_members(pair)
                 if trader._members(pair)[2] != identities:
@@ -357,6 +374,20 @@ class PairManager:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
             return self.recovery.skip_positions(pair_id, batch_id, acknowledge_skip)
+
+    def preview_baseline(self, pair_id):
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            return self.recovery.preview_baseline(pair_id)
+
+    def confirm_baseline(self, pair_id, token, acknowledge_unknown=False):
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            return self.recovery.confirm_baseline(pair_id, token, acknowledge_unknown)
 
     def delete(self, pair_id):
         pair = self.store.pair(pair_id)

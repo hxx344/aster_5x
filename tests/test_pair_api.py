@@ -83,7 +83,7 @@ class PairApiTests(unittest.TestCase):
         self.assertEqual(self.f.store.get("pair_runtime:gold"), state)
 
     def test_order_recovery_requires_authentication_and_same_origin(self):
-        endpoints = ("/api/pairs/gold/recovery-check", "/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm", "/api/pairs/gold/recovery-skip")
+        endpoints = ("/api/pairs/gold/recovery-check", "/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm", "/api/pairs/gold/recovery-skip", "/api/pairs/gold/baseline-preview", "/api/pairs/gold/baseline-confirm")
         body = {"token": "a" * 32, "acknowledge_unknown": True}
         for endpoint in endpoints:
             self.assertEqual(self.client.post(endpoint, json=body).status_code, 401)
@@ -122,6 +122,27 @@ class PairApiTests(unittest.TestCase):
         self.assertNotIn("token", response.json())
         self.assertFalse(self.f.store.pair("gold")["enabled"])
         self.assertIsNone(self.f.store.get("pair_runtime:gold")["pending"])
+
+    def test_archived_baseline_preview_and_explicit_confirmation(self):
+        from tests.test_pair_order_recovery import seed_pending
+        self.login()
+        seed_pending(self.engine)
+        manager = self.engine.pairs
+        manager.confirm_recovery("gold", manager.preview_recovery("gold")["token"], True)
+        for aid, side in (("test", "LONG"), ("second", "SHORT")):
+            broker = self.engine.broker(self.f.store.account(aid))
+            broker.state["positions"]["XAUUSD1:" + side]["qty"] = "4"
+            broker.save()
+        response = self.client.post("/api/pairs/gold/baseline-preview")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = {"token": response.json()["token"], "acknowledge_unknown": True}
+        for bad in ({}, {**body, "acknowledge_unknown": 1}, {**body, "acknowledge_unknown": "true"}, {**body, "force": True}):
+            self.assertEqual(self.client.post("/api/pairs/gold/baseline-confirm", json=bad).status_code, 422)
+        response = self.client.post("/api/pairs/gold/baseline-confirm", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.f.store.get("pair_runtime:gold")["owned"], {"LONG": "4", "SHORT": "4"})
+        self.assertFalse(self.f.store.pair("gold")["enabled"])
+        self.assertEqual(self.client.post("/api/pairs/gold/enable").status_code, 200)
 
     def test_skip_requires_strict_batch_ack_and_rejects_stale_or_unknown_orders(self):
         from tests.test_pair_order_recovery import seed_pending, receipt_for, BATCH_ID

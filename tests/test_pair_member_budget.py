@@ -55,6 +55,28 @@ class PairMemberBudgetTests(TestCase):
         self.assertEqual(budget.snapshot()["used"], 1724)
         self.assert_no_reads()
 
+    def test_start_admits_ownership_reads_before_any_account_http(self):
+        self.f.store.save_pair(self.pair, create=True)
+        budget = self.budgets()["test"]
+        budget.configure_capacity_reserve(31)
+        budget.reserve(1235)
+        with self.assertRaisesRegex(BudgetWait, "239"):
+            self.engine.pairs.enable(self.pair["id"], True)
+        self.assert_no_reads()
+        self.verify.assert_not_called()
+        self.assertEqual(budget.snapshot()["used"], 1235)
+        self.assertFalse(self.f.store.pair(self.pair["id"])["enabled"])
+
+    def test_start_completes_with_room_for_full_ownership_check(self):
+        self.f.store.save_pair(self.pair, create=True)
+        budget = self.budgets()["test"]
+        budget.configure_capacity_reserve(31)
+        budget.reserve(1230)
+        self.verify.side_effect = lambda pair: [budget.reserve(5) for _ in range(3)]
+        self.engine.pairs.enable(self.pair["id"], True)
+        self.assertEqual(budget.snapshot()["used"], 1467)
+        self.assertTrue(self.f.store.pair(self.pair["id"])["enabled"])
+
     def test_shared_recovery_reserve_completes_all_checks_for_222_weight(self):
         budget = self.budgets()["test"]
         budget.reserve(1500)

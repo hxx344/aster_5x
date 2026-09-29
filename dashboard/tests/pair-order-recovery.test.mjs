@@ -6,6 +6,8 @@ import {
   pairOrderRecoverySkipBlock,
   parsePairOrderRecovery,
   parsePairOrderRecoveryCheck,
+  pairBaselineRecoveryBlock,
+  parsePairBaselineReview,
 } from '../lib/pair-order-recovery.ts';
 
 const pair = {
@@ -13,6 +15,86 @@ const pair = {
   enabled: false,
   state: { pending: { id: 'batch-a', kind: 'ordinary', phase: 'open' } },
 };
+
+test('archived baseline remains reviewable without a pending batch', () => {
+  const archived = {
+    ...pair,
+    state: { pending: null, recovery_watch: { batches: [{ id: 'old' }] } },
+  };
+  assert.equal(pairBaselineRecoveryBlock(archived), '');
+  assert.notEqual(pairOrderRecoveryBlock(archived), '');
+  assert.match(
+    pairBaselineRecoveryBlock({ ...archived, enabled: true }),
+    /暂停/,
+  );
+  assert.match(
+    pairBaselineRecoveryBlock({
+      ...archived,
+      state: { ...archived.state, pending: { id: 'new' } },
+    }),
+    /批次/,
+  );
+  assert.match(
+    pairBaselineRecoveryBlock({
+      ...archived,
+      state: { ...archived.state, margin: { pending: {} } },
+    }),
+    /划转/,
+  );
+  assert.match(
+    pairBaselineRecoveryBlock({
+      ...archived,
+      state: { ...archived.state, progress: { quantities: { LONG: '1' } } },
+    }),
+    /循环/,
+  );
+});
+
+test('baseline response must match pair and cannot turn unknown or filled orders into clear orders', () => {
+  const review = {
+    status: 'baseline_review',
+    pair_id: pair.id,
+    token: 'a'.repeat(32),
+    checked_at: 1000,
+    before: { LONG: '3', SHORT: '3' },
+    actual: { LONG: '4', SHORT: '4' },
+    leverage: 5,
+    orders: ['LONG', 'SHORT'].map((side) => ({
+      batch_id: 'old',
+      side,
+      client_order_id: side,
+      status: 'UNKNOWN',
+      executed_qty: null,
+    })),
+  };
+  assert.equal(
+    parsePairBaselineReview(review, pair).orders[0].status,
+    'UNKNOWN',
+  );
+  for (const change of [
+    { pair_id: 'another' },
+    { token: '' },
+    { actual: { LONG: '-1', SHORT: '4' } },
+    {
+      orders: review.orders.map((order) => ({
+        ...order,
+        status: 'FILLED',
+        executed_qty: '1',
+      })),
+    },
+    {
+      orders: review.orders.map((order) => ({
+        ...order,
+        status: 'NEW',
+        executed_qty: '0',
+      })),
+    },
+  ]) {
+    assert.throws(() =>
+      parsePairBaselineReview({ ...review, ...change }, pair),
+    );
+  }
+});
 function preview(changes = {}) {
   return {
     status: 'review',

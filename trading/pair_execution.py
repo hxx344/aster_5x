@@ -9,7 +9,8 @@ import time
 import uuid
 
 from .exchange import (AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent,
-                       LeverageRejected, LEVERAGE_REJECTION_CODES)
+                       LeverageRejected, LEVERAGE_REJECTION_CODES, ORDER_REJECTION_CODES)
+from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, wire, cycle_margin_limit, opening_margin_limit
 from .paper import PaperOrderAbsent
@@ -171,6 +172,9 @@ class PairTrader:
         _, _, actual = self._members(current)
         if actual != identities:
             raise PairPositionError("配对组账户身份发生变化，禁止写入")
+        if opening:
+            from .pair_recovery import require_archived_orders_clear
+            require_archived_orders_clear(self.engine, current)
 
     def tick(self, pair):
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
@@ -385,15 +389,17 @@ class PairTrader:
                 if not isinstance(result, list) or len(result) != 1:
                     raise TradingError("单腿订单回执无效，等待查询")
                 row = result[0]
-                if isinstance(row, dict) and row.get("code") in LEVERAGE_REJECTION_CODES and row.get("code") not in (-1006, -1007):
-                    row = self._absent(order, "交易所拒绝订单", local=False)
+                if isinstance(row, dict) and row.get("code") in ORDER_REJECTION_CODES:
+                    code = row["code"]
+                    reason = exchange_reason(row.get("msg")) or MISSING_REJECT_REASON
+                    row = {**self._absent(order, f"Aster 拒绝订单（代码 {code}）：{reason}", local=False), "reject_code": code}
                 Executor.validate_receipt(order, row)
                 return row, None
             except RequestNotSent as exc:
                 return {**self._absent(order, str(exc)), "retry_after": max(1, getattr(exc, "retry_after", 0))}, None
             except ExchangeError as exc:
-                if not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES:
-                    return self._absent(order, str(exc), local=False), None
+                if not isinstance(exc, AmbiguousOrder) and exc.code in ORDER_REJECTION_CODES:
+                    return {**self._absent(order, str(exc), local=False), "reject_code": exc.code}, None
                 return None, str(exc)
             except Exception as exc:
                 return None, str(exc) if isinstance(exc, TradingError) else "订单结果未知，继续按客户端订单号核对"
@@ -402,6 +408,7 @@ class PairTrader:
             for leg, future in futures:
                 receipt, error = future.result()
                 leg["receipt"], leg["error"] = receipt, error
+                leg["submit_error"] = error or (receipt or {}).get("reject_reason")
                 self._save(pair, state)
 
     def _query(self, pair, state, brokers):
@@ -513,8 +520,13 @@ class PairTrader:
         state["pending"] = None
         state["last_batch"] = {"id": pending["id"], "kind": pending["kind"], "phase": pending["phase"],
                                "quantity": pending["quantity"], "completed": completed, "at": time.time()}
+        any_fill = any(dec(leg["receipt"]["executedQty"]) for leg in pending["legs"] + pending["repairs"])
         state.update(phase="holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
-                     reason="两个子账户本批成交与持仓核对完成" if completed else "本批未完整成交，已减回原始基线")
+                     reason="两个子账户本批成交与持仓核对完成" if completed else
+                            "本批未完整成交，已减回原始基线" if any_fill else "本批未成交，底仓保持不变")
+        rejection_notes = [f"{'A 多侧' if leg['key'] == 'long' else 'B 空侧'}：{exchange_reason(leg['receipt']['reject_reason'])}"
+                           for leg in pending["legs"] + pending["repairs"] if leg["receipt"].get("reject_reason")]
+        rejection_text = "；拒单反馈：" + "；".join(rejection_notes) if rejection_notes else ""
         state["updated_at"] = time.time()
         # History and lifecycle advancement share one commit. A restart cannot
         # count the batch twice or forget its remaining cycle position.
@@ -525,7 +537,7 @@ class PairTrader:
                 db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
             for key, _ in SIDES:
                 db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
-                           (pair[key + "_account_id"], "order", f"配对组 {pair['name']}：{state['reason']}；XAUUSD1 每边 {pending['quantity']}", time.time()))
+                           (pair[key + "_account_id"], "order", f"配对组 {pair['name']}：{state['reason']}；XAUUSD1 本批每边委托 {pending['quantity']}{rejection_text}", time.time()))
         # The outer tick always persists its state, even after an exception.
         # Publish only after the history and lifecycle transaction commits.
         published.clear()

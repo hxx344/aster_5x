@@ -545,6 +545,8 @@ class MarginBalancer:
                 if plan is None:
                     self.store.put("pair_margin:" + pair["id"], state)
                     return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
+                from .pair_recovery import require_archived_orders_clear
+                require_archived_orders_clear(self.engine, pair)
                 pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": now, "status": "submitting"}
                 state["cooldown_until"] = now + config["cooldown_seconds"]
                 self._paper(pair, members, snapshots, state, pending)
@@ -696,6 +698,8 @@ class MarginBalancer:
                     raise TradingError("账户未完成委托响应无效，禁止划转")
                 snapshots = {**snapshots, side: replace(snapshots[side], open_orders=orders)}
             self._check_snapshots(pair, snapshots, require_orders=True)
+            from .pair_recovery import require_archived_orders_clear
+            require_archived_orders_clear(self.engine, pair)
             require_current()
             created = time.time()
             pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": created, "status": "submitting",

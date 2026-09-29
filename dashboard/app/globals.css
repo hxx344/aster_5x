@@ -1639,6 +1639,24 @@ label input,
   height: auto;
   padding: 12px 10px;
 }
+.pair-order-recovery-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+.pair-order-recovery-ack input {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px !important;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+}
+.pair-order-recovery-ack > span {
+  float: none;
+  color: var(--foreground);
+  font-size: inherit;
+}
 .reconcile-button {
   display: block;
   margin: 0 22px 18px;

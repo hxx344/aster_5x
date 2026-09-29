@@ -411,6 +411,35 @@ class Store:
                        (pair["id"], "pair", message, time.time()))
             return saved
 
+    def commit_pair_recovery(self, pair, runtime, *, expected_runtime, expected_margin,
+                             accounts, check_current, message, audit=None):
+        """A reviewed local recovery is atomic with its unchanged paused ownership."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
+            if not row or json.loads(row[0]) != pair or pair.get("enabled") is not False:
+                raise TradingError("核对期间配对组状态已变化，请重新核对")
+            for key, expected in (("pair_runtime:" + pair["id"], expected_runtime),
+                                  ("pair_margin:" + pair["id"], expected_margin)):
+                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                if (json.loads(row[0]) if row else {}) != expected:
+                    raise TradingError("核对期间订单或划转记录已变化，请重新核对")
+            for account in accounts:
+                row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
+                binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
+                side = "LONG" if account["id"] == pair["long_account_id"] else "SHORT"
+                if not row or json.loads(row[0]) != account or not binding or tuple(binding) != (pair["id"], side):
+                    raise TradingError("核对期间子账户配置或绑定已变化，请重新核对")
+            check_current()
+            self._save_pair(db, pair)
+            if audit is not None:
+                db.execute("INSERT INTO kv(key,data) VALUES (?,?)", (
+                    "pair_order_recovery:" + pair["id"] + ":" + audit["pending"]["id"], dumps(audit)))
+            db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("pair_runtime:" + pair["id"], dumps(runtime)))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                       (pair["id"], "pair", message + "；本次核对未下单或划转", time.time()))
+
     def _save_pair(self, db, pair, *, create=False):
         row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
         if create and row:
@@ -453,6 +482,8 @@ class Store:
                 raise TradingError("请先暂停配对组")
             runtime_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_runtime:" + pair_id,)).fetchone()
             runtime = json.loads(runtime_row[0]) if runtime_row else {}
+            if runtime.get("recovery_watch") is not None:
+                raise TradingError("人工归档订单仍需跟踪，不能解除子账户绑定；请保留此配对组")
             if runtime.get("pending"):
                 raise TradingError("配对组仍有未完成批次")
             if any(dec(qty) for qty in (runtime.get("owned") or {}).values()) or any(

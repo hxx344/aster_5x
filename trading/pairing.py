@@ -1,6 +1,6 @@
 """Exclusive two-account ownership, configuration and scheduler coordination."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 import json
 import re
@@ -82,6 +82,8 @@ class PairManager:
         self.engine, self.store = engine, engine.store
         self.locks = {}
         self.trader = None
+        from .pair_recovery import PairOrderRecovery
+        self.recovery = PairOrderRecovery(self)
 
     def group_lock(self, pair_id):
         with self.engine.lock:
@@ -117,11 +119,16 @@ class PairManager:
                 raise TradingError("原账户循环仍有新增持仓，请先完成原循环")
         return accounts
 
-    def _read_members(self, pair, *, flat=False, adopt=False):
+    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False):
         accounts = self._members(pair)
 
         def read(account):
             broker = self.engine.broker(account)
+            budget = broker.reconciliation_budget() if reconciliation and isinstance(broker, LiveBroker) else nullcontext()
+            with budget:
+                return read_broker(broker)
+
+        def read_broker(broker):
             if hasattr(broker, "reload"):
                 broker.reload()
             snapshot = broker.snapshot([SYMBOL], fresh_modes=True)
@@ -260,6 +267,12 @@ class PairManager:
                 if original_runtime.get("identities") and original_runtime["identities"] != identities:
                     raise TradingError("配对组凭据指向的真实账户发生变化，不能采纳持仓，请先核对账户身份")
                 snapshots, guards = self._read_members(pair, adopt=True)
+                if original_runtime.get("recovery_watch") is not None:
+                    from .pair_recovery import require_archived_orders_clear
+                    require_archived_orders_clear(self.engine, pair, state=original_runtime)
+                    for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1)):
+                        if snapshots[key].pair(SYMBOL)[index].qty != dec(original_runtime["owned"][side]):
+                            raise TradingError("人工归档后实际仓位发生变化，不能自动采纳；请先核对原订单是否迟到成交")
                 from .margin_balance import MarginBalancer
                 MarginBalancer(self.engine).verify_members(pair)
                 if trader._members(pair)[2] != identities:
@@ -298,13 +311,29 @@ class PairManager:
             self._changed(saved)
             return saved
 
+    def preview_recovery(self, pair_id):
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            return self.recovery.preview(pair_id)
+
+    def confirm_recovery(self, pair_id, token, acknowledge_unknown=False):
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            return self.recovery.confirm(pair_id, token, acknowledge_unknown)
+
     def delete(self, pair_id):
         pair = self.store.pair(pair_id)
         if not pair:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.engine.registration_lock:
             pair = self.store.pair(pair_id)
-            self._idle(pair, require_flat=True)
+            runtime = self._idle(pair, require_flat=True)
+            if runtime.get("recovery_watch") is not None:
+                raise TradingError("人工归档订单仍需跟踪，不能解除子账户绑定；请保留此配对组")
             _, guards = self._read_members(pair, flat=True)
             with self._current_members(guards):
                 self.store.delete_pair(pair_id)

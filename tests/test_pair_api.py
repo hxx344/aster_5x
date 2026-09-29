@@ -81,3 +81,52 @@ class PairApiTests(unittest.TestCase):
         self.assertEqual(state["progress"]["baseline"], state["owned"])
         self.assertEqual(self.client.post("/api/pairs/gold/enable").status_code, 409)
         self.assertEqual(self.f.store.get("pair_runtime:gold"), state)
+
+    def test_order_recovery_requires_authentication_and_same_origin(self):
+        endpoints = ("/api/pairs/gold/recovery-preview", "/api/pairs/gold/recovery-confirm")
+        body = {"token": "a" * 32, "acknowledge_unknown": True}
+        for endpoint in endpoints:
+            self.assertEqual(self.client.post(endpoint, json=body).status_code, 401)
+        self.login()
+        for endpoint in endpoints:
+            response = self.client.post(endpoint, json=body, headers={"origin": "https://other.invalid"})
+            self.assertEqual(response.status_code, 403, response.text)
+
+    def test_order_recovery_confirmation_rejects_coerced_or_missing_acknowledgment(self):
+        from tests.test_pair_order_recovery import seed_pending
+        self.login()
+        seed_pending(self.engine)
+        preview = self.client.post("/api/pairs/gold/recovery-preview")
+        self.assertEqual(preview.status_code, 200, preview.text)
+        token = preview.json()["token"]
+        for body in ({"token": token}, {"token": token, "acknowledge_unknown": "true"},
+                     {"token": token, "acknowledge_unknown": 1}, {"token": token, "acknowledge_unknown": None},
+                     {"token": token, "acknowledge_unknown": True, "force": True}):
+            with self.subTest(body=body):
+                response = self.client.post("/api/pairs/gold/recovery-confirm", json=body)
+                self.assertEqual(response.status_code, 422, response.text)
+        response = self.client.post("/api/pairs/gold/recovery-confirm", json={"token": token, "acknowledge_unknown": False})
+        self.assertIn(response.status_code, (409, 422), response.text)
+        self.assertIsNotNone(self.f.store.get("pair_runtime:gold")["pending"])
+
+    def test_order_recovery_routes_archive_and_leave_start_as_a_separate_action(self):
+        from tests.test_pair_order_recovery import seed_pending
+        self.login()
+        original = seed_pending(self.engine)
+        preview = self.client.post("/api/pairs/gold/recovery-preview")
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["status"], "review")
+        response = self.client.post("/api/pairs/gold/recovery-confirm",
+                                    json={"token": preview.json()["token"], "acknowledge_unknown": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["ok"])
+        self.assertFalse(self.f.store.pair("gold")["enabled"])
+        runtime = self.f.store.get("pair_runtime:gold")
+        self.assertIsNone(runtime["pending"])
+        self.assertEqual(runtime["owned"], original["owned"])
+        state_response = self.client.get("/api/pairs")
+        self.assertEqual(state_response.status_code, 200)
+        self.assertIsNone(state_response.json()["pairs"][0]["state"]["pending"])
+        start = self.client.post("/api/pairs/gold/enable")
+        self.assertEqual(start.status_code, 200, start.text)
+        self.assertTrue(start.json()["pair"]["enabled"])

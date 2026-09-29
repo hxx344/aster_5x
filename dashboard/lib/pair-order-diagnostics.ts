@@ -8,6 +8,7 @@ export type PairOrderDiagnostic = {
   statusLabel: string;
   executedQty: string;
   error: string;
+  initialError?: string;
   terminal: boolean;
 };
 
@@ -66,6 +67,11 @@ export function pendingOrderDiagnostics(pair: Pair): PairOrderDiagnostic[] {
       const clientOrderId = text(order?.newClientOrderId, '—');
       const status = text(receipt?.status);
       const executedQty = receipt?.executedQty;
+      const error = text(leg.error, text(receipt?.reject_reason)).slice(
+        0,
+        1000,
+      );
+      const initialError = text(leg.submit_error).slice(0, 1000);
       diagnostics.push({
         id: `${kind}:${index}:${clientOrderId}`,
         sideLabel:
@@ -95,7 +101,8 @@ export function pendingOrderDiagnostics(pair: Pair): PairOrderDiagnostic[] {
           /^\d+(?:\.\d+)?$/.test(executedQty)
             ? executedQty
             : '—',
-        error: text(leg.error, text(receipt?.reject_reason)).slice(0, 1000),
+        error,
+        ...(initialError && initialError !== error ? { initialError } : {}),
         // This is a display hint only; execution recovery remains server-owned.
         terminal: terminalStatuses.has(status),
       });

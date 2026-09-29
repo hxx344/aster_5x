@@ -295,6 +295,7 @@ test('code-like values remain plain strings while nested errors and raw receipts
     key: nested,
     order: { newClientOrderId: nested, apiKey: 'order-secret' },
     error: nested,
+    submit_error: nested,
     receipt: {
       status: nested,
       executedQty: nested,
@@ -306,6 +307,23 @@ test('code-like values remain plain strings while nested errors and raw receipts
   assert.equal(safe.clientOrderId, '—');
   assert.equal(safe.terminal, false);
   assert.doesNotMatch(JSON.stringify(safe), /secret|token|signature|apiKey/);
+});
+
+test('initial submission errors survive later query feedback without inventing or duplicating old evidence', () => {
+  const initial = 'HTTP 400 / -2010: New order rejected';
+  const latest = 'HTTP 400 / -2013: Order does not exist';
+  const result = diagnostic({ submit_error: initial, error: latest });
+  assert.equal(result.initialError, initial);
+  assert.equal(result.error, latest);
+  assert.equal(diagnostic({ error: latest }).initialError, undefined);
+  assert.equal(
+    diagnostic({ submit_error: initial, error: initial }).initialError,
+    undefined,
+  );
+  assert.equal(
+    diagnostic({ submit_error: 'x'.repeat(1200), error: latest }).initialError,
+    'x'.repeat(1000),
+  );
 });
 
 test('reading diagnostics never mutates pairs, order payloads, receipts or repair arrays', () => {

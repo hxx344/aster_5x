@@ -32,9 +32,15 @@ export function PairOrderDiagnostics({ pair }: { pair: Pair }) {
             <p className="muted small-note">
               原客户端订单编号：{order.clientOrderId}
             </p>
+            {order.initialError ? (
+              <p className={order.terminal ? 'muted' : 'amber'}>
+                最初下单反馈：{order.initialError}
+              </p>
+            ) : null}
             {order.error ? (
               <p className={order.terminal ? 'muted' : 'amber'}>
-                最近反馈：{order.error}
+                {order.initialError ? '最近查询反馈' : '最近反馈'}：
+                {order.error}
               </p>
             ) : !order.terminal ? (
               <p className="muted">等待原订单查询取得有效终态回执。</p>

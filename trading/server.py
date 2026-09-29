@@ -135,6 +135,17 @@ class CycleRecoveryConfirmation(BaseModel):
     token: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
+class PairRecoveryConfirmation(CycleRecoveryConfirmation):
+    acknowledge_unknown: Literal[True]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_acknowledgement(cls, values):
+        if not isinstance(values, dict) or values.get("acknowledge_unknown") is not True:
+            raise ValueError("请明确确认未知订单归档")
+        return values
+
+
 class NewAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
@@ -432,6 +443,14 @@ def create_app(engine=None, *, demo=False, start_engine=True):
     @app.post("/api/pairs/{pair_id}/pause", dependencies=write_dependencies)
     def pause_pair(pair_id: str):
         return {"ok": True, "pair": engine.pairs.enable(pair_id, False)}
+
+    @app.post("/api/pairs/{pair_id}/recovery-preview", dependencies=write_dependencies)
+    def preview_pair_recovery(pair_id: str):
+        return engine.pairs.preview_recovery(pair_id)
+
+    @app.post("/api/pairs/{pair_id}/recovery-confirm", dependencies=write_dependencies)
+    def confirm_pair_recovery(pair_id: str, body: PairRecoveryConfirmation):
+        return engine.pairs.confirm_recovery(pair_id, body.token, body.acknowledge_unknown)
 
     @app.delete("/api/pairs/{pair_id}", dependencies=write_dependencies)
     def delete_pair(pair_id: str):

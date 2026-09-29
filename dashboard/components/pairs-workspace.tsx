@@ -21,6 +21,7 @@ import {
 import { PairSettings } from '@/components/pair-settings';
 import { PairNotices } from '@/components/pair-notices';
 import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
+import { PairOrderRecovery } from '@/components/pair-order-recovery';
 import {
   clearPastPairNotices,
   pairStatusNotices,
@@ -377,6 +378,13 @@ function PairDetail({
               <CirclePause size={16} />
               暂停配对组
             </Button>
+            <PairOrderRecovery
+              pair={pair}
+              disabled={busy || offline || !ready || draft.dirty}
+              now={now}
+              action={action}
+              setNotice={setNotice}
+            />
             <Button
               variant="outline"
               disabled={busy || offline || Boolean(configurationLock)}

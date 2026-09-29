@@ -48,6 +48,70 @@ function apiNotice(
   return null;
 }
 
+export function pairScheduledMarginWait(
+  pair: Pair,
+  now: number,
+  offline = false,
+): {
+  checkedAt: number;
+  nextCheckAt: number;
+  coolingDown: boolean;
+  checking: boolean;
+} | null {
+  const state = pair.state;
+  const margin = state?.margin;
+  // Display-only: the backend intentionally retains snapshots between balance
+  // checks. This must never relax freshness checks used by trading controls.
+  if (
+    !pair.enabled ||
+    pair.ordinary?.enabled !== false ||
+    pair.cycle?.enabled !== false ||
+    pair.margin?.enabled !== true ||
+    margin?.enabled !== true ||
+    margin.blocks_trading !== false ||
+    state?.phase !== 'monitoring' ||
+    !['waiting', 'cooldown', 'confirmed'].includes(margin.status ?? '') ||
+    !pairDataFresh(state.updated_at, now, offline) ||
+    pairHasPending(pair) ||
+    Object.values(state.progress?.quantities ?? {}).some(
+      (quantity) =>
+        typeof quantity !== 'string' || !/^0(?:\.0+)?$/.test(quantity),
+    ) ||
+    apiNotice(state.api_notice, state.reason) ||
+    apiNotice(margin.api_notice, margin.reason)
+  )
+    return null;
+  const checkedAt = margin.checked_at;
+  const nextCheckAt = margin.next_check_at;
+  const cooldownUntil = margin.cooldown_until ?? 0;
+  const validTime = (stamp: unknown): stamp is number =>
+    typeof stamp === 'number' && Number.isFinite(stamp) && stamp > 0;
+  if (
+    !validTime(checkedAt) ||
+    checkedAt > now + 1 ||
+    !validTime(nextCheckAt) ||
+    nextCheckAt <= checkedAt ||
+    !Number.isFinite(cooldownUntil) ||
+    cooldownUntil < 0 ||
+    !['long', 'short'].every((side) => {
+      const snapshot = state.snapshots?.[side as 'long' | 'short'];
+      return validTime(snapshot?.timestamp) && snapshot.timestamp <= now + 1;
+    })
+  )
+    return null;
+  const deadline = Math.max(nextCheckAt, cooldownUntil);
+  // A scheduled read takes time. Give its still-live worker the same bounded
+  // eight-second window; do not flash a warning at every check boundary.
+  return now - deadline < 8
+    ? {
+        checkedAt,
+        nextCheckAt: deadline,
+        coolingDown: cooldownUntil > now,
+        checking: now >= deadline,
+      }
+    : null;
+}
+
 export function pairStatusNotices(
   pair: Pair,
   now: number,
@@ -68,7 +132,7 @@ export function pairStatusNotices(
     pairDataFresh(pair.state?.updated_at, now, offline) &&
     pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
     pairDataFresh(snapshots?.short?.timestamp, now, offline);
-  if (!fresh) {
+  if (!fresh && !pairScheduledMarginWait(pair, now, offline)) {
     add(
       'data',
       (offline

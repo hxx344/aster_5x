@@ -25,6 +25,7 @@ import { PairOrderRecovery } from '@/components/pair-order-recovery';
 import { PairBaselineRecovery } from '@/components/pair-baseline-recovery';
 import {
   clearPastPairNotices,
+  pairScheduledMarginWait,
   pairStatusNotices,
   recordPairNotices,
   updatePairNoticeHistories,
@@ -297,6 +298,7 @@ function PairDetail({
     (account) => account.id === pair.short_account_id,
   );
   const offline = Boolean(connectionError);
+  const scheduledMarginWait = pairScheduledMarginWait(pair, now, offline);
   const fresh =
     pairDataFresh(pair.state?.updated_at, now, offline) &&
     pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
@@ -446,6 +448,7 @@ function PairDetail({
           offline={offline}
           baseLimit={pair.ordinary.margin_limit}
           cycle={pair.cycle.enabled}
+          scheduledWait={Boolean(scheduledMarginWait)}
         />
         <PairSide
           side="short"
@@ -455,14 +458,21 @@ function PairDetail({
           offline={offline}
           baseLimit={pair.ordinary.margin_limit}
           cycle={pair.cycle.enabled}
+          scheduledWait={Boolean(scheduledMarginWait)}
         />
       </div>
       <section className="panel" aria-label="配对数量与执行进度">
         <div className="section-head">
           <h2>配对执行</h2>
-          <span className={`small-note ${!fresh ? 'amber' : ''}`}>
+          <span
+            className={`small-note ${!fresh && !scheduledMarginWait ? 'amber' : ''}`}
+          >
             组状态 {clock(pair.state?.updated_at)}
-            {!fresh ? ' · 过期或不完整' : ''}
+            {scheduledMarginWait
+              ? ' · 按计划检查'
+              : !fresh
+                ? ' · 过期或不完整'
+                : ''}
           </span>
         </div>
         <dl className="cycle-key-values">
@@ -756,6 +766,7 @@ function PairSide({
   offline,
   baseLimit,
   cycle,
+  scheduledWait,
 }: {
   side: 'long' | 'short';
   account?: Account;
@@ -764,6 +775,7 @@ function PairSide({
   offline: boolean;
   baseLimit: string;
   cycle: boolean;
+  scheduledWait: boolean;
 }) {
   const fresh = pairDataFresh(snapshot?.timestamp, now, offline);
   const positions = snapshot?.positions.filter(
@@ -788,9 +800,11 @@ function PairSide({
             {side === 'long' ? 'A · 只多' : 'B · 只空'}{' '}
             <span className="muted">{account?.name ?? '账户待确认'}</span>
           </h2>
-          <p className={!fresh ? 'amber' : 'muted'}>
-            {pairSnapshotStatus(snapshot, now, offline)} ·{' '}
-            {clock(snapshot?.timestamp)}
+          <p className={!fresh && !scheduledWait ? 'amber' : 'muted'}>
+            {scheduledWait
+              ? '上次检查快照'
+              : pairSnapshotStatus(snapshot, now, offline)}{' '}
+            · {clock(snapshot?.timestamp)}
           </p>
         </div>
       </div>

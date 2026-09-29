@@ -327,12 +327,17 @@ class MarginBalancer:
         source, destination = ("long", "short") if delta > 0 else ("short", "long")
         snapshot = snapshots[source]
         buffer = Fraction(dec(config["buffer_ratio"]))
-        limits = [positive(members[source].get("policy", {}).get("margin_limit", "0.5"))]
-        if "margin_limit" in pair.get("ordinary", {}):
-            limits.append(positive(pair["ordinary"]["margin_limit"]))
-        limit = Fraction(min(limits)) - buffer
-        if limit <= 0 or limit > 1:
-            raise TradingError("风险缓冲必须小于来源账户保证金占用上限")
+        # Paired transfers use the group's policy, just like paired opening.
+        # Standalone account limits must not silently override group settings.
+        ordinary = pair.get("ordinary")
+        if not isinstance(ordinary, dict) or "margin_limit" not in ordinary:
+            raise TradingError("编组基础保证金占用上限缺失")
+        base_limit = positive(ordinary["margin_limit"])
+        if base_limit > 1:
+            raise TradingError("编组基础保证金占用上限不得超过 100%")
+        limit = Fraction(base_limit) - buffer
+        if limit <= 0:
+            raise TradingError("风险缓冲必须小于编组基础保证金占用上限")
         equity = Fraction(positive(snapshot.equity))
         # Keep both spare cash and enough post-transfer equity for ALL occupied
         # margin. Available funds are not synonymous with safely transferable funds.
@@ -353,9 +358,6 @@ class MarginBalancer:
                     return wire(Decimal(int(Fraction(value) * 10000)) * Decimal("0.01"))
                 def cash(value):
                     return wire(Decimal(int(max(Fraction(0), value) // TRANSFER_UNIT)) * Decimal("0.00000001"))
-                bases = f"账户基础 {percent(limits[0])}%"
-                if len(limits) > 1:
-                    bases += f"、编组基础 {percent(limits[1])}%，取较低值"
                 limited = "、".join(f"{name}（可划 {cash(value)} USD1）" for name, value in constraints.items()
                     if max(Fraction(0), value) // TRANSFER_UNIT * TRANSFER_UNIT < dec(config["min_transfer"]))
                 side = "A 多侧" if source == "long" else "B 空侧"
@@ -363,7 +365,7 @@ class MarginBalancer:
                     if Fraction(snapshot.maintenance) > occupied else "")
                 diagnostics["reason"] = (
                     f"转出侧 {side}占用率约 {percent(occupied / equity)}%{maintenance}，"
-                    f"划转后占用上限 {percent(limit)}%（{bases}，再扣 {percent(buffer)} 个百分点；"
+                    f"划转后占用上限 {percent(limit)}%（编组基础 {percent(base_limit)}%，再扣 {percent(buffer)} 个百分点；"
                     "不含普通高杠杆或循环额外的 5 个百分点）；"
                     f"限制项：{limited}；共同约束后的安全可划金额 {wire(rounded)} USD1，"
                     f"低于最小划转额 {_display_amount(Fraction(dec(config['min_transfer'])))} USD1")

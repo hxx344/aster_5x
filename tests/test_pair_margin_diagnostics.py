@@ -34,19 +34,35 @@ class PairMarginDiagnosticsTests(unittest.TestCase):
         result, reason = self.explain()
         self.assertIsNone(result)
         for text in ("转出侧 A 多侧占用率约 89.07%", "划转后占用上限 85.00%",
-                     "账户基础 90.00%、编组基础 90.00%", "再扣 5.00 个百分点",
+                     "编组基础 90.00%", "再扣 5.00 个百分点",
                      "不含普通高杠杆或循环额外的 5 个百分点", "限制项：风险缓冲（可划 0.00000000 USD1）",
                      "低于最小划转额 500 USD1"):
             self.assertIn(text, reason)
         self.assertNotIn("限制项：现金保留", reason)
 
-    def test_lower_account_limit_and_newer_exchange_occupation_are_reported(self):
+    def test_group_limit_and_newer_exchange_occupation_are_reported(self):
         self.members["long"]["policy"]["margin_limit"] = "0.8"
         result, reason = self.explain(occupied_floors={"long": Fraction(70000)})
         self.assertIsNone(result)
-        self.assertIn("账户基础 80.00%、编组基础 90.00%", reason)
-        self.assertIn("划转后占用上限 75.00%", reason)
+        self.assertIn("编组基础 90.00%", reason)
+        self.assertNotIn("账户基础", reason)
+        self.assertIn("划转后占用上限 85.00%", reason)
         self.assertIn("占用率约 94.65%", reason)
+
+    def test_screenshot_group_95_buffer_1_allows_balance_despite_account_50(self):
+        self.pair["ordinary"]["margin_limit"] = "0.95"
+        for member in self.members.values():
+            member["policy"]["margin_limit"] = "0.5"
+        self.config.update(buffer_ratio="0.01", threshold="1000", min_transfer="300")
+        self.snapshots = {"long": snapshot("70601.50"), "short": snapshot("75079.21")}
+        self.snapshots["long"].available = dec("4801.48")
+        self.snapshots["short"].available = dec("9279.19")
+        result, _ = self.explain(occupied_floors={"short": Fraction(dec("65799.42"))})
+        self.assertEqual(result, {"source": "short", "destination": "long", "amount": "2238.85500000"})
+        result, reason = self.explain(occupied_floors={"short": Fraction(dec("71000"))})
+        self.assertIsNone(result)
+        self.assertIn("划转后占用上限 94.00%（编组基础 95.00%，再扣 1.00 个百分点", reason)
+        self.assertNotIn("账户基础", reason)
 
     def test_cash_and_withdrawal_constraints_are_distinguished(self):
         self.config.update(threshold="10", min_transfer="100")

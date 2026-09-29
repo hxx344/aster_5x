@@ -63,7 +63,8 @@ class PairMarginTests(unittest.TestCase):
             live_allowed=lambda member: True)
         self.balancer = MarginBalancer(self.engine)
         self.pair = {"id": "gold", "symbol": "XAUUSD1", "long_account_id": "long", "short_account_id": "short",
-            "enabled": True, "margin": {**DEFAULT_MARGIN, "enabled": True, "master_env_prefix": "ASTER_MASTER"}}
+            "enabled": True, "ordinary": {"margin_limit": "0.5"},
+            "margin": {**DEFAULT_MARGIN, "enabled": True, "master_env_prefix": "ASTER_MASTER"}}
 
     def snapshots(self):
         return {side: broker.snapshot(["XAUUSD1"]) for side, broker in self.brokers.items()}
@@ -352,7 +353,7 @@ class PairMarginTests(unittest.TestCase):
                     self.assertIsNone(result["pending"])
                     self.assertEqual(self.refreshed[-2:], ["long", "short"])
 
-    def test_transfer_respects_stricter_pair_and_member_margin_limits(self):
+    def test_transfer_uses_pair_limit_independently_of_member_limit(self):
         self.pair["ordinary"] = {"margin_limit": "0.3"}
         snapshots = {"long": snapshot(100), "short": snapshot(0)}
         snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(100), dec(100), 5)]
@@ -360,9 +361,51 @@ class PairMarginTests(unittest.TestCase):
         plan = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
         self.assertEqual(plan["amount"], "20.00000000")
         self.pair["ordinary"]["margin_limit"] = "0.8"
-        self.members["long"]["policy"]["margin_limit"] = "0.3"
-        same = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
-        self.assertEqual(same["amount"], "20.00000000")
+        for legacy_limit in ("0.1", "0.3", "0.5", "1"):
+            with self.subTest(legacy_limit=legacy_limit):
+                self.members["long"]["policy"]["margin_limit"] = legacy_limit
+                plan = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
+                self.assertEqual(plan["amount"], "50.00000000")
+
+    def test_live_transfer_in_both_directions_obeys_only_group_limit(self):
+        for source, destination in (("long", "short"), ("short", "long")):
+            for group_limit in ("0.6", "0.95"):
+                with self.subTest(source=source, group_limit=group_limit):
+                    snapshots = self.live()
+                    self.store.put("pair_margin:gold", {})
+                    self.pair["ordinary"]["margin_limit"] = group_limit
+                    self.pair["margin"]["buffer_ratio"] = "0.01"
+                    for side, equity, available in ((source, 3000, 900), (destination, 1000, 100)):
+                        snapshots[side] = snapshot(equity)
+                        snapshots[side].available = dec(available)
+                        snapshots[side].account_read_generation = 0
+                        self.brokers[side].api.account["assets"][0].update(marginBalance=str(equity),
+                            availableBalance=str(available), maxWithdrawAmount=str(available))
+                    snapshots[source].positions = [Position("XAUUSD1", source.upper(), dec(105), dec(100), dec(100), 5)]
+                    self.brokers[source].api.account["positions"] = [{"symbol": "XAUUSD1", "positionSide": source.upper(),
+                        "positionAmt": "105", "leverage": "5", "isolated": False, "positionInitialMargin": "2100"}]
+                    result = self.balancer.tick(self.pair, snapshots)
+                    if group_limit == "0.6":
+                        self.assertEqual(result["status"], "waiting", result)
+                        self.assertIn("划转后占用上限 59.00%", result["reason"])
+                        self.assertEqual(self.transfers, [])
+                    else:
+                        self.assertEqual(result["status"], "acknowledged", result)
+                        self.assertEqual(result["plan"], {"source": source, "destination": destination, "amount": "400.00000000"})
+                        self.assertEqual(len(self.transfers), 1)
+                        self.assertEqual(self.transfers[0][2]["fromAccountAddress"], self.creds["ASTER_" + source.upper()]["user"])
+
+    def test_invalid_group_limit_never_falls_back_to_account_limit(self):
+        for ordinary in (None, {}, {"margin_limit": "0"}, {"margin_limit": "NaN"},
+                         {"margin_limit": "1.01"}, {"margin_limit": "0.05"}):
+            with self.subTest(ordinary=ordinary):
+                self.ready()
+                self.pair["ordinary"] = ordinary
+                result = self.balancer.tick(self.pair, self.snapshots())
+                self.assertEqual(result["status"], "blocked", result)
+                self.assertFalse(self.state().get("last_transfer"))
+                self.assertEqual(self.brokers["long"].state["wallet"], "3000")
+                self.assertEqual(self.brokers["short"].state["wallet"], "1000")
 
     def test_wrong_direction_isolated_modes_pending_orders_and_staleness_block(self):
         valid = self.snapshots()

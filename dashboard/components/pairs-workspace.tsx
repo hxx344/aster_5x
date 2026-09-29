@@ -639,7 +639,7 @@ function PairDetail({
           <div>
             <dt>转出侧风险与现金缓冲</dt>
             <dd>
-              较低的账户／编组基础上限扣减{' '}
+              编组基础上限 {pct(pair.ordinary.margin_limit)} 扣减{' '}
               {fmt(Number(pair.margin.buffer_ratio) * 100)} 个百分点
               <small>
                 不含普通高杠杆或循环额外的 5 个百分点； 可用余额保留 ≥ 当前权益

@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import { clock } from '@/lib/desk-format';
 import type { Pair } from '@/lib/pairs';
 import {
+  pairScheduledMarginWait,
   pairStatusNotices,
   recordPairNotices,
   type PairNoticeEntry,
@@ -23,6 +24,7 @@ export function PairNotices({
   clear: () => void;
 }) {
   const notices = pairStatusNotices(pair, now, offline);
+  const scheduledWait = pairScheduledMarginWait(pair, now, offline);
   const currentKeys = new Set(notices.map((notice) => notice.key));
   // Derive current warnings immediately; history never authorizes an action.
   const entries = recordPairNotices(history, notices, now).entries;
@@ -39,12 +41,13 @@ export function PairNotices({
   if (latest && !currentKeys.has(latest.key)) visible.push(latest);
   const visibleKeys = new Set(visible.map((entry) => entry.key));
   const older = entries.filter((entry) => !visibleKeys.has(entry.key));
-  if (!visible.length) return null;
+  if (!visible.length && !scheduledWait) return null;
   const hasPast = entries.some((entry) => !currentKeys.has(entry.key));
   const status = (entry: PairNoticeEntry) => {
     if (currentKeys.has(entry.key)) return '当前提示';
     if (
       entry.kind === 'data' &&
+      !scheduledWait &&
       Number.isFinite(now) &&
       now > 0 &&
       !notices.some((notice) => notice.kind === 'data')
@@ -82,6 +85,19 @@ export function PairNotices({
           </Button>
         ) : null}
       </div>
+      {scheduledWait ? (
+        <p className="muted" aria-live="polite">
+          {scheduledWait.checking
+            ? '等待本次保证金检查结果'
+            : scheduledWait.coolingDown
+              ? '划转冷却中'
+              : '等待下一次保证金检查'}{' '}
+          · 上次检查 {clock(scheduledWait.checkedAt)} ·{' '}
+          {scheduledWait.checking ? '计划检查' : '下一次检查'}{' '}
+          {clock(scheduledWait.nextCheckAt)}
+          。账户数值保留上次快照，实际划转前会重新核验。
+        </p>
+      ) : null}
       {visible.map((entry) => item(entry, true))}
       {older.length ? (
         <details className="pair-notices-history">
@@ -89,10 +105,12 @@ export function PairNotices({
           {older.map((entry) => item(entry))}
         </details>
       ) : null}
-      <p className="muted pair-notice-scope">
-        仅保留本次页面会话最近 8
-        种提示，按配对组分别记录；历史提示不代表当前仍有异常。
-      </p>
+      {entries.length ? (
+        <p className="muted pair-notice-scope">
+          仅保留本次页面会话最近 8
+          种提示，按配对组分别记录；历史提示不代表当前仍有异常。
+        </p>
+      ) : null}
     </section>
   );
 }

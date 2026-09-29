@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   PAIR_NOTICE_LIMIT,
   clearPastPairNotices,
+  pairScheduledMarginWait,
   pairStatusNotices,
   recordPairNotices,
   updatePairNoticeHistories,
@@ -36,6 +37,222 @@ function pair(state = {}, options = {}) {
 function notice(text, kind = 'execution') {
   return { key: `${kind}:${text}`, kind, text };
 }
+
+function marginPair() {
+  return pair(
+    {
+      phase: 'monitoring',
+      updated_at: 110,
+      progress: { quantities: { LONG: '0', SHORT: '0.000' } },
+      margin: {
+        enabled: true,
+        status: 'waiting',
+        blocks_trading: false,
+        checked_at: 100,
+        next_check_at: 130,
+        cooldown_until: 0,
+        pending: null,
+        api_notice: null,
+      },
+    },
+    {
+      ordinary: { enabled: false },
+      cycle: { enabled: false },
+      margin: { enabled: true },
+    },
+  );
+}
+
+test('scheduled margin waits retain source timestamps without recurring stale notices', () => {
+  let history;
+  for (const now of [107.9, 108, 110, 120, 130, 131]) {
+    const fixture = marginPair();
+    fixture.state.updated_at = now;
+    const wait = pairScheduledMarginWait(fixture, now);
+    assert.deepEqual(wait, {
+      checkedAt: 100,
+      nextCheckAt: 130,
+      coolingDown: false,
+      checking: now >= 130,
+    });
+    const notices = pairStatusNotices(fixture, now);
+    assert.deepEqual(notices, []);
+    history = recordPairNotices(history, notices, now);
+    assert.deepEqual(history.entries, []);
+    assert.equal(fixture.state.snapshots.long.timestamp, 100);
+    assert.equal(fixture.state.snapshots.short.timestamp, 100);
+  }
+});
+
+test('normal cooldown uses the later balance deadline and cannot wait indefinitely', () => {
+  const fixture = marginPair();
+  fixture.state.margin.status = 'cooldown';
+  fixture.state.margin.cooldown_until = 160;
+  fixture.state.updated_at = 150;
+  assert.deepEqual(pairScheduledMarginWait(fixture, 150), {
+    checkedAt: 100,
+    nextCheckAt: 160,
+    coolingDown: true,
+    checking: false,
+  });
+  fixture.state.updated_at = 167.99;
+  assert.equal(pairScheduledMarginWait(fixture, 167.99).checking, true);
+  fixture.state.updated_at = 168;
+  assert.equal(pairScheduledMarginWait(fixture, 168), null);
+  assert.ok(
+    pairStatusNotices(fixture, 168).some(({ kind }) => kind === 'data'),
+  );
+});
+
+test('scheduled check grace requires a live runtime and preserves overdue or offline warnings', () => {
+  for (const [now, updatedAt, offline] of [
+    [118, 110, false],
+    [110, 110, true],
+    [138, 138, false],
+  ]) {
+    const fixture = marginPair();
+    fixture.state.updated_at = updatedAt;
+    assert.equal(pairScheduledMarginWait(fixture, now, offline), null);
+    assert.ok(
+      pairStatusNotices(fixture, now, offline).some(
+        ({ kind }) => kind === 'data',
+      ),
+    );
+  }
+});
+
+test('opening modes and incomplete or invalid schedules retain the existing freshness checks', () => {
+  const mutations = [
+    (p) => {
+      p.enabled = false;
+    },
+    (p) => {
+      p.ordinary.enabled = true;
+    },
+    (p) => {
+      p.cycle.enabled = true;
+    },
+    (p) => {
+      delete p.ordinary;
+    },
+    (p) => {
+      p.margin.enabled = false;
+    },
+    (p) => {
+      p.state.margin.enabled = false;
+    },
+    (p) => {
+      p.state.snapshots.long = null;
+    },
+    (p) => {
+      p.state.snapshots.short.timestamp = 112;
+    },
+    (p) => {
+      p.state.snapshots.long.timestamp = NaN;
+    },
+    (p) => {
+      p.state.margin.checked_at = 112;
+    },
+    (p) => {
+      p.state.margin.next_check_at = 99;
+    },
+    (p) => {
+      p.state.margin.next_check_at = Infinity;
+    },
+    (p) => {
+      delete p.state.margin.next_check_at;
+    },
+    (p) => {
+      p.state.margin.cooldown_until = NaN;
+    },
+    (p) => {
+      p.state.margin.cooldown_until = -1;
+    },
+  ];
+  for (const mutate of mutations) {
+    const fixture = marginPair();
+    mutate(fixture);
+    assert.equal(pairScheduledMarginWait(fixture, 110), null);
+    assert.ok(
+      pairStatusNotices(fixture, 110).some(({ kind }) => kind === 'data'),
+    );
+  }
+});
+
+test('pending work, failed reads, API waits and remaining cycle positions are never suppressed', () => {
+  const mutations = [
+    (p) => {
+      p.state.pending = { id: 'unresolved-order' };
+    },
+    (p) => {
+      p.state.margin.pending = {
+        request_id: 'unresolved-transfer',
+        status: 'unknown',
+      };
+    },
+    (p) => {
+      p.state.margin.status = 'unknown';
+    },
+    (p) => {
+      p.state.margin.status = 'rejected';
+    },
+    (p) => {
+      p.state.margin.blocks_trading = true;
+    },
+    (p) => {
+      p.state.phase = 'waiting';
+    },
+    (p) => {
+      p.state.phase = 'attention';
+    },
+    (p) => {
+      p.state.progress.quantities.LONG = '0.1';
+    },
+    (p) => {
+      p.state.progress.quantities.SHORT = '1e-999';
+    },
+    (p) => {
+      p.state.progress.quantities.SHORT = 'invalid';
+    },
+    (p) => {
+      p.state.margin.api_notice = {
+        kind: 'budget',
+        text: '本地执行 API 请求权重预算不足',
+      };
+    },
+    (p) => {
+      p.state.api_notice = { kind: 'cooldown', text: '接口冷却中' };
+    },
+    (p) => {
+      p.state.reason = '本地执行 API 请求权重预算不足';
+    },
+  ];
+  for (const mutate of mutations) {
+    const fixture = marginPair();
+    mutate(fixture);
+    assert.equal(pairScheduledMarginWait(fixture, 110), null);
+    assert.ok(
+      pairStatusNotices(fixture, 110).some(({ kind }) => kind === 'data'),
+    );
+  }
+});
+
+test('a genuine failure stays in history when the next healthy scheduled wait clears it', () => {
+  const fixture = marginPair();
+  fixture.state.phase = 'waiting';
+  let history = recordPairNotices(
+    undefined,
+    pairStatusNotices(fixture, 110),
+    110,
+  );
+  assert.equal(history.entries.length, 1);
+  fixture.state.phase = 'monitoring';
+  fixture.state.updated_at = 111;
+  history = recordPairNotices(history, pairStatusNotices(fixture, 111), 111);
+  assert.deepEqual(history.activeKeys, []);
+  assert.equal(history.entries.length, 1);
+  assert.equal(history.entries[0].occurrences, 1);
+});
 
 function freeze(value) {
   if (value && typeof value === 'object') {

@@ -47,6 +47,7 @@ import {
   pairNetQuantity,
   pairPhaseLabel,
   pairSnapshotStatus,
+  pairStartRecoveryBlock,
   pairTransferStatus,
   parsePairDraft,
   type Pair,
@@ -329,9 +330,7 @@ function PairDetail({
       ? '等待服务就绪'
       : draft.dirty
         ? '请先保存或撤销设置草稿'
-        : pending
-          ? '订单或划转结果仍待确认'
-          : '';
+        : pairStartRecoveryBlock(pair);
   const reason = pair.state?.reason || pair.pause_reason;
   return (
     <>
@@ -363,7 +362,8 @@ function PairDetail({
             <Button
               disabled={busy || offline || Boolean(startBlock)}
               title={
-                startBlock || '核验并采纳两侧实际仓位为底仓，再按已保存配置启动'
+                startBlock ||
+                '自动核对原订单与实际持仓；核验通过后保留实际平衡底仓，再按已保存配置启动'
               }
               onClick={() => void action(`/api/pairs/${pair.id}/enable`)}
             >
@@ -420,7 +420,7 @@ function PairDetail({
           </p>
           {!pair.enabled ? (
             <p className="muted">
-              无未完成订单、划转或循环新增仓位时，启动会核验并采纳两侧实际仓位为底仓，后续循环仅处理新增部分。手动全部平仓后也可「核对空仓」清除底仓记录。
+              启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未决划转或循环仓位仍须先完成恢复。
             </p>
           ) : null}
         </div>
@@ -489,7 +489,9 @@ function PairDetail({
             </dd>
             <small>
               {pending
-                ? '结果未明时停止新增，等待确认或减回风险暴露'
+                ? !pair.enabled && !pairStartRecoveryBlock(pair)
+                  ? '可直接点击启动自动核对；原单全部结束后，保留已核验的实际平衡底仓'
+                  : '结果未明时停止新增，继续核对原订单与恢复状态'
                 : '单侧异常时由配对组统一处理'}
             </small>
           </div>

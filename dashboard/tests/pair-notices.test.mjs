@@ -105,6 +105,12 @@ test('pending execution and stale data remain two independent complete notices',
 test('paused unresolved orders or transfers explain the start block before adoption', () => {
   for (const pendingState of [
     { pending: { kind: 'ordinary', id: 'demo-order' } },
+    { pending: { kind: 'cycle', phase: 'open', id: 'cycle-order' } },
+    { pending: { kind: 'leverage', id: 'leverage-order' } },
+    {
+      pending: { kind: 'ordinary', phase: 'open', id: 'ordinary-order' },
+      progress: { quantities: { LONG: '0.1' } },
+    },
     { margin: { pending: { request_id: 'demo-transfer' } } },
   ]) {
     const notices = pairStatusNotices(
@@ -116,6 +122,47 @@ test('paused unresolved orders or transfers explain the start block before adopt
     assert.match(data.text, /完成后才能启动/);
     assert.ok(!data.text.includes('再采纳实际仓位'));
   }
+});
+
+test('paused ordinary opening offers automatic start checks and preserves balanced manual additions', () => {
+  const fixture = pair(
+    {
+      phase: 'reconciling',
+      pending: { kind: 'ordinary', phase: 'open', id: 'ordinary-order' },
+      progress: { quantities: { LONG: '0', SHORT: '0' } },
+    },
+    { enabled: false },
+  );
+  for (const now of [100, 108]) {
+    const notices = pairStatusNotices(fixture, now);
+    const execution = notices.find(({ kind }) => kind === 'execution');
+    assert.match(execution.text, /启动时会自动核验原单与补偿单/);
+    assert.match(execution.text, /全部结束且账户检查通过/);
+    assert.match(execution.text, /保留实际平衡底仓，无需减回旧底仓/);
+    const data = notices.find(({ kind }) => kind === 'data');
+    if (data) {
+      assert.match(data.text, /可直接点击“启动配对组”自动核对/);
+      assert.match(data.text, /结果未明时仍保持暂停/);
+      assert.doesNotMatch(data.text, /完成后才能启动/);
+    }
+  }
+  const concurrentTransfer = pairStatusNotices(
+    {
+      ...fixture,
+      state: {
+        ...fixture.state,
+        margin: { pending: { request_id: 'transfer' } },
+      },
+    },
+    108,
+  );
+  assert.match(
+    concurrentTransfer.find(({ kind }) => kind === 'data').text,
+    /完成后才能启动/,
+  );
+  assert.ok(
+    concurrentTransfer.every(({ text }) => !text.includes('启动时会自动核验')),
+  );
 });
 
 test('unknown order or transfer outcomes stay pending and use the available reason', () => {

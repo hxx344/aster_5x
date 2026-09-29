@@ -15,6 +15,10 @@ class PairPositionError(TradingError):
     """An unowned or externally changed position cannot authorize a new order."""
 
 
+class PairRecoveryConflict(TradingError):
+    """A newer durable state must never be overwritten by a stale recovery."""
+
+
 def positions(snapshots, *, equal_leverage=True):
     result = {}
     for key, side in SIDES:

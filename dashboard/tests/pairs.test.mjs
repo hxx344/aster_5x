@@ -12,6 +12,7 @@ import {
   pairNetQuantity,
   pairPhaseLabel,
   pairSnapshotStatus,
+  pairStartRecoveryBlock,
   pairTransferStatus,
   parsePairDraft,
 } from '../lib/pairs.ts';
@@ -528,6 +529,64 @@ test('unknown orders and transfers block edits/deletion without claiming complet
   assert.match(
     pairConfigurationLock(pair({ progress: { quantities: { LONG: '0.01' } } })),
     /基线/,
+  );
+});
+
+test('ordinary opening can request reconciliation at start without unlocking edits or deletion', () => {
+  const fixture = pair({
+    pending: {
+      id: 'unknown-original',
+      kind: 'ordinary',
+      phase: 'open',
+      legs: [{ receipt: null }],
+    },
+    snapshots: {
+      long: snapshot([position('LONG', '19.5')], 1),
+      short: snapshot([position('SHORT', '19.5')], 1),
+    },
+    progress: { quantities: { LONG: '0', SHORT: '0.000' } },
+  });
+  assert.equal(pairStartRecoveryBlock(fixture), '');
+  assert.equal(pairHasPending(fixture), true);
+  assert.match(pairConfigurationLock(fixture), /待核对/);
+  assert.match(pairDeletionBlock(fixture, 100), /等待确认/);
+  // UI values do not authorize adoption or require reducing larger holdings.
+  assert.equal(
+    pairStartRecoveryBlock(pair({ pending: fixture.state.pending })),
+    '',
+  );
+  assert.equal(pairStartRecoveryBlock(pair()), '');
+});
+
+test('other pending work still blocks start even alongside an ordinary opening', () => {
+  const ordinary = { id: 'batch', kind: 'ordinary', phase: 'open' };
+  for (const pending of [
+    { kind: 'cycle', phase: 'open' },
+    { kind: 'ordinary', phase: 'close' },
+    { kind: 'leverage' },
+    { id: 'unclassified' },
+  ])
+    assert.match(pairStartRecoveryBlock(pair({ pending })), /批次仍待核对/);
+  for (const margin of [
+    { pending: { request_id: 'transfer' } },
+    ...['submitting', 'accepted', 'acknowledged', 'unknown'].map((status) => ({
+      status,
+    })),
+  ])
+    assert.match(
+      pairStartRecoveryBlock(pair({ pending: ordinary, margin })),
+      /划转/,
+    );
+  for (const qty of ['0.1', '0.000000000000000000000000001', '-0.1', 'invalid'])
+    assert.match(
+      pairStartRecoveryBlock(
+        pair({ pending: ordinary, progress: { quantities: { LONG: qty } } }),
+      ),
+      /循环新增仓位/,
+    );
+  assert.equal(
+    pairStartRecoveryBlock(pair({ margin: { status: 'confirmed' } })),
+    '',
   );
 });
 

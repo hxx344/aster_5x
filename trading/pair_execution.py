@@ -14,7 +14,7 @@ from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, wire, cycle_margin_limit, opening_margin_limit
 from .paper import PaperOrderAbsent
-from .pair_planning import (SYMBOL, SIDES, PairPositionError, positions, require_quantities,
+from .pair_planning import (SYMBOL, SIDES, PairPositionError, PairRecoveryConflict, positions, require_quantities,
                             plan_ordinary, plan_paired_cycle, ordinary_upgrade)
 from .store import dumps
 
@@ -199,6 +199,7 @@ class PairTrader:
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
         state.pop("retry_after", None)
         state["api_notice"] = None
+        save_state = True
         if not isinstance(state.get("progress"), dict):
             state["progress"] = empty_progress(state["owned"])
         try:
@@ -303,7 +304,7 @@ class PairTrader:
                 state.update(phase="attention", reason=state["attention"])
                 return state
             if not holding and time.time() < state.get("retry_at", 0):
-                state.update(phase="waiting", reason="上批未完整成交，已减回原始基线；当前处于开仓冷却期，结束后系统重新检查开仓条件")
+                state.update(phase="waiting", reason="上批已核对结束，当前底仓保留；开仓冷却结束后系统重新检查开仓条件")
                 return state
             book = self.engine.cycle_book(SYMBOL) if pair["cycle"]["enabled"] or holding else self.market.book(SYMBOL)
             rule = self.market.rules[SYMBOL]
@@ -328,6 +329,9 @@ class PairTrader:
                 state.update(phase="monitoring", reason="未启用开仓模式，仅管理保证金；"
                              + ("自动平衡已开启，满足余额差额及安全可划条件时会划转"
                                 if pair["margin"]["enabled"] else "自动平衡未开启，不发起新划转"))
+        except PairRecoveryConflict:
+            save_state = False
+            return self.store.get("pair_runtime:" + pair["id"], state)
         except PairPositionError as exc:
             state.update(phase="attention", reason=str(exc), attention=str(exc))
         except TradingError as exc:
@@ -337,7 +341,8 @@ class PairTrader:
                          "holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
                          reason=str(exc))
         finally:
-            self._save(pair, state)
+            if save_state:
+                self._save(pair, state)
         return state
 
     @staticmethod
@@ -427,7 +432,8 @@ class PairTrader:
                         raise RequestNotSent(str(exc)) from None
                 budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
                 with budget:
-                    result = broker.submit([order])
+                    result = (broker.submit([order], timeout=3) if isinstance(broker, LiveBroker)
+                              else broker.submit([order]))
                 if not isinstance(result, list) or len(result) != 1:
                     raise TradingError("单腿订单回执无效，等待查询")
                 row = result[0]
@@ -510,12 +516,27 @@ class PairTrader:
         return all(leg.get("receipt") and leg["receipt"]["status"] in TERMINAL
                    for leg in pending["legs"] + pending["repairs"])
 
-    def _recover(self, pair, state, brokers, *, read_only=False):
+    def _recover(self, pair, state, brokers, *, read_only=False, recovery_source=None):
         pending = state["pending"]
         if pending["kind"] == "leverage":
             return self._recover_leverage(pair, state, brokers)
         if not self._query(pair, state, brokers):
             state.update(phase="reconciling", reason="至少一条市价单结果未确定，系统按原订单编号继续查询；禁止重发、新开仓及划转")
+            # Observation is for visibility only. Even balanced positions never
+            # replace a terminal receipt, especially with external manual trades.
+            now = time.time()
+            if not state.get("retry_after") and not 0 <= now - pending.get("observation_attempt_at", 0) < 3:
+                pending["observation_attempt_at"] = now
+                self._save(pair, state)
+                try:
+                    snapshots, _ = self._read(brokers, reconciliation=True)
+                    self._publish_snapshots(state, snapshots)
+                except TradingError as exc:
+                    self._retry_delay(state, exc)
+                    notice = api_wait_notice(exc)
+                    if notice is not None:
+                        state["api_notice"] = notice
+                    state["reason"] += "；账户仓位刷新暂未完成：" + exchange_reason(str(exc))
             return
         snapshots, guards = self._read(brokers, reconciliation=True)
         self._publish_snapshots(state, snapshots)
@@ -526,16 +547,30 @@ class PairTrader:
             order, row = leg["order"], leg["receipt"]
             adding = (order["positionSide"] == "LONG") == (order["side"] == "BUY")
             expected[order["positionSide"]] += dec(row["executedQty"]) * (1 if adding else -1)
+        original_full = all(leg["receipt"]["status"] == "FILLED" for leg in pending["legs"])
+        # Balanced terminal ordinary batches are a normal completion path.
+        # Preserve manual additions; do not enter a repair path merely because
+        # the old local baseline differs. Cycles retain their separate baseline.
+        if (pending["kind"] == "ordinary" and pending["phase"] == "open"
+                and (actual != expected or (actual["LONG"] == actual["SHORT"]
+                     and actual != {side: dec(pending["before"][side]) for _, side in SIDES}
+                     and (not original_full or pending["repairs"])))
+                and self.engine.pairs.recovery.reconcile_positions(
+                    self, pair, state, source=recovery_source or "automatic_positions")):
+            return
         if actual != expected or any(pos.leverage != pending["leverage"] for pos in held.values()):
             detail = "；".join(
                 f"{'A 多侧' if key == 'long' else 'B 空侧'}实际 {wire(actual[side])} / {held[side].leverage}x，"
                 f"按回执应为 {wire(expected[side])} / {pending['leverage']}x，本批前底仓 {pending['before'][side]}"
                 for key, side in SIDES)
             raise PairPositionError("成交回执与两子账户实际仓位或杠杆不一致，保留批次并停止新增；" + detail)
-        original_full = all(leg["receipt"]["status"] == "FILLED" for leg in pending["legs"])
         if pending["phase"] == "open" and original_full and not pending["repairs"]:
             limit = cycle_margin_limit(pair["ordinary"]) if pending["kind"] == "cycle" else opening_margin_limit(pair["ordinary"], pending["leverage"])
             if any(s.equity <= 0 or s.margin_exceeds(limit) for s in snapshots.values()):
+                if (pending["kind"] == "ordinary" and actual["LONG"] == actual["SHORT"]
+                        and self.engine.pairs.recovery.reconcile_positions(
+                            self, pair, state, source=recovery_source or "automatic_positions")):
+                    return
                 original_full = False
                 pending["last_error"] = "成交后子账户保证金超限，撤回本批新增量"
         desired = pending["target"] if pending["phase"] == "close" or original_full and not pending["repairs"] else pending["before"]
@@ -576,7 +611,7 @@ class PairTrader:
             pending["repair_retry_at"] = time.time() + max(leg["receipt"].get("retry_after", 1) for leg in repairs)
             self._save(pair, state)
 
-    def _finish(self, pair, state, pending, *, completed):
+    def _finish(self, pair, state, pending, *, completed, check_current=None):
         published = state
         state = deepcopy(state)
         state.pop("attention", None)
@@ -604,9 +639,13 @@ class PairTrader:
         state.update(phase="holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
                      reason="两个子账户本批成交与持仓核对完成" if completed else
                             "本批未完整成交，已减回原始基线" if any_fill else "本批未成交，底仓保持不变")
-        if pending.get("manual_position_reconciliation"):
-            state.update(phase="paused", reason="手动核对确认两侧实际仓位已回到本批开仓前底仓；"
-                         "原成交回执保留，本批已结束，配对组仍暂停。未将外部减仓计入程序成交量")
+        audit = pending.get("manual_position_reconciliation")
+        if audit:
+            automatic = audit["source"] == "automatic_positions"
+            reason = (f"自动核对完成，保留实际底仓：多 {state['owned']['LONG']}、空 {state['owned']['SHORT']} XAU；本批已结束" if automatic else
+                      f"已核验并保留实际底仓：多 {state['owned']['LONG']}、空 {state['owned']['SHORT']} XAU；遗留批次已结束，本次未下单或划转")
+            state.update(phase="waiting" if pair["enabled"] else "paused",
+                         reason=reason + "；原成交记录保留，外部增减仓未计入程序成交量")
         rejection_notes = [f"{'A 多侧' if leg['key'] == 'long' else 'B 空侧'}：{exchange_reason(leg['receipt']['reject_reason'])}"
                            for leg in pending["legs"] + pending["repairs"] if leg["receipt"].get("reject_reason")]
         rejection_text = "；拒单反馈：" + "；".join(rejection_notes) if rejection_notes else ""
@@ -615,6 +654,8 @@ class PairTrader:
         # count the batch twice or forget its remaining cycle position.
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if check_current is not None:
+                check_current(db)
             for key, value in (("pair_runtime:" + pair["id"], self._durable(state)),
                                ("pair_batch:" + pending["id"], {**pending, "completed": completed, "finished_at": time.time()})):
                 db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))

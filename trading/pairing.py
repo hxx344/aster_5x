@@ -255,6 +255,14 @@ class PairManager:
             if enabled:
                 from .engine import snapshot_json
                 from .pair_execution import PairTrader, empty_progress
+                if pair["enabled"]:
+                    raise TradingError("配对组已启动，无需重复启动")
+                pending = (self.store.get("pair_runtime:" + pair_id, {}) or {}).get("pending")
+                if isinstance(pending, dict) and pending.get("kind") == "ordinary" and pending.get("phase") == "open":
+                    result = self.recovery.check(pair_id, source="paused_start")
+                    if not result["completed"]:
+                        raise TradingError("启动前自动核对尚未完成，仓位保持不变；" + result["message"])
+                    pair = self.store.pair(pair_id)
                 margin = self.store.get("pair_margin:" + pair_id, {})
                 original_runtime = self._idle(pair)
                 if not any(pair[key]["enabled"] for key in ("ordinary", "cycle", "margin")):

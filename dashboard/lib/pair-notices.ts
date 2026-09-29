@@ -2,6 +2,7 @@ import {
   pairDataFresh,
   pairHasPending,
   pairPhaseLabel,
+  pairStartRecoveryBlock,
   pairTransferStatus,
   type PairApiNotice,
   type Pair,
@@ -61,6 +62,8 @@ export function pairStatusNotices(
     pair.state?.margin?.reason,
   );
   const snapshots = pair.state?.snapshots;
+  const canCheckAtStart =
+    !pair.enabled && pairHasPending(pair) && !pairStartRecoveryBlock(pair);
   const fresh =
     pairDataFresh(pair.state?.updated_at, now, offline) &&
     pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
@@ -73,7 +76,9 @@ export function pairStatusNotices(
         : '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。') +
         (!pair.enabled && !offline
           ? pairHasPending(pair)
-            ? ' 仍有订单或划转待核对，暂停不会结束核对；完成后才能启动。'
+            ? canCheckAtStart
+              ? ' 可直接点击“启动配对组”自动核对，无需另点手动核对；结果未明时仍保持暂停。'
+              : ' 仍有订单或划转待核对，暂停不会结束核对；完成后才能启动。'
             : ' 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。'
           : ' 等待有效快照后才能新增开仓。'),
     );
@@ -100,7 +105,11 @@ export function pairStatusNotices(
     const label = trackedTransfer
       ? pairTransferStatus(trackedTransfer)
       : pairPhaseLabel(pair.state?.phase);
-    const text = `${label}${reason && !apiReason ? ` · ${reason}` : ''}`;
+    const text =
+      `${label}${reason && !apiReason ? ` · ${reason}` : ''}` +
+      (canCheckAtStart
+        ? ' · 启动时会自动核验原单与补偿单；全部结束且账户检查通过后，保留实际平衡底仓，无需减回旧底仓。'
+        : '');
     if (trackedTransfer) {
       // A retry countdown is still the same transfer and stage. Its current
       // text may change without creating another event or hiding other intents.

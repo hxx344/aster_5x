@@ -375,7 +375,7 @@ class API:
         data["signature"] = signature if signature.startswith("0x") else "0x" + signature
         return data
 
-    def call(self, method, path, params=None, signed=False, weight=1):
+    def call(self, method, path, params=None, signed=False, weight=1, *, timeout=None):
         with transport_stage("budget_ms"):
             ticket = self.budget.reserve(weight, track=True)
         try:
@@ -393,7 +393,8 @@ class API:
                 with transport_stage("http_ms"):
                     response = self.http.request(method, BASE + path,
                         params=params if method == "GET" else None, content=content,
-                        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "AsterAccountDesk/1.0"})
+                        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "AsterAccountDesk/1.0"},
+                        **({"timeout": timeout} if timeout is not None else {}))
             except httpx.HTTPError:
                 error = AmbiguousOrder if is_write else ExchangeError
                 raise error("请求结果未知，需核对订单" if is_write else "Aster 网络连接失败") from None
@@ -1091,12 +1092,13 @@ class LiveBroker:
         self.invalidate_cycle_hot_data("账户事件：" + str(kind),
             refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
 
-    def _cycle_write(self, method, path, params, *, weight=1, refresh_modes=False):
+    def _cycle_write(self, method, path, params, *, weight=1, refresh_modes=False, timeout=None):
         # No snapshot HTTP lock: in-flight background results are revoked by
         # generation instead of making a ready order wait for another request.
         self.invalidate_cycle_hot_data("账户写入开始", refresh_modes=refresh_modes)
         try:
-            return self.api.call(method, path, params, signed=True, weight=weight)
+            return self.api.call(method, path, params, signed=True, weight=weight,
+                                 **({"timeout": timeout} if timeout is not None else {}))
         finally:
             # A refresh that started during this write must also be discarded.
             self.invalidate_cycle_hot_data("账户写入结束", refresh_modes=refresh_modes)
@@ -1832,11 +1834,12 @@ class LiveBroker:
             raise TradingError("循环逐笔成交尚未查全，后台继续补账")
         raise TradingError("循环逐笔成交正在分页补账，等待后续核对")
 
-    def submit(self, orders):
+    def submit(self, orders, *, timeout=None):
         self.leverage_snapshot = None
+        options = {"timeout": timeout} if timeout is not None else {}
         if len(orders) == 1:
-            return [self._cycle_write("POST", "/fapi/v3/order", orders[0])]
-        return self._cycle_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5)
+            return [self._cycle_write("POST", "/fapi/v3/order", orders[0], **options)]
+        return self._cycle_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5, **options)
 
     def query(self, symbol, client_id):
         with self.reconciliation_budget():

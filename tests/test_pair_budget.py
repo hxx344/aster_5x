@@ -23,7 +23,7 @@ class OfflineAPI:
         self.calls = []
         self.hedge = True
 
-    def call(self, method, path, params=None, *, signed=False, weight=1):
+    def call(self, method, path, params=None, *, signed=False, weight=1, timeout=None):
         self.budget.reserve(weight)
         self.calls.append((method, path, self.budget._priority_flags()))
         if path == "/fapi/v3/order":

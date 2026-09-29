@@ -357,6 +357,33 @@ export function pairHasPending(pair: Pair): boolean {
     pair.state?.margin?.status === 'unknown'
   );
 }
+export function pairStartRecoveryBlock(pair: Pair): string {
+  const margin = pair.state?.margin;
+  if (
+    margin?.pending ||
+    ['submitting', 'accepted', 'acknowledged', 'unknown'].includes(
+      margin?.status ?? '',
+    )
+  )
+    return '划转结果仍待核对，完成后才能启动';
+  if (
+    Object.values(pair.state?.progress?.quantities ?? {}).some((value) => {
+      const quantity = typeof value === 'string' ? quantityUnits(value) : null;
+      return !quantity || quantity.units !== BigInt(0);
+    })
+  )
+    return '本轮循环新增仓位仍需恢复，完成后才能启动';
+  const pending = pair.state?.pending;
+  if (
+    pending &&
+    Object.keys(pending).length &&
+    (pending.kind !== 'ordinary' || pending.phase !== 'open')
+  )
+    return '循环、减仓或杠杆批次仍待核对，完成后才能启动';
+  // An ordinary opening may request reconciliation at start. Only the server
+  // can validate receipts and current positions, then authorize activation.
+  return '';
+}
 export function pairConfigurationLock(pair: Pair): string {
   if (pair.enabled) return '暂停配对组后可修改设置。';
   if (pairHasPending(pair)) return '订单或划转结果待核对，暂不能修改设置。';

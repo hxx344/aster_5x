@@ -115,10 +115,6 @@ class PairManualBaselineTests(unittest.TestCase):
     def test_single_filled_leg_can_be_manually_reduced_to_its_own_baseline(self):
         original = self.seed()
         external = self.reduce("short")
-        # Autonomous recovery must not adopt the external position change.
-        with self.no_writes():
-            self.engine.pairs.tick("gold")
-        self.assert_retained(original)
         state, batch = self.assert_completed_at_baseline(original, {"LONG": dec(0), "SHORT": dec(QUANTITY)})
         self.assertNotIn(external["clientOrderId"], str(batch))
         with self.assertRaisesRegex(TradingError, "当前没有待核对批次"):
@@ -193,13 +189,35 @@ class PairManualBaselineTests(unittest.TestCase):
         self.assertEqual(self.broker("short").snapshot([SYMBOL]).pair(SYMBOL)[1].qty, dec(BEFORE["SHORT"]))
         self.assert_blocked(original)
 
-    def test_equal_sides_are_not_a_substitute_for_each_saved_baseline(self):
+    def test_equal_terminal_positions_become_the_new_baseline_without_reduction(self):
         original = self.seed(("long", "short"))
         self.reduce("long", "1.009")
         self.reduce("short", "1.409")
         self.assertEqual(self.broker().snapshot([SYMBOL]).pair(SYMBOL)[0].qty, dec("0.5"))
         self.assertEqual(self.broker("short").snapshot([SYMBOL]).pair(SYMBOL)[1].qty, dec("0.5"))
-        self.assert_blocked(original)
+        result = self.check()
+        self.assertTrue(result["completed"], result)
+        self.assertEqual(self.state()["owned"], {"LONG": "0.5", "SHORT": "0.5"})
+        self.assertEqual(self.state()["progress"]["baseline"], self.state()["owned"])
+        batch = self.f.store.get("pair_batch:" + original["pending"]["id"])
+        self.assertEqual(batch["legs"], original["pending"]["legs"])
+        self.assertEqual(batch["repairs"], [])
+
+    def test_restored_baseline_finishes_automatically_while_paused_or_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                original = self.seed()
+                self.reduce("short", client_id="external-auto-" + str(enabled))
+                self.f.store.save_pair({**self.f.store.pair("gold"), "enabled": enabled})
+                with self.no_writes():
+                    self.engine.pairs.tick("gold")
+                current = self.state()
+                self.assertIsNone(current["pending"])
+                self.assertEqual(current["owned"], original["owned"])
+                self.assertEqual(self.f.store.pair("gold")["enabled"], enabled)
+                self.assertNotIn("attention", current)
+                audit = self.f.store.get("pair_batch:" + original["pending"]["id"])["manual_position_reconciliation"]
+                self.assertEqual(audit["source"], "automatic_positions")
 
     def test_changed_leverage_keeps_pending_even_when_both_sides_match_baseline(self):
         original = self.seed()
@@ -305,6 +323,33 @@ class PairManualBaselineLiveTests(unittest.TestCase):
             return value
 
         with self.no_writes(), patch.object(self.engine.pairs, "_read_members", side_effect=invalidate_after_read):
+            result = self.engine.pairs.check_recovery("gold")
+        self.assertFalse(result["completed"])
+        self.assert_retained(original)
+
+    def test_snapshot_expiring_after_guard_acquisition_cannot_commit(self):
+        original = self.seed()
+        from trading.pair_execution import PairTrader
+        trader = PairTrader(self.engine)
+        self.engine.pairs.trader = trader
+        read = self.engine.pairs._read_members
+        finish = trader._finish
+        captured = {}
+
+        def capture(*args, **kwargs):
+            result = read(*args, **kwargs)
+            captured.update(result[0])
+            return result
+
+        def expire_before_transaction(*args, **kwargs):
+            # Simulate time spent waiting for the database writer after the
+            # outer generation guards have already been acquired and checked.
+            for snapshot in captured.values():
+                snapshot.timestamp -= 60
+            return finish(*args, **kwargs)
+
+        with self.no_writes(), patch.object(self.engine.pairs, "_read_members", side_effect=capture), \
+                patch.object(trader, "_finish", side_effect=expire_before_transaction):
             result = self.engine.pairs.check_recovery("gold")
         self.assertFalse(result["completed"])
         self.assert_retained(original)

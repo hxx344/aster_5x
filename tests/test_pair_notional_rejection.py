@@ -15,6 +15,8 @@ from trading.pair_execution import PairTrader
 SYMBOL = "XAUUSD1"
 ORIGINAL_REJECTION = ("Aster 拒绝请求（代码 -2029）：You've reached the maximum notional value limit for this symbol. "
                       "You can still reduce or close your position to manage your risk.")
+REPORTED_REJECTION = ("Aster 拒绝请求（代码 -2029）：You’ve reached the maximum notional value limit for this symbol. "
+                      "You can still reduce or close your position to manage your risk.")
 
 
 class PairNotionalRejectionTests(TestCase):
@@ -140,6 +142,42 @@ class PairNotionalRejectionTests(TestCase):
         self.assertTrue(state["last_batch"]["completed"])
         self.assertEqual(state["owned"], original["pending"]["target"])
 
+    def test_reported_curly_apostrophe_rejection_manual_check_then_background_recovery(self):
+        state = self.seed_legacy()
+        state["pending"]["legs"][0]["submit_error"] = REPORTED_REJECTION
+        self.store.put("pair_runtime:gold", state)
+        self.store.save_pair({**self.store.pair("gold"), "enabled": False})
+        short = self.brokers["short"]
+        with patch.object(self.brokers["long"], "query", side_effect=ExchangeError("not found", code=-2013, http_status=400)) as query, \
+                patch.object(self.brokers["long"], "submit", side_effect=AssertionError("no missing leg addition")), \
+                patch.object(short, "submit", side_effect=AssertionError("manual check must not trade")):
+            result = self.engine.pairs.check_recovery("gold")
+        self.assertFalse(result["completed"])
+        self.assertFalse(result["archive_available"])
+        self.assertEqual([(row["status"], row["executed_qty"]) for row in result["orders"]],
+                         [("REJECTED", "0"), ("FILLED", "1.209")])
+        self.assertEqual(result["orders"][0]["error"], REPORTED_REJECTION)
+        self.assertIn("仍需减仓", result["message"])
+        query.assert_called_once_with(SYMBOL, "legacy_long")
+        state = self.store.get("pair_runtime:gold")
+        self.assertEqual(state["pending"]["repairs"], [])
+        self.trader = PairTrader(self.engine)
+        with patch.object(self.brokers["long"], "query", side_effect=AssertionError("saved rejection")), \
+                patch.object(self.brokers["long"], "submit", side_effect=AssertionError("no missing leg addition")), \
+                patch.object(short, "submit", wraps=short.submit) as reduce:
+            self.assertEqual(self.tick()["phase"], "repairing")
+            self.assertIsNone(self.tick()["pending"])
+            self.tick()
+        self.assertEqual(reduce.call_count, 1)
+        order = reduce.call_args.args[0][0]
+        self.assertEqual((order["side"], order["positionSide"], order["quantity"]), ("BUY", "SHORT", "1.209"))
+        self.assert_baseline()
+        self.assertFalse(self.store.pair("gold")["enabled"])
+        leg = self.store.get("pair_batch:legacy2029")["legs"][0]
+        self.assertEqual(leg["submit_error"], REPORTED_REJECTION)
+        self.assertEqual(leg["receipt"]["reject_reason"], REPORTED_REJECTION)
+        self.assertTrue(leg["receipt"]["recovered_from_submit_error"])
+
     def test_active_order_receipt_prevents_legacy_reclassification(self):
         original = self.seed_legacy()
         order = original["pending"]["legs"][0]["order"]
@@ -154,6 +192,8 @@ class PairNotionalRejectionTests(TestCase):
         original = self.seed_legacy()
         messages = (None, "timeout", ORIGINAL_REJECTION.replace("-2029", "-1007"),
                     "untrusted prefix " + ORIGINAL_REJECTION, ORIGINAL_REJECTION + "；接口冷却中",
+                    REPORTED_REJECTION.replace("-2029", "-1007"),
+                    "untrusted prefix " + REPORTED_REJECTION, REPORTED_REJECTION + "；接口冷却中",
                     "Aster 拒绝请求（代码 -2029）：unknown message")
         for message in messages:
             with self.subTest(message=message):

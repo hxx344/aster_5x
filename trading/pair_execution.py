@@ -467,13 +467,15 @@ class PairTrader:
         # accept an embedded code, timeout, gateway error, or unknown message.
         reason = ("Aster 拒绝请求（代码 -2029）：You've reached the maximum notional value limit for this symbol. "
                   "You can still reduce or close your position to manage your risk.")
-        if leg.get("submit_error") != reason:
+        # Aster has returned both straight and curly apostrophes in this message.
+        original_reason = leg.get("submit_error")
+        if original_reason not in (reason, reason.replace("You've", "You’ve")):
             return None
         order = leg["order"]
         if (order.get("symbol") != SYMBOL or order.get("type") != "MARKET"
                 or (order.get("positionSide"), order.get("side")) not in {("LONG", "BUY"), ("SHORT", "SELL")}):
             return None
-        return {**self._absent(order, reason, local=False), "reject_code": -2029,
+        return {**self._absent(order, original_reason, local=False), "reject_code": -2029,
                 "recovered_from_submit_error": True}
 
     def _query(self, pair, state, brokers):

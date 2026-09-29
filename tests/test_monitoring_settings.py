@@ -106,15 +106,15 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.store.edit_monitoring({"feishu_enabled": True})
         self.assertIsNone(self.store.notification_for_delivery("master"))
 
-    def test_symbol_alert_mute_applies_to_every_category(self):
-        for category in monitoring.CATEGORIES:
+    def test_symbol_alert_mute_applies_to_every_symbol_category(self):
+        for category in monitoring.CATEGORIES - {"hourly_summary"}:
             self.queue(category, ["BTCUSD1"])
         self.store.edit_monitoring({"alerts": False}, symbol="BTCUSD1")
         self.assertEqual(self.store.pending_notifications(), 0)
         self.assertEqual(self.store.due_notifications(), [])
 
     def test_monitoring_off_suppresses_public_alerts_but_preserves_trade_alerts(self):
-        for category in monitoring.CATEGORIES:
+        for category in monitoring.CATEGORIES - {"hourly_summary"}:
             self.queue(category, ["BTCUSD1"])
         self.store.edit_monitoring({"monitor": False}, symbol="BTCUSD1")
         self.assertEqual([row["id"] for row in self.store.due_notifications()], ["trade_summary"])
@@ -303,6 +303,8 @@ class MonitoringAPITests(unittest.TestCase):
         self.assertEqual(self.client.patch("/api/monitoring", json={"feishu_enabled": False}, headers={"origin": "https://bad.invalid"}).status_code, 403)
         for path, body in (("/api/monitoring", {}), ("/api/monitoring", {"feishu_enabled": "false"}),
                            ("/api/monitoring", {"feishu_enabled": None}), ("/api/monitoring", {"feishu_enabled": 1}),
+                           ("/api/monitoring", {"hourly_summary_alerts": "false"}),
+                           ("/api/monitoring", {"hourly_summary_alerts": 1}), ("/api/monitoring", {"hourly_summary_alerts": None}),
                            ("/api/monitoring", {"webhook": "test"}), ("/api/monitoring/symbols/BTCUSD1", {"feishu_enabled": False}),
                            ("/api/monitoring/symbols/BTCUSD1", {"monitor": None})):
             self.assertEqual(self.client.patch(path, json=body).status_code, 422, (path, body))
@@ -310,6 +312,25 @@ class MonitoringAPITests(unittest.TestCase):
         with patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": "secret-sentinel"}):
             response = self.client.get("/api/state")
         self.assertNotIn("secret-sentinel", response.text)
+
+    def test_hourly_summary_settings_persist_and_status_hides_inactive_schedule(self):
+        self.login()
+        self.assertTrue(self.client.get("/api/monitoring").json()["settings"]["hourly_summary_alerts"])
+        with patch("trading.store.time.time", return_value=3500), \
+             patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": "secret-sentinel"}):
+            self.store.hourly_summary_due(available=True)
+            status = self.client.get("/api/state").json()["notification"]["hourly_summary"]
+            self.assertEqual(status, {"interval_seconds": 3600, "next_due_at": 3600, "last_sent_at": None, "pending": False})
+            response = self.client.patch("/api/monitoring", json={"hourly_summary_alerts": False})
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(Store(self.store.path).monitoring_settings()["hourly_summary_alerts"])
+            self.assertIsNone(self.client.get("/api/state").json()["notification"]["hourly_summary"]["next_due_at"])
+            self.assertEqual(self.client.patch("/api/monitoring", json={"hourly_summary_alerts": True}).status_code, 200)
+            self.engine.demo = True
+            self.assertIsNone(self.client.get("/api/state").json()["notification"]["hourly_summary"]["next_due_at"])
+            self.engine.demo = False
+        with patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": ""}):
+            self.assertIsNone(self.client.get("/api/state").json()["notification"]["hourly_summary"]["next_due_at"])
 
     def test_no_account_persistence_legacy_endpoint_and_demo(self):
         self.login()

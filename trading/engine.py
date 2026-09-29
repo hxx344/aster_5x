@@ -17,6 +17,7 @@ import uuid
 
 import monitor
 from . import monitoring
+from .hourly_summary import format_hourly_summary
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import AccountCacheUnavailable, HotAccountUnavailable
@@ -170,6 +171,7 @@ class Engine:
         self.ready = False
         self.error = "正在连接行情服务"
         self.notification_error = None
+        self.hourly_summary_error = None
         self.capacity_notification_errors = {}
         self.capacity_targets, self.capacity_accounts = {}, []
         self.capacity_intervals = {}
@@ -2272,6 +2274,18 @@ class Engine:
             return 5
         try:
             config = self.notification_config()
+            try:
+                now = time.time()
+                token = self.store.hourly_summary_due(available=bool(config), now=now)
+                if token is not None:
+                    message = format_hourly_summary(self.state(background_reports=True, compact=True), now)
+                    if not self.shutdown.is_set() and self.notification_config() == config:
+                        self.store.enqueue_hourly_summary(token, message)
+                self.hourly_summary_error = None
+            except Exception:
+                # A failed local report must not delay unrelated outbox delivery.
+                self.hourly_summary_error = "每小时摘要生成失败，等待重试"
+                LOG.exception("Hourly summary generation failed")
             if not config:
                 return 5
             try:
@@ -2371,6 +2385,8 @@ class Engine:
                                    saved_accounts[0]["id"] if saved_accounts else None)
             events = reader.events(account_id=history_account if compact else None)
             pending_notifications = reader.pending_notifications()
+            hourly_summary = reader.hourly_summary_status(
+                available=not self.demo and bool(os.environ.get("FEISHU_WEBHOOK_URL")), now=state_now)
             listings = reader.get("usd1_listings") or {"initialized": False, "checked_at": None, "rows": {}}
             listings.update(enabled=self.listing_monitor is not None, poll_seconds=LISTING_POLL_SECONDS,
                             stale_seconds=LISTING_STALE_SECONDS, watched_symbols=reader.listing_watch_symbols())
@@ -2538,10 +2554,12 @@ class Engine:
                                    and self.market.remote_capacity is True else None),
                 "accounts": accounts, "pairs": paired_states, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
-                                 "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
+                                 "hourly_summary": hourly_summary,
+                                 "error": self.notification_error or self.hourly_summary_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
     def run(self):
         pending, due = {}, {}
+        rules_due = 0
         market_started, market_backoff = {}, {}
         cycle_job_due = {}
         account_ids, account_generation, accounts_due = [], -1, 0
@@ -2563,16 +2581,6 @@ class Engine:
                 try:
                     while not self.shutdown.is_set():
                         self.scheduler_event.clear()
-                        if not self.ready:
-                            try:
-                                self.market.load_rules()
-                                if any(s not in self.market.rules for s in SYMBOLS):
-                                    raise TradingError("缺少配置市场的交易规则")
-                                self.ready, self.error = True, None
-                            except (TradingError, KeyError, ValueError, TypeError) as exc:
-                                self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
-                                self.shutdown.wait(max(10, getattr(exc, "retry_after", 0)))
-                                continue
                         for key, future in list(pending.items()):
                             if future.done():
                                 failed = False
@@ -2624,6 +2632,24 @@ class Engine:
                                     if key.startswith("market:"):
                                         market_backoff[key] = due[key]
                                 del pending[key]
+                        if not self.ready:
+                            if time.monotonic() >= rules_due:
+                                try:
+                                    self.market.load_rules()
+                                    if any(s not in self.market.rules for s in SYMBOLS):
+                                        raise TradingError("缺少配置市场的交易规则")
+                                    self.ready, self.error = True, None
+                                except (TradingError, KeyError, ValueError, TypeError) as exc:
+                                    self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
+                                    rules_due = time.monotonic() + max(10, getattr(exc, "retry_after", 0))
+                            if not self.ready:
+                                # Startup failures still need local status reports.
+                                # Market polling and trading jobs remain behind ready.
+                                if (not self.shutdown.is_set() and "notify" not in pending
+                                        and time.monotonic() >= due.get("notify", 0)):
+                                    pending["notify"] = pool.submit(self.notify)
+                                self.scheduler_event.wait(.1)
+                                continue
                         with self.lock:
                             generation = self.accounts_generation
                         refresh_schedules = generation != account_generation or time.monotonic() >= accounts_due

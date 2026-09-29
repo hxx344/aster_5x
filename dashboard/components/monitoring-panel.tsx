@@ -6,6 +6,7 @@ import type {
   MonitoringSettings,
   State,
 } from '@/lib/desk-types';
+import { isDisplayTimestamp } from '@/lib/display-time';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -44,6 +45,11 @@ const categories: {
     description: '普通开仓结束后按币种汇总成交；循环与迁移目前只记录本地历史。',
   },
 ];
+
+const date = (value?: number | null) =>
+  isDisplayTimestamp(value)
+    ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false })
+    : '—';
 
 function SettingSwitch({
   title,
@@ -98,6 +104,27 @@ export function MonitoringPanel({
       </section>
     );
   const settings = monitoring.settings;
+  const summary = notification?.hourly_summary;
+  const summaryAvailable =
+    !demo &&
+    settings.feishu_enabled &&
+    settings.hourly_summary_alerts &&
+    notification?.configured;
+  const summaryStatus = demo
+    ? '模拟环境不发送每小时摘要。'
+    : !settings.feishu_enabled
+      ? '飞书总开关已关闭，每小时摘要暂停发送。'
+      : !settings.hourly_summary_alerts
+        ? '每小时摘要已关闭。'
+        : !notification?.configured
+          ? '飞书未配置，每小时摘要不会发送。请在服务器设置 FEISHU_WEBHOOK_URL。'
+          : summary?.pending
+            ? notification.error
+              ? '本小时摘要待发送，通知服务等待重试。'
+              : '本小时摘要待发送。'
+            : summary?.next_due_at != null
+              ? '等待下个整点发送。'
+              : '等待服务器安排下个整点。';
   const disabled = busy || pending || Boolean(connectionError) || demo;
   const save = async (body: object, symbol?: string) => {
     if (disabled) return;
@@ -159,6 +186,38 @@ export function MonitoringPanel({
                 (notification?.configured
                   ? `飞书已配置 · ${notification.pending} 条待发送`
                   : '飞书未配置，请在服务器设置 FEISHU_WEBHOOK_URL。')}
+        </output>
+      </section>
+      <section className="panel">
+        <div className="section-head">
+          <div>
+            <h2>每小时运行摘要</h2>
+            <p>覆盖所有账户与配对组，仅遵循飞书总开关与本摘要开关</p>
+          </div>
+        </div>
+        <div className="monitor-master-grid">
+          <SettingSwitch
+            title="发送每小时摘要"
+            description="每小时整点汇总运行状态、UTC 日交易量目标进度、持仓与保证金划转、API 预算及异常。"
+            checked={settings.hourly_summary_alerts}
+            disabled={disabled}
+            onChange={(value) => void save({ hourly_summary_alerts: value })}
+          />
+          <div className="monitor-setting">
+            <div>
+              <strong>发送安排</strong>
+              <p>
+                上次成功发送：{date(demo ? null : summary?.last_sent_at)}
+                <br />
+                下次计划：
+                {date(summaryAvailable ? summary?.next_due_at : null)}
+              </p>
+            </div>
+          </div>
+        </div>
+        <output className="monitor-status monitor-notification-status">
+          {connectionError ? '连接中断，以下为上次获取的发送状态。' : ''}
+          {summaryStatus} 重新开启后从下个整点开始，不补发历史摘要。
         </output>
       </section>
       <section className="panel">

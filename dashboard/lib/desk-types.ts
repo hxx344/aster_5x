@@ -137,6 +137,7 @@ export type MonitoringSettings = {
   strategy_capacity_alerts: boolean;
   listing_capacity_alerts: boolean;
   trade_summary_alerts: boolean;
+  hourly_summary_alerts: boolean;
 };
 export type MonitoredSymbol = {
   symbol: string;
@@ -207,6 +208,12 @@ export type State = {
     enabled?: boolean;
     pending: number;
     error?: string;
+    hourly_summary?: {
+      interval_seconds: number;
+      next_due_at: number | null;
+      last_sent_at: number | null;
+      pending: boolean;
+    };
   };
 };
 

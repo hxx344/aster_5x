@@ -299,7 +299,7 @@ class WSStreamLifecycleTests(unittest.TestCase):
             self.engine.run()
         load_rules.assert_called_once_with()
         tick.assert_called_once_with("test")
-        self.assertEqual(poll.call_count, len(self.market.rules))
+        poll.assert_called_once_with("XAUUSD1")
         self.stream.start.assert_called_once_with()
         self.stream.close.assert_called_once_with()
         self.api.close.assert_called_once_with()

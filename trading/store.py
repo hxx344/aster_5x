@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, listing_alerts, monitoring
+from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -171,6 +171,7 @@ class Store:
             for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT"), ("category", "TEXT"), ("symbols", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {kind}")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_outbox_category_pending ON outbox(category,expires_at) WHERE delivered_at IS NULL")
             event_columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
             if "cycle_check" not in event_columns:
                 db.execute("ALTER TABLE events ADD COLUMN cycle_check TEXT")
@@ -565,13 +566,33 @@ class Store:
             else:
                 if all(config[key] == value for key, value in changes.items()):
                     return config
+                hourly_changed = any(key in changes and config[key] != changes[key]
+                                     for key in ("feishu_enabled", "hourly_summary_alerts"))
                 config.update(changes)
             config["revision"] += 1
             monitoring.write(db, config)
             if "max_capacity_alert" in changes:
                 listing_alerts.set_watch(db, symbol, changes["max_capacity_alert"], time.time())
             monitoring.cancel_disabled(db, config)
+            if symbol is None and hourly_changed:
+                hourly_notifications.reset(db, time.time(), monitoring.allowed(config, "hourly_summary", []))
             return config
+
+    def hourly_summary_due(self, *, available, now=None):
+        """Read only the persisted timer and settings on ordinary notification ticks."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return hourly_notifications.due(db, time.time() if now is None else now, available)
+
+    def enqueue_hourly_summary(self, token, message, *, now=None):
+        """Publish one current bucket and advance its timer in the same transaction."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return hourly_notifications.enqueue(db, token, message, time.time() if now is None else now)
+
+    def hourly_summary_status(self, *, available, now=None):
+        with self.connect() as db:
+            return hourly_notifications.status(db, time.time() if now is None else now, available)
 
     def save_listing_state(self, state, alerts=(), *, policy_revision=None):
         """Persist discovery progress and its notification outbox atomically."""
@@ -1425,6 +1446,8 @@ class Store:
             now = time.time()
             if success:
                 db.execute("UPDATE outbox SET delivered_at=? WHERE id=?", (now, item["id"]))
+                if row["category"] == "hourly_summary":
+                    hourly_notifications.delivered(db, now)
                 if item["id"].startswith(listing_alerts.MESSAGE_PREFIX):
                     listing_alerts.delivered(db, item)
                 if row["capacity_key"]:
@@ -1445,7 +1468,7 @@ class Store:
     def pending_notifications(self):
         with self.connect() as db:
             config = monitoring.read(db)
-            rows = db.execute("SELECT * FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>0)")
+            rows = db.execute("SELECT * FROM outbox WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at>?)", (time.time(),))
             return sum(monitoring.message_allowed(db, dict(row), config) for row in rows)
 
 

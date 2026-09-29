@@ -238,7 +238,7 @@ class CapacityAlertStoreTests(unittest.TestCase):
         self.now = 1003
         self.assertEqual(self.store.due_notifications(), [])
         self.assertIsNone(self.store.notification_for_delivery(item["id"]))
-        self.assertEqual(self.store.pending_notifications(), 1)
+        self.assertEqual(self.store.pending_notifications(), 0)
 
     def test_delivery_reloads_latest_message_after_batch_selection(self):
         self.observe("11000")

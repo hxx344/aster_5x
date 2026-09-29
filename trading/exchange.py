@@ -71,8 +71,9 @@ LEVERAGE_REJECTION_CODES = frozenset({
 # Aster documents these as WAF/rate-limit/IP-ban rejections. Gateways may
 # return HTML or no body, so the status itself must survive JSON parsing.
 LEVERAGE_REJECTION_HTTP_STATUSES = frozenset({403, 418, 429})
-# NEW_ORDER_REJECTED is definitive for an order POST, not a leverage update.
-ORDER_REJECTION_CODES = LEVERAGE_REJECTION_CODES | {-2010}
+# Order POST rejections include NEW_ORDER_REJECTED and Aster's symbol notional
+# cap (-2029). Neither is used to classify a leverage update.
+ORDER_REJECTION_CODES = LEVERAGE_REJECTION_CODES | {-2010, -2029}
 
 
 class BudgetWait(RequestNotSent):

@@ -410,6 +410,9 @@ class PairTrader:
         # permission to repeat it. Each leg retains its own durable client ID.
         for leg in legs:
             leg["dispatch"] = "sending"
+            # Persist before HTTP: only older records may use the narrow legacy
+            # rejection recovery below, never a new ambiguous submission.
+            leg["submit_evidence_version"] = 1
         self._save(pair, state)
         def send(leg):
             order, broker = leg["order"], brokers[leg["key"]]
@@ -447,6 +450,29 @@ class PairTrader:
                 leg["submit_error"] = error or (receipt or {}).get("reject_reason")
                 self._save(pair, state)
 
+    def _legacy_notional_rejection(self, pending, leg, exc):
+        """Recover the old -2029 classification bug, not arbitrary missing orders."""
+        if (pending.get("kind") not in {"ordinary", "cycle"} or pending.get("phase") != "open"
+                or not any(leg is original for original in pending["legs"])
+                or leg.get("receipt") is not None or leg.get("dispatch") != "sending"
+                or "submit_evidence_version" in leg
+                or not isinstance(exc, ExchangeError) or isinstance(exc, (AmbiguousOrder, RequestNotSent))
+                or exc.code != -2013 or exc.retry_after or exc.http_status not in (None, 400, 404)):
+            return None
+        # Old releases retained only the locally formatted original POST error.
+        # Match the whole known response; never search the latest query error or
+        # accept an embedded code, timeout, gateway error, or unknown message.
+        reason = ("Aster 拒绝请求（代码 -2029）：You've reached the maximum notional value limit for this symbol. "
+                  "You can still reduce or close your position to manage your risk.")
+        if leg.get("submit_error") != reason:
+            return None
+        order = leg["order"]
+        if (order.get("symbol") != SYMBOL or order.get("type") != "MARKET"
+                or (order.get("positionSide"), order.get("side")) not in {("LONG", "BUY"), ("SHORT", "SELL")}):
+            return None
+        return {**self._absent(order, reason, local=False), "reject_code": -2029,
+                "recovered_from_submit_error": True}
+
     def _query(self, pair, state, brokers):
         pending = state["pending"]
         for leg in pending["legs"] + pending["repairs"]:
@@ -469,6 +495,9 @@ class PairTrader:
             except TradingError as exc:
                 self._retry_delay(state, exc)
                 leg["error"] = str(exc)
+                restored = self._legacy_notional_rejection(pending, leg, exc)
+                if restored is not None:
+                    leg["receipt"] = restored
             self._save(pair, state)
         return all(leg.get("receipt") and leg["receipt"]["status"] in TERMINAL
                    for leg in pending["legs"] + pending["repairs"])

@@ -31,6 +31,9 @@ from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, Position
 BASE = "https://fapi.asterdex.com"
 PUBLIC_BRACKETS_REFRESH_INTERVAL = 60
 PUBLIC_BRACKETS_MAX_AGE = 300
+# Periodic mode calibration; startup, reconnects and configuration events still
+# invalidate the cache and require an immediate authenticated read.
+MULTI_ASSETS_MODE_MAX_AGE = 600
 # Keep this well below the 200 ms scheduler cadence. The HTTP read starts
 # after that scheduler's clock, so an equal TTL can skip every other sample.
 PUBLIC_OI_SHARE_MAX_AGE = .1
@@ -1255,8 +1258,8 @@ class LiveBroker:
         reuse_dual = (reuse_account_mode and not fresh_modes and isinstance(previous_dual, dict)
                       and previous_dual.get("dualSidePosition") is True
                       and "dual" in self.cached_at and now >= self.cached_at["dual"])
-        weight += sum(30 for key in ("dual", "multi")
-                      if not (key == "dual" and reuse_dual) and (fresh_modes or due(key, 15)))
+        weight += sum(30 for key, ttl in (("dual", 15), ("multi", MULTI_ASSETS_MODE_MAX_AGE))
+                      if not (key == "dual" and reuse_dual) and (fresh_modes or due(key, ttl)))
         weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
         return weight
 
@@ -1275,7 +1278,7 @@ class LiveBroker:
         # Account; reserve for one full risk fallback and the
         # one-request mark fallback when risk omits a flat row or reports zero.
         weight = 5 + 5 + len(symbols)
-        if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= 15:
+        if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= MULTI_ASSETS_MODE_MAX_AGE:
             weight += 30
         weight += sum(1 for symbol in symbols if now - self.cached_at.get("bracket:" + symbol, -1e9) + 8 >= 5)
         return weight
@@ -1344,7 +1347,7 @@ class LiveBroker:
                 self.cached_at.pop("dual", None)
                 self.cached_at.pop("multi", None)
         dual = None if position_mode else read("dual", "/fapi/v3/positionSide/dual", ttl=15, weight=30)
-        multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
+        multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=MULTI_ASSETS_MODE_MAX_AGE, weight=30)
         if (not isinstance(multi, dict) or type(multi.get("multiAssetsMargin")) is not bool
                 or (not position_mode and (not isinstance(dual, dict) or type(dual.get("dualSidePosition")) is not bool))):
             raise TradingError("账户持仓或保证金模式响应无效")
@@ -1638,7 +1641,7 @@ class LiveBroker:
         started = time.time()
         if fresh_modes:
             cached_at.pop("multi", None)
-        specs = [("multi", "/fapi/v3/multiAssetsMargin", None, 15, 30),
+        specs = [("multi", "/fapi/v3/multiAssetsMargin", None, MULTI_ASSETS_MODE_MAX_AGE, 30),
                  ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5)]
         values, fetched, pending = {}, {}, []
         for key, path, params, ttl, weight in specs:
@@ -1704,7 +1707,7 @@ class LiveBroker:
             asset = self._account_asset(account)
             positions, rows, leverages, risk_unrealized = self._cycle_positions(account, symbols, read)
             caps = self._cycle_current_caps(symbols, rows, leverages, read)
-            multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=15, weight=30)
+            multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=MULTI_ASSETS_MODE_MAX_AGE, weight=30)
             if not isinstance(multi, dict) or type(multi.get("multiAssetsMargin")) is not bool:
                 raise TradingError("账户保证金模式响应无效")
             snapshot = self._account_snapshot(account, asset, positions, symbols, hedge=True,
@@ -1725,7 +1728,8 @@ class LiveBroker:
                         raise TradingError("账户风控档位查询已过期，等待重试")
             # Failed rounds publish neither partially refreshed caches nor an
             # authorization token; cache age includes signing and network time.
-            snapshot.cycle_mode_valid_until = (fetched["multi"][1] if "multi" in fetched else cached_at["multi"]) + 15
+            snapshot.cycle_mode_valid_until = ((fetched["multi"][1] if "multi" in fetched else cached_at["multi"])
+                                               + MULTI_ASSETS_MODE_MAX_AGE)
             with self._snapshot_lock:
                 if generation != self._snapshot_generation:
                     raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")

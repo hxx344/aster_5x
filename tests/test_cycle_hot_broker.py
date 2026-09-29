@@ -175,7 +175,7 @@ class CycleHotBrokerTests(unittest.TestCase):
         self.assertEqual(market.public_reads, [])
 
     def test_hot_repricing_keeps_account_tier_and_mode_expiries(self):
-        for source, published_at, expired_at in (("account", 100, 108.001), ("tier", 104.9, 105.1), ("mode", 114.9, 115.1)):
+        for source, published_at, expired_at in (("account", 100, 108.001), ("tier", 104.9, 105.1), ("mode", 699.9, 700.1)):
             with self.subTest(source=source):
                 clock = SimpleNamespace(mono=100.0, wall=1000.0)
                 broker, api, _ = self.make_broker()

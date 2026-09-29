@@ -65,8 +65,9 @@ class PairWarmModeRecoveryTests(TestCase):
             self.trader._read(self.brokers, reconciliation=True)
         self.assertTrue(all(not self.paths(key) for key in self.brokers))
 
-    def test_modes_expire_at_fifteen_seconds_and_hits_do_not_renew_them(self):
+    def test_dual_expires_at_fifteen_seconds_but_multi_at_ten_minutes(self):
         self.warm()
+        started = self.ticks
         self.ticks += 14.999
         self.trader._read(self.brokers, reconciliation=True)
         self.assertTrue(all(DUAL not in self.paths(key) and MULTI not in self.paths(key) for key in self.brokers))
@@ -74,7 +75,18 @@ class PairWarmModeRecoveryTests(TestCase):
         self.ticks += 0.002
         self.trader._read(self.brokers, reconciliation=True)
         for key in self.brokers:
-            self.assertEqual(self.paths(key), [DUAL, MULTI, ACCOUNT, RISK])
+            self.assertEqual(self.paths(key), [DUAL, ACCOUNT, RISK])
+        self.clear_calls()
+        self.ticks = started + 599.999
+        self.trader._read(self.brokers, reconciliation=True)
+        for key, broker in self.brokers.items():
+            self.assertNotIn(MULTI, self.paths(key))
+            self.assertEqual(broker.cached_at["multi"], started)
+        self.clear_calls()
+        self.ticks = started + 600.001
+        self.trader._read(self.brokers, reconciliation=True)
+        for key in self.brokers:
+            self.assertEqual(self.paths(key), [MULTI, ACCOUNT, RISK])
 
     def test_one_expired_field_refreshes_only_that_accounts_mode(self):
         self.warm()

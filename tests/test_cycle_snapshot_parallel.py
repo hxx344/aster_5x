@@ -165,9 +165,9 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         with patch("trading.exchange.time.monotonic", side_effect=lambda: clock.now):
             broker.cycle_snapshot([SYMBOL])
             api.calls.clear()
-            clock.now = 114.9
+            clock.now = 699.9
             original = api.call
-            barrier = threading.Barrier(1, action=lambda: setattr(clock, "now", 115.1))
+            barrier = threading.Barrier(1, action=lambda: setattr(clock, "now", 700.1))
             def call(method, path, *args, **kwargs):
                 if path != MULTI:
                     barrier.wait(timeout=3)
@@ -175,7 +175,7 @@ class CycleSnapshotParallelTests(unittest.TestCase):
             api.call = call
             broker.cycle_snapshot([SYMBOL])
         self.assertCountEqual([call[1] for call in api.calls], [ACCOUNT, MULTI])
-        self.assertEqual(broker.cached_at, {"multi": 115.1})
+        self.assertEqual(broker.cached_at, {"multi": 700.1})
 
     def test_conditional_bracket_expiring_during_account_reads_is_refetched(self):
         clock = SimpleNamespace(now=100.0)

@@ -38,7 +38,7 @@ class PairAccountModeReuseTests(TestCase):
             snapshot.require_modes([SYMBOL])
             broker.require_snapshot_current(snapshot)
             self.assertEqual(self.count(broker, fixtures.DUAL), 1)
-            self.assertEqual(self.count(broker, fixtures.MULTI), 2)
+            self.assertEqual(self.count(broker, fixtures.MULTI), 1)
             self.assertEqual(self.count(broker, ACCOUNT), 2)
             self.assertEqual(self.count(broker, RISK), 2)
             self.assertEqual(broker.cached_at["dual"], stamp)

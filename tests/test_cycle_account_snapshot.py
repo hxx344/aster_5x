@@ -341,13 +341,13 @@ class CycleAccountSnapshotTests(unittest.TestCase):
         with patch("trading.exchange.time.monotonic", side_effect=lambda: clock.now):
             broker.cycle_snapshot([SYMBOL], fresh_modes=True)
             self.assertEqual(broker.cached_at, {"dual": 88, "multi": 100})
-            clock.now = 114.9
+            clock.now = 699.9
             api.responses[MULTI]["multiAssetsMargin"] = True
             self.assertFalse(broker.cycle_snapshot([SYMBOL]).multi_assets)
-            clock.now = 115
+            clock.now = 700
             self.assertTrue(broker.cycle_snapshot([SYMBOL]).multi_assets)
             self.assertEqual([call[1] for call in api.calls].count(MULTI), 2)
-            self.assertEqual(broker.cached_at["multi"], 115)
+            self.assertEqual(broker.cached_at["multi"], 700)
             api.responses[MULTI]["multiAssetsMargin"] = False
             self.assertFalse(broker.cycle_snapshot([SYMBOL], fresh_modes=True).multi_assets)
             self.assertEqual([call[1] for call in api.calls].count(MULTI), 3)
@@ -384,6 +384,8 @@ class CycleAccountSnapshotTests(unittest.TestCase):
             self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 12)
             self.assertEqual(broker.cycle_snapshot_weight([SYMBOL], fresh_modes=True), 42)
             clock.now = 107
+            self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 12)
+            clock.now = 692
             self.assertEqual(broker.cycle_snapshot_weight([SYMBOL]), 42)
             self.assertEqual(api.calls, [])
 

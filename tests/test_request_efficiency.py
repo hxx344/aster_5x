@@ -124,6 +124,8 @@ class LeverageReadEfficiencyTests(unittest.TestCase):
         self.assertEqual(self.broker.snapshot_weight([SYMBOL], fresh_modes=True), 72)
         self.broker.cached_at["dual"] = time.monotonic() - 8
         self.broker.cached_at["multi"] = time.monotonic() - 8
+        self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 42)
+        self.broker.cached_at["multi"] = time.monotonic() - 592
         self.assertEqual(self.broker.snapshot_weight([SYMBOL]), 72)
 
 

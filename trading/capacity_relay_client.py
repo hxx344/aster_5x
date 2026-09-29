@@ -26,6 +26,8 @@ class _Sample:
     started: float
     checked_at: float
     payload: object
+    source: str
+    received_at: float
 
 
 class PublicCapacityRelayClient:
@@ -97,6 +99,18 @@ class PublicCapacityRelayClient:
         self._last_attempt = {}
         self._update_listener = None
         self._last_error = None
+        self._ws_connected_at = None
+        self._ws_disconnected_at = None
+        self._ws_last_message_at = None
+        self._ws_last_sample_at = None
+        self._ws_connection_attempts = 0
+        self._ws_retry_at = None
+        self._ws_last_error = None
+        self._http_requests = 0
+        self._http_failures = 0
+        self._http_last_attempt_at = None
+        self._http_last_success_at = None
+        self._http_last_error = None
 
     @classmethod
     def from_env(cls, environ=None, **kwargs):
@@ -132,7 +146,10 @@ class PublicCapacityRelayClient:
             if self._stop.is_set():
                 return
             self._stop.set()
+            if self._connected:
+                self._ws_disconnected_at = self._clock()
             self._connected = False
+            self._ws_retry_at = None
             self._connection_generation += 1
             self._cache.clear()
             pending = tuple(self._inflight.values())
@@ -147,9 +164,32 @@ class PublicCapacityRelayClient:
 
     def status(self):
         with self._lock:
+            wall, ticks = self._clock(), self._monotonic()
+            samples = []
+            for (kind, symbol), value in sorted(self._cache.items()):
+                age = self._sample_age(value, wall, ticks)
+                samples.append({"kind": kind, "symbol": symbol, "source": value.source,
+                                "age_seconds": age if math.isfinite(age) else None,
+                                "max_age_seconds": self._MAX_AGE[kind],
+                                "received_at": value.received_at})
             return {"enabled": True, "running": self._thread is not None and self._thread.is_alive(),
                     "connected": self._connected, "closed": self._stop.is_set(),
-                    "cached_samples": len(self._cache), "last_error": self._last_error}
+                    "cached_samples": len(self._cache), "last_error": self._last_error,
+                    "observed_at": wall,
+                    "ws": {"connected_at": self._ws_connected_at,
+                           "disconnected_at": self._ws_disconnected_at,
+                           "last_message_at": self._ws_last_message_at,
+                           "last_sample_at": self._ws_last_sample_at,
+                           "connection_attempts": self._ws_connection_attempts,
+                           "retry_in_seconds": (max(0.0, self._ws_retry_at - ticks)
+                                                if self._ws_retry_at is not None else None),
+                           "last_error": self._ws_last_error},
+                    "http": {"inflight": len(self._inflight), "requests": self._http_requests,
+                             "failures": self._http_failures,
+                             "last_attempt_at": self._http_last_attempt_at,
+                             "last_success_at": self._http_last_success_at,
+                             "last_error": self._http_last_error},
+                    "samples": samples}
 
     @staticmethod
     def _key(kind, symbol):
@@ -163,13 +203,18 @@ class PublicCapacityRelayClient:
             raise ValueError("Invalid relay time")
         return float(value)
 
+    @staticmethod
+    def _sample_age(value, wall, ticks):
+        return max(ticks - value.started, wall - value.checked_at)
+
     def _read_locked(self, key, max_age):
         if self._stop.is_set():
             raise TradingError("容量中继已关闭")
         value = self._cache.get(key)
         if value is None:
             return None
-        age = max(self._monotonic() - value.started, self._clock() - value.checked_at)
+        ticks, wall = self._monotonic(), self._clock()
+        age = self._sample_age(value, wall, ticks)
         if not 0 <= age <= max_age:
             return None
         return value.started, value.checked_at, deepcopy(value.payload)
@@ -196,6 +241,8 @@ class PublicCapacityRelayClient:
                 self._last_attempt[key] = ticks
                 pending = self._inflight[key] = Future()
                 epoch_serial = self._epoch_serial
+                self._http_requests += 1
+                self._http_last_attempt_at = self._clock()
         if owner:
             failure = None
             try:
@@ -203,7 +250,10 @@ class PublicCapacityRelayClient:
             except Exception:
                 failure = TradingError("容量中继快照暂不可用")
                 with self._lock:
-                    self._last_error = "snapshot_unavailable"
+                    if not self._stop.is_set():
+                        self._last_error = "snapshot_unavailable"
+                        self._http_last_error = "snapshot_unavailable"
+                        self._http_failures += 1
             with self._lock:
                 if self._inflight.get(key) is pending:
                     self._inflight.pop(key, None)
@@ -244,41 +294,59 @@ class PublicCapacityRelayClient:
                 abs((wall - started_wall) - (received - started)) > self._CLOCK_TOLERANCE):
             raise ValueError("Invalid relay response")
         self._accept(json.loads(body), wall=wall, ticks=received,
-                     network_age=received - started, expected_key=key, epoch_serial=epoch_serial)
+                     network_age=received - started, expected_key=key, epoch_serial=epoch_serial,
+                     source="http")
 
-    def _accept(self, envelope, *, wall=None, ticks=None, network_age=0.0,
-                expected_key=None, generation=None, epoch_serial=None):
-        """Accept one original source sample; repeats cannot renew timestamps."""
-        wall = self._clock() if wall is None else wall
-        ticks = self._monotonic() if ticks is None else ticks
+    def _decode_envelope(self, envelope, *, wall, network_age, expected_key):
         try:
             if not isinstance(envelope, dict) or type(envelope.get("version")) is not int or envelope["version"] != 1:
-                return False
+                return None
             key = self._key(envelope.get("kind"), envelope.get("symbol"))
             if expected_key is not None and key != expected_key:
-                return False
+                return None
             epoch = str(UUID(envelope["epoch"]))
             sequence = envelope["sequence"]
             if type(sequence) is not int or not 0 < sequence <= 2**63 - 1:
-                return False
+                return None
             sampled = self._number(envelope["sampled_at"])
             published = self._number(envelope["published_at"])
             source_age = self._number(envelope["age_ms"]) / 1000
             if (published < sampled or published - wall > self._FUTURE_ALLOWANCE or
                     sampled - wall > self._FUTURE_ALLOWANCE or
                     abs((published - sampled) - source_age) > self._CLOCK_TOLERANCE):
-                return False
+                return None
             payload = envelope["payload"]
             if not isinstance(payload, (dict, list)):
-                return False
+                return None
             age = max(source_age + network_age, source_age + abs(wall - published), wall - sampled)
             if not math.isfinite(age) or age > self._MAX_AGE[key[0]]:
-                return False
+                return None
         except (KeyError, TypeError, ValueError, OverflowError, AttributeError, TradingError):
-            return False
+            return None
+        return key, epoch, sequence, age, payload
+
+    def _accept(self, envelope, *, wall=None, ticks=None, network_age=0.0,
+                expected_key=None, generation=None, epoch_serial=None, source="ws"):
+        """Accept one original source sample; repeats cannot renew timestamps."""
+        wall = self._clock() if wall is None else wall
+        ticks = self._monotonic() if ticks is None else ticks
+        decoded = self._decode_envelope(envelope, wall=wall, network_age=network_age,
+                                        expected_key=expected_key)
         with self._lock:
             if self._stop.is_set() or (generation is not None and generation != self._connection_generation):
                 return False
+            # A valid HTTP response can contain a duplicate source sample. It
+            # confirms transport availability without renewing any sample age.
+            if source == "http":
+                if decoded is None:
+                    self._http_failures += 1
+                    self._http_last_error = "snapshot_invalid"
+                else:
+                    self._http_last_success_at = wall
+                    self._http_last_error = None
+            if decoded is None:
+                return False
+            key, epoch, sequence, age, payload = decoded
             if epoch in self._retired_epochs:
                 return False
             # In-flight HTTP from before an epoch transition cannot reverse it.
@@ -294,7 +362,9 @@ class PublicCapacityRelayClient:
             if sequence <= self._order.get(key, 0):
                 return False
             self._order[key] = sequence
-            self._cache[key] = _Sample(ticks - age, wall - age, deepcopy(payload))
+            self._cache[key] = _Sample(ticks - age, wall - age, deepcopy(payload), source, wall)
+            if source == "ws":
+                self._ws_last_sample_at = wall
             self._last_error = None
             listener = self._update_listener
         if listener is not None and not self._stop.is_set():
@@ -308,6 +378,11 @@ class PublicCapacityRelayClient:
     def _run(self):
         retry = self._RETRY_INITIAL
         while not self._stop.is_set():
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                self._ws_connection_attempts += 1
+                self._ws_retry_at = None
             connected_at = self._monotonic()
             generation = None
             try:
@@ -322,12 +397,17 @@ class PublicCapacityRelayClient:
                         self._connection_generation += 1
                         generation = self._connection_generation
                         self._connected = True
+                        self._ws_connected_at = self._clock()
+                        self._ws_last_error = None
                         self._last_error = None
                     while not self._stop.is_set():
                         try:
                             message = connection.recv(timeout=self._RECV_TIMEOUT)
                         except TimeoutError:
                             continue
+                        with self._lock:
+                            if not self._stop.is_set() and generation == self._connection_generation:
+                                self._ws_last_message_at = self._clock()
                         try:
                             envelope = json.loads(message)
                         except (TypeError, ValueError, UnicodeError):
@@ -337,12 +417,18 @@ class PublicCapacityRelayClient:
                 with self._lock:
                     if not self._stop.is_set():
                         self._last_error = "stream_unavailable"
+                        self._ws_last_error = "stream_unavailable"
             finally:
                 with self._lock:
                     if generation is None or generation == self._connection_generation:
+                        if self._connected:
+                            self._ws_disconnected_at = self._clock()
                         self._connected = False
             if self._monotonic() - connected_at >= 30:
                 retry = self._RETRY_INITIAL
+            with self._lock:
+                if not self._stop.is_set():
+                    self._ws_retry_at = self._monotonic() + retry
             if self._stop.wait(retry):
                 break
             retry = min(self._RETRY_MAX, retry * 2)

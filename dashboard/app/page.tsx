@@ -37,6 +37,7 @@ import { AddAccountDialog } from '@/components/add-account-dialog';
 import { ListingsPanel } from '@/components/listings-panel';
 import { MonitoringPanel } from '@/components/monitoring-panel';
 import { PairsWorkspace } from '@/components/pairs-workspace';
+import { CapacityRelayPanel } from '@/components/capacity-relay-panel';
 
 export default function Home() {
   const desk = useTradingDesk();
@@ -239,6 +240,15 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             />
           </div>
         </div>
+        {state && !needsLogin ? (
+          <CapacityRelayPanel
+            relay={state.capacity_relay}
+            now={serverNow}
+            updatedAt={state.updated_at}
+            connectionError={connectionError}
+            demo={state.demo}
+          />
+        ) : null}
         {(separateError || connectionError || notice) && (
           <output
             className={`message ${separateError || connectionError ? 'message-error' : ''}`}

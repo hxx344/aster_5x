@@ -156,6 +156,41 @@ export type Monitoring = {
   strategy_capacity_environment_enabled: boolean;
   symbols: MonitoredSymbol[];
 };
+export type CapacityRelaySample = {
+  kind: 'oi' | 'brackets';
+  symbol: string;
+  source: 'ws' | 'http';
+  age_seconds: number | null;
+  max_age_seconds: number;
+  received_at: number | null;
+};
+export type CapacityRelayStatus = {
+  enabled: boolean;
+  running: boolean;
+  connected: boolean;
+  closed: boolean;
+  cached_samples: number;
+  last_error: string | null;
+  observed_at?: number;
+  ws?: {
+    connected_at: number | null;
+    disconnected_at: number | null;
+    last_message_at: number | null;
+    last_sample_at: number | null;
+    connection_attempts: number;
+    retry_in_seconds: number | null;
+    last_error: string | null;
+  };
+  http?: {
+    inflight: number;
+    requests: number;
+    failures: number;
+    last_attempt_at: number | null;
+    last_success_at: number | null;
+    last_error: string | null;
+  };
+  samples?: CapacityRelaySample[];
+};
 export type State = {
   demo: boolean;
   ready: boolean;
@@ -164,6 +199,7 @@ export type State = {
   markets: Record<string, Market>;
   listings?: Listings;
   monitoring?: Monitoring;
+  capacity_relay?: CapacityRelayStatus | null;
   events: ExecutionEvent[];
   updated_at: number;
   notification: {

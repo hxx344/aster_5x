@@ -24,6 +24,7 @@ from .depth_stream import PublicDepthStream
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
+from .ws_evidence import PrivateEventEvidence
 from .request_timing import transport_stage
 from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
@@ -1014,6 +1015,7 @@ class LiveBroker:
         self._cycle_stream_callback_lock = threading.RLock()
         self._cycle_stream_token = None
         self._cycle_stream_connected = None
+        self._private_evidence = PrivateEventEvidence()
         self._cycle_hot_closed = False
         self.cycle_cache = CycleAccountCache()
         self.cycle_stream = None
@@ -1031,10 +1033,13 @@ class LiveBroker:
                 token = object()
                 stream = PrivateAccountStream(self.api,
                     on_state=lambda connected: self._cycle_stream_state(token, connected),
-                    on_event=lambda kind: self._cycle_stream_event(token, kind))
+                    on_event=lambda kind: self._cycle_stream_event(token, kind),
+                    on_payload=lambda event: self._cycle_stream_payload(token, event))
                 with self._cycle_stream_callback_lock:
-                    self._cycle_stream_token = token
-                    self._cycle_stream_connected = None
+                    with self._snapshot_lock:
+                        self._cycle_stream_token = token
+                        self._cycle_stream_connected = None
+                        self._private_evidence.reset(False)
                 self.cycle_stream = stream
             self.cycle_stream.start()
 
@@ -1045,8 +1050,10 @@ class LiveBroker:
             with self._cycle_stream_callback_lock:
                 if self._cycle_stream_token is not None:
                     self._invalidate_snapshot_reads(refresh_modes=True)
-                self._cycle_stream_token = None
-                self._cycle_stream_connected = None
+                with self._snapshot_lock:
+                    self._cycle_stream_token = None
+                    self._cycle_stream_connected = None
+                    self._private_evidence.reset(False)
                 self.cycle_cache.set_listener(None)
                 self.cycle_cache.set_connected(False)
             if stream is not None:
@@ -1059,14 +1066,52 @@ class LiveBroker:
                 # A stream gap may hide a mode change. Invalidate once per state
                 # transition, not on every disconnected retry callback.
                 if connected is not self._cycle_stream_connected:
-                    self._cycle_stream_connected = connected
-                    self._invalidate_snapshot_reads(refresh_modes=True)
+                    with self._snapshot_lock:
+                        self._cycle_stream_connected = connected
+                        self._private_evidence.reset(connected)
+                        self._invalidate_snapshot_reads(refresh_modes=True)
                 self.cycle_cache.set_connected(connected)
 
     def _cycle_stream_event(self, token, kind):
         with self._cycle_stream_callback_lock:
             if token is self._cycle_stream_token:
                 self._cycle_account_event(kind)
+
+    def _cycle_stream_payload(self, token, event):
+        with self._cycle_stream_callback_lock:
+            if token is self._cycle_stream_token:
+                with self._snapshot_lock:
+                    self._private_evidence.payload(event)
+
+    def order_event_receipt(self, order):
+        """Return only fresh terminal evidence; historical query() stays REST."""
+        with self._snapshot_lock:
+            return self._private_evidence.order_receipt(order)
+
+    def transfer_ws_checkpoint(self, wallet):
+        with self._snapshot_lock:
+            return self._private_evidence.checkpoint(wallet)
+
+    def transfer_ws_checkpoint_current(self, checkpoint):
+        with self._snapshot_lock:
+            return self._private_evidence.checkpoint_current(checkpoint)
+
+    def transfer_ws_balance(self, checkpoint, delta, created_at):
+        with self._snapshot_lock:
+            evidence = self._private_evidence.transfer_balance(checkpoint, delta, created_at)
+            if evidence is None:
+                return None
+            generation = self._snapshot_generation
+
+        def require_current():
+            # Commit code already holds this RLock. Never acquire the stream
+            # callback lock here: stream callbacks take those locks in reverse.
+            with self._snapshot_lock:
+                latest = self._private_evidence.transfer_balance(checkpoint, delta, created_at)
+                if generation != self._snapshot_generation or latest != evidence:
+                    raise SnapshotSuperseded("划转账户事件已变化，等待重新核对")
+
+        return evidence, require_current
 
     def invalidate_cycle_hot_data(self, reason, *, refresh_modes=False):
         self._invalidate_snapshot_reads(refresh_modes=refresh_modes)
@@ -1089,7 +1134,10 @@ class LiveBroker:
                 self.cached_at.pop("multi", None)
 
     def _cycle_account_event(self, kind):
-        self.invalidate_cycle_hot_data("账户事件：" + str(kind),
+        with self._snapshot_lock:
+            self._private_evidence.event(kind)
+            self._invalidate_snapshot_reads(refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
+        self.discard_cycle_hot_snapshot("账户事件：" + str(kind),
             refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
 
     def _cycle_write(self, method, path, params, *, weight=1, refresh_modes=False, timeout=None):

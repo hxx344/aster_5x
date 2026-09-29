@@ -496,7 +496,10 @@ class PairTrader:
                 leg["receipt"] = self._absent(order, "重启确认该订单尚未进入发送阶段")
                 continue
             try:
-                row = brokers[leg["key"]].query(SYMBOL, order["newClientOrderId"])
+                broker = brokers[leg["key"]]
+                row = broker.order_event_receipt(order) if isinstance(broker, LiveBroker) else None
+                if not isinstance(row, dict):
+                    row = broker.query(SYMBOL, order["newClientOrderId"])
                 Executor.validate_receipt(order, row)
                 if receipt and dec(row["executedQty"]) < dec(receipt["executedQty"]):
                     raise PairPositionError("订单查询累计成交数量倒退")

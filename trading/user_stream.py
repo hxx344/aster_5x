@@ -1,4 +1,4 @@
-"""Private account events revoke account leases; they never synthesize balances."""
+"""Private events revoke account leases and optionally deliver full evidence."""
 from __future__ import annotations
 
 import json
@@ -23,7 +23,7 @@ class PrivateAccountStream:
     """Manage one signed listen key entirely on a background daemon.
 
     Aster has no documented account sequence/replay bridge. Every valid event
-    is therefore an invalidation signal; only a later REST refresh is eligible.
+    invalidates snapshots; its payload may independently corroborate a receipt.
     """
 
     _OPEN_TIMEOUT = 3
@@ -36,12 +36,15 @@ class PrivateAccountStream:
     _KEEPALIVE_SECONDS = 30 * 60
     _RECONNECT_SECONDS = 23 * 60 * 60 + 50 * 60
 
-    def __init__(self, api, on_state, on_event, *, connect=None, clock=None, monotonic=None):
+    def __init__(self, api, on_state, on_event, *, on_payload=None, connect=None, clock=None, monotonic=None):
         if not callable(on_state) or not callable(on_event):
             raise ValueError("Invalid private account stream listener")
+        if on_payload is not None and not callable(on_payload):
+            raise ValueError("Invalid private account payload listener")
         self._api = api
         self._on_state = on_state
         self._on_event = on_event
+        self._on_payload = on_payload
         self._connect = connect or websocket_connect
         self._clock = clock
         self._monotonic = monotonic
@@ -113,6 +116,8 @@ class PrivateAccountStream:
                 return
             try:
                 self._on_event(kind)
+                if self._on_payload is not None:
+                    self._on_payload(event)
             except Exception:
                 self._set_connected(False)
                 raise _Reconnect("Account event listener failed") from None

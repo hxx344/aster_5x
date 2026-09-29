@@ -2,13 +2,15 @@ import {
   pairDataFresh,
   pairHasPending,
   pairPhaseLabel,
+  type PairApiNotice,
   type Pair,
 } from './pairs.ts';
 
 export type PairNotice = {
   key: string;
-  kind: 'data' | 'execution';
+  kind: 'data' | 'execution' | 'api';
   text: string;
+  source?: 'pair' | 'margin';
 };
 export type PairNoticeEntry = PairNotice & {
   firstSeen: number;
@@ -21,6 +23,29 @@ export type PairNoticeHistory = {
 };
 export const PAIR_NOTICE_LIMIT = 8;
 
+function apiNotice(
+  current: PairApiNotice | null | undefined,
+  legacyReason: unknown,
+): PairApiNotice | null {
+  if (current !== undefined) {
+    return current &&
+      ['budget', 'cooldown', 'rate_limit'].includes(current.kind) &&
+      typeof current.text === 'string' &&
+      current.text.trim()
+      ? current
+      : null;
+  }
+  // Only old servers lacking the field use this narrow compatibility path.
+  // Explicit null means the server cleared the API notice, even if its general
+  // display reason has not changed yet. Trading capacity is not API quota.
+  if (
+    typeof legacyReason === 'string' &&
+    /本地(?:普通|执行)?\s*API\s*请求权重预算不足/.test(legacyReason)
+  )
+    return { kind: 'budget', text: legacyReason };
+  return null;
+}
+
 export function pairStatusNotices(
   pair: Pair,
   now: number,
@@ -29,6 +54,11 @@ export function pairStatusNotices(
   const notices: PairNotice[] = [];
   const add = (kind: PairNotice['kind'], text: string) =>
     notices.push({ key: `${kind}:${text}`, kind, text });
+  const pairApiNotice = apiNotice(pair.state?.api_notice, pair.state?.reason);
+  const marginApiNotice = apiNotice(
+    pair.state?.margin?.api_notice,
+    pair.state?.margin?.reason,
+  );
   const snapshots = pair.state?.snapshots;
   const fresh =
     pairDataFresh(pair.state?.updated_at, now, offline) &&
@@ -49,10 +79,24 @@ export function pairStatusNotices(
   }
   if (pairHasPending(pair)) {
     const reason = pair.state?.reason || pair.pause_reason;
+    const apiReason =
+      reason === pairApiNotice?.text || reason === marginApiNotice?.text;
     add(
       'execution',
-      `${pairPhaseLabel(pair.state?.phase)}${reason ? ` · ${reason}` : ''}`,
+      `${pairPhaseLabel(pair.state?.phase)}${reason && !apiReason ? ` · ${reason}` : ''}`,
     );
+  }
+  for (const [source, notice] of [
+    ['pair', pairApiNotice],
+    ['margin', marginApiNotice],
+  ] as const) {
+    if (notice)
+      notices.push({
+        key: `api:${source}:${notice.kind}`,
+        kind: 'api',
+        source,
+        text: notice.text,
+      });
   }
   return notices;
 }
@@ -75,9 +119,16 @@ export function recordPairNotices(
     const index = entries.findIndex((entry) => entry.key === notice.key);
     const old = entries[index];
     if (old && wasActive.has(notice.key)) {
-      if (now > old.lastSeen) {
+      if (
+        now > old.lastSeen ||
+        notice.text !== old.text ||
+        notice.kind !== old.kind ||
+        notice.source !== old.source
+      ) {
         entries = entries.map((entry, i) =>
-          i === index ? { ...entry, lastSeen: now } : entry,
+          i === index
+            ? { ...entry, ...notice, lastSeen: Math.max(now, old.lastSeen) }
+            : entry,
         );
       }
     } else {

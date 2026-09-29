@@ -79,6 +79,20 @@ class BudgetWait(RequestNotSent):
     """The local scheduler must wait; this is not an exchange rejection."""
 
 
+def api_wait_notice(exc):
+    """Expose only typed local quota waits and sanitized exchange throttles."""
+    if isinstance(exc, BudgetWait):
+        kind = "budget"
+    elif isinstance(exc, ExchangeError) and (
+            exc.http_status in (418, 429) or exc.code in (-1003, -1015)):
+        kind = "rate_limit"
+    elif isinstance(exc, ExchangeError) and str(exc).startswith("接口冷却中："):
+        kind = "cooldown"
+    else:
+        return None
+    return {"kind": kind, "text": exchange_reason(str(exc))}
+
+
 class RateBudget:
     def __init__(self, reconciliation_reserve=300, capacity_reserve=0):
         if type(reconciliation_reserve) is not int or reconciliation_reserve < 0:
@@ -1134,18 +1148,23 @@ class LiveBroker:
                 self.cached[key], self.cached_at[key] = value, started
         return value
 
-    def snapshot_weight(self, symbols, *, fresh_modes=False):
+    def snapshot_weight(self, symbols, *, fresh_modes=False, reuse_account_mode=False):
         with self._snapshot_lock:
-            return self._snapshot_weight(symbols, fresh_modes=fresh_modes)
+            return self._snapshot_weight(symbols, fresh_modes=fresh_modes, reuse_account_mode=reuse_account_mode)
 
-    def _snapshot_weight(self, symbols, *, fresh_modes=False):
+    def _snapshot_weight(self, symbols, *, fresh_modes=False, reuse_account_mode=False):
         """Conservative admission estimate using cache expiries, without a request."""
         now = time.monotonic()
         def due(key, ttl):
             # Leave time for this read to complete before reusing an expiring item.
             return now - self.cached_at.get(key, -1e9) + 8 >= ttl
         weight = 10 + len(symbols)  # Balances, all positions, mark-only fallback.
-        weight += sum(30 for key in ("dual", "multi") if fresh_modes or due(key, 15))
+        previous_dual = self.cached.get("dual")
+        reuse_dual = (reuse_account_mode and not fresh_modes and isinstance(previous_dual, dict)
+                      and previous_dual.get("dualSidePosition") is True
+                      and "dual" in self.cached_at and now >= self.cached_at["dual"])
+        weight += sum(30 for key in ("dual", "multi")
+                      if not (key == "dual" and reuse_dual) and (fresh_modes or due(key, 15)))
         weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
         return weight
 

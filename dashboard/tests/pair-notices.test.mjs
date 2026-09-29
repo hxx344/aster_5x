@@ -177,6 +177,146 @@ test('a short stale interval remains readable with its original text after recov
   assert.equal(recovered.entries[0].text, pausedStaleText);
 });
 
+test('API notices are retained for both execution and margin without pending orders or transfers', () => {
+  const execution = {
+    kind: 'budget',
+    text: '本地执行 API 请求权重预算不足，已为市场额度监控、订单核对和补偿保留请求权重',
+  };
+  const margin = {
+    kind: 'rate_limit',
+    text: '交易所请求限流，等待 12 秒后继续核对',
+  };
+  for (const phase of ['waiting', 'holding', 'attention', 'margin_wait']) {
+    const notices = pairStatusNotices(
+      pair({ phase, api_notice: execution, margin: { api_notice: margin } }),
+      100,
+    );
+    assert.deepEqual(notices, [
+      {
+        key: 'api:pair:budget',
+        kind: 'api',
+        source: 'pair',
+        text: execution.text,
+      },
+      {
+        key: 'api:margin:rate_limit',
+        kind: 'api',
+        source: 'margin',
+        text: margin.text,
+      },
+    ]);
+  }
+  const observed = recordPairNotices(
+    undefined,
+    pairStatusNotices(pair({ api_notice: execution }), 100),
+    100,
+  );
+  const cleared = recordPairNotices(
+    observed,
+    pairStatusNotices(pair({ api_notice: null, reason: execution.text }), 101),
+    101,
+  );
+  assert.deepEqual(cleared.activeKeys, []);
+  assert.equal(cleared.entries[0].kind, 'api');
+  assert.equal(cleared.entries[0].text, execution.text);
+});
+
+test('legacy API quota text is narrowly recognized and explicit server clearing takes precedence', () => {
+  for (const text of [
+    '本地 API 请求权重预算不足',
+    '本地普通 API 请求权重预算不足，已为订单核对和补偿保留请求权重',
+    '本地执行 API 请求权重预算不足，已为市场额度监控、订单核对和补偿保留请求权重',
+  ]) {
+    const old = pairStatusNotices(
+      pair({ reason: text, margin: { reason: text } }),
+      100,
+    );
+    assert.deepEqual(
+      old.map(({ key }) => key),
+      ['api:pair:budget', 'api:margin:budget'],
+    );
+    assert.ok(old.every((notice) => notice.text === text));
+    assert.deepEqual(
+      pairStatusNotices(
+        pair({
+          reason: text,
+          api_notice: null,
+          margin: { reason: text, api_notice: null },
+        }),
+        100,
+      ),
+      [],
+    );
+  }
+  for (const reason of [
+    '公共额度不足，等待市场额度更新',
+    '本地记录的交易额度不足',
+    'API 返回公共交易额度不足',
+    '等待价差满足普通开仓条件',
+    '本地请求预算不足',
+  ]) {
+    assert.deepEqual(
+      pairStatusNotices(pair({ reason, margin: { reason } }), 100),
+      [],
+    );
+  }
+  for (const api_notice of [
+    null,
+    {},
+    { kind: 'unknown', text: '未识别消息' },
+    { kind: 'budget', text: { nested: 'secret' } },
+    { kind: 'budget', text: '   ' },
+  ]) {
+    assert.deepEqual(pairStatusNotices(pair({ api_notice }), 100), []);
+  }
+});
+
+test('API countdown updates keep one full latest message and count only real reappearances', () => {
+  const observations = Array.from({ length: 12 }, (_, index) => {
+    const text = `交易所请求冷却，剩余 ${20 - index} 秒；${'完整反馈。'.repeat(250)}`;
+    return pairStatusNotices(
+      pair({
+        phase: 'reconciling',
+        reason: text,
+        api_notice: { kind: 'cooldown', text },
+        pending: { id: 'demo-order' },
+      }),
+      100 + index / 10,
+    );
+  });
+  let history;
+  for (const [index, notices] of observations.entries()) {
+    history = recordPairNotices(history, notices, 100 + index / 10);
+  }
+  assert.equal(history.entries.length, 2);
+  const current = history.entries.find(({ kind }) => kind === 'api');
+  assert.equal(current.firstSeen, 100);
+  assert.equal(current.lastSeen, 101.1);
+  assert.equal(current.occurrences, 1);
+  assert.equal(
+    current.text,
+    observations.at(-1).find(({ kind }) => kind === 'api').text,
+  );
+  assert.equal(
+    history.entries.find(({ kind }) => kind === 'execution').text,
+    '订单结果核对中',
+  );
+  history = recordPairNotices(history, [], 102);
+  history = recordPairNotices(history, observations[0], 103);
+  assert.equal(
+    history.entries.find(({ kind }) => kind === 'api').occurrences,
+    2,
+  );
+  assert.equal(
+    history.entries.find(({ kind }) => kind === 'api').firstSeen,
+    100,
+  );
+  assert.equal(
+    history.entries.find(({ kind }) => kind === 'api').text,
+    observations[0].find(({ kind }) => kind === 'api').text,
+  );
+});
+
 test('continuous polling and repeated StrictMode updates count one occurrence', () => {
   const warning = notice('虚构结果待核对');
   const first = recordPairNotices(undefined, [warning], 100);

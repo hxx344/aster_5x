@@ -12,6 +12,10 @@ import {
 } from './policy.ts';
 
 export type PairSnapshot = NonNullable<Account['snapshot']>;
+export type PairApiNotice = {
+  kind: 'budget' | 'cooldown' | 'rate_limit';
+  text: string;
+};
 export type PairTransfer = {
   request_id: string;
   source: 'long' | 'short';
@@ -28,6 +32,7 @@ export type PairMarginState = {
   enabled?: boolean;
   status?: string;
   reason?: string;
+  api_notice?: PairApiNotice | null;
   blocks_trading?: boolean;
   checked_at?: number;
   pending?: PairTransfer | null;
@@ -67,6 +72,7 @@ export type Pair = {
   state?: {
     phase?: string;
     reason?: string;
+    api_notice?: PairApiNotice | null;
     updated_at?: number;
     snapshots?: { long?: PairSnapshot | null; short?: PairSnapshot | null };
     owned?: Partial<Record<'LONG' | 'SHORT', string>>;

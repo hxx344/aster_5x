@@ -3,7 +3,7 @@
 The caller holds the pair lock and both member-account locks. Transfer identity
 comes from authenticated Aster responses, never a locally supplied account name.
 """
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
-from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, credentials_for
+from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, api_wait_notice, credentials_for
 from .models import TradingError, dec, positive, wire
 
 
@@ -145,6 +145,43 @@ class MarginBalancer:
         if len({member["mode"] for member in members.values()}) != 1:
             raise TradingError("模拟与实盘账户不能互相划转")
         return members
+
+    def _require_budget(self, members, weights, *, reconciliation=False):
+        """Admit a complete read group before spending on its first account."""
+        groups = {}
+        for side, weight in weights.items():
+            broker = self.engine.broker(members[side])
+            budget = getattr(getattr(broker, "api", None), "budget", None)
+            if budget is not None and weight:
+                group = groups.setdefault(id(budget), [broker, budget, 0])
+                group[2] += weight
+        for broker, budget, weight in groups.values():
+            priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
+            with priority:
+                budget.require_available(weight)
+
+    def _live_budget_weights(self, pair, members, snapshots):
+        # Listing and POST use the long member's shared budget. Each member
+        # additionally needs its account, income, and ALL open orders (5+30+40).
+        weights = {"long": 85, "short": 75}
+        for side, member in members.items():
+            if type(getattr(snapshots[side], "account_read_generation", None)) is not int:
+                weights[side] += self.engine.broker(member).snapshot_weight([pair.get("symbol", "XAUUSD1")])
+        watch = (self.store.get("pair_runtime:" + pair["id"], {}) or {}).get("recovery_watch")
+        if watch is not None:
+            from .pair_recovery import MAX_WATCH_BATCHES
+            batches = watch.get("batches") if isinstance(watch, dict) else None
+            if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
+                raise TradingError("人工归档订单跟踪记录无效，禁止新开仓与划转")
+            for batch in batches:
+                legs = batch.get("legs") if isinstance(batch, dict) else None
+                if (not isinstance(legs, list) or len(legs) != 2
+                        or any(not isinstance(leg, dict) for leg in legs)
+                        or {leg.get("key") for leg in legs} != {"long", "short"}):
+                    raise TradingError("人工归档订单明细无效，禁止新开仓与划转")
+                for leg in legs:
+                    weights[leg["key"]] += 1
+        return weights
 
     @contextmanager
     def _master(self, pair, members):
@@ -309,10 +346,19 @@ class MarginBalancer:
 
     @staticmethod
     def _view(state, config, status, reason, *, blocks=False, plan=None):
-        return {"enabled": config["enabled"], "status": status, "reason": reason,
+        notice = state.get("api_notice")
+        notice = ({"kind": notice["kind"], "text": notice["text"]}
+                  if isinstance(notice, dict) and notice.get("kind") in {"budget", "cooldown", "rate_limit"}
+                  and isinstance(notice.get("text"), str) and notice["text"] else None)
+        result = {"enabled": config["enabled"], "status": status, "reason": reason,
             "blocks_trading": bool(blocks or state.get("pending")), "checked_at": state.get("checked_at"),
             "pending": _public_record(state.get("pending")), "last_transfer": _public_record(state.get("last_transfer")),
-            "plan": plan, "next_check_at": state.get("next_check_at", 0), "cooldown_until": state.get("cooldown_until", 0)}
+            "plan": plan, "next_check_at": state.get("next_check_at", 0), "cooldown_until": state.get("cooldown_until", 0),
+            "api_notice": notice}
+        deadline = state.get("next_check_at", 0)
+        if notice and type(deadline) in (int, float) and math.isfinite(deadline):
+            result["retry_after"] = max(0, deadline - time.time())
+        return result
 
     @staticmethod
     def status_view(pair, journal, runtime_view=None):
@@ -359,11 +405,15 @@ class MarginBalancer:
         return view("waiting", "等待系统下一次保证金检查" + _remaining_time(journal.get("next_check_at"), time.time())
                     + "；满足余额差额及安全可划条件后才发起划转")
 
-    def _income(self, members, start, end):
+    def _income(self, members, start, end, *, reconciliation=False):
+        self._require_budget(members, {side: 30 for side in members}, reconciliation=reconciliation)
         result = {}
         for side, member in members.items():
-            rows = self.engine.broker(member).api.call("GET", "/fapi/v3/income",
-                {"startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=30)
+            broker = self.engine.broker(member)
+            priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
+            with priority:
+                rows = broker.api.call("GET", "/fapi/v3/income",
+                    {"startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=30)
             if not isinstance(rows, list) or len(rows) >= 1000 or any(not isinstance(row, dict) for row in rows):
                 raise TradingError("划转流水不完整，无法核对")
             result[side] = rows
@@ -379,7 +429,8 @@ class MarginBalancer:
             return self._view(state, config, "unknown", "划转结果未知且没有交易编号，系统无法自动核实；请人工核对交易所两侧划转记录。保留原记录，停止新开仓和新划转，不按余额猜测或重发")
         start = int(pending["created_at"] * 1000) // 1000 * 1000
         end = int((pending["created_at"] + 90) * 1000)
-        rows = self._income(members, start, end)
+        rows = self._income(members, start, end, reconciliation=True)
+        self._record_success(pair, state)
         matches = []
         for side, sign in ((pending["source"], -1), (pending["destination"], 1)):
             found = set()
@@ -424,14 +475,27 @@ class MarginBalancer:
         acknowledged_at = pending.get("acknowledged_at")
         if type(acknowledged_at) not in (int, float) or not math.isfinite(acknowledged_at):
             raise TradingError("划转成功回执缺少有效时间，保留待核对状态")
-        for member in members.values():
-            current = self.engine.broker(member).snapshot([pair.get("symbol", "XAUUSD1")], fresh_modes=True)
-            current.require_fresh()
-            if current.timestamp < acknowledged_at:
-                raise TradingError("划转后的账户查询返回旧快照，继续等待新余额")
-        done = {**pending, "refreshed_at": time.time()}
-        state.update(pending=None, last_transfer=done)
-        self.store.put("pair_margin:" + pair["id"], state)
+        symbols = [pair.get("symbol", "XAUUSD1")]
+        brokers = {side: self.engine.broker(member) for side, member in members.items()}
+        self._require_budget(members, {side: broker.snapshot_weight(symbols, fresh_modes=True)
+                                     for side, broker in brokers.items()}, reconciliation=True)
+        snapshots = {}
+        for side, broker in brokers.items():
+            with getattr(broker, "reconciliation_budget", nullcontext)():
+                current = broker.snapshot(symbols, fresh_modes=True)
+                current.require_fresh()
+                if current.timestamp < acknowledged_at:
+                    raise TradingError("划转后的账户查询返回旧快照，继续等待新余额")
+                broker.require_snapshot_current(current)
+                snapshots[side] = current
+        with ExitStack() as locks:
+            for side in sorted(brokers, key=lambda value: members[value]["id"]):
+                locks.enter_context(brokers[side]._snapshot_lock)
+            for side, broker in brokers.items():
+                broker.require_snapshot_current(snapshots[side])
+            done = {**pending, "refreshed_at": time.time()}
+            state.update(pending=None, last_transfer=done)
+            self._record_success(pair, state)
         self._invalidate(members)
         return self._view(state, config, "acknowledged", "交易所回执确认，余额已刷新；等待下一轮账户快照", blocks=True,
             plan={key: done[key] for key in ("source", "destination", "amount")})
@@ -497,8 +561,8 @@ class MarginBalancer:
                 positive(pending.get("amount"))
                 if now < state.get("next_check_at", 0):
                     return self._view(state, config, pending.get("status", "unknown"),
-                        "等待下一次划转只读核对" + _remaining_time(state["next_check_at"], now)
-                        + "；保留原请求，期间不开始新开仓或新划转")
+                        state.get("blocked_reason") or ("等待下一次划转只读核对" + _remaining_time(state["next_check_at"], now)
+                        + "；保留原请求，期间不开始新开仓或新划转"))
                 state.update(checked_at=now, next_check_at=now + config["check_interval_seconds"])
                 self.store.put("pair_margin:" + pair["id"], state)
                 if members["long"]["mode"] != "live":
@@ -519,6 +583,9 @@ class MarginBalancer:
                 return self._view(state, config, "blocked", "实盘全局开关未开启，禁止划转", blocks=True)
             if pending_orders:
                 return self._view(state, config, "waiting", "配对组正在核对订单或减回本轮仓位，暂不划转；完成后重新评估保证金")
+            if state.get("api_notice") and now < state.get("next_check_at", 0):
+                return self._view(state, config, "blocked", state.get("blocked_reason") or
+                    "等待 API 请求预算恢复后重新检查保证金；期间不开始新开仓或新划转", blocks=True)
             if now < state.get("cooldown_until", 0):
                 return self._view(state, config, "cooldown", "划转冷却中" + _remaining_time(state["cooldown_until"], now)
                                   + "；结束后重新评估划转条件")
@@ -527,7 +594,6 @@ class MarginBalancer:
                     state.get("blocked_reason", "等待下一次保证金检查" + _remaining_time(state["next_check_at"], now)
                               + "；届时重新评估余额差额及安全可划条件"), blocks=bool(state.get("blocked_reason")))
             state.update(checked_at=now, next_check_at=now + config["check_interval_seconds"])
-            state.pop("blocked_reason", None)
             self.store.put("pair_margin:" + pair["id"], state)
             self._check_snapshots(pair, snapshots)
             if not self._may_need_transfer(snapshots, config):
@@ -538,28 +604,33 @@ class MarginBalancer:
                     if members[side]["mode"] == "live" and type(getattr(snapshot, "account_read_generation", None)) is int:
                         self.engine.broker(members[side]).require_snapshot_current(snapshot)
                     snapshot.require_fresh()
+                self._record_success(pair, state)
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
             if members["long"]["mode"] == "paper":
                 plan = self._plan(pair, members, snapshots, config,
                     {side: max(Decimal(0), min(snapshot.available, snapshot.wallet)) for side, snapshot in snapshots.items()})
                 if plan is None:
-                    self.store.put("pair_margin:" + pair["id"], state)
+                    self._record_success(pair, state)
                     return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
                 from .pair_recovery import require_archived_orders_clear
                 require_archived_orders_clear(self.engine, pair)
                 pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": now, "status": "submitting"}
                 state["cooldown_until"] = now + config["cooldown_seconds"]
                 self._paper(pair, members, snapshots, state, pending)
+                self._record_success(pair, state)
                 return self._view(state, config, "paper_confirmed", "模拟 USD1 划转已原子入账，系统重新读取两侧余额；取得新快照前不开始新开仓或新划转", blocks=True, plan=plan)
             return self._live(pair, members, snapshots, state, config)
         except TradingError as exc:
             # Local validation messages are fixed strings; remote error bodies
             # and credential values never enter durable state or the dashboard.
-            reason = "Aster 划转只读检查失败，系统将重试账户或流水查询；核实前不开始新开仓或新划转" if isinstance(exc, ExchangeError) else str(exc)
-            state = self._record_failure(pair, state, reason)
+            notice = api_wait_notice(exc)
+            reason = (notice["text"] if notice else
+                "Aster 划转只读检查失败，系统将重试账户或流水查询；核实前不开始新开仓或新划转" if isinstance(exc, ExchangeError) else str(exc))
+            state = self._record_failure(pair, state, reason, exc=exc)
             if (isinstance(exc, ExchangeError) and isinstance(state.get("pending"), dict)
                     and state["pending"].get("status") == "acknowledged"):
-                reason = "交易所已确认划转，但两侧余额尚未完成刷新；继续只读重试，不重新划转"
+                reason = "交易所已确认划转，但两侧余额尚未完成刷新；继续只读重试，不重新划转" + (
+                    "；" + notice["text"] if notice else "")
             return self._view(state, config, self._failure_status(state), reason, blocks=True)
         except Exception:
             state = self._record_failure(pair, state, "保证金日志或账户读取失败，禁止新划转")
@@ -572,17 +643,36 @@ class MarginBalancer:
             return "acknowledged"
         return "unknown" if pending else "blocked"
 
-    def _record_failure(self, pair, state, reason):
+    def _record_success(self, pair, state):
+        state.pop("api_notice", None)
+        state.pop("blocked_reason", None)
+        self.store.put("pair_margin:" + pair["id"], state)
+
+    @staticmethod
+    def _apply_api_wait(state, exc):
+        notice = api_wait_notice(exc)
+        if notice:
+            state["api_notice"] = notice
+        delay = getattr(exc, "retry_after", 0)
+        if type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
+            deadline = state.get("next_check_at", 0)
+            if type(deadline) not in (int, float) or not math.isfinite(deadline):
+                deadline = 0
+            state["next_check_at"] = max(deadline, time.time() + delay)
+
+    def _record_failure(self, pair, state, reason, *, exc=None):
         # Re-read durable state: a rolled-back paper transfer or failed receipt
         # commit must never be saved as completed by an error handler.
         try:
             durable = self.store.get("pair_margin:" + pair["id"], {})
             if isinstance(durable, dict):
                 durable["blocked_reason"] = reason
+                self._apply_api_wait(durable, exc)
                 self.store.put("pair_margin:" + pair["id"], durable)
                 return durable
         except Exception:
             pass
+        self._apply_api_wait(state, exc)
         return state
 
     def _live_snapshots(self, pair, members, snapshots):
@@ -661,6 +751,24 @@ class MarginBalancer:
         return occupied
 
     def _live(self, pair, members, snapshots, state, config):
+        # New transfers, including archived-order guards whose query method
+        # requests recovery priority, may never spend the recovery reserve.
+        with ExitStack() as ordinary:
+            seen = set()
+            for member in members.values():
+                budget = getattr(getattr(self.engine.broker(member), "api", None), "budget", None)
+                if budget is not None and id(budget) not in seen:
+                    ordinary.enter_context(budget.cycle_accounting())
+                    seen.add(id(budget))
+            self._require_budget(members, self._live_budget_weights(pair, members, snapshots))
+            result = self._submit_live(pair, members, snapshots, state, config)
+        # Only an already accepted write may use the recovery reserve. Leave
+        # the ordinary context before its one confirmation refresh.
+        if isinstance(state.get("pending"), dict) and state["pending"].get("status") == "acknowledged":
+            return self._refresh_acknowledged(pair, members, state, config)
+        return result
+
+    def _submit_live(self, pair, members, snapshots, state, config):
         key = "pair_margin:" + pair["id"]
         snapshots, require_current = self._live_snapshots(pair, members, snapshots)
         with self._master(pair, members) as (api, master, children):
@@ -688,7 +796,7 @@ class MarginBalancer:
             require_current()
             plan = self._plan(pair, members, snapshots, config, available, occupied_floors=occupied)
             if plan is None:
-                self.store.put(key, state)
+                self._record_success(pair, state)
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config))
             before_at = time.time()
             before = self._income(members, int((before_at - 90) * 1000), int(before_at * 1000))
@@ -707,6 +815,8 @@ class MarginBalancer:
                 "before_receipts": {side: [[row["incomeType"], _identifier(row.get("tranId"))] for row in rows
                     if row.get("incomeType") in TRANSFER_TYPES and _identifier(row.get("tranId"))] for side, rows in before.items()}}
             state.update(pending=pending, last_transfer=pending, cooldown_until=created + config["cooldown_seconds"])
+            state.pop("api_notice", None)
+            state.pop("blocked_reason", None)
             self.store.put(key, state)  # Must commit before any signed mutation.
             transfer = TransferAPI(master, budget=api.budget, before_submit=require_current)
             try:
@@ -730,12 +840,17 @@ class MarginBalancer:
                 pending["status"] = "rejected" if rejected else "unknown"
                 if rejected:
                     state["pending"] = None
+                self._apply_api_wait(state, exc)
+                if state.get("api_notice"):
+                    state["blocked_reason"] = state["api_notice"]["text"]
             finally:
                 transfer.close()
                 self._invalidate(members)
             self.store.put(key, state)
             if pending["status"] == "acknowledged":
-                return self._refresh_acknowledged(pair, members, state, config)
+                return self._view(state, config, "acknowledged", "交易所已确认划转，继续刷新两侧余额", blocks=True)
             reason = {"unknown": "划转结果未知，停止新划转和新开仓；保留原记录供只读核对，不重发原请求",
                       "rejected": "划转请求明确未被接受，本次未划转；冷却结束后系统重新评估划转条件"}[pending["status"]]
+            if state.get("api_notice"):
+                reason += "；" + state["api_notice"]["text"]
             return self._view(state, config, pending["status"], reason, blocks=True, plan=plan)

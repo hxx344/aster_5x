@@ -58,7 +58,13 @@ export function PairNotices({
         className={currentKeys.has(entry.key) ? 'amber' : 'muted'}
         aria-live={announce ? 'polite' : undefined}
       >
-        <strong>{status(entry)}</strong> · {entry.text}
+        <strong>{status(entry)}</strong> ·{' '}
+        {entry.source === 'pair'
+          ? '配对执行 API · '
+          : entry.source === 'margin'
+            ? '保证金管理 API · '
+            : ''}
+        {entry.text}
       </p>
       <p className="pair-notice-time muted">
         首次看到 {clock(entry.firstSeen)} · 最近看到 {clock(entry.lastSeen)}

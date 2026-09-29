@@ -9,7 +9,7 @@ import time
 import uuid
 
 from .exchange import (AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent,
-                       LeverageRejected, LEVERAGE_REJECTION_CODES, ORDER_REJECTION_CODES)
+                       LeverageRejected, LEVERAGE_REJECTION_CODES, ORDER_REJECTION_CODES, api_wait_notice)
 from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, wire, cycle_margin_limit, opening_margin_limit
@@ -67,6 +67,10 @@ class PairTrader:
         interval = min(5, pair["margin"]["check_interval_seconds"]) if pair["margin"]["enabled"] else 5
         if not 0 <= time.monotonic() - started < interval:
             return None
+        # A slow read has already consumed part of the eight-second freshness
+        # window. Start the observation interval at the source read, not its end.
+        if any(not 0 <= time.time() - snapshot.timestamp < interval for snapshot in snapshots.values()):
+            return None
         try:
             for guard in guards.values():
                 guard()
@@ -121,6 +125,18 @@ class PairTrader:
         return accounts, brokers, identities
 
     def _read(self, brokers, *, hot=False, reconciliation=False):
+        if not hot:
+            budgets = {}
+            for broker in brokers.values():
+                if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
+                    budget = broker.api.budget
+                    budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight(
+                        [SYMBOL], fresh_modes=reconciliation, reuse_account_mode=not reconciliation)
+            # Check the complete shared-budget read before either worker starts;
+            # actual requests still perform their own atomic admission checks.
+            for budget, weight in budgets.items():
+                with budget.reconciliation() if reconciliation else budget.cycle_accounting():
+                    budget.require_available(weight)
         def read(key):
             broker = brokers[key]
             # Budget priority is thread-local: establish it inside each worker.
@@ -179,6 +195,7 @@ class PairTrader:
     def tick(self, pair):
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
         state.pop("retry_after", None)
+        state["api_notice"] = None
         if not isinstance(state.get("progress"), dict):
             state["progress"] = empty_progress(state["owned"])
         try:
@@ -204,6 +221,16 @@ class PairTrader:
                 for field in ("checked_at", "next_check_at", "cooldown_until"))
             margin_pending = margin_state.get("pending") if isinstance(margin_state, dict) else None
             from .margin_balance import MarginBalancer
+            if (not holding and margin_pending is None and not margin_invalid
+                    and margin_state.get("api_notice")
+                    and time.time() < margin_state.get("next_check_at", 0)):
+                # A failed balance preparation blocks new work. Re-reading both
+                # accounts during its quota backoff cannot authorize anything.
+                margin = MarginBalancer.status_view(pair, margin_state, state.get("margin"))
+                if margin.get("blocks_trading"):
+                    state.update(margin=margin, phase="margin_wait", reason=margin["reason"],
+                                 retry_after=max(0, margin_state["next_check_at"] - time.time()))
+                    return state
             if not holding and (margin_pending is not None or margin_invalid):
                 # Pending transfers consume only their own reconciliation reads.
                 # Even a completed reconciliation ends this turn: subsequent
@@ -212,6 +239,8 @@ class PairTrader:
                 self._margin_observations.pop(pair["id"], None)
                 margin = MarginBalancer(self.engine).tick(pair, {})
                 state.update(margin=margin, phase="margin_wait", reason=margin.get("reason", "划转核对中"))
+                if margin.get("api_notice"):
+                    state["retry_after"] = max(0, margin.get("retry_after", 0))
                 return state
             if not pair["enabled"] and not holding and not margin_pending:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
@@ -253,10 +282,16 @@ class PairTrader:
                     (pair["revision"], deepcopy(identities)), snapshots, guards, time.monotonic())
             # The independent balancer uses the same ordered account locks. A
             # transfer invalidates both read leases before any following order.
+            if pair["margin"]["enabled"] and not holding:
+                # Publish the completed read before potentially slow transfer
+                # preparation; this never changes the original snapshot time.
+                self._save(pair, state)
             margin = MarginBalancer(self.engine).tick(pair, snapshots, pending_orders=closing_due)
             state["margin"] = margin
             if margin.get("blocks_trading") and not holding:
                 state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
+                if margin.get("api_notice"):
+                    state["retry_after"] = max(0, margin.get("retry_after", 0))
                 return state
             if not pair["enabled"] and not holding:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
@@ -294,6 +329,7 @@ class PairTrader:
             state.update(phase="attention", reason=str(exc), attention=str(exc))
         except TradingError as exc:
             self._retry_delay(state, exc)
+            state["api_notice"] = api_wait_notice(exc)
             state.update(phase="reconciling" if state.get("pending") else
                          "holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
                          reason=str(exc))

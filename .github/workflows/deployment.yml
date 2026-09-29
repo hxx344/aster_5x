@@ -7,6 +7,23 @@ on:
 permissions:
   contents: read
 jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check relay installer and management scripts
+        run: |
+          for script in install-relay.sh deploy/aster-capacity-relay deploy/aster-desk; do bash -n "$script"; done
+      - name: Exercise relay certificate, configuration and isolated upgrade fixtures
+        run: sudo python3 -m unittest tests.test_relay_install -v
+      - name: Install locked Python dependencies for relay integration
+        run: |
+          python3 -m venv .venv-relay-ci
+          .venv-relay-ci/bin/python -m pip install --disable-pip-version-check -r requirements.lock
+          .venv-relay-ci/bin/python -m pip check
+      - name: Verify relay client, server and real TLS integration
+        run: .venv-relay-ci/bin/python -m unittest tests.test_capacity_relay_server tests.test_capacity_relay_client tests.test_capacity_relay_integration tests.test_capacity_relay_e2e -v
   installer:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

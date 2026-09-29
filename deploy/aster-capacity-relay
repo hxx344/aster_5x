@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=/opt/aster-capacity-relay/current
+case "${1:-status}" in
+  status) systemctl --no-pager status aster-capacity-relay; "$root/.venv/bin/python" "$root/deploy/configure-capacity-relay.py" status ;;
+  logs) journalctl -u aster-capacity-relay -f --no-hostname ;;
+  start|stop|restart) systemctl "$1" aster-capacity-relay ;;
+  export-connect) exec "$root/.venv/bin/python" "$root/deploy/configure-capacity-relay.py" export-connect ;;
+  *) printf 'Usage: sudo aster-capacity-relay {status|logs|start|stop|restart|export-connect}\n' >&2; exit 2 ;;
+esac

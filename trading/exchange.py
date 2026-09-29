@@ -496,8 +496,12 @@ class PublicCapacitySample(dict):
 
 
 class MarketData:
-    def __init__(self, api=None, *, stream=None, depth_stream=None):
+    def __init__(self, api=None, *, stream=None, depth_stream=None, capacity_relay=None):
         self.api = api or API()
+        if capacity_relay is None:
+            from .capacity_relay_client import PublicCapacityRelayClient
+            capacity_relay = PublicCapacityRelayClient.from_env()
+        self.capacity_relay = capacity_relay
         self.stream = stream if stream is not None else PublicQuoteStream()
         self.depth_stream = depth_stream if depth_stream is not None else PublicDepthStream()
         self.rules = {}
@@ -516,6 +520,14 @@ class MarketData:
         self.public_sample_guard = threading.Lock()
         self.public_samples, self.public_sample_reads = {}, {}
 
+    @property
+    def remote_capacity(self):
+        return self.capacity_relay is not None
+
+    def set_capacity_update_listener(self, listener):
+        if self.capacity_relay is not None:
+            self.capacity_relay.set_update_listener(listener)
+
     def set_update_listener(self, listener):
         """Forward optional market signals while supporting older injected streams."""
         if listener is not None and not callable(listener):
@@ -527,15 +539,23 @@ class MarketData:
 
     def start_stream(self):
         try:
-            self.stream.start()
+            try:
+                self.stream.start()
+            finally:
+                self.depth_stream.start()
         finally:
-            self.depth_stream.start()
+            if self.capacity_relay is not None:
+                self.capacity_relay.start()
 
     def close_stream(self):
         try:
-            self.stream.close()
+            try:
+                self.stream.close()
+            finally:
+                self.depth_stream.close()
         finally:
-            self.depth_stream.close()
+            if self.capacity_relay is not None:
+                self.capacity_relay.close()
 
     @staticmethod
     def market_quantity_limits(lot, market_lot=None):
@@ -861,6 +881,13 @@ class MarketData:
 
     def _public_sample(self, path, symbol, *, brackets=False, priority=True):
         """Share only unsigned public responses, with one in-flight read per key."""
+        if self.capacity_relay is not None:
+            # Remote samples already carry their source age in local clock
+            # coordinates. Neither receiving nor rereading may freshen them.
+            sample = self.capacity_relay.sample("brackets" if brackets else "oi", symbol,
+                                               max_age=PUBLIC_BRACKETS_MAX_AGE if brackets else 8)
+            self._validate_public_sample(sample[2], symbol, brackets=brackets)
+            return sample
         key = path, symbol
         lifetime = PUBLIC_BRACKETS_REFRESH_INTERVAL if brackets else PUBLIC_OI_SHARE_MAX_AGE
         while True:
@@ -892,16 +919,7 @@ class MarketData:
         try:
             started, checked_at = time.monotonic(), time.time()
             payload = self._public_json(path, symbol, brackets=brackets, priority=priority)
-            try:
-                if brackets:
-                    from .listings import maximum_leverage
-                    maximum_leverage(payload, symbol)
-                else:
-                    data = monitor.unwrap(payload)
-                    if data.get("symbol") != symbol or not isinstance(data.get("leverageOiRemainingMap"), dict):
-                        raise monitor.MonitorError("Public capacity symbol or leverage map is invalid")
-            except monitor.MonitorError as exc:
-                raise ExchangeError(str(exc)) from None
+            self._validate_public_sample(payload, symbol, brackets=brackets)
             sample = started, checked_at, payload
             with self.public_sample_guard:
                 self.public_samples[key] = sample
@@ -916,6 +934,19 @@ class MarketData:
             with self.public_sample_guard:
                 if self.public_sample_reads.get(key) is pending:
                     self.public_sample_reads.pop(key)
+
+    @staticmethod
+    def _validate_public_sample(payload, symbol, *, brackets):
+        try:
+            if brackets:
+                from .listings import maximum_leverage
+                maximum_leverage(payload, symbol)
+            else:
+                data = monitor.unwrap(payload)
+                if data.get("symbol") != symbol or not isinstance(data.get("leverageOiRemainingMap"), dict):
+                    raise monitor.MonitorError("Public capacity symbol or leverage map is invalid")
+        except monitor.MonitorError as exc:
+            raise ExchangeError(str(exc)) from None
 
     def _public_json(self, path, symbol, *, brackets=False, priority=True):
         # Reuse the public client's connections; no account signature or data.

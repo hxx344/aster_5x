@@ -75,8 +75,9 @@ class InstallerHarness:
         path.chmod(0o755)
 
     def install_commands(self):
-        for name in ("chown", "id", "useradd", "sleep"):
+        for name in ("id", "useradd", "sleep"):
             self.executable(self.commands / name, "exit 0")
+        self.executable(self.commands / "chown", 'printf "%s\\n" "$*" >> "$HARNESS_BASE/chown-calls"')
         self.executable(self.commands / "journalctl", 'printf "fixture service diagnostics\\n"')
         self.executable(self.commands / "systemd-run", 'printf "%s\\n" "$HARNESS_BASE/runtime"')
         self.executable(self.commands / "df", '''if [[ -f "$HARNESS_BASE/fail-space" ]]; then
@@ -262,6 +263,21 @@ esac''')
 class TradingInstallerTests(unittest.TestCase):
     def setUp(self):
         self.h = InstallerHarness(self)
+
+    def test_upgrade_preserves_runtime_access_to_imported_relay_ca(self):
+        self.h.success()
+        certificate = self.h.etc / "relay-ca.pem"
+        certificate.write_text("public CA certificate fixture\n")
+        certificate.chmod(0o600)
+        self.h.etc.chmod(0o700)
+        # A code upgrade re-enters the existing permission setup path.
+        self.h.append("trading/server.py", "\n# New release\n")
+        self.h.success()
+        self.assertEqual(self.h.etc.stat().st_mode & 0o777, 0o750)
+        self.assertEqual(certificate.stat().st_mode & 0o777, 0o640)
+        self.assertEqual((self.h.etc / "environment").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(certificate.read_text(), "public CA certificate fixture\n")
+        self.assertIn(f"root:aster-desk {self.h.etc} {certificate}", (self.h.base / "chown-calls").read_text().splitlines())
 
     def test_success_and_warm_upgrade_reuse_runtimes_dependencies_and_frontend(self):
         first = self.h.success()

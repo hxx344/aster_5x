@@ -511,6 +511,8 @@ class Engine:
         capacity_symbols = self.capacity_market_symbols(accounts)
         public_capacity_cost = (sum(60 / self.capacity_interval(symbol) for symbol in capacity_symbols)
                                 + len(capacity_symbols) * 60 / self.capacity_brackets_interval) if self.capacity_poll_enabled else 0
+        if isinstance(self.market, MarketData) and self.market.remote_capacity is True:
+            public_capacity_cost = 0
         extra_capacity = public_capacity_cost - CAPACITY_MONITOR_RESERVE
         capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE - extra_capacity)
         with self.lock:
@@ -791,6 +793,13 @@ class Engine:
         """Fit all public quota samples, including brackets, into their real reserve."""
         symbols = self.capacity_market_symbols() if symbols is None else set(symbols)
         targets = {symbol: tiers for symbol, tiers in targets.items() if symbol in symbols}
+        if isinstance(self.market, MarketData) and self.market.remote_capacity is True:
+            # Reading the relay's cache spends no Aster weight on this host.
+            # Keep consumption cadence independent of the local IP's budget.
+            self.market.api.budget.configure_capacity_reserve(0)
+            intervals = dict.fromkeys(SYMBOLS, CAPACITY_POLL_INTERVAL)
+            intervals.update(dict.fromkeys(targets, FAST_CAPACITY_POLL_INTERVAL))
+            return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL, bool(symbols)
         count = len(targets)
         baseline = len(symbols) * CAPACITY_MONITOR_RESERVE
         allowance = baseline + count * (60 / FAST_CAPACITY_POLL_INTERVAL - 60 / CAPACITY_POLL_INTERVAL)
@@ -814,7 +823,8 @@ class Engine:
             self.market.refresh_public_brackets(symbol)
             return self.capacity_brackets_interval
         except (TradingError, KeyError, ValueError, TypeError) as exc:
-            return max(10, getattr(exc, "retry_after", 0))
+            floor = 1 if isinstance(self.market, MarketData) and self.market.remote_capacity is True else 10
+            return max(floor, getattr(exc, "retry_after", 0))
 
     def poll_market(self, symbol):
         if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.capacity_market_symbols():
@@ -874,6 +884,8 @@ class Engine:
             self.scheduler_event.set()
             if isinstance(exc, PublicBracketsUnavailable):
                 return CAPACITY_POLL_INTERVAL
+            if isinstance(self.market, MarketData) and self.market.remote_capacity is True:
+                return PollBackoff(max(.5, getattr(exc, "retry_after", 0)))
             return PollBackoff(max(10, getattr(exc, "retry_after", 0)))
 
     def poll_book(self, symbol):
@@ -2510,6 +2522,8 @@ class Engine:
                     cycle["close_eligible_at"] = cycle["opened_at"] + cycle.get("config", account["cycle"])["hold_seconds"]
                 account["cycle_state"] = cycle
             return json.loads(dumps({"demo": self.demo, "ready": self.ready, "error": self.error,
+                "capacity_relay": (self.market.capacity_relay.status() if isinstance(self.market, MarketData)
+                                   and self.market.remote_capacity is True else None),
                 "accounts": accounts, "pairs": paired_states, "markets": self.markets, "listings": listings, "monitoring": monitoring_state, "events": events, "updated_at": time.time(), "request_budget": request_budget,
                 "notification": {"configured": bool(os.environ.get("FEISHU_WEBHOOK_URL")), "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "error": self.notification_error or next(iter(self.capacity_notification_errors.values()), None)}}))
@@ -2525,8 +2539,9 @@ class Engine:
         try:
             self.dashboard_reports.start(self._dashboard_report_accounts)
             if isinstance(self.market, MarketData) and not self.shutdown.is_set():
-                self.market.api.budget.configure_capacity_reserve(CAPACITY_MONITOR_RESERVE)
+                self.market.api.budget.configure_capacity_reserve(0 if self.market.remote_capacity is True else CAPACITY_MONITOR_RESERVE)
                 self.market.set_update_listener(self.on_cycle_market_update)
+                self.market.set_capacity_update_listener(lambda symbol, kind: self.scheduler_event.set())
                 try:
                     self.market.start_stream()
                 except Exception:
@@ -2768,6 +2783,7 @@ class Engine:
             if isinstance(self.market, MarketData):
                 try:
                     self.market.set_update_listener(None)
+                    self.market.set_capacity_update_listener(None)
                     self.market.close_stream()
                 except Exception:
                     LOG.error("Public quote stream close failed")

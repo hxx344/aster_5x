@@ -420,6 +420,13 @@ rm -rf -- "$stage/dashboard/node_modules"
 id aster-desk >/dev/null 2>&1 || useradd --system --home-dir /var/lib/aster-desk --shell /usr/sbin/nologin aster-desk
 chown aster-desk:aster-desk /var/lib/aster-desk
 chmod 700 /var/lib/aster-desk /etc/aster-desk
+if [[ -f /etc/aster-desk/relay-ca.pem ]]; then
+  # The runtime must traverse this directory to read its imported public CA.
+  # EnvironmentFile remains root-only and is read by systemd, not the service.
+  chown root:aster-desk /etc/aster-desk /etc/aster-desk/relay-ca.pem
+  chmod 750 /etc/aster-desk
+  chmod 640 /etc/aster-desk/relay-ca.pem
+fi
 new_password=''
 if [[ ! -f /etc/aster-desk/environment ]]; then
   new_password=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')

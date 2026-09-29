@@ -1,0 +1,24 @@
+[Unit]
+Description=Aster public capacity relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aster-capacity-relay
+Group=aster-capacity-relay
+WorkingDirectory=/opt/aster-capacity-relay/current
+EnvironmentFile=/etc/aster-capacity-relay/environment
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/aster-capacity-relay/current/.venv/bin/python -m trading.capacity_relay_server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

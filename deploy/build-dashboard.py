@@ -105,7 +105,10 @@ def mirror_source(source, workspace, keep_info):
         if path.name != "node_modules" and not (keep_info and path.name == BUILD_INFO):
             remove(path, workspace)
     def ignored(_directory, names):
-        return {name for name in names if name in GENERATED or name == BUILD_INFO or name.startswith(".env")}
+        ignored_names = {name for name in names if name in GENERATED or name == BUILD_INFO or name.startswith(".env")}
+        if Path(_directory) == source / "dashboard":
+            ignored_names.update(name for name in names if name in {"tests", "README.md", "AGENTS.md"})
+        return ignored_names
     shutil.copytree(source / "dashboard", dashboard, dirs_exist_ok=True, ignore=ignored)
     trading = workspace / "trading"
     remove(trading, workspace)
@@ -130,6 +133,38 @@ def typecheck_key(source, dependency_key):
     for path in sorted((source / "dashboard").glob("tsconfig*.json")):
         digest.update(path.name.encode() + b"\0" + path.read_bytes())
     return digest.hexdigest()
+
+
+def validation_key(source, dependency_key):
+    """Successful code checks are independent of CSS/image-only asset builds.
+
+    Unlike the tsbuildinfo compatibility key, this includes source contents,
+    deletions, configuration and the check recipe. Production workspaces omit
+    the dedicated tests directory; tests continue to run in CI/development.
+    """
+    digest = hashlib.sha256(("validation-v1:" + dependency_key).encode())
+    assets = {".css", ".scss", ".sass", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".woff", ".woff2"}
+    files = [source / "trading/cycle-config.json", Path(__file__).resolve()]
+    dashboard = source / "dashboard"
+    for directory, dirs, names in os.walk(dashboard):
+        dirs[:] = [name for name in dirs if name not in GENERATED]
+        if Path(directory) == dashboard:
+            dirs[:] = [name for name in dirs if name != "tests"]
+            names = [name for name in names if name not in {"README.md", "AGENTS.md"}]
+        files.extend(Path(directory) / name for name in names
+                     if not name.startswith(".env") and name != BUILD_INFO and Path(name).suffix not in assets)
+    for path in sorted(files):
+        name = path.relative_to(source).as_posix() if path.is_relative_to(source) else "deploy/build-dashboard.py"
+        encoded, data = name.encode(), path.read_bytes()
+        digest.update(len(encoded).to_bytes(8, "big") + encoded)
+        digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+def atomic_text(path, value):
+    temporary = path.with_name(path.name + ".new")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
 
 
 def build(source, workspace, dependency_key, run=None):
@@ -164,6 +199,8 @@ def build(source, workspace, dependency_key, run=None):
         log("Migrate npm dependency cache in place (no dependency copy)")
     reusable = completed and modules.is_dir() and not linked(modules) and (legacy or re.fullmatch(r"[a-f0-9]{64}", baseline))
     check_key = typecheck_key(source, dependency_key)
+    checks_key = validation_key(source, dependency_key)
+    checks_reusable = reusable and read_text(workspace / ".validation-key") == checks_key
     keep_info = bool(reusable and read_text(workspace / ".typecheck-key") == check_key
                      and (dashboard / BUILD_INFO).is_file() and not linked(dashboard / BUILD_INFO))
     with step("Prepare dashboard workspace"):
@@ -178,19 +215,23 @@ def build(source, workspace, dependency_key, run=None):
         if not reusable or legacy:
             baseline = modules_digest(modules)
             baseline_path.write_text(baseline, encoding="utf-8")
-    with step("Typecheck dashboard"):
-        log("Reuse TypeScript incremental cache; changed files are still checked" if keep_info
-            else "No compatible TypeScript cache; full typecheck")
-        run(["run", "typecheck"], dashboard)
-    with step("Lint dashboard"):
-        run(["run", "lint"], dashboard)
+    if checks_reusable:
+        log("Reuse successful typecheck and lint (code, configuration and dependencies unchanged)")
+    else:
+        with step("Typecheck dashboard"):
+            log("Reuse TypeScript incremental cache; changed files are still checked" if keep_info
+                else "No compatible TypeScript cache; full typecheck")
+            run(["run", "typecheck"], dashboard)
+        with step("Lint dashboard"):
+            run(["run", "lint"], dashboard)
     with step("Build dashboard assets"):
         run(["run", "build"], dashboard)
         if not (dashboard / "dist/client/index.html").is_file():
             raise ValueError("Dashboard build did not produce index.html")
     with step("Verify reusable npm dependencies"):
         if modules_digest(modules) == baseline:
-            (workspace / ".typecheck-key").write_text(check_key, encoding="utf-8")
+            atomic_text(workspace / ".typecheck-key", check_key)
+            atomic_text(workspace / ".validation-key", checks_key)
             marker.touch()
         else:
             log("Build changed installed packages; discard workspace cache after this release")

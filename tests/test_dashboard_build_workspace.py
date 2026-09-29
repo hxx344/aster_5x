@@ -115,6 +115,7 @@ class DashboardBuildWorkspaceTests(unittest.TestCase):
     def test_failure_leaves_workspace_incomplete_and_retry_installs_clean_dependencies(self):
         for check in ('typecheck', 'lint', 'build'):
             with self.subTest(check=check):
+                (self.source / 'dashboard/lib/a.ts').write_text(f'export const a = "{check}";')
                 self.failure = check
                 with self.assertRaises(subprocess.CalledProcessError):
                     self.build()
@@ -124,6 +125,39 @@ class DashboardBuildWorkspaceTests(unittest.TestCase):
                 self.build()
                 self.assertFalse(self.warm[-1])
                 self.assertTrue((self.workspace / '.complete').is_file())
+
+    def test_asset_only_build_reuses_checks_but_code_changes_do_not(self):
+        self.build()
+        (self.source / 'dashboard/public').mkdir()
+        (self.source / 'dashboard/public/logo.svg').write_text('<svg/>')
+        output = self.build()
+        self.assertIn('Reuse successful typecheck and lint', output)
+        self.assertEqual(self.calls.count(('run', 'typecheck')), 1)
+        self.assertEqual(self.calls.count(('run', 'lint')), 1)
+        self.assertEqual(self.calls.count(('run', 'build')), 2)
+        (self.source / 'dashboard/lib/a.ts').write_text('export const a = 3;')
+        self.build()
+        self.assertEqual(self.calls.count(('run', 'typecheck')), 2)
+        self.assertEqual(self.calls.count(('run', 'lint')), 2)
+
+    def test_production_workspace_omits_tests_and_docs_and_does_not_revalidate_them(self):
+        self.build()
+        tests = self.source / 'dashboard/tests'
+        tests.mkdir()
+        (tests / 'fixture.test.ts').write_text('const testOnly: number = "not production";')
+        (self.source / 'dashboard/README.md').write_text('deployment documentation')
+        self.build()
+        self.assertFalse((self.workspace / 'dashboard/tests').exists())
+        self.assertFalse((self.workspace / 'dashboard/README.md').exists())
+        self.assertEqual(self.calls.count(('run', 'typecheck')), 1)
+        self.assertEqual(self.calls.count(('run', 'lint')), 1)
+
+    def test_missing_validation_stamp_rechecks_even_if_dependencies_are_reusable(self):
+        self.build()
+        (self.workspace / '.validation-key').unlink()
+        self.build()
+        self.assertEqual(self.calls.count(('run', 'typecheck')), 2)
+        self.assertEqual(self.calls.count(('run', 'lint')), 2)
 
     def test_package_mutation_discards_cache_but_checked_assets_remain_publishable(self):
         self.build()

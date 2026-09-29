@@ -79,7 +79,7 @@ class InstallerHarness:
             self.executable(self.commands / name, "exit 0")
         self.executable(self.commands / "chown", 'printf "%s\\n" "$*" >> "$HARNESS_BASE/chown-calls"')
         self.executable(self.commands / "journalctl", 'printf "fixture service diagnostics\\n"')
-        self.executable(self.commands / "systemd-run", 'printf "%s\\n" "$HARNESS_BASE/runtime"')
+        self.executable(self.commands / "systemd-run", 'printf "1\\n" >> "$HARNESS_COUNTERS/storage-context"; printf "%s\\n" "$HARNESS_BASE/runtime"')
         self.executable(self.commands / "df", '''if [[ -f "$HARNESS_BASE/fail-space" ]]; then
   printf 'Filesystem Blocks Used Available Capacity Mounted\\nfixture 100 100 0 100%% /\\n'
 elif [[ -f "$HARNESS_BASE/fail-inodes" && $1 == -Pi ]]; then
@@ -323,6 +323,29 @@ class TradingInstallerTests(unittest.TestCase):
         self.h.append("dashboard/package.json", "\n")
         self.h.success()
         self.h.assert_counts(pip=1, npm_ci=3, build=4)
+
+    def test_docs_and_tests_only_skip_release_switch_and_storage_traversal(self):
+        previous = self.h.success()
+        scans = self.h.count("storage-context")
+        calls = (self.h.base / "service-calls").read_text().splitlines()
+        self.h.append("DEPLOYMENT.md", "documentation edit\n")
+        (self.h.source / "dashboard/tests").mkdir()
+        self.h.write("dashboard/tests/new.test.mjs", "test-only edit\n")
+        current = self.h.success()
+        self.assertEqual(current, previous)
+        self.assertEqual(self.h.count("storage-context"), scans)
+        after = (self.h.base / "service-calls").read_text().splitlines()[len(calls):]
+        self.assertFalse(any(line.split()[0] in {"start", "stop", "restart", "enable"} for line in after))
+        self.h.assert_counts(pip=1, npm_ci=1, build=1)
+
+    def test_public_asset_change_builds_without_repeating_code_checks(self):
+        self.h.success()
+        (self.h.source / "dashboard/public").mkdir()
+        self.h.write("dashboard/public/logo.svg", "<svg/>\n")
+        result = self.h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Reuse successful typecheck and lint", result.stdout)
+        self.h.assert_counts(pip=1, npm_ci=1, build=2)
 
     def test_shared_cycle_configuration_rebuilds_frontend_without_reinstalling_dependencies(self):
         self.h.success()

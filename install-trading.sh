@@ -14,8 +14,8 @@ command -v systemctl >/dev/null || { printf 'systemd is required.\n' >&2; exit 1
 root=/opt/aster-desk
 stage='' scratch='' old='' storage_running='' source_revision=''
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)
-storage_gc() {
-  local pressure=${1:-0} active_stage=${2-$stage} pid data_path
+read_running_release() {
+  local pid
   if ! pid=$(systemctl show --property=MainPID --value aster-desk 2>/dev/null); then
     [[ ! -e $root/current && ! -f /etc/systemd/system/aster-desk.service ]] || { printf 'Cannot inspect installed service; cleanup skipped.\n' >&2; return 1; }
   fi
@@ -25,6 +25,10 @@ storage_gc() {
   elif [[ $pid != 0 && ( -n $pid || -e $root/current || -f /etc/systemd/system/aster-desk.service ) ]]; then
     printf 'Cannot identify the running service; storage cleanup skipped.\n' >&2; return 1
   fi
+}
+storage_gc() {
+  local pressure=${1:-0} active_stage=${2-$stage} data_path
+  read_running_release || return 1
   data_path=/var/lib/aster-desk
   if [[ -f /etc/aster-desk/environment ]]; then
     data_path=$(systemd-run --quiet --wait --pipe --collect --unit="aster-desk-storage-$$" \
@@ -192,11 +196,11 @@ step() {
   printf '[upgrade] %s...\n' "$step_name"
 }
 mkdir -p "$root"
+[[ ! -L $root && $(readlink -f "$root") == "$root" ]] || { printf 'Refusing linked installation root.\n' >&2; exit 1; }
 # Lock before collection: another installer may still be building in a cache.
 exec 9>"$root/upgrade.lock"
 flock -n 9 || { printf 'Another Aster Desk upgrade is running.\n' >&2; exit 1; }
 if [[ -L $root/current && -d $root/current ]]; then old=$(readlink -f "$root/current"); fi
-if command -v python3 >/dev/null; then storage_gc; fi
 if ((cleanup_only)); then
   command -v python3 >/dev/null || { printf 'Python is required for safe cleanup.\n' >&2; exit 1; }
   storage_gc 1
@@ -204,6 +208,9 @@ if ((cleanup_only)); then
   df -i "$root" /tmp /var
   exit 0
 fi
+# Read only the process identity before the no-change path. Full cache traversal
+# happens after an update, for explicit cleanup, or when disk space is low.
+read_running_release
 step 'Check system dependencies'
 system_ready() {
   local tool
@@ -312,6 +319,7 @@ npm_identity=$(npm --version)
 # Hash paths and contents, including public assets/configuration, not mtimes.
 # Bump the recipe prefix when changing how dependencies or assets are prepared.
 fingerprints=$(python3 - "$source_dir" "$node_identity" "$npm_identity" <<'PY'
+# INPUTS_BEGIN: also exercised by native fingerprint regression tests.
 import hashlib, json, os, platform, sys, sysconfig
 from pathlib import Path
 source = Path(sys.argv[1])
@@ -331,17 +339,24 @@ ignored = {'node_modules', 'dist', '.wrangler', '.vinext', '.next', '.git', '__p
 files = [source / 'trading/cycle-config.json', source / 'deploy/build-dashboard.py']
 for directory, dirs, names in os.walk(source / 'dashboard'):
     dirs[:] = [name for name in dirs if name not in ignored]
+    if Path(directory) == source / 'dashboard':
+        dirs[:] = [name for name in dirs if name != 'tests']
+        names = [name for name in names if name not in {'README.md', 'AGENTS.md'}]
     files.extend(Path(directory) / name for name in names if not name.startswith('.env') and name != 'tsconfig.tsbuildinfo')
 build_env = json.dumps({key: value for key, value in sorted(os.environ.items()) if key.startswith(('VITE_', 'NEXT_PUBLIC_')) or key == 'NODE_ENV'})
-frontend_key = digest('frontend-v2:' + npm_key + build_env, files)
+frontend_key = digest('frontend-v3:' + npm_key + build_env, files)
 print(python_key, npm_key, frontend_key, sep='\n')
-release_files = [source / name for name in ('requirements.txt', 'requirements.lock', 'monitor.py', 'config.json', 'DEPLOYMENT.md', 'install-trading.sh')]
+release_files = [source / name for name in ('requirements.txt', 'requirements.lock', 'monitor.py', 'config.json', 'install-trading.sh')]
 release_files += files
 for folder in ('trading', 'deploy'):
     for directory, dirs, names in os.walk(source / folder):
         dirs[:] = [name for name in dirs if name not in ignored]
+        if Path(directory) == source / 'deploy':
+            names = [name for name in names if name not in
+                     {'relay.env.example', 'aster-capacity-relay.service', 'aster-capacity-relay', 'aster-5x.service'}]
         release_files.extend(Path(directory) / name for name in names if not name.startswith('.env'))
-print(digest('release-v2:' + python_key + frontend_key, release_files))
+print(digest('release-v3:' + python_key + frontend_key, release_files))
+# INPUTS_END
 PY
 )
 mapfile -t keys <<< "$fingerprints"

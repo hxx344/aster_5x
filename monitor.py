@@ -197,12 +197,28 @@ def validate_config(config, *, environ=None):
     return config
 
 
+FEISHU_CARD_PREFIX = "ASTER-FEISHU-CARD/1\n"
+
+
 def feishu_payload(message, secret, timestamp):
-    payload = {"msg_type": "text", "content": {"text": message}}
+    # Only an explicit, versioned outbox envelope is a card. Old messages stay text.
+    if isinstance(message, str) and message.startswith(FEISHU_CARD_PREFIX):
+        try:
+            card = json.loads(message[len(FEISHU_CARD_PREFIX):])
+            if (not isinstance(card, dict) or card.get("schema") != "2.0"
+                    or not isinstance(card.get("body", {}).get("elements"), list)):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise MonitorError("Invalid queued Feishu card") from None
+        payload = {"msg_type": "interactive", "card": card}
+    else:
+        payload = {"msg_type": "text", "content": {"text": message}}
     if secret:
         key = f"{timestamp}\n{secret}".encode()
         payload.update(timestamp=str(timestamp), sign=base64.b64encode(
             hmac.new(key, b"", hashlib.sha256).digest()).decode())
+    if payload["msg_type"] == "interactive" and len(json.dumps(payload).encode("utf-8")) > 20000:
+        raise MonitorError("Feishu card exceeds message size limit")
     return payload
 
 

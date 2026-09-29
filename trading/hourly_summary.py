@@ -1,21 +1,25 @@
-"""Bounded Feishu text from published state only; no exchange or database I/O."""
+"""Compact, native Feishu cards from published state; no exchange/database I/O."""
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_UP
+import json
 
+from monitor import FEISHU_CARD_PREFIX
 from .report_cache import REPORT_MAX_AGE
 
 
-MAX_MESSAGE_BYTES = 12000
+# Budget the HTTP serialization, leaving room below the custom bot's 20 KB limit.
+MAX_MESSAGE_BYTES = 18000
 DISPLAY_ZONE = timezone(timedelta(hours=8))
 PHASES = {
     "starting": "启动中", "waiting": "等待条件", "paused": "已暂停",
     "attention": "需要处理", "error": "异常", "reconciling": "核对中",
     "waiting_open": "等待开仓", "waiting_close": "等待平仓", "holding": "持仓中",
     "daily_limit": "当日目标已达", "complete": "已完成", "disabled": "未启用",
-    "unknown": "结果未知", "accepted": "已受理待核对", "acknowledged": "已确认待刷新",
+    "unknown": "结果未知", "accepted": "待核对", "acknowledged": "待刷新",
     "blocked": "已阻止", "cooldown": "冷却中", "confirmed": "已核实",
-    "paper_confirmed": "模拟已核实", "rejected": "已拒绝",
+    "paper_confirmed": "模拟已核实", "rejected": "已拒绝", "submitting": "提交中",
 }
+ATTENTION = {"attention", "error", "reconciling", "unknown", "blocked", "rejected"}
 
 
 def _map(value):
@@ -26,7 +30,7 @@ def _rows(value):
     return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
 
 
-def _text(value, fallback="待同步", limit=120):
+def _text(value, fallback="待同步", limit=64):
     return " ".join(value.split())[:limit] if isinstance(value, str) and value.strip() else fallback
 
 
@@ -54,132 +58,216 @@ def _fresh(stamp, now, max_age):
     return stamp is not None and 0 <= Decimal(str(now)) - stamp < max_age
 
 
+def _label(content, size="normal", color="default"):
+    # Dynamic names/reasons are plain text, never links, HTML or @ mentions.
+    return {"tag": "div", "text": {"tag": "plain_text", "content": content,
+            "text_size": size, "text_color": color}}
+
+
+def _columns(*columns, background="default", padding="0px"):
+    return {"tag": "column_set", "flex_mode": "bisect" if len(columns) == 2 else "none",
+            "horizontal_spacing": "12px", "background_style": background,
+            "columns": [{"tag": "column", "width": "weighted", "weight": 1,
+                         "vertical_align": "top", "vertical_spacing": "4px",
+                         "padding": padding, "elements": elements} for elements in columns]}
+
+
+def _metric(title, value, size="heading-2", color="default"):
+    return [_label(title, "notation", "grey"), _label(value, size, color)]
+
+
 def _progress(value, target, known):
     used, limit = _number(value), _number(target)
-    goal = "未设置" if limit is None else "未设上限" if limit == 0 else f"{_amount(limit)} USD1"
     if not known or used is None or used < 0:
-        recorded = f"（已记录 {_amount(used)} USD1）" if used is not None and used >= 0 else ""
-        return f"待同步/待核实{recorded}；目标 {goal}"
-    result = f"{_amount(used)} USD1 / {goal}"
-    if limit is not None and limit > 0:
-        result += f"（{used / limit * 100:.1f}%{'，已达标' if used >= limit else ''}）"
-    return result
+        return "待同步 / 待核实"
+    if limit is None or limit < 0:
+        return "目标待同步"
+    if limit == 0:
+        return "未设目标上限"
+    if used >= limit:
+        return "已达标"
+    # Never round a positive remaining amount to zero or label 99.998% as 100%.
+    remaining = (limit - used).quantize(Decimal("0.01"), rounding=ROUND_UP)
+    return f"还差 {remaining:,.2f}"
 
 
-def _snapshot(snapshot, now):
-    snapshot = _map(snapshot)
-    if not snapshot:
-        return "账户快照缺失，持仓与余额待同步"
+def _usage(snapshot):
+    equity, occupied = _number(snapshot.get("equity")), _number(snapshot.get("occupied_margin"))
+    if equity is None or equity <= 0 or occupied is None or occupied < 0:
+        return "待同步"
+    return f"{occupied / equity * 100:.2f}%"
+
+
+def _latest_snapshot(account, saved=None):
+    saved, published = _map(saved), _map(account.get("snapshot"))
+    saved_stamp, published_stamp = _number(saved.get("timestamp")), _number(published.get("timestamp"))
+    return published if published_stamp is not None and (saved_stamp is None or published_stamp > saved_stamp) else saved or published
+
+
+def _snapshot_note(snapshot, now):
     stamp = _number(snapshot.get("timestamp"))
-    age = Decimal(str(now)) - stamp if stamp is not None else None
-    freshness = ("时间无效，待同步" if age is None or age < 0 else
-                 f"{age:.0f} 秒前" + ("，已超过 8 秒交易新鲜度" if age >= 8 else ""))
-    ratio = _number(snapshot.get("margin_ratio"))
-    lines = [f"快照 {freshness}；权益 {_amount(snapshot.get('equity'))}，可用 {_amount(snapshot.get('available'))} USD1",
-             f"占用保证金 {_amount(snapshot.get('occupied_margin'))} USD1；保证金率 {f'{ratio * 100:.1f}%' if ratio is not None else '待同步'}；浮盈亏 {_amount(snapshot.get('unrealized'))} USD1"]
-    positions = _rows(snapshot.get("positions"))
-    held = [p for p in positions if _number(p.get("qty")) != 0]
+    if stamp is None or stamp > now:
+        return "账户数据待同步"
+    return f"账户数据 {now - float(stamp):.0f} 秒前 · 待刷新" if not _fresh(stamp, now, 8) else None
+
+
+def _account_card(account, snapshot, label, progress, now, side=None):
+    mode = {"live": "实盘", "paper": "模拟"}.get(account.get("mode"), "模式待同步")
+    color = "blue" if side == "long" else "red" if side == "short" else "default"
+    elements = [_label(f"{label} · {_text(account.get('name'))}（{mode}）", "heading", color),
+                _columns(_metric("可用保证金", _amount(snapshot.get("available"))),
+                         _metric("保证金占用率", _usage(snapshot))),
+                _label(f"距交易量目标  {progress}")]
+    note = _snapshot_note(snapshot, now)
+    if note:
+        elements.append(_label(note, "notation", "orange"))
+    background = "rgba(51,112,255,0.06)" if side != "short" else "rgba(245,74,69,0.06)"
+    return _columns(elements, background=background, padding="12px")
+
+
+def _position_text(snapshot, symbol=None, side=None):
     if not isinstance(snapshot.get("positions"), list):
-        lines.append("持仓待同步")
-    elif not held:
-        lines.append("快照记录空仓")
-    else:
-        names = [f"{_text(p.get('symbol'), limit=24)} {'多' if p.get('side') == 'LONG' else '空' if p.get('side') == 'SHORT' else '方向待核实'} {_amount(p.get('qty'), 6)}（名义 {_amount(p.get('notional'))} USD1）" for p in held[:3]]
-        lines.append("持仓：" + "；".join(names) + (f"；另 {len(held) - 3} 项" if len(held) > 3 else ""))
-    return "\n".join(lines)
+        return "待同步"
+    rows = [p for p in _rows(snapshot["positions"]) if (not symbol or p.get("symbol") == symbol)
+            and (not side or p.get("side") == side)]
+    values = [_number(p.get("qty")) for p in rows]
+    if any(value is None or value < 0 for value in values):
+        return "待同步"
+    if side:
+        return f"{sum(values, Decimal(0)):,.6f}".rstrip("0").rstrip(".")
+    held = [(p, value) for p, value in zip(rows, values) if value]
+    if not held:
+        return "空仓"
+    return "；".join(f"{_text(p.get('symbol'), limit=16)} {'多' if p.get('side') == 'LONG' else '空' if p.get('side') == 'SHORT' else '?'} {_amount(value, 3)}"
+                     for p, value in held[:2]) + (f"；另 {len(held)-2} 项" if len(held) > 2 else "")
+
+
+def _capacity(pair, snapshots, markets, now):
+    symbol = pair.get("symbol")
+    leverages = {_number(p.get("leverage")) for snapshot in snapshots.values()
+                 for p in _rows(snapshot.get("positions")) if p.get("symbol") == symbol}
+    if len(leverages) != 1 or None in leverages:
+        return "公开额度待同步"
+    leverage = next(iter(leverages))
+    if leverage <= 0 or leverage != int(leverage):
+        return "公开额度待同步"
+    key = str(int(leverage))
+    market = _map(markets.get(symbol))
+    value = _number(_map(market.get("capacities")).get(key))
+    stamp = _map(market.get("capacity_checked_at")).get(key)
+    if value is None or value < 0 or market.get("error") or not _fresh(stamp, now, 8):
+        return f"公开额度 {key}x 待同步"
+    return f"公开额度 {key}x  {_amount(value)}"
+
+
+def _pair_block(pair, accounts, markets, now, utc_date):
+    state, config = _map(pair.get("state")), _map(pair.get("cycle"))
+    margin = _map(state.get("margin"))
+    transfer = _map(margin.get("pending"))
+    urgent = (state.get("phase") in ATTENTION or bool(pair.get("pause_reason"))
+              or bool(state.get("pending")) or bool(state.get("volume_unknown")) or bool(transfer)
+              or margin.get("status") in ATTENTION)
+    phase = "已暂停" if not pair.get("enabled") else _phase(state.get("phase"))
+    reason = _text(pair.get("pause_reason") or state.get("reason"), "")
+    if (pair.get("enabled") and state.get("phase") in {"waiting", "waiting_open"}
+            and any(word in reason for word in ("公开额度", "公开可用额度"))):
+        phase = "等待公开额度"
+    elements = [_label(f"{_text(pair.get('name'))} · {_text(pair.get('symbol'))}  |  {phase}", "heading")]
+    if urgent and reason:
+        elements.append(_label(reason, color="orange"))
+    if state.get("pending"):
+        elements.append(_label("订单 / 执行批次待核对", color="orange"))
+    daily = _map(_map(state.get("daily_volume")).get(utc_date))
+    known = not state.get("volume_unknown") and not state.get("pending") and _fresh(state.get("updated_at"), now, 120)
+    snapshots = {}
+    for side, label in (("long", "A 多"), ("short", "B 空")):
+        account = accounts.get(pair.get(side + "_account_id"), {})
+        snapshot = _latest_snapshot(account, _map(state.get("snapshots")).get(side))
+        snapshots[side] = snapshot
+        progress = _progress(daily.get(side), config.get("daily_volume_limit"), known) if config.get("enabled") else "循环未启用"
+        elements.append(_account_card(account, snapshot, label, progress, now, side))
+    positions = f"持仓  多 {_position_text(snapshots['long'], pair.get('symbol'), 'LONG')} / 空 {_position_text(snapshots['short'], pair.get('symbol'), 'SHORT')}"
+    elements.append(_label(positions, "notation"))
+    elements.append(_label(f"{_capacity(pair, snapshots, markets, now)} · 划转{_phase(margin.get('status'))}", "notation"))
+    if transfer:
+        directions = {"long": "A 多", "short": "B 空"}
+        elements.append(_label(f"待核对划转 {directions.get(transfer.get('source'), '?')} → {directions.get(transfer.get('destination'), '?')}：{_amount(transfer.get('amount'))} USD1", color="orange"))
+    elif margin.get("status") in ATTENTION and margin.get("reason"):
+        elements.append(_label(_text(margin["reason"]), color="orange"))
+    return urgent, elements
 
 
 def _account_block(account, now, utc_date):
     cycle = _map(account.get("cycle_state"))
-    mode = "实盘" if account.get("mode") == "live" else "模拟"
-    lines = [f"账户 {_text(account.get('name'))}（{mode}，{'启用' if account.get('enabled') else '暂停'}）：{_phase(account.get('status'))}"]
-    if account.get("reason"):
-        lines.append(_text(account["reason"]))
-    lines.append(_snapshot(account.get("snapshot"), now))
-    if _map(account.get("cycle")).get("enabled"):
-        daily, report = _map(cycle.get("daily_volume")), _map(cycle.get("report_status"))
-        known = (report.get("status") == "ready" and _fresh(report.get("as_of"), now, REPORT_MAX_AGE)
-                 and daily.get("utc_date") == utc_date and not daily.get("sync_pending") and not daily.get("error"))
-        lines.append(f"UTC 日循环成交：{_progress(daily.get('volume'), _map(account.get('cycle')).get('daily_volume_limit'), known)}")
-    urgent = account.get("status") in {"attention", "error", "reconciling"} or bool(account.get("pause_reason"))
-    return urgent, "\n".join(lines)
-
-
-def _pair_block(pair, accounts, now, utc_date):
-    state, config = _map(pair.get("state")), _map(pair.get("cycle"))
-    margin = _map(state.get("margin"))
-    phase = state.get("phase")
-    lines = [f"配对组 {_text(pair.get('name'))} · {_text(pair.get('symbol'))}：{'启用' if pair.get('enabled') else '暂停'} / {_phase(phase)}"]
-    if pair.get("pause_reason") or state.get("reason"):
-        lines.append(_text(pair.get("pause_reason") or state.get("reason")))
-    if state.get("pending"):
-        lines.append("订单/执行批次尚未完成核对")
-    daily = _map(_map(state.get("daily_volume")).get(utc_date))
-    known = not state.get("volume_unknown") and not state.get("pending") and _fresh(state.get("updated_at"), now, 120)
-    for side, label in (("long", "A 多"), ("short", "B 空")):
-        account = accounts.get(pair.get(side + "_account_id"), {})
-        snapshot = _map(_map(state.get("snapshots")).get(side))
-        published = _map(account.get("snapshot"))
-        if (_number(published.get("timestamp")) or 0) > (_number(snapshot.get("timestamp")) or 0):
-            snapshot = published
-        mode = "实盘" if account.get("mode") == "live" else "模拟" if account.get("mode") == "paper" else "模式待同步"
-        lines.append(f"{label} · {_text(account.get('name'), _text(pair.get(side + '_account_id')))}（{mode}）")
-        if config.get("enabled"):
-            lines.append("UTC 日循环成交：" + _progress(daily.get(side), config.get("daily_volume_limit"), known))
-        lines.append(_snapshot(snapshot, now))
-    lines.append(f"保证金划转：{_phase(margin.get('status'))}；{_text(margin.get('reason'))}")
-    transfer = _map(margin.get("pending"))
-    if transfer:
-        source = {"long": "A 多", "short": "B 空"}.get(transfer.get("source"), "待核实")
-        destination = {"long": "A 多", "short": "B 空"}.get(transfer.get("destination"), "待核实")
-        lines.append(f"待核对划转 {source} → {destination}：{_amount(transfer.get('amount'))} USD1")
-    urgent = (phase in {"attention", "error", "reconciling"} or bool(pair.get("pause_reason"))
-              or bool(state.get("pending")) or bool(state.get("volume_unknown")) or bool(transfer)
-              or margin.get("status") in {"blocked", "unknown", "rejected"})
-    return urgent, "\n".join(lines)
+    daily, report = _map(cycle.get("daily_volume")), _map(cycle.get("report_status"))
+    known = (report.get("status") == "ready" and _fresh(report.get("as_of"), now, REPORT_MAX_AGE)
+             and daily.get("utc_date") == utc_date and not daily.get("sync_pending") and not daily.get("error"))
+    progress = _progress(daily.get("volume"), _map(account.get("cycle")).get("daily_volume_limit"), known) if _map(account.get("cycle")).get("enabled") else "循环未启用"
+    snapshot = _map(account.get("snapshot"))
+    urgent = account.get("status") in ATTENTION or bool(account.get("pause_reason"))
+    elements = [_account_card(account, snapshot, "账户", progress, now),
+                _label(f"{'启用' if account.get('enabled') else '暂停'} · {_phase(account.get('status'))} · 持仓 {_position_text(snapshot)}", "notation")]
+    if urgent and (account.get("pause_reason") or account.get("reason")):
+        elements.append(_label(_text(account.get("pause_reason") or account.get("reason")), color="orange"))
+    return urgent, elements
 
 
 def format_hourly_summary(state, now):
-    """Format whitelisted fields; never infer missing amounts as zero."""
+    """Serialize an explicit card envelope for the unchanged persistent outbox."""
     state = _map(state)
     point = datetime.fromtimestamp(now, timezone.utc)
     utc_date = point.date().isoformat()
     accounts, pairs = _rows(state.get("accounts")), _rows(state.get("pairs"))
-    live = sum(a.get("mode") == "live" for a in accounts)
-    interval = _map(_map(state.get("notification")).get("hourly_summary")).get("interval_seconds", 3600)
-    lines = ["ASTER 定时运行摘要", f"发送间隔：{_amount(interval / 60, 0)} 分钟" if isinstance(interval, (int, float)) else "发送间隔：待同步",
-             point.astimezone(DISPLAY_ZONE).strftime("%Y-%m-%d %H:%M:%S UTC+8"),
-             f"成交口径：UTC 日 {utc_date}；金额单位 USD1",
-             f"服务：{'就绪' if state.get('ready') else '未就绪'}；实盘 {live} 个账户，模拟 {len(accounts) - live} 个；启用配对组 {sum(bool(p.get('enabled')) for p in pairs)}/{len(pairs)}"]
+    account_by_id = {a.get("id"): a for a in accounts}
+    snapshots = {aid: _map(a.get("snapshot")) for aid, a in account_by_id.items()}
+    bound = {p.get(key) for p in pairs for key in ("long_account_id", "short_account_id")}
+    for pair in pairs:
+        for side in ("long", "short"):
+            aid = pair.get(side + "_account_id")
+            snapshots[aid] = _latest_snapshot({"snapshot": snapshots.get(aid)}, _map(_map(pair.get("state")).get("snapshots")).get(side))
+    live = [snapshots[a["id"]] for a in accounts if a.get("mode") == "live" and "id" in a]
+    pnl_values = [_number(s.get("unrealized")) for s in live]
+    pnl = sum(pnl_values, Decimal(0)) if pnl_values and all(v is not None for v in pnl_values) and not (bound - account_by_id.keys()) else None
+    elements = _metric("实盘合计浮盈亏 · USD1", _amount(pnl), "heading-1", "red" if pnl is not None and pnl < 0 else "green" if pnl is not None and pnl > 0 else "default")
+    if live and any(not _fresh(s.get("timestamp"), now, 8) for s in live):
+        elements.append(_label("浮盈亏含未刷新快照", "notation", "orange"))
+    if not state.get("ready"):
+        elements.append(_label("服务：未就绪", color="orange"))
     if state.get("demo"):
-        lines.append("演示环境，所有数据仅为模拟")
+        elements.append(_label("演示环境 · 模拟数据", color="orange"))
     for error in (state.get("error"), _map(state.get("notification")).get("error")):
         if error:
-            lines.append("异常：" + _text(error))
-    budget = _map(state.get("request_budget"))
-    if budget:
-        lines.append(f"API 当前窗口：估算 {_amount(budget.get('used'), 0)}/{_amount(budget.get('limit'), 0)}；本进程 {_amount(budget.get('local_used'), 0)}；Aster 同 IP 回报 {_amount(budget.get('aster_ip_used'), 0)}")
-        lines.append(f"执行可用权重 {_amount(budget.get('ordinary_remaining'), 0)}；重置约 {_amount(budget.get('reset_after'), 0)} 秒；预算/冷却等待 {_amount(budget.get('retry_after'), 0)} 秒")
-    else:
-        lines.append("API 预算：暂无采样")
-    relay = _map(state.get("capacity_relay"))
-    if relay:
-        lines.append(f"副服务器 WS：{'已连接' if relay.get('connected') else '未连接'}；缓存 {_amount(relay.get('cached_samples'), 0)} 项（连接状态不代表样本新鲜）")
-        if relay.get("last_error"):
-            lines.append("副服务器异常：" + _text(relay["last_error"]))
-    account_by_id = {a.get("id"): a for a in accounts}
-    bound = {p.get(key) for p in pairs for key in ("long_account_id", "short_account_id")}
-    blocks = [_pair_block(p, account_by_id, now, utc_date) for p in pairs]
+            elements.append(_label("异常：" + _text(error), color="orange"))
+    markets = _map(state.get("markets"))
+    blocks = [_pair_block(p, account_by_id, markets, now, utc_date) for p in pairs]
     blocks += [_account_block(a, now, utc_date) for a in accounts if a.get("id") not in bound]
     blocks.sort(key=lambda block: not block[0])
-    text, omitted = "\n".join(lines), 0
+    budget, relay = _map(state.get("request_budget")), _map(state.get("capacity_relay"))
+    footer = ["WS " + ("已连接" if relay.get("connected") else "未连接" if relay else "未配置"),
+              f"API {_amount(budget.get('used'), 0)} / {_amount(budget.get('limit'), 0)}" if budget else "API 暂无采样"]
+    interval = _number(_map(_map(state.get("notification")).get("hourly_summary")).get("interval_seconds", 3600))
+    tail = [{"tag": "hr"}, _label(" · ".join(footer), "notation"),
+            _label(f"金额 USD1 · 交易量 UTC 日 {utc_date} · 每 {_amount(interval / 60, 0) if interval is not None else '待同步'} 分钟", "notation", "grey")]
+    if relay.get("last_error"):
+        tail.insert(1, _label("WS：" + _text(relay["last_error"]), color="orange"))
+    retry = _number(budget.get("retry_after"))
+    if retry is not None and retry > 0:
+        tail.insert(1, _label(f"API 预算 / 冷却等待 {_amount(retry, 0)} 秒", color="orange"))
+    card = {"schema": "2.0", "config": {"summary": {"content": "ASTER 定时运行摘要"}},
+            "header": {"template": "turquoise", "title": {"tag": "plain_text", "content": "ASTER 运行摘要"},
+                       "subtitle": {"tag": "plain_text", "content": point.astimezone(DISPLAY_ZONE).strftime("%m-%d %H:%M:%S UTC+8")}},
+            "body": {"direction": "vertical", "padding": "16px", "vertical_spacing": "12px", "elements": elements}}
+    omitted = 0
     for _, block in blocks:
-        if len((text + "\n\n" + block).encode("utf-8")) <= MAX_MESSAGE_BYTES - 250:
-            text += "\n\n" + block
+        candidate = elements + [{"tag": "hr"}] + block
+        card["body"]["elements"] = candidate + tail
+        if len(json.dumps(card).encode("utf-8")) <= MAX_MESSAGE_BYTES - 600:
+            elements = candidate
         else:
             omitted += 1
     if omitted:
-        text += f"\n\n另有 {omitted} 个账户或配对组未展开，请在工作台查看；异常优先展示。"
+        elements.append(_label(f"另有 {omitted} 个账户或配对组未展开，请在工作台查看；异常优先。", "notation"))
     if not blocks:
-        text += "\n\n尚未配置账户或配对组。"
-    return text + "\n\n仅汇总已有记录；本次摘要未额外查询交易所。"
+        elements.append(_label("尚未配置账户或配对组"))
+    card["body"]["elements"] = elements + tail
+    return FEISHU_CARD_PREFIX + json.dumps(card, ensure_ascii=False, separators=(",", ":"))

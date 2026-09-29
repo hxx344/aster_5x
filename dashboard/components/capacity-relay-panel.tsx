@@ -42,13 +42,17 @@ export function CapacityRelayPanel({
   });
   const ws = relay?.ws;
   const http = relay?.http;
-  const elapsed =
-    typeof relay?.observed_at === 'number' && Number.isFinite(relay.observed_at)
-      ? Math.max(0, now - relay.observed_at)
-      : 0;
+  const observationAge =
+    typeof relay?.observed_at === 'number' &&
+    Number.isFinite(relay.observed_at) &&
+    relay.observed_at > 0 &&
+    Number.isFinite(now) &&
+    now >= relay.observed_at
+      ? now - relay.observed_at
+      : null;
   const retry =
     ws?.retry_in_seconds != null && Number.isFinite(ws.retry_in_seconds)
-      ? Math.max(0, ws.retry_in_seconds - elapsed)
+      ? Math.max(0, ws.retry_in_seconds - (observationAge ?? 0))
       : null;
   const detailed = !demo && Boolean(ws || http || relay?.samples);
 
@@ -160,7 +164,8 @@ export function CapacityRelayPanel({
               <h3>已收到的额度样本</h3>
               <span>
                 {view.stale ? '最近记录' : '状态采集'} ·{' '}
-                {relayTime(relay?.observed_at)}
+                {relayTime(relay?.observed_at)} · 页面状态年龄{' '}
+                {relayDuration(observationAge)}
               </span>
             </div>
             {view.samples.length ? (
@@ -173,8 +178,8 @@ export function CapacityRelayPanel({
                     <TableHead>交易对</TableHead>
                     <TableHead>数据</TableHead>
                     <TableHead>最近来源</TableHead>
-                    <TableHead>样本年龄</TableHead>
-                    <TableHead>新鲜度</TableHead>
+                    <TableHead>采集时样本年龄</TableHead>
+                    <TableHead>采集时新鲜度</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -203,7 +208,7 @@ export function CapacityRelayPanel({
             </p>
             <p className="relay-status-footnote">
               页面沿用约 3
-              秒一次的状态刷新；消息时间、样本年龄与请求次数均来自主服务器，次数在主服务重启后重新计数。
+              秒一次的状态刷新；表格显示主服务器采集状态时的样本年龄，不叠加页面等待时间。两次页面刷新之间主服务器仍可接收新样本，实际开仓按当时最新样本校验。请求次数在主服务重启后重新计数。
             </p>
           </>
         ) : null}

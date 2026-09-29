@@ -66,7 +66,7 @@ function sampleView(
   sample: CapacityRelaySample,
   index: number,
   relay: CapacityRelayStatus,
-  ageSinceObservation: number | null,
+  observationAge: number | null,
   stale: boolean,
 ): {
   view: RelaySampleView;
@@ -81,14 +81,15 @@ function sampleView(
   const receivedAge = validTime(relay.observed_at)
     ? elapsed(relay.observed_at, sample.received_at)
     : null;
+  // Polling delay cannot establish the age of samples the server may have replaced.
+  // Show the measured age at observation; stale snapshots are marked separately.
   const ageSeconds =
-    ageSinceObservation !== null &&
+    observationAge !== null &&
     receivedAge !== null &&
     typeof age === 'number' &&
     Number.isFinite(age) &&
-    age >= 0 &&
-    Number.isFinite(age + ageSinceObservation)
-      ? age + ageSinceObservation
+    age >= 0
+      ? age
       : null;
   const limit = sample.max_age_seconds;
   const validLimit =
@@ -132,7 +133,8 @@ function sampleView(
             : '未知来源',
       ageSeconds,
       ageLabel: relayDuration(ageSeconds),
-      freshness,
+      freshness:
+        !stale && !inactive && known ? `采集时 · ${freshness}` : freshness,
       tone:
         stale || inactive ? 'muted' : fresh && cycleFresh ? 'good' : 'warning',
     },
@@ -262,7 +264,7 @@ export function capacityRelayView(
           ? 'good'
           : 'warning',
     connection: `${stale ? '最近记录 · ' : ''}${connection}`,
-    data: `${stale ? '最近记录 · ' : ''}${data}`,
+    data: `${stale ? '最近记录 · ' : active && relay.samples !== undefined ? '采集时 · ' : ''}${data}`,
     stale,
     note,
     samples,

@@ -260,12 +260,30 @@ class PairOrderRecoveryTests(unittest.TestCase):
         review = self.preview()
         def poll(state):
             state.update(updated_at=time.time() + 1, reason="updated query explanation", snapshots={"long": {"timestamp": 1}})
+            state["pending"]["observation_attempt_at"] = time.time()
             for leg in state["pending"]["legs"]:
                 leg["error"] = "Aster code -2013"
         self.change_state(poll)
         with self.no_writes():
             self.confirm(review["token"])
         self.assertIsNone(self.state()["pending"])
+
+    def test_real_background_observation_keeps_existing_archive_preview_valid(self):
+        self.seed()
+        with self.no_writes() as stack:
+            for key in ("long", "short"):
+                stack.enter_context(patch.object(self.broker(key), "query", side_effect=
+                    ExchangeError("Order does not exist", code=-2013)))
+            self.engine.pairs.tick("gold")
+            review = self.preview()
+            previous = self.state()["pending"]["observation_attempt_at"]
+            self.change_state(lambda state: state["pending"].update(observation_attempt_at=previous - 4))
+            self.engine.pairs.tick("gold")
+            self.assertGreater(self.state()["pending"]["observation_attempt_at"], previous)
+            self.assertIsNotNone(self.state()["pending"])
+            self.confirm(review["token"])
+        self.assertIsNone(self.state()["pending"])
+        self.assertIsNotNone(self.state()["recovery_watch"])
 
     def test_changed_batch_or_actual_positions_invalidates_confirmation(self):
         original = self.seed()

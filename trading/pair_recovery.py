@@ -75,6 +75,8 @@ class PairOrderRecovery:
         value = deepcopy(state)
         for key in ("updated_at", "reason", "phase", "attention", "retry_after", "snapshots", "margin"):
             value.pop(key, None)
+        # A display-only observation does not change order or position authority.
+        value["pending"].pop("observation_attempt_at", None)
         for leg in value["pending"]["legs"]:
             leg.pop("error", None)
         return {"pair": pair, "state": value, "margin": margin, "accounts": accounts}

@@ -138,6 +138,7 @@ export type MonitoringSettings = {
   listing_capacity_alerts: boolean;
   trade_summary_alerts: boolean;
   hourly_summary_alerts: boolean;
+  hourly_summary_interval_minutes: number;
   relay_health_alerts: boolean;
 };
 export type MonitoredSymbol = {

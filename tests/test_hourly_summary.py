@@ -29,6 +29,12 @@ def paired_state():
 
 
 class HourlySummaryTests(unittest.TestCase):
+    def test_custom_interval_appears_in_summary_without_an_hourly_label(self):
+        text = format_hourly_summary({"notification": {"hourly_summary": {"interval_seconds": 900}}}, NOW)
+        self.assertIn("ASTER 定时运行摘要", text)
+        self.assertIn("发送间隔：15 分钟", text)
+        self.assertNotIn("每小时", text)
+
     def test_pair_sides_use_separate_targets_without_duplicate_accounts(self):
         text = format_hourly_summary(paired_state(), NOW)
         self.assertIn("UTC 日 2026-09-30", text)

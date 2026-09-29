@@ -146,7 +146,9 @@ def format_hourly_summary(state, now):
     utc_date = point.date().isoformat()
     accounts, pairs = _rows(state.get("accounts")), _rows(state.get("pairs"))
     live = sum(a.get("mode") == "live" for a in accounts)
-    lines = ["ASTER 每小时运行摘要", point.astimezone(DISPLAY_ZONE).strftime("%Y-%m-%d %H:%M:%S UTC+8"),
+    interval = _map(_map(state.get("notification")).get("hourly_summary")).get("interval_seconds", 3600)
+    lines = ["ASTER 定时运行摘要", f"发送间隔：{_amount(interval / 60, 0)} 分钟" if isinstance(interval, (int, float)) else "发送间隔：待同步",
+             point.astimezone(DISPLAY_ZONE).strftime("%Y-%m-%d %H:%M:%S UTC+8"),
              f"成交口径：UTC 日 {utc_date}；金额单位 USD1",
              f"服务：{'就绪' if state.get('ready') else '未就绪'}；实盘 {live} 个账户，模拟 {len(accounts) - live} 个；启用配对组 {sum(bool(p.get('enabled')) for p in pairs)}/{len(pairs)}"]
     if state.get("demo"):

@@ -192,6 +192,7 @@
   font-size: 14px;
 }
 .monitor-setting p,
+.monitor-summary-feedback,
 .monitor-status {
   font-size: 13px;
   color: var(--muted-foreground);
@@ -200,8 +201,26 @@
 .monitor-notification-status {
   display: block;
 }
-.monitor-setting p {
+.monitor-setting p,
+.monitor-summary-feedback {
   margin: 6px 0 0;
+}
+.monitor-summary-interval {
+  grid-column: 1 / -1;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.monitor-summary-field {
+  width: 340px;
+  max-width: 100%;
+}
+.monitor-summary-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.monitor-summary-feedback {
+  display: block;
 }
 .monitor-status {
   padding: 14px 22px 18px;

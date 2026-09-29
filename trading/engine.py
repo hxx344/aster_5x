@@ -2311,7 +2311,7 @@ class Engine:
                     self.store.enqueue_hourly_summary(token, message)
             self.hourly_summary_error = None
         except Exception:
-            self.hourly_summary_error = "每小时摘要生成失败，等待重试"
+            self.hourly_summary_error = "定时摘要生成失败，等待重试"
             LOG.exception("Hourly summary generation failed")
         capacity_sent = 0
         available = {channel for channel, config in configs.items() if config is not None}

@@ -183,12 +183,13 @@ class MonitoringEdit(BaseModel):
     listing_capacity_alerts: bool | None = None
     trade_summary_alerts: bool | None = None
     hourly_summary_alerts: bool | None = None
+    hourly_summary_interval_minutes: StrictInt | None = Field(default=None, ge=1, le=1440)
     relay_health_alerts: bool | None = None
 
     @model_validator(mode="after")
-    def nonempty_booleans(self):
+    def nonempty_settings(self):
         if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
-            raise ValueError("请提交至少一个有效开关")
+            raise ValueError("请提交至少一个有效监控设置")
         return self
 
 

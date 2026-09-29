@@ -16,6 +16,7 @@ DEFAULTS = {
     "listing_capacity_alerts": True,
     "trade_summary_alerts": True,
     "hourly_summary_alerts": True,
+    "hourly_summary_interval_minutes": 60,
     "relay_health_alerts": True,
 }
 CATEGORIES = {"new_listing", "strategy_capacity", "listing_capacity", "trade_summary", "hourly_summary", "relay_health"}
@@ -71,8 +72,14 @@ def message_allowed(db, item, config=None):
 
 
 def validate_edit(changes, fields):
-    if not changes or set(changes) - set(fields) or any(type(value) is not bool for value in changes.values()):
+    if not changes or set(changes) - set(fields):
         raise TradingError("请提交有效的监控或告警开关")
+    for field, value in changes.items():
+        if field == "hourly_summary_interval_minutes":
+            if type(value) is not int or not 1 <= value <= 1440:
+                raise TradingError("摘要发送间隔必须为 1–1440 的整数分钟")
+        elif type(value) is not bool:
+            raise TradingError("请提交有效的监控或告警开关")
 
 
 def validate_symbol(db, symbol):

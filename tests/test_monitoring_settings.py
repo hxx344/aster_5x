@@ -322,7 +322,7 @@ class MonitoringAPITests(unittest.TestCase):
              patch.dict(os.environ, {"FEISHU_WEBHOOK_URL": "https://open.feishu.cn/open-apis/bot/v2/hook/secret-sentinel"}):
             self.store.hourly_summary_due(available=True)
             status = self.client.get("/api/state").json()["notification"]["hourly_summary"]
-            self.assertEqual(status, {"interval_seconds": 3600, "next_due_at": 3600, "last_sent_at": None, "pending": False})
+            self.assertEqual(status, {"interval_seconds": 3600, "next_due_at": 7100, "last_sent_at": None, "pending": False})
             response = self.client.patch("/api/monitoring", json={"hourly_summary_alerts": False})
             self.assertEqual(response.status_code, 200)
             self.assertFalse(Store(self.store.path).monitoring_settings()["hourly_summary_alerts"])
@@ -342,6 +342,23 @@ class MonitoringAPITests(unittest.TestCase):
         self.assertFalse(Store(self.store.path).monitoring_settings()["relay_health_alerts"])
         self.assertEqual(self.client.patch("/api/monitoring", json={"relay_health_alerts": True}).status_code, 200)
         self.assertTrue(Store(self.store.path).monitoring_settings()["relay_health_alerts"])
+
+    def test_summary_interval_strict_validation_and_persistence(self):
+        self.login()
+        self.assertEqual(self.client.get("/api/monitoring").json()["settings"]["hourly_summary_interval_minutes"], 60)
+        for value in (None, True, False, "15", 1.5, 60.0, 0, -1, 1441):
+            with self.subTest(value=value):
+                response = self.client.patch("/api/monitoring", json={"hourly_summary_interval_minutes": value,
+                                                                      "feishu_enabled": False})
+                self.assertEqual(response.status_code, 422)
+                self.assertTrue(self.store.monitoring_settings()["feishu_enabled"])
+                with self.assertRaises(TradingError):
+                    self.store.edit_monitoring({"hourly_summary_interval_minutes": value})
+        for value in (1, 15, 90, 1440):
+            with self.subTest(value=value), patch("trading.store.time.time", return_value=123):
+                self.assertEqual(self.client.patch("/api/monitoring", json={"hourly_summary_interval_minutes": value}).status_code, 200)
+                self.assertEqual(Store(self.store.path).monitoring_settings()["hourly_summary_interval_minutes"], value)
+                self.assertEqual(self.store.hourly_summary_status(available=True)["next_due_at"], 123 + value * 60)
 
     def test_no_account_persistence_legacy_endpoint_and_demo(self):
         self.login()

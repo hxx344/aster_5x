@@ -567,7 +567,7 @@ class Store:
                 if all(config[key] == value for key, value in changes.items()):
                     return config
                 hourly_changed = any(key in changes and config[key] != changes[key]
-                                     for key in ("feishu_enabled", "hourly_summary_alerts"))
+                                     for key in ("feishu_enabled", "hourly_summary_alerts", "hourly_summary_interval_minutes"))
                 relay_changed = any(key in changes and config[key] != changes[key]
                                     for key in ("feishu_enabled", "relay_health_alerts"))
                 config.update(changes)

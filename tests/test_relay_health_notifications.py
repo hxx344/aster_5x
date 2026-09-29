@@ -295,7 +295,7 @@ class RelayHealthEngineTests(unittest.TestCase):
 
     def test_status_failure_does_not_block_trade_or_hourly_notifications(self):
         self.engine.notify()
-        self.now = 3600
+        self.now = self.store.hourly_summary_status(available=True)["next_due_at"]
         self.queue_trade()
         self.relay.status.side_effect = RuntimeError("private-status-secret")
         # The shared dashboard report may independently succeed from cached state.

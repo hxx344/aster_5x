@@ -1,17 +1,13 @@
 'use client';
 import { useState } from 'react';
-import type {
-  DeskAction,
-  Monitoring,
-  MonitoringSettings,
-  State,
-} from '@/lib/desk-types';
+import type { DeskAction, Monitoring, State } from '@/lib/desk-types';
 import { isDisplayTimestamp } from '@/lib/display-time';
 import {
   notificationChannel,
   notificationOverview,
 } from '@/lib/notification-channels';
 import { Input } from '@/components/ui/input';
+import { SummaryIntervalForm } from '@/components/summary-interval-form';
 import { Switch } from '@/components/ui/switch';
 import {
   Table,
@@ -23,7 +19,11 @@ import {
 } from '@/components/ui/table';
 
 const categories: {
-  key: keyof MonitoringSettings;
+  key:
+    | 'new_listing_alerts'
+    | 'strategy_capacity_alerts'
+    | 'listing_capacity_alerts'
+    | 'trade_summary_alerts';
   title: string;
   description: string;
 }[] = [
@@ -108,6 +108,7 @@ export function MonitoringPanel({
       </section>
     );
   const settings = monitoring.settings;
+  const summaryIntervalMinutes = settings.hourly_summary_interval_minutes ?? 60;
   const summary = notification?.hourly_summary;
   const scheduledChannel = notificationChannel(notification, 'scheduled');
   const summaryAvailable =
@@ -116,26 +117,26 @@ export function MonitoringPanel({
     settings.hourly_summary_alerts &&
     scheduledChannel.configured;
   const summaryStatus = demo
-    ? '模拟环境不发送每小时摘要。'
+    ? '模拟环境不发送定时摘要。'
     : !settings.feishu_enabled
-      ? '飞书总开关已关闭，每小时摘要暂停发送。'
+      ? '飞书总开关已关闭，定时摘要暂停发送。'
       : !settings.hourly_summary_alerts
-        ? '每小时摘要已关闭。'
+        ? '定时摘要已关闭。'
         : !scheduledChannel.configured
-          ? '定时机器人未配置或配置无效，每小时摘要暂停发送。'
+          ? '定时机器人未配置或配置无效，定时摘要暂停发送。'
           : summary?.pending
             ? scheduledChannel.error
-              ? '本小时摘要待发送，通知服务等待重试。'
-              : '本小时摘要待发送。'
+              ? '本次摘要待发送，通知服务等待重试。'
+              : '本次摘要待发送。'
             : summary?.next_due_at != null
-              ? '等待下个整点发送。'
-              : '等待服务器安排下个整点。';
+              ? '等待下次计划发送。'
+              : '等待服务器安排下次发送。';
   const disabled = busy || pending || Boolean(connectionError) || demo;
   const save = async (body: object, symbol?: string) => {
-    if (disabled) return;
+    if (disabled) return false;
     setPending(true);
     try {
-      await action(
+      return await action(
         symbol
           ? `/api/monitoring/symbols/${encodeURIComponent(symbol)}`
           : '/api/monitoring',
@@ -159,7 +160,8 @@ export function MonitoringPanel({
           <div>
             <h2>监控与告警</h2>
             <p>
-              所有账户共用 · 修改即保存 · 服务器运行期间，关闭网页后仍按设置运行
+              所有账户共用 · 开关修改即保存，摘要间隔需点击保存 ·
+              服务器运行期间，关闭网页后仍按设置运行
             </p>
           </div>
           <output className="small-note">
@@ -202,7 +204,7 @@ export function MonitoringPanel({
                   </strong>
                   <p>
                     {key === 'scheduled'
-                      ? '每小时运行摘要'
+                      ? `定时运行摘要 · 每 ${summaryIntervalMinutes} 分钟`
                       : 'WS 故障与恢复、上新、额度达标、成交汇总'}
                   </p>
                   <p className={channel.error ? 'amber' : 'muted'}>
@@ -226,7 +228,7 @@ export function MonitoringPanel({
       <section className="panel">
         <div className="section-head">
           <div>
-            <h2>每小时运行摘要</h2>
+            <h2>定时运行摘要</h2>
             <p>
               发送到定时机器人 ·
               覆盖所有账户与配对组，仅遵循飞书总开关与本摘要开关
@@ -235,8 +237,8 @@ export function MonitoringPanel({
         </div>
         <div className="monitor-master-grid">
           <SettingSwitch
-            title="发送每小时摘要"
-            description="每小时整点汇总运行状态、UTC 日交易量目标进度、持仓与保证金划转、API 预算及异常。"
+            title="发送定时摘要"
+            description="按已保存的间隔汇总运行状态、UTC 日交易量目标进度、持仓与保证金划转、API 预算及异常。"
             checked={settings.hourly_summary_alerts}
             disabled={disabled}
             onChange={(value) => void save({ hourly_summary_alerts: value })}
@@ -245,6 +247,8 @@ export function MonitoringPanel({
             <div>
               <strong>发送安排</strong>
               <p>
+                已保存间隔：每 {summaryIntervalMinutes} 分钟
+                <br />
                 上次成功发送：{date(demo ? null : summary?.last_sent_at)}
                 <br />
                 下次计划：
@@ -252,10 +256,16 @@ export function MonitoringPanel({
               </p>
             </div>
           </div>
+          <SummaryIntervalForm
+            savedMinutes={summaryIntervalMinutes}
+            disabled={disabled}
+            save={save}
+          />
         </div>
         <output className="monitor-status monitor-notification-status">
           {connectionError ? '连接中断，以下为上次获取的发送状态。' : ''}
-          {summaryStatus} 重新开启后从下个整点开始，不补发历史摘要。
+          {summaryStatus} 保存新间隔会取消待发摘要，并从保存时刻等待完整周期；
+          保存相同间隔不改变安排。重新启用或通道恢复后也等待完整周期，不补发历史摘要。
         </output>
       </section>
       <section className="panel">

@@ -15,7 +15,7 @@ WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/test-hourly-summary"
 
 class HourlyNotificationEngineTests(unittest.TestCase):
     def setUp(self):
-        self.now = 3500.0
+        self.now = 0.0
         clock = patch("trading.engine.time.time", side_effect=lambda: self.now)
         clock.start()
         self.addCleanup(clock.stop)
@@ -41,7 +41,7 @@ class HourlyNotificationEngineTests(unittest.TestCase):
     def test_regular_ticks_only_check_timer_and_due_snapshot_is_compact(self):
         with patch.object(self.engine, "state", return_value={"snapshot": "cached"}) as state, \
              patch("trading.engine.format_hourly_summary", return_value="hourly") as formatter:
-            for now in (3500, 3505, 3550, 3599.9):
+            for now in (0, 5, 3550, 3599.9):
                 self.now = now
                 self.assertEqual(self.engine.notify(), 5)
             state.assert_not_called()
@@ -134,6 +134,16 @@ class HourlyNotificationEngineTests(unittest.TestCase):
         self.assertEqual(self.sender.call_args.args[1], "trade message")
         self.assertEqual(self.f.store.pending_notifications(), 0)
 
+    def test_interval_change_during_event_delivery_cancels_queued_summary(self):
+        self.at_hour()
+        self.queue_trade()
+        self.sender.side_effect = lambda *_: self.f.store.edit_monitoring({"hourly_summary_interval_minutes": 5})
+        self.engine.notify()
+        self.sender.assert_called_once()
+        self.assertEqual(self.sender.call_args.args[1], "trade message")
+        self.assertEqual(self.f.store.hourly_summary_status(available=True)["next_due_at"], 3900)
+        self.assertEqual(self.f.store.pending_notifications(), 0)
+
     def test_summary_failure_does_not_block_trade_delivery_and_retries(self):
         self.at_hour()
         self.queue_trade()
@@ -142,14 +152,18 @@ class HourlyNotificationEngineTests(unittest.TestCase):
             self.engine.notify()
         self.sender.assert_called_once()
         self.assertEqual(self.sender.call_args.args[1], "trade message")
-        self.assertEqual(self.engine.hourly_summary_error, "每小时摘要生成失败，等待重试")
+        self.assertEqual(self.engine.hourly_summary_error, "定时摘要生成失败，等待重试")
         self.engine.notify()
         self.assertEqual(self.sender.call_count, 2)
         self.assertIsNone(self.engine.hourly_summary_error)
 
 
 class StartupHourlyNotificationTests(unittest.TestCase):
-    setUp = HourlyNotificationEngineTests.setUp
+    def setUp(self):
+        HourlyNotificationEngineTests.setUp(self)
+        self.now = 3500.0
+        # Exercise startup backoff with an existing pre-upgrade hourly schedule.
+        self.f.store.put("hourly_summary_schedule", {"next_due_at": 3600, "last_sent_at": None})
 
     def run_scheduler(self, control, rules_effect, *, notify_effect=None):
         from tests.test_cycle_ws_scheduler import _Pool, _SchedulerEvent

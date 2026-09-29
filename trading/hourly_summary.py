@@ -68,6 +68,7 @@ def _columns(*columns, background="default", padding="0px"):
     return {"tag": "column_set", "flex_mode": "bisect" if len(columns) == 2 else "none",
             "horizontal_spacing": "12px", "background_style": background,
             "columns": [{"tag": "column", "width": "weighted", "weight": 1,
+                         "background_style": background,
                          "vertical_align": "top", "vertical_spacing": "4px",
                          "padding": padding, "elements": elements} for elements in columns]}
 
@@ -114,14 +115,15 @@ def _snapshot_note(snapshot, now):
 def _account_card(account, snapshot, label, progress, now, side=None):
     mode = {"live": "实盘", "paper": "模拟"}.get(account.get("mode"), "模式待同步")
     color = "blue" if side == "long" else "red" if side == "short" else "default"
+    # Feishu expects a named color, not an inline CSS rgba() expression.
+    background = "red-50" if side == "short" else "blue-50"
     elements = [_label(f"{label} · {_text(account.get('name'))}（{mode}）", "heading", color),
                 _columns(_metric("可用保证金", _amount(snapshot.get("available"))),
-                         _metric("保证金占用率", _usage(snapshot))),
+                         _metric("保证金占用率", _usage(snapshot)), background=background),
                 _label(f"距交易量目标  {progress}")]
     note = _snapshot_note(snapshot, now)
     if note:
         elements.append(_label(note, "notation", "orange"))
-    background = "rgba(51,112,255,0.06)" if side != "short" else "rgba(245,74,69,0.06)"
     return _columns(elements, background=background, padding="12px")
 
 

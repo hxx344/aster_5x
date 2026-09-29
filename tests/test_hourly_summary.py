@@ -66,6 +66,27 @@ class HourlySummaryTests(unittest.TestCase):
         self.assertNotIn("账户 · long", text)
         self.assertNotIn("账户 · short", text)
 
+    def test_backgrounds_use_feishu_color_references_without_white_inner_columns(self):
+        result = card(paired_state())
+        registered = set(result.get("config", {}).get("style", {}).get("color", {}))
+
+        def check(node):
+            if isinstance(node, dict):
+                if "background_style" in node:
+                    color = node["background_style"]
+                    self.assertTrue(color in registered or color in {"default", "blue-50", "red-50"},
+                                    "Feishu needs a color token or registered custom color, not inline CSS")
+                    if node.get("tag") == "column_set" and color != "default":
+                        for column in node["columns"]:
+                            self.assertEqual(column.get("background_style", "default"), color)
+                for value in node.values():
+                    check(value)
+            elif isinstance(node, list):
+                for value in node:
+                    check(value)
+
+        check(result)
+
     def test_screenshot_values_use_occupied_over_equity_and_exact_remaining(self):
         state = paired_state()
         long, short = state["accounts"]

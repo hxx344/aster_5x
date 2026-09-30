@@ -42,7 +42,8 @@ class FakeAccountAPI:
 
 
 def snapshot(wallet):
-    return AccountSnapshot(dec(wallet), dec(0), dec(wallet), dec(wallet), dec(0), [], [], True, False, True, time.time())
+    positions = [Position("XAUUSD1", side, dec(0), dec(0), dec(100), 5) for side in ("LONG", "SHORT")]
+    return AccountSnapshot(dec(wallet), dec(0), dec(wallet), dec(wallet), dec(0), positions, [], True, False, True, time.time())
 
 
 class PairMarginTests(unittest.TestCase):
@@ -97,6 +98,7 @@ class PairMarginTests(unittest.TestCase):
                 current.account_read_generation = self.brokers[side]._snapshot_generation
                 return current
             self.brokers[side].snapshot = fresh
+            self.brokers[side].margin_snapshot = fresh
         self.listing = [{"accountId": 1, "parentAccount": True},
             {"accountId": 10, "parentAccount": False, "sourceAddr": self.creds["ASTER_LONG"]["user"]},
             {"accountId": 20, "parentAccount": False, "sourceAddr": self.creds["ASTER_SHORT"]["user"]}]
@@ -537,13 +539,13 @@ class PairMarginTests(unittest.TestCase):
 
     def test_acknowledged_requires_both_post_response_snapshots(self):
         snapshots = self.live()
-        original = self.brokers["short"].snapshot
-        self.brokers["short"].snapshot = lambda *args, **kwargs: snapshots["short"]
+        original = self.brokers["short"].margin_snapshot
+        self.brokers["short"].margin_snapshot = lambda *args, **kwargs: snapshots["short"]
         first = self.balancer.tick(self.pair, snapshots)
         self.assertIsNotNone(first["pending"])
         self.assertEqual(first["status"], "acknowledged")
         self.assertIn("旧快照", first["reason"])
-        self.brokers["short"].snapshot = original
+        self.brokers["short"].margin_snapshot = original
         self.ready()
         self.assertIsNone(MarginBalancer(self.engine).tick(self.pair, snapshots)["pending"])
         self.assertEqual(len(self.transfers), 1)
@@ -819,6 +821,9 @@ class PairMarginTests(unittest.TestCase):
                 broker.api.budget = budget
                 broker.api.account["assets"][0].update(availableBalance="2000", marginBalance="2000",
                     maxWithdrawAmount="2000", crossWalletBalance="2000", crossUnPnl="0")
+                broker.api.account["positions"] = [{"symbol": "XAUUSD1", "positionSide": side,
+                    "positionAmt": "0", "entryPrice": "0", "leverage": "5", "isolated": False}
+                    for side in ("LONG", "SHORT")]
                 original = broker.api.call
 
                 def call(method, path, params=None, original=original, **kwargs):
@@ -830,7 +835,9 @@ class PairMarginTests(unittest.TestCase):
                     if path.endswith("/multiAssetsMargin"):
                         return {"multiAssetsMargin": False}
                     if path.endswith("/positionRisk"):
-                        return []
+                        return [{"symbol": "XAUUSD1", "positionSide": side, "positionAmt": "0",
+                            "entryPrice": "0", "markPrice": "100", "leverage": "5", "marginType": "cross",
+                            "unRealizedProfit": "0", "liquidationPrice": "0"} for side in ("LONG", "SHORT")]
                     if path.endswith("/leverageBracket"):
                         return {"symbol": "XAUUSD1", "brackets": [{"notionalFloor": "0", "notionalCap": "10000000",
                             "maintMarginRatio": "0.005", "cum": "0", "initialLeverage": 125}]}

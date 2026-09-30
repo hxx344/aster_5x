@@ -6,6 +6,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_budget as fixtures
+from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.margin_balance import MarginBalancer
 from trading.models import TradingError, dec
 from trading.pair_execution import runtime_default
@@ -50,13 +51,13 @@ class PairMarginPollEfficiencyTests(TestCase):
         for side, broker in self.brokers.items():
             original = broker.api.call
 
-            def call(method, path, params=None, *, signed=False, weight=1, side=side, original=original):
+            def call(method, path, params=None, *, signed=False, weight=1, timeout=None, side=side, original=original):
                 if path == INCOME:
                     api = self.brokers[side].api
                     api.budget.reserve(weight)
                     api.calls.append((method, path, api.budget._priority_flags()))
                     return deepcopy(self.income_rows[side])
-                return original(method, path, params, signed=signed, weight=weight)
+                return original(method, path, params, signed=signed, weight=weight, timeout=timeout)
 
             broker.api.call = call
 
@@ -232,23 +233,83 @@ class PairMarginPollEfficiencyTests(TestCase):
                 self.assertIn("无效", state["reason"])
         self.assertEqual(self.calls(), [])
 
-    def test_existing_order_and_held_cycle_keep_recovery_priority(self):
+    def test_pending_transfer_keeps_its_read_only_priority_with_orders_and_holdings(self):
         self.pending(wait=5)
         _, _, identities = self.trader._members(self.pair)
         state = runtime_default()
         state["pending"] = {"identities": identities}
         self.store.put("pair_runtime:gold", state)
-        with patch.object(self.trader, "_recover") as recover, \
-             patch.object(MarginBalancer, "tick", side_effect=AssertionError("order recovery first")):
-            self.tick()
+        with patch.object(self.trader, "_recover") as recover:
+            result = self.tick()
         recover.assert_called_once()
+        self.assertEqual(result["margin"]["status"], "accepted")
+        self.assertTrue(result["margin"]["blocks_trading"])
         state.update(pending=None)
         state["progress"].update(quantities={"LONG": "1", "SHORT": "1"},
                                  opened_at=self.wall - 10, config={"hold_seconds": 1})
         self.store.put("pair_runtime:gold", state)
-        with patch.object(self.trader, "_read", side_effect=TradingError("read due reduction")) as read, \
-             patch.object(MarginBalancer, "tick", side_effect=AssertionError("held position read first")):
+        with patch.object(self.trader, "_read", side_effect=TradingError("read due reduction")) as read:
             result = self.tick()
+        self.assertEqual(result["margin"]["status"], "accepted")
         self.assertEqual(result["reason"], "read due reduction")
         self.assertTrue(read.call_args.kwargs["reconciliation"])
         self.assertEqual(self.calls(), [])
+
+    def test_unknown_and_accepted_transfers_do_not_freeze_due_reduction(self):
+        for status in ("unknown", "accepted", "acknowledged"):
+            with self.subTest(status=status):
+                for side, broker in self.paper.items():
+                    broker.state["positions"]["XAUUSD1:" + side.upper()].update(qty="0.01", entry="4412.015")
+                    broker.save()
+                state = runtime_default()
+                state["progress"].update(phase="holding", quantities={"LONG": "0.01", "SHORT": "0.01"},
+                    opened_at=self.wall - 10, config={**self.pair["cycle"], "enabled": True,
+                                                    "hold_seconds": 1, "leverage": 5})
+                self.store.put("pair_runtime:gold", state)
+                record = self.pending(status, transaction=status != "unknown")
+                result = self.tick()
+                self.assertIsNone(result["pending"], result)
+                self.assertEqual(result["progress"]["completed_cycles"], 1, result)
+                self.assertEqual(result["margin"]["status"], status)
+                for side, broker in self.paper.items():
+                    self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)
+                self.assertEqual(self.store.get("pair_margin:gold")["pending"],
+                    None if status == "acknowledged" else record)
+                self.advance(5)
+
+    def test_unknown_transfer_does_not_starve_pending_close_order_recovery(self):
+        for side, broker in self.paper.items():
+            broker.state["positions"]["XAUUSD1:" + side.upper()].update(qty="0.01", entry="4412.015")
+            broker.save()
+        state = runtime_default()
+        state["progress"].update(phase="holding", quantities={"LONG": "0.01", "SHORT": "0.01"},
+            opened_at=self.wall - 10, config={**self.pair["cycle"], "enabled": True,
+                                            "hold_seconds": 1, "leverage": 5})
+        self.store.put("pair_runtime:gold", state)
+        transfer = self.pending("unknown", transaction=False)
+        long = self.brokers["long"]
+        submit = long.submit
+
+        def uncertain(orders, **options):
+            submit(orders, **options)
+            raise AmbiguousOrder("lost close receipt")
+
+        with patch.object(long, "submit", side_effect=uncertain), \
+             patch.object(long, "query", side_effect=ExchangeError("not found yet", code=-2013)):
+            result = self.tick()
+        self.assertIsNotNone(result["pending"], result)
+        order_id = result["pending"]["legs"][0]["order"]["newClientOrderId"]
+        self.advance(5)
+        with patch.object(long, "query", wraps=long.query) as query, \
+             patch.object(long, "submit", side_effect=AssertionError("never repeat close")), \
+             patch.object(self.brokers["short"], "submit", side_effect=AssertionError("never repeat close")), \
+             patch.object(MarginBalancer, "_live", side_effect=AssertionError("no new transfer")):
+            result = self.tick()
+        query.assert_called_once_with("XAUUSD1", order_id)
+        self.assertIsNone(result["pending"], result)
+        self.assertEqual(result["progress"]["completed_cycles"], 1)
+        self.assertEqual(result["margin"]["status"], "unknown")
+        self.assertEqual(self.store.get("pair_margin:gold")["pending"], transfer)
+        for side, broker in self.paper.items():
+            self.assertEqual(len(broker.state["orders"]), 1)
+            self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)

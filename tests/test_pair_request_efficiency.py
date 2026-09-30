@@ -42,7 +42,12 @@ class PairRequestEfficiencyTests(TestCase):
             self.assertEqual(self.read_count(), 20)  # Ten rounds, not thirty.
             self.assertEqual(sum(path == fixtures.DUAL for b in self.brokers.values()
                                  for _, path, _ in b.api.calls), 2)
-            self.assertEqual(used, 821)  # Includes two initial independent mode checks.
+            self.assertEqual(sum(path == fixtures.MULTI for b in self.brokers.values()
+                                 for _, path, _ in b.api.calls), 2)
+            # Ten paired account/risk/tier reads (220), the initial dual and
+            # multi-asset checks (120), and the independent public feed (301).
+            # The existing 600-second multi-asset TTL needs no repeat this minute.
+            self.assertEqual(used, 641)
             self.assertLess(used, self.budget.snapshot()["execution_limit"])
             self.assertTrue(all(method == "GET" for b in self.brokers.values() for method, _, _ in b.api.calls))
 

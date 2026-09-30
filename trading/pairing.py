@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 import json
+import math
 import re
 import threading
 import time
@@ -478,7 +479,20 @@ class PairManager:
                     self.trader = PairTrader(self.engine)
                 state = self.trader.tick(pair)
                 delay = self.poll_interval(pair, state)
-                return max(delay, state.get("retry_after", 0))
+                delay = max(delay, state.get("retry_after", 0))
+                margin = self.store.get("pair_margin:" + pair["id"]) or {}
+                if isinstance(margin, dict) and (margin.get("pending") or pair["enabled"] and pair["margin"]["enabled"]):
+                    deadlines = [margin.get("next_check_at", 0)]
+                    if not margin.get("pending"):
+                        deadlines.append(margin.get("cooldown_until", 0))
+                    deadline = max((value for value in deadlines
+                                    if type(value) in (int, float) and math.isfinite(value)), default=0)
+                    remaining = deadline - time.time()
+                    # An overdue check blocked by unknown orders still gets a
+                    # visible check at its own cadence, not a hot polling loop.
+                    delay = min(delay, max(1, remaining if remaining > 0
+                                           else pair["margin"]["check_interval_seconds"]))
+                return delay
             except (TradingError, KeyError, ValueError, TypeError) as exc:
                 runtime = self.store.get("pair_runtime:" + pair_id) or {}
                 runtime.update(phase="attention" if isinstance(exc, AccountModeError) else "waiting",

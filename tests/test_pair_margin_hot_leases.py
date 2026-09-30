@@ -34,6 +34,7 @@ class PairMarginHotLeaseTests(TestCase):
                 return original(*args, **kwargs)
 
             broker.snapshot = after_transfer_only
+            broker.margin_snapshot = after_transfer_only
         self.snapshots, self.guards = PairTrader(self.engine)._read(self.brokers, hot=True)
 
     def tick(self):

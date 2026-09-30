@@ -21,6 +21,7 @@ from eth_account.messages import encode_typed_data
 
 from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, api_wait_notice, credentials_for
 from .models import TradingError, dec, positive, wire
+from .pair_planning import PairRecoveryConflict
 
 
 DEFAULT_MARGIN = {"enabled": False, "master_env_prefix": "", "check_interval_seconds": 5,
@@ -272,6 +273,7 @@ class MarginBalancer:
             raise TradingError("保证金平衡缺少两侧账户快照")
         for side, snapshot in snapshots.items():
             snapshot.require_fresh()
+            snapshot.require_modes([pair.get("symbol", "XAUUSD1")])
             if snapshot.hedge_mode is not True or snapshot.multi_assets is not False:
                 raise TradingError("保证金平衡要求双向持仓协议、USD1 单币全仓模式，每子账户只持指定方向")
             if (not snapshot.can_trade or snapshot.equity <= 0 or snapshot.open_orders
@@ -525,12 +527,12 @@ class MarginBalancer:
             self._record_success(pair, state)
             return self._view(state, config, "acknowledged", "交易所已确认划转，等待两侧 WebSocket 余额；最多 2 秒后改用 REST 刷新",
                 blocks=True)
-        self._require_budget(members, {side: broker.snapshot_weight(symbols, fresh_modes=True)
+        self._require_budget(members, {side: broker.margin_snapshot_weight(symbols, fresh_modes=True)
                                      for side, broker in brokers.items()}, reconciliation=True)
         snapshots = {}
         for side, broker in brokers.items():
             with getattr(broker, "reconciliation_budget", nullcontext)():
-                current = broker.snapshot(symbols, fresh_modes=True)
+                current = broker.margin_snapshot(symbols, fresh_modes=True)
                 current.require_fresh()
                 if current.timestamp < acknowledged_at:
                     raise TradingError("划转后的账户查询返回旧快照，继续等待新余额")
@@ -616,7 +618,7 @@ class MarginBalancer:
         for member in members.values():
             self.engine.broker(member).reload()
 
-    def tick(self, pair, snapshots, pending_orders=False, *, snapshot_guards=None):
+    def tick(self, pair, snapshots, pending_orders=False, *, snapshot_guards=None, snapshot_loader=None):
         """Return display state; the caller must obey ``blocks_trading``."""
         config = validate_margin(pair.get("margin", {}))
         try:
@@ -678,6 +680,8 @@ class MarginBalancer:
                               + "；届时重新评估余额差额及安全可划条件"), blocks=bool(state.get("blocked_reason")))
             state.update(checked_at=now, next_check_at=now + config["check_interval_seconds"])
             self.store.put("pair_margin:" + pair["id"], state)
+            if snapshot_loader is not None:
+                snapshots, snapshot_guards = snapshot_loader()
             self._check_snapshots(pair, snapshots)
             diagnostics = {}
             may_transfer = self._may_need_transfer(snapshots, config)
@@ -710,12 +714,16 @@ class MarginBalancer:
                     return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
                 from .pair_recovery import require_archived_orders_clear
                 require_archived_orders_clear(self.engine, pair)
+                for guard in (snapshot_guards or {}).values():
+                    guard()
                 pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": now, "status": "submitting"}
                 state["cooldown_until"] = now + config["cooldown_seconds"]
                 self._paper(pair, members, snapshots, state, pending)
                 self._record_success(pair, state)
                 return self._view(state, config, "paper_confirmed", "模拟 USD1 划转已原子入账，系统重新读取两侧余额；取得新快照前不开始新开仓或新划转", blocks=True, plan=plan)
             return self._live(pair, members, snapshots, state, config, snapshot_guards)
+        except PairRecoveryConflict:
+            raise
         except TradingError as exc:
             # Local validation messages are fixed strings; remote error bodies
             # and credential values never enter durable state or the dashboard.
@@ -797,12 +805,13 @@ class MarginBalancer:
                 raise TradingError("账户缺少可撤销的快照校验，禁止划转")
             # PairTrader can lend its revocable hot lease for this synchronous
             # call under the same account locks. A bare snapshot is insufficient.
-            if type(getattr(originals[side], "account_read_generation", None)) is not int:
-                guard = (snapshot_guards or {}).get(side)
-                if callable(guard):
-                    guards[side] = guard
-                else:
-                    replacements.append(side)
+            guard = (snapshot_guards or {}).get(side)
+            if callable(guard):
+                # Keep the caller's configuration/identity guard as well as
+                # the snapshot lease, including REST reads with generations.
+                guards[side] = guard
+            elif type(getattr(originals[side], "account_read_generation", None)) is not int:
+                replacements.append(side)
         if replacements:
             # Reuse the ordinary 15s mode cache; account events still invalidate
             # it. Every read gets a new generation-checked balance/position view.

@@ -1248,7 +1248,7 @@ class LiveBroker:
         with self._snapshot_lock:
             return self._snapshot_weight(symbols, fresh_modes=fresh_modes, reuse_account_mode=reuse_account_mode)
 
-    def _snapshot_weight(self, symbols, *, fresh_modes=False, reuse_account_mode=False):
+    def _snapshot_weight(self, symbols, *, fresh_modes=False, reuse_account_mode=False, include_brackets=True):
         """Conservative admission estimate using cache expiries, without a request."""
         now = time.monotonic()
         def due(key, ttl):
@@ -1261,12 +1261,29 @@ class LiveBroker:
                       and "dual" in self.cached_at and now >= self.cached_at["dual"])
         weight += sum(30 for key, ttl in (("dual", 15), ("multi", MULTI_ASSETS_MODE_MAX_AGE))
                       if not (key == "dual" and reuse_dual) and (fresh_modes or due(key, ttl)))
-        weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
+        if include_brackets:
+            weight += sum(1 for symbol in symbols if due("bracket:" + symbol, 5))
         return weight
 
     def snapshot(self, symbols, fresh_modes=False, *, reuse_account_mode=False):
         with self._ordinary_read_lock:
             return self._snapshot(symbols, fresh_modes=fresh_modes, reuse_account_mode=reuse_account_mode)
+
+    def margin_snapshot_weight(self, symbols, *, fresh_modes=False, reuse_account_mode=False):
+        with self._snapshot_lock:
+            return self._snapshot_weight(symbols, fresh_modes=fresh_modes,
+                                         reuse_account_mode=reuse_account_mode, include_brackets=False)
+
+    def margin_snapshot(self, symbols, *, fresh_modes=False, reuse_account_mode=False):
+        """Read collateral risk without depending on opening tiers or capacity.
+
+        Retain the ordinary reader's full positions, mode evidence and revocable
+        generation. This read has no opening tiers or leverage-write authority.
+        """
+        with self._ordinary_read_lock:
+            return self._snapshot(symbols, fresh_modes=fresh_modes,
+                                  reuse_account_mode=reuse_account_mode, include_brackets=False,
+                                  authorize_leverage=False)
 
     def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
         with self._snapshot_lock:
@@ -1324,7 +1341,8 @@ class LiveBroker:
         if asset != "USD1":
             raise TradingError(f"{symbol} 保证金资产为 {asset}；检测到非 USD1 仓位，需要核对风险范围")
 
-    def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None, reuse_account_mode=False):
+    def _snapshot(self, symbols, fresh_modes=False, *, read=None, started=None, reuse_account_mode=False,
+                  include_brackets=True, authorize_leverage=True):
         """Shared parsing; the ordinary path retains its sequential reads."""
         with self._snapshot_lock:
             generation = self._snapshot_generation
@@ -1405,7 +1423,7 @@ class LiveBroker:
                 raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
         positions = self._fill_missing_marks(positions)
         brackets = {}
-        for symbol in symbols:
+        for symbol in symbols if include_brackets else ():
             b = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
             if isinstance(b, list):
                 if any(not isinstance(item, dict) for item in b):
@@ -1428,7 +1446,7 @@ class LiveBroker:
             if generation != self._snapshot_generation:
                 raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
             snapshot.account_read_generation = generation
-            if fresh_modes:
+            if fresh_modes and authorize_leverage:
                 self.leverage_snapshot = (snapshot, time.monotonic())
         return snapshot
 

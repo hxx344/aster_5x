@@ -100,7 +100,7 @@ class PairTrader:
     @staticmethod
     def _durable(state):
         # This relative delay belongs to this scheduler turn, not a restarted one.
-        return {key: value for key, value in state.items() if key != "retry_after"}
+        return {key: value for key, value in state.items() if key not in {"retry_after", "_trading_write_started"}}
 
     @staticmethod
     def _retry_delay(state, exc):
@@ -127,7 +127,7 @@ class PairTrader:
             raise PairPositionError("两个方向不能使用同一个真实账户")
         return accounts, brokers, identities
 
-    def _read(self, brokers, *, hot=False, reconciliation=False, fresh_modes=False):
+    def _read(self, brokers, *, hot=False, reconciliation=False, fresh_modes=False, margin=False):
         # Recovery priority does not require reloading unchanged account modes.
         # Recovery uses their normal TTL; configuration confirmation can force GETs.
         reuse_account_mode = not reconciliation and not fresh_modes
@@ -136,8 +136,10 @@ class PairTrader:
             for broker in brokers.values():
                 if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
                     budget = broker.api.budget
-                    budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight(
-                        [SYMBOL], fresh_modes=fresh_modes, reuse_account_mode=reuse_account_mode)
+                    weight = (broker.margin_snapshot_weight([SYMBOL], reuse_account_mode=reuse_account_mode)
+                              if margin else broker.snapshot_weight([SYMBOL], fresh_modes=fresh_modes,
+                                                                   reuse_account_mode=reuse_account_mode))
+                    budgets[budget] = budgets.get(budget, 0) + weight
             # Check the complete shared-budget read before either worker starts;
             # actual requests still perform their own atomic admission checks.
             for budget, weight in budgets.items():
@@ -155,7 +157,8 @@ class PairTrader:
                 # Ordinary polling retains the broker's mode TTL; account events
                 # still revoke these reads and mode changes clear its cache.
                 options = {"reuse_account_mode": reuse_account_mode} if isinstance(broker, LiveBroker) else {}
-                snapshot = broker.snapshot([SYMBOL], fresh_modes=fresh_modes, **options)
+                snapshot = (broker.margin_snapshot([SYMBOL], **options) if margin and isinstance(broker, LiveBroker)
+                            else broker.snapshot([SYMBOL], fresh_modes=fresh_modes, **options))
                 guard = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
                 return snapshot, guard
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-read") as pool:
@@ -164,6 +167,35 @@ class PairTrader:
         for _, guard in rows.values():
             guard()
         return {key: row[0] for key, row in rows.items()}, {key: row[1] for key, row in rows.items()}
+
+    def _balance(self, pair, state, brokers, identities, snapshots=None, guards=None, *, pending_orders=False):
+        from .margin_balance import MarginBalancer
+
+        def load():
+            current, checks = snapshots, guards
+            try:
+                if not current or not checks:
+                    raise TradingError("保证金检查需要新账户快照")
+                for check in checks.values():
+                    check()
+            except TradingError:
+                # One ordinary-budget REST attempt, only when the balancer's
+                # own check is due. These reads never enter the order planner.
+                current, checks = self._read(brokers, margin=True)
+                self._publish_snapshots(state, current)
+
+            def check(side):
+                self._config_guard(pair, identities, opening=False)
+                if not self.store.pair(pair["id"])["enabled"]:
+                    raise RequestNotSent("配对组已暂停，禁止新划转")
+                checks[side]()
+
+            return current, {side: lambda side=side: check(side) for side in checks}
+
+        result = MarginBalancer(self.engine).tick(pair, snapshots or {}, pending_orders=pending_orders,
+            snapshot_guards=guards, snapshot_loader=load)
+        state["margin"] = result
+        return result
 
     @contextmanager
     def _confirmed(self, pair, brokers, guards):
@@ -202,7 +234,11 @@ class PairTrader:
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
         pending_at_entry = state.get("pending")
         margin_waiting = False
+        margin_checked = margin_eligible = trade_work = False
+        margin_delay = 0
+        snapshots = guards = None
         state.pop("retry_after", None)
+        state.pop("_trading_write_started", None)
         state["api_notice"] = None
         save_state = True
         if not isinstance(state.get("progress"), dict):
@@ -213,12 +249,11 @@ class PairTrader:
                 raise PairPositionError("配对组凭据指向的真实账户发生变化，等待人工核对")
             state["identities"] = identities
             pending = state.get("pending")
-            if pending:
-                if pending["identities"] != identities:
-                    raise PairPositionError("未完成批次的账户身份与当前凭据不一致")
-                self._recover(pair, state, brokers)
-                return state
+            if pending and pending["identities"] != identities:
+                raise PairPositionError("未完成批次的账户身份与当前凭据不一致")
             holding = any(dec(qty) for qty in state["progress"]["quantities"].values())
+            closing_due = holding and (not pair["enabled"] or time.time() >=
+                state["progress"]["opened_at"] + state["progress"]["config"]["hold_seconds"])
             if state.get("volume_unknown_until_utc"):
                 state["volume_unknown"] = datetime.now(timezone.utc).date().isoformat() <= state["volume_unknown_until_utc"]
             margin_state = self.store.get("pair_margin:" + pair["id"], {})
@@ -230,7 +265,33 @@ class PairTrader:
                 for field in ("checked_at", "next_check_at", "cooldown_until"))
             margin_pending = margin_state.get("pending") if isinstance(margin_state, dict) else None
             margin_waiting = bool(margin_pending)
+            margin_eligible = bool(pair["margin"]["enabled"] or margin_pending is not None or margin_invalid)
             from .margin_balance import MarginBalancer
+            retry = state.get("trade_retry") or {}
+            if (not pair["margin"]["enabled"] or retry.get("revision") != pair["revision"]
+                    or retry.get("identities") != identities):
+                state.pop("trade_retry", None)
+                retry = {}
+            if margin_pending is not None or margin_invalid:
+                # Confirm existing transfers first, then recover outstanding
+                # orders or a due reduction using fresh reconciliation reads.
+                self._ordinary_observations.pop(pair["id"], None)
+                self._margin_observations.pop(pair["id"], None)
+                margin_checked = True
+                margin = self._balance(pair, state, brokers, identities, pending_orders=bool(pending))
+                state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
+                if not closing_due and not pending:
+                    margin_delay = max(0, margin.get("retry_after", 0))
+                    return state
+            if time.time() < retry.get("until", 0):
+                state.update(phase=retry["phase"], reason=retry["reason"], api_notice=retry.get("api_notice"),
+                             retry_after=retry["until"] - time.time())
+                return state
+            state.pop("trade_retry", None)
+            if pending:
+                trade_work = True
+                self._recover(pair, state, brokers)
+                return state
             if (not holding and margin_pending is None and not margin_invalid
                     and margin_state.get("api_notice")
                     and time.time() < margin_state.get("next_check_at", 0)):
@@ -238,20 +299,10 @@ class PairTrader:
                 # accounts during its quota backoff cannot authorize anything.
                 margin = MarginBalancer.status_view(pair, margin_state, state.get("margin"))
                 if margin.get("blocks_trading"):
-                    state.update(margin=margin, phase="margin_wait", reason=margin["reason"],
-                                 retry_after=max(0, margin_state["next_check_at"] - time.time()))
+                    margin_checked = True
+                    state.update(margin=margin, phase="margin_wait", reason=margin["reason"])
+                    margin_delay = max(0, margin_state["next_check_at"] - time.time())
                     return state
-            if not holding and (margin_pending is not None or margin_invalid):
-                # Pending transfers consume only their own reconciliation reads.
-                # Even a completed reconciliation ends this turn: subsequent
-                # trading must obtain a new account read, not an older wait hint.
-                self._ordinary_observations.pop(pair["id"], None)
-                self._margin_observations.pop(pair["id"], None)
-                margin = MarginBalancer(self.engine).tick(pair, {})
-                state.update(margin=margin, phase="margin_wait", reason=margin.get("reason", "划转核对中"))
-                if margin.get("api_notice"):
-                    state["retry_after"] = max(0, margin.get("retry_after", 0))
-                return state
             if not pair["enabled"] and not holding and not margin_pending:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
@@ -259,24 +310,24 @@ class PairTrader:
                 # Project the journal without invoking a funds workflow. A
                 # deadline crossing here cannot create a transfer with no read.
                 margin = MarginBalancer.status_view(pair, margin_state, state.get("margin"))
+                margin_checked = True
                 state.update(margin=margin, phase="margin_wait" if margin.get("blocks_trading") else "monitoring",
                              reason=margin.get("reason", "等待下一次保证金检查"))
                 return state
             if not holding and not margin_pending:
                 reason = self._ordinary_wait(pair, state, identities, margin_state)
                 if reason:
+                    margin_checked = True
                     margin = state.get("margin") or {}
                     state.update(phase="margin_wait" if margin.get("blocks_trading") else "waiting",
                                  reason=margin.get("reason", reason) if margin.get("blocks_trading") else reason)
                     return state
-            closing_due = holding and (not pair["enabled"] or time.time() >=
-                state["progress"]["opened_at"] + state["progress"]["config"]["hold_seconds"])
             # A due reduction must not depend on a hot refresh that uses ordinary
             # quota. Read fresh positions with the repair reserve when closing.
             hot = not closing_due and bool(pair["enabled"] and pair["cycle"]["enabled"] or holding)
+            trade_work = True
             snapshots, guards = self._read(brokers, hot=hot, reconciliation=closing_due)
             self._publish_snapshots(state, snapshots)
-            held = require_quantities(snapshots, self._expected(state))
             if not pair["ordinary"]["enabled"] and not pair["cycle"]["enabled"] and not holding:
                 if len(self._margin_observations) >= 16:
                     self._margin_observations.clear()
@@ -296,13 +347,14 @@ class PairTrader:
                 # Publish the completed read before potentially slow transfer
                 # preparation; this never changes the original snapshot time.
                 self._save(pair, state)
-            margin = MarginBalancer(self.engine).tick(pair, snapshots, pending_orders=closing_due, snapshot_guards=guards)
-            state["margin"] = margin
-            if margin.get("blocks_trading") and not holding:
-                state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
-                if margin.get("api_notice"):
-                    state["retry_after"] = max(0, margin.get("retry_after", 0))
-                return state
+            if not closing_due:
+                margin_checked = True
+                margin = self._balance(pair, state, brokers, identities, snapshots, guards)
+                if margin.get("blocks_trading"):
+                    state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
+                    margin_delay = max(0, margin.get("retry_after", 0))
+                    return state
+            held = require_quantities(snapshots, self._expected(state))
             if not pair["enabled"] and not holding:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
@@ -347,7 +399,26 @@ class PairTrader:
                          "holding" if any(dec(q) for q in state["progress"]["quantities"].values()) else "waiting",
                          reason=str(exc))
         finally:
+            trading_attempted = state.pop("_trading_write_started", False)
             if save_state:
+                # Only an earlier guarantee of the same pair and identities may
+                # survive the scheduler's independent margin wake-up.
+                if trade_work and pair["margin"]["enabled"] and state.get("retry_after", 0) > 0:
+                    state["trade_retry"] = {"until": time.time() + state["retry_after"],
+                        "revision": pair["revision"], "identities": deepcopy(identities),
+                        "phase": state["phase"], "reason": state["reason"], "api_notice": state.get("api_notice")}
+                if margin_eligible and not margin_checked:
+                    try:
+                        margin = self._balance(pair, state, brokers, identities, snapshots, guards,
+                            pending_orders=bool(pending_at_entry or trading_attempted or state.get("pending")))
+                        if not holding:
+                            margin_delay = max(0, margin.get("retry_after", 0))
+                    except PairRecoveryConflict:
+                        # An archived late order can commit a newer runtime
+                        # during the funds checks. Never save this old copy.
+                        return self.store.get("pair_runtime:" + pair["id"], state)
+                if margin_delay:
+                    state["retry_after"] = max(state.get("retry_after", 0), margin_delay)
                 self._save(pair, state)
                 if ((pending_at_entry and pending_at_entry.get("kind") == "leverage" and not state.get("pending"))
                         or (margin_waiting and not (self.store.get("pair_margin:" + pair["id"]) or {}).get("pending"))):
@@ -465,6 +536,7 @@ class PairTrader:
         return evidence
 
     def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False):
+        state["_trading_write_started"] = True
         pending = state.get("pending") or {}
         observe = pending.get("kind") == "cycle" and legs is pending.get("legs")
         quality_clocks = {}
@@ -810,6 +882,7 @@ class PairTrader:
                 return {"rejected": True, "reason": str(exc)}
             except Exception:
                 return {"unknown": True, "reason": "杠杆请求结果未知，系统继续读取两侧实际杠杆；不重发原请求"}
+        state["_trading_write_started"] = True
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-leverage") as pool:
             futures = {key: pool.submit(send, key) for key, _ in SIDES}
             for key, future in futures.items():

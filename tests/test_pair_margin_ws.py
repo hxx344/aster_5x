@@ -207,6 +207,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
                         previous.stop_cycle_hot_data()
                         broker = LiveBroker({}, self.market, api=previous.api)
                         broker.snapshot = previous.snapshot
+                        broker.margin_snapshot = previous.margin_snapshot
                         self.brokers[side] = broker
                         self.connect(broker)
                 self.ready()

@@ -43,6 +43,7 @@ class PairMarginBudgetWaitTests(TestCase):
                 return fresh(symbols, fresh_modes=fresh_modes)
 
             broker.snapshot = snapshot
+            broker.margin_snapshot = snapshot
 
         master_class, transfer_class = margin_balance.API, margin_balance.TransferAPI
 
@@ -225,14 +226,14 @@ class PairMarginBudgetWaitTests(TestCase):
 
     def test_acknowledged_refresh_rechecks_first_generation_before_releasing_pending(self):
         self.pending("acknowledged")
-        original = self.brokers["short"].snapshot
+        original = self.brokers["short"].margin_snapshot
 
         def change_first_account(*args, **kwargs):
             current = original(*args, **kwargs)
             self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
             return current
 
-        with patch.object(self.brokers["short"], "snapshot", side_effect=change_first_account):
+        with patch.object(self.brokers["short"], "margin_snapshot", side_effect=change_first_account):
             result = self.tick()
         self.assertEqual(result["status"], "acknowledged")
         self.assertIsNotNone(result["pending"])

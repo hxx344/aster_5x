@@ -444,6 +444,7 @@ class PairManager:
 
     def states(self, reader=None):
         from .pair_quality import read as read_quality
+        from .pair_cost import read as read_cost
         from .margin_balance import MarginBalancer
         reader = reader or self.store
         rows = []
@@ -455,6 +456,12 @@ class PairManager:
             state["margin"] = MarginBalancer.status_view(pair,
                 reader.get("pair_margin:" + pair["id"], {}), state.get("margin"))
             state.update(read_quality(reader, pair["id"], runtime))
+            try:
+                state["cycle_costs"] = read_cost(reader, pair, runtime)
+            except Exception:
+                # Display-derived history must never disrupt execution or the
+                # rest of the dashboard, nor publish fabricated zero expenses.
+                state["cycle_costs"] = None
             rows.append({**pair, "state": state})
         return rows
 

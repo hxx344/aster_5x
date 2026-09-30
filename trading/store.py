@@ -12,7 +12,7 @@ import time
 import uuid
 
 from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations
+from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations, pair_cost
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -66,6 +66,7 @@ class Store:
         self.lock = threading.RLock()
         self._connection_local = threading.local()
         self._rolling_cache = LedgerCache()
+        self._pair_cost_cache = pair_cost.HistoryCache()
         with self.connect() as db:
             # Decide HTTP exposure before touching historical schema or state.
             # Keep the claim and migrations in one rollback-capable transaction;
@@ -155,6 +156,7 @@ class Store:
                     db.execute(statement)
             position_observations.initialize(db)
             cycle_quality_history.initialize(db)
+            pair_cost.initialize(db)
             # A revision changes in the same transaction as its fills, including
             # backfills and writes from a different process/Store. Rollbacks
             # cannot publish a new revision. Never infer validity from a TTL.
@@ -317,7 +319,7 @@ class Store:
         if demo:
             expected = {"accounts", "deleted_accounts", "kv", "intents", "events", "outbox", "cycle_fills",
                         "cycle_volume_days", "cycle_symbol_volume_days", "cycle_volume_sync", "cycle_fill_versions",
-                        "pairs", "pair_members", "cycle_quality_history"}
+                        "pairs", "pair_members", "cycle_quality_history", "pair_cost_revision", "pair_cost_changes"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
             if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -1535,6 +1537,7 @@ class _StoreSnapshot(Store):
     def __init__(self, owner, db):
         self.path, self.db = owner.path, db
         self._rolling_cache = owner._rolling_cache
+        self._pair_cost_cache = owner._pair_cost_cache
 
     @contextmanager
     def connect(self):

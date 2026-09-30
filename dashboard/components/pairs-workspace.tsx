@@ -19,6 +19,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { PairSettings } from '@/components/pair-settings';
+import { PairCycleCostsPanel } from '@/components/pair-cycle-costs';
 import { PairNotices } from '@/components/pair-notices';
 import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
 import { PairOrderRecovery } from '@/components/pair-order-recovery';
@@ -555,6 +556,11 @@ function PairDetail({
           </div>
         </dl>
       </section>
+      <PairCycleCostsPanel
+        report={pair.state?.cycle_costs}
+        now={now}
+        offline={offline}
+      />
       <section className="panel" aria-label="配对组当日成交量">
         <div className="section-head">
           <h2>两侧当日成交量</h2>

@@ -459,7 +459,7 @@ class PairTrader:
         target = {side: wire(dec(before[side]) + (plan.qty if opening else -plan.qty)) for _, side in SIDES}
         if any(dec(q) < dec(state["owned"][side]) for side, q in target.items()):
             raise PairPositionError("平仓数量会侵占配对组原始底仓")
-        pending = {"id": token, "kind": kind, "phase": plan.phase, "symbol": SYMBOL,
+        pending = {"id": token, "pair_id": pair["id"], "kind": kind, "phase": plan.phase, "symbol": SYMBOL,
                    "identities": deepcopy(identities), "created_at": time.time(), "quantity": wire(plan.qty),
                    "before": before, "target": target, "leverage": plan.leverage, "legs": legs,
                    "repairs": [], "repair_attempts": 0, "config": {**pair["cycle"], "leverage": plan.leverage}}

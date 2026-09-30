@@ -1,4 +1,5 @@
 import type { Account } from './desk-types';
+import type { PairCycleCosts } from './pair-cost';
 import type {
   CycleExecutionQuality,
   CycleQualityHistory,
@@ -107,6 +108,7 @@ export type Pair = {
     };
     daily_volume?: Record<string, { long?: string; short?: string }>;
     volume_unknown?: boolean;
+    cycle_costs?: PairCycleCosts | null;
   };
 };
 export type PairDraft = {

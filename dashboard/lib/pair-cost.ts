@@ -8,6 +8,14 @@ export type PairCostPeriod = {
   spread_cost: string;
   slippage_cost: string | null;
   total_cost: string;
+  fee_scenario?: {
+    basis: 'assumed_aster5_referral10_after_discount';
+    aster_discount: string;
+    discounted_fee: string;
+    rebate: string;
+    final_fee: string;
+    total_cost: string;
+  } | null;
   complete: boolean;
   slippage_complete: boolean;
   fill_count: number;
@@ -55,6 +63,18 @@ export function pairCostPeriodView(period?: PairCostPeriod) {
   const count = (n: number | undefined) =>
     typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
   const known = ![fee, spread, total].includes('—');
+  const scenario = period?.fee_scenario;
+  const scenarioAmounts = {
+    discount: cycleAmount(scenario?.aster_discount),
+    discountedFee: cycleAmount(scenario?.discounted_fee),
+    rebate: cycleAmount(scenario?.rebate),
+    finalFee: cycleAmount(scenario?.final_fee),
+    total: cycleSignedAmount(scenario?.total_cost),
+  };
+  const scenarioAvailable =
+    known &&
+    scenario?.basis === 'assumed_aster5_referral10_after_discount' &&
+    !Object.values(scenarioAmounts).includes('—');
   const hasUnmatched =
     unmatched !== '—' &&
     !/^0+(?:\.0+)?$/.test(period?.unmatched_notional ?? '');
@@ -80,6 +100,12 @@ export function pairCostPeriodView(period?: PairCostPeriod) {
       notices.push(`待配对成交金额 ${unmatched} USD1，价差尚未完整计入。`);
     if (!complete && notices.length === 0)
       notices.push('成交记录尚未完整确认，当前仅为已统计小计。');
+    if (!scenarioAvailable)
+      notices.push(
+        scenario === undefined
+          ? '优惠估算尚未提供，当前总花费仍为优惠前口径。'
+          : '优惠估算无效或不可用，当前保留优惠前总花费。',
+      );
   }
   const first = cycleUtcDate(period?.start);
   const last = period ? cycleUtcDate(period.end - 1) : null;
@@ -99,5 +125,15 @@ export function pairCostPeriodView(period?: PairCostPeriod) {
     notices,
     count: count(period?.fill_count) ? String(period!.fill_count) : '—',
     slippageComplete: Boolean(period?.slippage_complete && slippage !== '—'),
+    scenarioAvailable,
+    scenario: scenarioAvailable
+      ? scenarioAmounts
+      : {
+          discount: '—',
+          discountedFee: '—',
+          rebate: '—',
+          finalFee: '—',
+          total: '—',
+        },
   };
 }

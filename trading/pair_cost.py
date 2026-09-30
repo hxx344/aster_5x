@@ -20,6 +20,8 @@ from .models import TradingError, positive
 
 PREFIX = "pair_batch:"
 FEE_RATE = Fraction(1, 8000)
+ASTER_DISCOUNT_RATE = Fraction(1, 20)
+REFERRAL_REBATE_RATE = Fraction(1, 10)
 AMOUNTS = ("fee", "spread", "slippage", "unmatched")
 COUNTS = ("fills", "missing", "unassigned", "slip_known", "slip_missing")
 
@@ -299,12 +301,23 @@ def read(reader, pair, runtime, *, now=None):
     result = {"as_of": now, "timezone": "UTC", "fee_rate_percent": "0.0125"}
     for name, (start, end, label) in windows.items():
         values = totals[name]
+        # User-requested scenario, not a verified account entitlement or ledger.
+        # Apply the assumed rebate to the discounted fee, without rounding early.
+        discount = values["fee"] * ASTER_DISCOUNT_RATE
+        discounted_fee = values["fee"] - discount
+        rebate = discounted_fee * REFERRAL_REBATE_RATE
+        final_fee = discounted_fee - rebate
         complete = not (values["missing"] or values["unassigned"] or values["unmatched"])
         slip_complete = complete and not values["slip_missing"]
         result[name] = {"start": start, "end": end, "label": label,
             "estimated_fee": number(values["fee"]), "spread_cost": number(values["spread"]),
             "slippage_cost": number(values["slippage"]) if values["slip_known"] or slip_complete else None,
             "total_cost": number(values["fee"] + values["spread"]), "complete": complete,
+            "fee_scenario": {
+                "basis": "assumed_aster5_referral10_after_discount",
+                "aster_discount": number(discount), "discounted_fee": number(discounted_fee),
+                "rebate": number(rebate), "final_fee": number(final_fee),
+                "total_cost": number(final_fee + values["spread"])},
             "slippage_complete": slip_complete, "fill_count": values["fills"],
             "unmatched_notional": number(values["unmatched"]), "missing_count": values["missing"],
             "unassigned_count": values["unassigned"]}

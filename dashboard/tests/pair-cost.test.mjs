@@ -26,6 +26,96 @@ const report = () => ({
   daily: period(),
   weekly: period({ end: monday + 7 * 86400 }),
 });
+const feeScenario = (changes = {}) => ({
+  basis: 'assumed_aster5_referral10_after_discount',
+  aster_discount: '0.01250625',
+  discounted_fee: '0.23761875',
+  rebate: '0.023761875',
+  final_fee: '0.213856875',
+  total_cost: '1.213856875',
+  ...changes,
+});
+
+test('conditional fee scenario formats server amounts without losing precision', () => {
+  const view = pairCostPeriodView(
+    period({
+      fee_scenario: feeScenario({
+        final_fee: '9007199254740993.00000000000001',
+        total_cost: '-0.99999999999999',
+      }),
+    }),
+  );
+  assert.equal(view.scenarioAvailable, true);
+  assert.equal(view.scenario.discount, '0.01250625');
+  assert.equal(view.scenario.discountedFee, '0.23761875');
+  assert.equal(view.scenario.rebate, '0.023761875');
+  assert.equal(view.scenario.finalFee, '9,007,199,254,740,993.00000000000001');
+  assert.equal(view.scenario.total, '-0.99999999999999');
+  assert.equal(view.fee, '0.250125');
+  assert.equal(view.total, '1.250125');
+});
+
+test('old responses retain gross totals without inventing discounted fees', () => {
+  const view = pairCostPeriodView(period());
+  assert.equal(view.scenarioAvailable, false);
+  assert.equal(view.scenario.finalFee, '—');
+  assert.equal(view.scenario.total, '—');
+  assert.equal(view.total, '1.250125');
+  assert.equal(view.complete, true);
+  assert.match(view.notices.join(''), /优惠前口径/);
+});
+
+test('unknown fee basis or invalid adjustment amounts cannot appear as valid savings', () => {
+  const invalid = [
+    null,
+    { basis: 'unknown' },
+    ...[
+      'aster_discount',
+      'discounted_fee',
+      'rebate',
+      'final_fee',
+      'total_cost',
+    ].map((key) => feeScenario({ [key]: 'NaN' })),
+    feeScenario({ rebate: '-1' }),
+  ];
+  for (const value of invalid) {
+    const view = pairCostPeriodView(period({ fee_scenario: value }));
+    assert.equal(view.scenarioAvailable, false);
+    assert.equal(view.scenario.finalFee, '—');
+    assert.equal(view.total, '1.250125');
+    assert.match(view.notices.join(''), /优惠估算无效/);
+  }
+});
+
+test('fee scenario preserves incomplete receipt status and confirmed zero costs', () => {
+  const partial = pairCostPeriodView(
+    period({
+      fee_scenario: feeScenario(),
+      complete: false,
+      missing_count: 1,
+    }),
+  );
+  assert.equal(partial.scenarioAvailable, true);
+  assert.equal(partial.complete, false);
+  const zero = pairCostPeriodView(
+    period({
+      fee_scenario: feeScenario({
+        aster_discount: '0',
+        discounted_fee: '0',
+        rebate: '0',
+        final_fee: '0',
+        total_cost: '0',
+      }),
+      estimated_fee: '0',
+      spread_cost: '0',
+      total_cost: '0',
+      fill_count: 0,
+    }),
+  );
+  assert.equal(zero.scenario.finalFee, '0');
+  assert.equal(zero.scenarioAvailable, true);
+  assert.equal(zero.complete, true);
+});
 
 test('costs preserve exact decimals, signed improvements and server totals', () => {
   const view = pairCostPeriodView(

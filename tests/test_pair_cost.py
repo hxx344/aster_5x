@@ -71,6 +71,39 @@ class PairCostTests(TestCase):
         self.assertEqual(result["fee_rate_percent"], "0.0125")
         self.assertNotIn("identities", json.dumps(result))
 
+    def test_fee_scenario_is_sequential_and_preserves_original_totals(self):
+        # 40,000 USD1 turnover: fee 5, ASTER discount 0.25,
+        # rebate 10% of 4.75 = 0.475, final fee 4.275 (not 4.25).
+        self.save(batch(quantity="200", buy="100", sell="100"))
+        for period in (self.report()["daily"], self.report()["weekly"]):
+            self.assertEqual(period["estimated_fee"], "5")
+            self.assertEqual(period["total_cost"], "5")
+            self.assertEqual(period["fee_scenario"], {
+                "basis": "assumed_aster5_referral10_after_discount",
+                "aster_discount": "0.25", "discounted_fee": "4.75",
+                "rebate": "0.475", "final_fee": "4.275", "total_cost": "4.275"})
+            scenario = period["fee_scenario"]
+            self.assertEqual(sum(Fraction(scenario[key]) for key in ("aster_discount", "rebate", "final_fee")), 5)
+
+    def test_fee_scenario_retains_signed_spread_without_adding_slippage_again(self):
+        self.save(batch(buy="99.5", sell="100.5"))
+        result = self.report()["daily"]
+        self.assertEqual(result["total_cost"], "-1.95")
+        self.assertEqual(result["fee_scenario"]["final_fee"], "0.04275")
+        self.assertEqual(result["fee_scenario"]["total_cost"], "-1.95725")
+
+    def test_fee_scenario_zero_and_partial_remain_distinct(self):
+        empty = self.report()["daily"]
+        self.assertTrue(empty["complete"])
+        for field in ("aster_discount", "discounted_fee", "rebate", "final_fee", "total_cost"):
+            self.assertEqual(empty["fee_scenario"][field], "0")
+        row = batch()
+        row["legs"][1]["receipt"] = None
+        partial = self.report(pending=row)["daily"]
+        self.assertFalse(partial["complete"])
+        self.assertEqual(partial["missing_count"], 1)
+        self.assertEqual(partial["fee_scenario"]["final_fee"], "0.021481875")
+
     def test_fraction_calculations_ignore_ambient_decimal_precision(self):
         row = batch(quantity="0.123456789123456789", buy="100.123456789", sell="99.987654321")
         self.save(row)
@@ -79,6 +112,9 @@ class PairCostTests(TestCase):
             result = self.report()["daily"]
         quotes = [Fraction(leg["receipt"]["cumQuote"]) for leg in row["legs"]]
         self.assertEqual(result["total_cost"], pair_cost.number(sum(quotes) / 8000 + quotes[0] - quotes[1]))
+        scenario_fee = sum(quotes) * Fraction(171, 1600000)
+        self.assertEqual(result["fee_scenario"]["final_fee"], pair_cost.number(scenario_fee))
+        self.assertEqual(result["fee_scenario"]["total_cost"], pair_cost.number(scenario_fee + quotes[0] - quotes[1]))
 
     def test_repair_fills_contribute_cost_without_inventing_a_repair_slippage_quote(self):
         row = batch()

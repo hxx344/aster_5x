@@ -115,7 +115,7 @@ function preview(changes = {}) {
   };
 }
 
-test('only paused ordinary opening batches allow the recovery entry', () => {
+test('ordinary openings retain recovery access while incomplete cycles and other phases stay blocked', () => {
   assert.equal(pairOrderRecoveryBlock(pair), '');
   assert.match(pairOrderRecoveryBlock({ ...pair, enabled: true }), /暂停/);
   for (const pending of [
@@ -141,6 +141,114 @@ test('only paused ordinary opening batches allow the recovery entry', () => {
     '',
     'server preview must report the detailed transfer conflict',
   );
+});
+
+function unknownCyclePair() {
+  return {
+    ...pair,
+    state: {
+      owned: { LONG: '0.0100', SHORT: '0.0200' },
+      progress: {
+        phase: 'waiting_open',
+        baseline: { LONG: '0.01', SHORT: '0.02' },
+        quantities: { LONG: '0', SHORT: '0.000' },
+      },
+      pending: {
+        ...pair.state.pending,
+        kind: 'cycle',
+        before: { LONG: '00.010', SHORT: '0.020' },
+        legs: ['long', 'short'].map((key) => ({
+          key,
+          receipt: null,
+          dispatch: 'sending',
+          error: '旧版错误：-5018',
+        })),
+        repairs: [],
+        repair_attempts: 0,
+      },
+    },
+  };
+}
+
+test('paused cycle openings with two unknown receipts allow manual review but never local skip', () => {
+  const cycle = unknownCyclePair();
+  assert.equal(pairOrderRecoveryBlock(cycle), '');
+  assert.equal(pairOrderRecoveryReviewBlock(preview(), cycle, 1001), '');
+  assert.match(pairOrderRecoverySkipBlock(cycle), /仅普通开仓/);
+  assert.match(pairOrderRecoveryBlock({ ...cycle, enabled: true }), /暂停/);
+  cycle.state.pending.legs[0].error = '网络超时，提交结果未知';
+  delete cycle.state.pending.legs[1].error;
+  assert.equal(
+    pairOrderRecoveryBlock(cycle),
+    '',
+    'error text neither proves a rejection nor controls manual review access',
+  );
+});
+
+test('cycle recovery requires untouched opening state and strictly unknown dispatched legs', () => {
+  const changes = [
+    (cycle) => (cycle.state.pending.phase = 'close'),
+    (cycle) => (cycle.state.progress.phase = 'holding'),
+    (cycle) => (cycle.state.progress = null),
+    (cycle) => delete cycle.state.progress.quantities.SHORT,
+    (cycle) => (cycle.state.progress.quantities.EXTRA = '0'),
+    (cycle) => (cycle.state.progress.quantities.LONG = '0.0000000000000001'),
+    (cycle) => (cycle.state.progress.quantities.SHORT = 'NaN'),
+    (cycle) => (cycle.state.progress.quantities.LONG = '1e-400'),
+    (cycle) => (cycle.state.progress.quantities.LONG = 0),
+    (cycle) => (cycle.state.owned = undefined),
+    (cycle) => delete cycle.state.progress.baseline.LONG,
+    (cycle) => (cycle.state.pending.before.LONG = '0.02'),
+    (cycle) => (cycle.state.pending.before.SHORT = 'NaN'),
+    (cycle) => (cycle.state.progress.baseline.LONG = 'Infinity'),
+    (cycle) => (cycle.state.pending.legs = []),
+    (cycle) => (cycle.state.pending.legs[1].key = 'long'),
+    (cycle) => (cycle.state.pending.legs[0].dispatch = 'prepared'),
+    (cycle) => (cycle.state.pending.legs[0].dispatch = undefined),
+    (cycle) => (cycle.state.pending.legs[1].receipt = undefined),
+    (cycle) => (cycle.state.pending.legs[0].receipt = {}),
+    (cycle) => (cycle.state.pending.legs[0].receipt = { status: 'NEW' }),
+    (cycle) => (cycle.state.pending.legs[1].receipt = { status: 'FILLED' }),
+    (cycle) => (cycle.state.pending.legs[1].receipt = { status: 'REJECTED' }),
+    (cycle) => (cycle.state.pending.repairs = undefined),
+    (cycle) => (cycle.state.pending.repairs = [{ receipt: null }]),
+    (cycle) => (cycle.state.pending.repair_attempts = 1),
+    (cycle) => (cycle.state.pending.repair_attempts = '0'),
+    (cycle) => delete cycle.state.pending.repair_attempts,
+  ];
+  for (const change of changes) {
+    const cycle = unknownCyclePair();
+    change(cycle);
+    assert.notEqual(pairOrderRecoveryBlock(cycle), '', String(change));
+    assert.notEqual(pairOrderRecoverySkipBlock(cycle), '', String(change));
+    assert.notEqual(
+      pairOrderRecoveryReviewBlock(preview(), cycle, 1001),
+      '',
+      'a changed cycle state must also invalidate archive confirmation',
+    );
+  }
+});
+
+test('cycle baseline comparison preserves decimal precision without numeric rounding or coercion', () => {
+  for (const value of [
+    '9007199254740993.123456789123456789',
+    '0.0000000000000000000000000000000000000001',
+  ]) {
+    const cycle = unknownCyclePair();
+    cycle.state.pending.before.LONG = value;
+    cycle.state.owned.LONG = value;
+    cycle.state.progress.baseline.LONG = `${value}0`;
+    assert.equal(pairOrderRecoveryBlock(cycle), '');
+    cycle.state.progress.baseline.LONG = `${value}1`;
+    assert.notEqual(pairOrderRecoveryBlock(cycle), '');
+  }
+  for (const value of ['NaN', 'Infinity', '-0', '0\n', '', ' 0', 0, null]) {
+    const cycle = unknownCyclePair();
+    cycle.state.pending.before.LONG = value;
+    cycle.state.owned.LONG = value;
+    cycle.state.progress.baseline.LONG = value;
+    assert.notEqual(pairOrderRecoveryBlock(cycle), '', String(value));
+  }
 });
 
 function checkResult(changes = {}) {

@@ -1,4 +1,4 @@
-"""Explicit review of unresolved ordinary opens; never infer fills from positions."""
+"""Explicit review of unresolved opens; never infer fills from positions."""
 from contextlib import ExitStack
 from copy import deepcopy
 from fractions import Fraction
@@ -172,16 +172,18 @@ class PairOrderRecovery:
         return {"pair": pair, "state": value, "margin": margin, "accounts": accounts}
 
     @staticmethod
-    def _eligible(pair, state, margin, *, archive=True, background=False):
+    def _eligible(pair, state, margin, *, archive=True, background=False, allow_cycle_unknown=False):
         from .pairing import has_cycle_quantity
         if pair.get("enabled") is not False and not background:
             raise TradingError("请先暂停配对组，再核对遗留订单与持仓")
         if not isinstance(state, dict) or not isinstance(margin, dict):
             raise TradingError("配对或划转记录无效，不能人工归档")
         pending = state.get("pending")
-        if (not isinstance(pending, dict) or pending.get("kind") != "ordinary" or pending.get("phase") != "open"
+        kinds = {"ordinary", "cycle"} if allow_cycle_unknown else {"ordinary"}
+        if (not isinstance(pending, dict) or pending.get("kind") not in kinds or pending.get("phase") != "open"
                 or pending.get("symbol") != SYMBOL):
-            raise TradingError("人工归档仅支持普通开仓未决批次；循环、减仓和杠杆调整须继续原恢复流程")
+            raise TradingError("此恢复入口仅支持符合条件的开仓未决批次；减仓和杠杆调整须继续原恢复流程")
+        cycle_unknown = pending["kind"] == "cycle"
         progress = state.get("progress")
         if (not isinstance(progress, dict) or not isinstance(progress.get("quantities"), dict)
                 or set(progress["quantities"]) != {"LONG", "SHORT"}):
@@ -193,6 +195,13 @@ class PairOrderRecovery:
                 or margin.get("pending") is not None
                 or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
             raise TradingError("仍有补偿减仓、循环新增仓位或未决划转，不能人工归档")
+        # Only explicit missing-order review may archive an unstarted cycle.
+        # Keep ordinary position adoption, skip and start recovery unchanged.
+        if cycle_unknown and (progress.get("phase") != "waiting_open"
+                or pending["repairs"] or pending["repair_attempts"]
+                or not isinstance(progress.get("baseline"), dict)
+                or set(progress["baseline"]) != {"LONG", "SHORT"}):
+            raise TradingError("循环批次仅支持尚无新增仓位和补偿记录的未知开仓；其余须继续原恢复流程")
         created = pending.get("created_at")
         if type(created) not in (int, float) or not math.isfinite(created) or created <= 0:
             raise TradingError("原批次缺少有效创建时间，不能核对历史订单")
@@ -218,6 +227,9 @@ class PairOrderRecovery:
         for leg in legs:
             side = leg["key"].upper()
             label = "A · 只多" if side == "LONG" else "B · 只空"
+            if cycle_unknown and ("receipt" not in leg or leg["receipt"] is not None
+                    or leg.get("dispatch") != "sending"):
+                raise TradingError("循环开仓仅支持两笔原订单均未知的人工核对；已知回执须继续原恢复流程")
             order = leg.get("order")
             if not isinstance(order, dict):
                 raise TradingError(f"{label}：原委托记录缺失，无法核对")
@@ -248,6 +260,8 @@ class PairOrderRecovery:
             target = positive((pending.get("target") or {}).get(side), True)
             if before != owned or Fraction(target) != Fraction(before) + Fraction(qty):
                 raise TradingError("原批次基线或目标与底仓记录不一致，不能人工归档")
+            if cycle_unknown and positive(progress["baseline"][side], True) != before:
+                raise TradingError("循环基线与本批前底仓不一致，不能人工归档")
         # Budget-rejected repair records do not consume an attempt; legitimate
         # journals may therefore contain more than two legs per attempt.
         for leg in pending["repairs"]:
@@ -268,7 +282,7 @@ class PairOrderRecovery:
         return pending
 
     def check(self, pair_id, *, source="paused_manual_check"):
-        """Run the ordinary recovery state machine without sending repair orders."""
+        """Review eligible opens without sending repair orders or assuming fills."""
         from .pair_execution import PairTrader, PairPositionError
         from .pair_planning import PairRecoveryConflict
         if source not in {"paused_manual_check", "paused_start"}:
@@ -281,7 +295,7 @@ class PairOrderRecovery:
         margin = self.store.get("pair_margin:" + pair_id, {})
         if isinstance(state, dict) and state.get("pending") is None:
             raise TradingError("当前没有待核对批次，可能已由后台完成；请刷新配对组查看结果")
-        pending = self._eligible(pair, state, margin, archive=False)
+        pending = self._eligible(pair, state, margin, archive=False, allow_cycle_unknown=source == "paused_manual_check")
         # Keep the queried batch even if _finish removes it from runtime.
         original = pending
         self.manager._members(pair)
@@ -310,7 +324,8 @@ class PairOrderRecovery:
         archive_available, archive_reason = False, "本批已完成核对，无需人工归档"
         if current:
             try:
-                self._eligible(pair, state, self.store.get("pair_margin:" + pair_id, {}))
+                self._eligible(pair, state, self.store.get("pair_margin:" + pair_id, {}),
+                               allow_cycle_unknown=source == "paused_manual_check")
                 archive_available, archive_reason = True, "两笔原订单仍无回执；可继续检查历史订单、实际底仓与挂单是否满足人工归档条件"
             except TradingError as exc:
                 archive_reason = str(exc)
@@ -499,7 +514,7 @@ class PairOrderRecovery:
         if pair is None:
             raise TradingError("配对组不存在")
         state, margin = self.store.get("pair_runtime:" + pair_id, {}), self.store.get("pair_margin:" + pair_id, {})
-        pending = self._eligible(pair, state, margin)
+        pending = self._eligible(pair, state, margin, allow_cycle_unknown=True)
         accounts = self.manager._members(pair)
         _, brokers, identities = PairTrader(self.engine)._members(pair)
         if pending.get("identities") != identities or state.get("identities") != identities:
@@ -613,7 +628,8 @@ class PairOrderRecovery:
             raise TradingError("待观察的人工归档批次已达上限，请先处理原订单记录")
         watches.append({"id": pending["id"], "created_at": pending["created_at"], "identities": read["identities"],
                         "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])} for leg in pending["legs"]]})
-        message = "已人工归档未取得回执的普通开仓批次，底仓保留；配对组仍暂停，可点击启动重新核验"
+        kind = "循环" if pending["kind"] == "cycle" else "普通"
+        message = f"已人工归档未取得回执的{kind}开仓批次，底仓保留；配对组仍暂停，可点击启动重新核验"
         audit = {"status": "manual_archived_unresolved", "pending": deepcopy(pending), "confirmed_at": time.time(),
                  "preview": deepcopy(preview["review"]), "confirmation": read["evidence"], "actual": read["actual"]}
         runtime.update(pending=None, phase="paused", reason=message, recovery_watch={"batches": watches},

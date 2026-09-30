@@ -165,7 +165,7 @@ class PairOrderRecoveryTests(unittest.TestCase):
             "young": lambda s: s["pending"].update(created_at=time.time() - 30),
             "too_old": lambda s: s["pending"].update(created_at=time.time() - 7 * 86400),
             "future": lambda s: s["pending"].update(created_at=time.time() + 10),
-            "cycle": lambda s: s["pending"].update(kind="cycle"),
+            "cycle_holding": lambda s: (s["pending"].update(kind="cycle"), s["progress"].update(phase="holding")),
             "close": lambda s: s["pending"].update(phase="close"),
             "repairs": lambda s: s["pending"].update(repairs=[deepcopy(s["pending"]["legs"][0])]),
             "cycle_increment": lambda s: s["progress"]["quantities"].update(LONG="0.1"),

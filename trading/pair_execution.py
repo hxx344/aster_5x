@@ -448,6 +448,22 @@ class PairTrader:
         return {**order, "clientOrderId": order["newClientOrderId"], "status": "REJECTED", "executedQty": "0",
                 "avgPrice": "0", "reject_reason": reason, "local_not_sent": local}
 
+    @staticmethod
+    def _submit_evidence(kind, *, error=None, code=None):
+        # Persist classification inputs, never exception reprs, response bodies
+        # or signed request data. Message text cannot prove a request's outcome.
+        evidence = {"kind": kind}
+        code = error.code if error is not None else code
+        if type(code) is int:
+            evidence["code"] = code
+        if error is not None:
+            status, delay = error.http_status, error.retry_after
+            if type(status) is int and 100 <= status <= 599:
+                evidence["http_status"] = status
+            if type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
+                evidence["retry_after"] = delay
+        return evidence
+
     def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False):
         pending = state.get("pending") or {}
         observe = pending.get("kind") == "cycle" and legs is pending.get("legs")
@@ -461,10 +477,11 @@ class PairTrader:
             leg["dispatch"] = "sending"
             # Persist before HTTP: only older records may use the narrow legacy
             # rejection recovery below, never a new ambiguous submission.
-            leg["submit_evidence_version"] = 1
+            leg["submit_evidence_version"] = 2
         self._save(pair, state)
         def send(leg):
             order, broker = leg["order"], brokers[leg["key"]]
+            evidence = {"kind": "unknown"}
             try:
                 if guards:
                     try:
@@ -475,28 +492,36 @@ class PairTrader:
                 with budget, pair_quality.observe(observations.get(leg["key"]), quality_clocks, observe):
                     result = (broker.submit([order], timeout=3) if isinstance(broker, LiveBroker)
                               else broker.submit([order]))
+                evidence = {"kind": "invalid"}
                 if not isinstance(result, list) or len(result) != 1:
                     raise TradingError("单腿订单回执无效，等待查询")
                 row = result[0]
-                if isinstance(row, dict) and row.get("code") in ORDER_REJECTION_CODES:
+                if isinstance(row, dict) and type(row.get("code")) is int and row["code"] < 0:
                     code = row["code"]
-                    reason = exchange_reason(row.get("msg")) or MISSING_REJECT_REASON
-                    row = {**self._absent(order, f"Aster 拒绝订单（代码 {code}）：{reason}", local=False), "reject_code": code}
+                    evidence = self._submit_evidence("error_response", code=code)
+                    if code in ORDER_REJECTION_CODES:
+                        reason = exchange_reason(row.get("msg")) or MISSING_REJECT_REASON
+                        row = {**self._absent(order, f"Aster 拒绝订单（代码 {code}）：{reason}", local=False), "reject_code": code}
                 Executor.validate_receipt(order, row)
-                return row, None
+                return row, None, evidence if evidence["kind"] == "error_response" else {"kind": "receipt"}
             except RequestNotSent as exc:
-                return {**self._absent(order, str(exc)), "retry_after": max(1, getattr(exc, "retry_after", 0))}, None
+                evidence = self._submit_evidence("request_not_sent", error=exc)
+                return {**self._absent(order, str(exc)), "retry_after": max(1, evidence.get("retry_after", 0))}, None, evidence
             except ExchangeError as exc:
-                if not isinstance(exc, AmbiguousOrder) and exc.code in ORDER_REJECTION_CODES:
-                    return {**self._absent(order, str(exc), local=False), "reject_code": exc.code}, None
-                return None, str(exc)
+                evidence = self._submit_evidence("ambiguous" if isinstance(exc, AmbiguousOrder) else "exchange_error", error=exc)
+                status = evidence.get("http_status")
+                if (evidence["kind"] == "exchange_error" and evidence.get("code") in ORDER_REJECTION_CODES
+                        and status != 408 and not (status is not None and status >= 500)):
+                    return {**self._absent(order, str(exc), local=False), "reject_code": exc.code}, None, evidence
+                return None, str(exc), evidence
             except Exception as exc:
-                return None, str(exc) if isinstance(exc, TradingError) else "订单结果未知，继续按客户端订单号核对"
+                return None, str(exc) if isinstance(exc, TradingError) else "订单结果未知，继续按客户端订单号核对", evidence
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
             futures = [(leg, pool.submit(send, leg)) for leg in legs]
             for index, (leg, future) in enumerate(futures):
-                receipt, error = future.result()
+                receipt, error, evidence = future.result()
                 leg["receipt"], leg["error"] = receipt, error
+                leg["submit_evidence"] = evidence
                 leg["submit_error"] = error or (receipt or {}).get("reject_reason")
                 if observe and "execution_timing" in observations[leg["key"]]:
                     leg["execution_timing"] = observations[leg["key"]]["execution_timing"]

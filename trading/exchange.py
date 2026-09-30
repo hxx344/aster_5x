@@ -76,8 +76,9 @@ LEVERAGE_REJECTION_CODES = frozenset({
 # return HTML or no body, so the status itself must survive JSON parsing.
 LEVERAGE_REJECTION_HTTP_STATUSES = frozenset({403, 418, 429})
 # Order POST rejections include NEW_ORDER_REJECTED and Aster's symbol notional
-# cap (-2029). Neither is used to classify a leverage update.
-ORDER_REJECTION_CODES = LEVERAGE_REJECTION_CODES | {-2010, -2029}
+# cap (-2029 and the observed exchange rejection -5018). These order codes do
+# not classify leverage updates or override an ambiguous transport outcome.
+ORDER_REJECTION_CODES = LEVERAGE_REJECTION_CODES | {-2010, -2029, -5018}
 
 
 class BudgetWait(RequestNotSent):

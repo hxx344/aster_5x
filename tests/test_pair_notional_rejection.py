@@ -100,7 +100,7 @@ class PairNotionalRejectionTests(TestCase):
         with patch.object(self.brokers["long"], "submit", side_effect=AmbiguousOrder(ORIGINAL_REJECTION, code=-2029)), \
                 patch.object(self.brokers["long"], "query", side_effect=ExchangeError("not found", code=-2013)):
             state = self.tick()
-            self.assertEqual(state["pending"]["legs"][0]["submit_evidence_version"], 1)
+            self.assertEqual(state["pending"]["legs"][0]["submit_evidence_version"], 2)
             self.trader = PairTrader(self.engine)
             with patch.object(self.brokers["short"], "submit", side_effect=AssertionError("do not reduce unknown")):
                 state = self.tick()

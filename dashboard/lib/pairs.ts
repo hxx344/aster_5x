@@ -31,6 +31,7 @@ export type PairTransfer = {
   confirmed_at?: number;
   acknowledged_at?: number;
   refreshed_at?: number;
+  skipped_at?: number;
   transaction_id?: string;
 };
 export type PairMarginState = {
@@ -512,6 +513,7 @@ export const PAIR_PHASES: Record<string, string> = {
   refreshed: '交易所回执确认，余额已刷新',
   paper_confirmed: '模拟划转已确认',
   rejected: '划转被拒绝',
+  skipped: '核对已跳过 · 结果未确认',
   margin_wait: '保证金检查阻止新增',
   submitting: '并行提交两侧市价单',
   leverage: '共同升杠杆核对',

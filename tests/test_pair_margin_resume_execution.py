@@ -1,4 +1,4 @@
-"""Reserved trading after unknown transfers, using offline live brokers."""
+"""Unknown-transfer skipping and legacy pending protection with offline brokers."""
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -29,6 +29,9 @@ class PairMarginResumeExecutionTests(TestCase):
         self.engine.capacities = lambda symbol: {5: dec(1000000), 10: dec(0), 20: dec(0)}
 
     def unknown(self, amount="20000", *, ready=True):
+        # Model an existing baseline during its bounded retry window. Due
+        # unknowns are now skipped after new reads; this protects the window
+        # before that durable transition, including failures and old journals.
         pending = self.pending("unknown", transaction=False)
         pending["amount"] = amount
         if ready:
@@ -106,7 +109,7 @@ class PairMarginResumeExecutionTests(TestCase):
         self.assertTrue(journal["retry_without_blocking"])
         self.assertTrue(all(path == ORDER for _, path, _ in self.posts()))
 
-    def test_unknown_without_baseline_refreshes_both_accounts_and_really_opens(self):
+    def test_unknown_without_baseline_is_skipped_after_fresh_reads_and_really_opens(self):
         original = self.unknown(ready=False)
         self.store.put("pair_margin:gold", {"pending": original, "next_check_at": 0})
         with ExitStack() as stack:
@@ -115,18 +118,24 @@ class PairMarginResumeExecutionTests(TestCase):
             transfer = stack.enter_context(patch("trading.margin_balance.TransferAPI",
                 side_effect=AssertionError("an unknown transfer must never be replayed")))
             state = self.tick()
-            self.assert_opened_pair(state)
+            self.assertEqual(state["phase"], "margin_wait", state)
+            self.assertEqual(self.posts(), [])
+            self.assert_flat()
             self.assertTrue(all(read.call_count == 1 for read in baseline_reads))
             self.assertTrue(all(read.call_args.kwargs["fresh_modes"] for read in baseline_reads))
-            resumed = self.store.get("pair_margin:gold")["pending"]
-            self.assertEqual({key: value for key, value in resumed.items() if key != "trading_baseline_at"}, original)
-            self.assertEqual(resumed["trading_baseline_at"], self.wall)
-            self.assertFalse(state["margin"]["blocks_trading"])
-            self.assertTrue(state["margin"]["trading_resume_allowed"])
-            self.tick()
+            journal = self.store.get("pair_margin:gold")
+            self.assertIsNone(journal["pending"])
+            self.assertEqual(journal["last_transfer"]["status"], "skipped")
+            self.assertEqual(journal["last_transfer"]["request_id"], original["request_id"])
+            self.assertEqual(journal["last_transfer"]["skipped_at"], self.wall)
+            self.assertTrue(state["margin"]["blocks_trading"])
+            state = self.tick()
+            self.assert_opened_pair(state)
             transfer.assert_not_called()
             self.assertTrue(all(read.call_count == 1 for read in baseline_reads))
-        self.assert_original_transfer_retained(resumed)
+        self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
+        self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"], journal["last_transfer"])
+        self.assertTrue(all(path == ORDER for _, path, _ in self.posts()))
 
     def test_hot_replacement_replans_with_the_same_unknown_debit_reservation(self):
         original = self.unknown("23000")

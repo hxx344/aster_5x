@@ -114,7 +114,7 @@ def _public_record(record):
     if not isinstance(record, dict) or not record:
         return None
     return {key: record[key] for key in ("request_id", "source", "destination", "amount", "created_at",
-        "status", "confirmed_at", "acknowledged_at", "refreshed_at", "refresh_source", "transaction_id", "income_type") if key in record}
+        "status", "confirmed_at", "acknowledged_at", "refreshed_at", "refresh_source", "skipped_at", "transaction_id", "income_type") if key in record}
 
 
 def _display_amount(value):
@@ -212,33 +212,63 @@ class MarginBalancer:
         return result
 
     def _resume_unknown(self, pair, members, state, config):
+        """Abandon reconciliation after a new read, without claiming settlement."""
         pending = state["pending"]
-        if not self.resume_ready(state):
-            symbols = [pair.get("symbol", "XAUUSD1")]
-            brokers = {side: self.engine.broker(member) for side, member in members.items()}
-            self._require_budget(members, {side: broker.margin_snapshot_weight(symbols, fresh_modes=True)
-                for side, broker in brokers.items()}, reconciliation=True)
-            snapshots = {}
-            for side, broker in brokers.items():
-                with getattr(broker, "reconciliation_budget", nullcontext)():
-                    snapshots[side] = broker.margin_snapshot(symbols, fresh_modes=True)
-                snapshots[side].require_fresh()
-                if snapshots[side].timestamp < pending["created_at"]:
-                    raise TradingError("保证金恢复查询返回划转前快照，等待新余额")
-            with ExitStack() as locks:
-                for side in sorted(brokers, key=lambda value: members[value]["id"]):
-                    locks.enter_context(brokers[side]._snapshot_lock)
+        saved_pair = self.store.pair(pair["id"])
+        if saved_pair is not None and saved_pair != pair:
+            raise TradingError("配对组配置已变化，等待重新读取余额")
+        symbols = [pair.get("symbol", "XAUUSD1")]
+        brokers = {side: self.engine.broker(member) for side, member in members.items()}
+        self._require_budget(members, {side: broker.margin_snapshot_weight(symbols, fresh_modes=True)
+            for side, broker in brokers.items()}, reconciliation=True)
+        started = time.time()
+        snapshots = {}
+        for side, broker in brokers.items():
+            with getattr(broker, "reconciliation_budget", nullcontext)():
+                snapshots[side] = broker.margin_snapshot(symbols, fresh_modes=True)
+            snapshots[side].require_fresh()
+            if snapshots[side].timestamp < max(started, pending["created_at"]):
+                raise TradingError("跳过旧划转前必须重新取得两侧余额，等待新快照")
+        with ExitStack() as locks:
+            for side in sorted(brokers, key=lambda value: members[value]["id"]):
+                locks.enter_context(brokers[side]._snapshot_lock)
+            self._verify_pending_identity(pair, members, pending)
+            self._check_snapshots(pair, snapshots)
+            done = {**pending, "status": "skipped", "refresh_source": "rest"}
+            updated = {**state, "pending": None, "last_transfer": done}
+            for field in ("api_notice", "blocked_reason", "retry_without_blocking"):
+                updated.pop(field, None)
+            archive = {"pair_id": pair["id"], "original": pending, "result": done,
+                "baseline": {side: {"account_id": members[side]["id"], "timestamp": value.timestamp,
+                    **{field: wire(getattr(value, field)) for field in ("available", "equity", "wallet")}}
+                    for side, value in snapshots.items()}}
+            key = "pair_margin:" + pair["id"]
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                current_pair = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
+                if (row is None or json.loads(row[0]) != state
+                        or (json.loads(current_pair[0]) if current_pair else None) != saved_pair):
+                    raise TradingError("划转记录或配对配置已变化，保留原请求并重新检查")
                 for side, broker in brokers.items():
+                    account = db.execute("SELECT data FROM accounts WHERE id=?", (members[side]["id"],)).fetchone()
+                    if account is None or self.store.account_defaults(json.loads(account[0])) != members[side]:
+                        raise TradingError("划转成员配置已变化，等待重新读取余额")
                     broker.require_snapshot_current(snapshots[side])
-                self._check_snapshots(pair, snapshots)
-                pending["trading_baseline_at"] = min(value.timestamp for value in snapshots.values())
-                self._record_success(pair, state)
-                self.refreshed_snapshots = snapshots
-            self._invalidate(members)
-        elif state.get("blocked_reason") or state.get("api_notice"):
-            self._record_success(pair, state)
-        return self._view(state, config, "unknown",
-            f"划转结果仍未知；已读取新的保证金基线，交易可继续按最新余额检查。转出侧额外预留 {pending['amount']} USD1；保留原请求，只读核对，不重发或发起新划转")
+                now = time.time()
+                done.update(skipped_at=now, refreshed_at=now)
+                updated.update(
+                    cooldown_until=max(state.get("cooldown_until", 0), now + config["cooldown_seconds"]),
+                    next_check_at=max(state.get("next_check_at", 0), now + config["check_interval_seconds"]))
+                db.execute("INSERT INTO kv(key,data) VALUES (?,?)",
+                    ("pair_margin_skipped:" + pair["id"] + ":" + pending["request_id"], json.dumps(archive)))
+                db.execute("UPDATE kv SET data=? WHERE key=?", (json.dumps(updated), key))
+            state.clear()
+            state.update(updated)
+            self.refreshed_snapshots = snapshots
+        self._invalidate(members)
+        return self._view(state, config, "skipped",
+            "旧划转核对已跳过，两侧余额已重新读取；按新余额继续运行，不再额外预留旧金额。原请求已归档，未标记成功且不会重发", blocks=True)
 
     def _require_budget(self, members, weights, *, reconciliation=False):
         """Admit a complete read group before spending on its first account."""
@@ -500,8 +530,8 @@ class MarginBalancer:
                 return view("blocked", "保证金划转待核对记录无效，停止新开仓和新划转；请人工核对服务器日志与交易所划转记录", blocks=True)
             status = "unknown" if pending["status"] == "submitting" else pending["status"]
             if MarginBalancer.resume_ready(journal) and (not journal.get("blocked_reason") or journal.get("retry_without_blocking")):
-                return view("unknown", f"划转仍待核对，交易按最新余额继续检查；转出侧额外预留 {pending['amount']} USD1，不重发或新增划转")
-            reasons = {"unknown": "划转结果未知，保留原记录供只读核对；缺少交易编号时需人工核对交易所流水。停止新开仓和新划转，不会重发原请求",
+                return view("unknown", f"等待重新读取两侧余额后跳过旧划转；读取成功前仍预留 {pending['amount']} USD1，不重发原请求")
+            reasons = {"unknown": "划转结果未知，等待重新读取两侧余额后自动跳过旧核对；原请求会归档，不会重发或标记为成功",
                 "accepted": "划转请求已受理，系统继续查询两侧 USD1 流水；核实前不开始新开仓或新划转",
                 "acknowledged": "交易所已确认划转，系统继续读取两侧最新余额；刷新前不开始新开仓或新划转"}
             return view(status, journal.get("blocked_reason") or reasons[status], blocks=True)
@@ -525,7 +555,7 @@ class MarginBalancer:
                 and runtime_view.get("checked_at") == journal.get("checked_at")
                 and runtime_view.get("pending") is None
                 and runtime_view.get("last_transfer") == _public_record(journal.get("last_transfer"))
-                and runtime_view.get("status") in {"waiting", "confirmed", "acknowledged", "paper_confirmed", "rejected", "blocked"}
+                and runtime_view.get("status") in {"waiting", "confirmed", "acknowledged", "paper_confirmed", "rejected", "skipped", "blocked"}
                 and isinstance(runtime_view.get("reason"), str)):
             plan = runtime_view.get("plan")
             plan = {key: plan[key] for key in ("source", "destination", "amount") if key in plan} if isinstance(plan, dict) else None
@@ -553,9 +583,7 @@ class MarginBalancer:
             pending["status"] = "unknown"
             state["last_transfer"] = pending
             self.store.put("pair_margin:" + pair["id"], state)
-        if pending.get("status") == "unknown" and not pending.get("transaction_id"):
-            return self._resume_unknown(pair, members, state, config)
-        if pending.get("status") == "unknown" and not self.resume_ready(state):
+        if pending.get("status") == "unknown":
             return self._resume_unknown(pair, members, state, config)
         start = int(pending["created_at"] * 1000) // 1000 * 1000
         end = int((pending["created_at"] + 90) * 1000)
@@ -585,8 +613,6 @@ class MarginBalancer:
             matches.append(found)
         common = matches[0] & matches[1]
         if len(common) != 1 or any(len(values) != 1 for values in matches):
-            if pending["status"] == "unknown":
-                return self._resume_unknown(pair, members, state, config)
             return self._view(state, config, pending["status"], "系统继续只读查询两侧 USD1 划转流水，需交易编号相同、金额对应且均在核对时间范围内；确认前不开始新开仓或新划转")
         kind, txn = common.pop()
         done = {**pending, "status": "confirmed", "confirmed_at": time.time(), "transaction_id": txn, "income_type": kind}
@@ -744,7 +770,7 @@ class MarginBalancer:
                 if now < state.get("next_check_at", 0):
                     if self.resume_ready(state) and (not state.get("blocked_reason") or state.get("retry_without_blocking")):
                         return self._view(state, config, "unknown",
-                            f"未知划转保留核对，交易按新余额继续检查；转出侧额外预留 {pending['amount']} USD1，暂停新划转")
+                            f"等待重新读取两侧余额后跳过旧划转；读取成功前仍预留 {pending['amount']} USD1，不重发原请求")
                     return self._view(state, config, pending.get("status", "unknown"),
                         state.get("blocked_reason") or ("等待下一次划转只读核对" + _remaining_time(state["next_check_at"], now)
                         + "；保留原请求，期间不开始新开仓或新划转"))
@@ -1102,7 +1128,7 @@ class MarginBalancer:
             self.store.put(key, state)
             if pending["status"] == "acknowledged":
                 return self._view(state, config, "acknowledged", "交易所已确认划转，继续刷新两侧余额", blocks=True)
-            reason = {"unknown": "划转结果未知，停止新划转和新开仓；保留原记录供只读核对，不重发原请求",
+            reason = {"unknown": "划转结果未知，等待重新读取两侧余额后自动跳过旧核对；原请求会归档，不会重发或标记为成功",
                       "rejected": "划转请求明确未被接受，本次未划转；冷却结束后系统重新评估划转条件"}[pending["status"]]
             if state.get("api_notice"):
                 reason += "；" + state["api_notice"]["text"]

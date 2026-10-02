@@ -441,7 +441,7 @@ function PairDetail({
           </p>
           {!pair.enabled ? (
             <p className="muted">
-              启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未知划转完成新余额读取后可在预留转出金额的条件下启动；其他未决请求或循环仓位仍须先恢复。
+              启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未知划转重新读取两侧余额后自动归档跳过，不再额外预留旧金额；其他未决请求或循环仓位仍须先恢复。
             </p>
           ) : null}
         </div>
@@ -617,10 +617,13 @@ function PairDetail({
               {pairTransferStatus(margin.pending)}：
               <TransferSummary transfer={margin.pending} />
               {margin.trading_resume_allowed && !margin.blocks_trading
-                ? '。交易按新余额检查，并额外预留转出金额；原请求保留，不重发或新增划转。'
+                ? '。等待重新读取两侧余额后自动跳过；读取成功前仍预留旧金额，原请求不重发。'
                 : margin.pending.status === 'acknowledged'
                   ? '。继续读取两侧余额，刷新完成前不重新划转或开始新开仓。'
-                  : '。只读核对，缺少可靠结果时保留待确认状态，不重新划转或开始新开仓。'}
+                  : margin.pending.status === 'unknown' ||
+                      margin.pending.status === 'submitting'
+                    ? '。重新读取两侧余额后自动归档跳过，不再额外预留旧金额；原请求不重发，也不标记成功。'
+                    : '。只读核对，缺少可靠结果时保留待确认状态，不重新划转或开始新开仓。'}
             </p>
           ) : null}
         </div>
@@ -634,7 +637,8 @@ function PairDetail({
                   <small>
                     {pairTransferStatus(margin.last_transfer)} ·{' '}
                     {clock(
-                      margin.last_transfer.refreshed_at ??
+                      margin.last_transfer.skipped_at ??
+                        margin.last_transfer.refreshed_at ??
                         margin.last_transfer.confirmed_at ??
                         margin.last_transfer.acknowledged_at ??
                         margin.last_transfer.created_at,

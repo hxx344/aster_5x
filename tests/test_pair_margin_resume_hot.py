@@ -156,7 +156,7 @@ class PairMarginResumeHotTests(TestCase):
             self.assertIs(broker.cycle_stream, private_stream)
         self.assertEqual(self.posts(), [])
 
-    def test_new_baseline_wakes_accounts_without_erasing_existing_hot_backoff(self):
+    def test_skipping_unknown_wakes_accounts_without_erasing_existing_hot_backoff(self):
         self.unknown(ready=False)
         for side in self.brokers:
             # Attach the engine's real cache listener while recovery still owns
@@ -169,9 +169,12 @@ class PairMarginResumeHotTests(TestCase):
         journal = self.store.get("pair_margin:gold")
         journal["next_check_at"] = 0
         self.store.put("pair_margin:gold", journal)
-        self.tick()  # Real balance reads establish the baseline and revoke hot data.
-        resumed = self.store.get("pair_margin:gold")["pending"]
-        self.assertEqual(resumed["trading_baseline_at"], self.wall)
+        self.tick()  # Fresh balances allow a durable skip and revoke hot data.
+        journal = self.store.get("pair_margin:gold")
+        self.assertIsNone(journal["pending"])
+        skipped = journal["last_transfer"]
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertEqual(skipped["skipped_at"], self.wall)
         self.assertEqual(self.posts(), [])
         for side in self.brokers:
             self.assertTrue(self.engine.work(side).hot_wake)
@@ -187,5 +190,6 @@ class PairMarginResumeHotTests(TestCase):
                 self.assertEqual(self.engine.poll_cycle_hot_data(side), CYCLE_HOT_POLL_INTERVAL)
                 refresh.assert_called_once()
             broker.cycle_hot_snapshot([SYMBOL]).require_fresh()
-        self.assertEqual(self.store.get("pair_margin:gold")["pending"], resumed)
+        self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
+        self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"], skipped)
         self.assertEqual(self.posts(), [])

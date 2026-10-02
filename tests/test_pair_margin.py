@@ -346,12 +346,12 @@ class PairMarginTests(unittest.TestCase):
                 self.refresh_error = None
                 with patch.object(self.balancer, "_may_need_transfer", side_effect=AssertionError("pending was filtered")):
                     result = self.balancer.tick(self.pair, {"long": snapshot(2000), "short": snapshot(2000)})
-                self.assertEqual(result["status"], status, result)
+                self.assertEqual(result["status"], "skipped" if status == "unknown" else status, result)
                 self.assertEqual(len(self.transfers), 1)
                 if status == "unknown":
-                    self.assertIsNotNone(result["pending"])
-                    self.assertFalse(result["blocks_trading"])
-                    self.assertTrue(result["trading_resume_allowed"])
+                    self.assertIsNone(result["pending"])
+                    self.assertTrue(result["blocks_trading"])
+                    self.assertEqual(result["last_transfer"]["status"], "skipped")
                 else:
                     self.assertIsNone(result["pending"])
                     self.assertEqual(self.refreshed[-2:], ["long", "short"])
@@ -557,7 +557,7 @@ class PairMarginTests(unittest.TestCase):
         self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], "unknown")
         self.assertEqual(self.refreshed, [])
 
-    def test_unknown_survives_restart_and_disabled_mode_without_resubmit_or_balance_guess(self):
+    def test_unknown_is_skipped_after_restart_and_disabled_mode_without_resubmit_or_balance_guess(self):
         snapshots = self.live()
         self.response = AmbiguousOrder("remote secret")
         first = self.balancer.tick(self.pair, snapshots)
@@ -567,10 +567,12 @@ class PairMarginTests(unittest.TestCase):
         self.pair["enabled"] = False
         self.pair["margin"]["enabled"] = False
         second = MarginBalancer(self.engine).tick(self.pair, snapshots)
-        self.assertEqual(second["status"], "unknown")
-        self.assertFalse(second["blocks_trading"])
-        self.assertTrue(second["trading_resume_allowed"])
-        self.assertEqual(self.state()["pending"]["request_id"], first["pending"]["request_id"])
+        self.assertEqual(second["status"], "skipped")
+        self.assertTrue(second["blocks_trading"])
+        self.assertIsNone(self.state()["pending"])
+        self.assertEqual(second["last_transfer"]["request_id"], first["pending"]["request_id"])
+        self.assertEqual(second["last_transfer"]["status"], "skipped")
+        self.assertNotIn("confirmed_at", second["last_transfer"])
         self.assertEqual(len(self.transfers), 1)
         self.assertNotIn("remote secret", str(second))
 
@@ -607,10 +609,10 @@ class PairMarginTests(unittest.TestCase):
     def test_known_transaction_id_must_match(self):
         snapshots = self.live()
         self.response["tranId"] = "known"
-        self.legacy_pending(snapshots, status="unknown")
+        self.legacy_pending(snapshots, status="accepted")
         self.receipts(txn="other")
         self.ready()
-        self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], "unknown")
+        self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], "accepted")
         self.receipts(txn="known")
         self.ready()
         self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], "confirmed")
@@ -673,7 +675,9 @@ class PairMarginTests(unittest.TestCase):
         self.assertEqual(self.state()["pending"]["status"], "submitting")
         self.ready()
         result = MarginBalancer(self.engine).tick(self.pair, snapshots)
-        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["status"], "skipped")
+        self.assertIsNone(result["pending"])
+        self.assertEqual(result["last_transfer"]["status"], "skipped")
         self.assertEqual(len(self.transfers), 1)
 
     def test_corrupt_or_unreadable_journal_blocks_without_submission(self):

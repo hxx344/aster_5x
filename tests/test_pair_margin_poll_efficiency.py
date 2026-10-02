@@ -102,20 +102,23 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertEqual(self.budget.local_weight, 60)
         self.assert_read_only()
 
-    def test_paused_unknown_reads_new_baseline_once_and_never_guesses_confirmation(self):
+    def test_paused_unknown_reads_balances_once_then_skips_without_guessing_confirmation(self):
         self.pending("unknown", transaction=False)
         self.pair = self.store.save_pair({**self.pair, "enabled": False})
-        for _ in range(12):
+        for index in range(12):
             state = self.tick()
-            self.assertEqual(state["margin"]["status"], "unknown")
-            self.assertFalse(state["margin"]["blocks_trading"])
-            self.assertEqual(state["phase"], "paused")
+            self.assertEqual(state["margin"]["status"], "skipped" if index == 0 else "paused")
+            self.assertEqual(state["margin"]["blocks_trading"], index == 0)
+            self.assertEqual(state["phase"], "margin_wait" if index == 0 else "paused")
             self.advance(5)
         self.assertEqual(len(self.calls(ACCOUNT)), 2)
         self.assertEqual(self.calls(INCOME), [])
         self.assertIn("long", state["snapshots"])
         self.assert_read_only()
-        self.assertIsNotNone(self.store.get("pair_margin:gold")["pending"])
+        journal = self.store.get("pair_margin:gold")
+        self.assertIsNone(journal["pending"])
+        self.assertEqual(journal["last_transfer"]["status"], "skipped")
+        self.assertNotIn("confirmed_at", journal["last_transfer"])
 
     def test_reconciliation_completion_ends_turn_and_next_turn_reads_both_accounts(self):
         self.tick()  # Seed an ordinary negative observation that must be discarded.
@@ -275,14 +278,13 @@ class PairMarginPollEfficiencyTests(TestCase):
                 result = self.tick()
                 self.assertIsNone(result["pending"], result)
                 self.assertEqual(result["progress"]["completed_cycles"], 1, result)
-                self.assertEqual(result["margin"]["status"], status)
+                self.assertEqual(result["margin"]["status"], "skipped" if status == "unknown" else status)
                 for side, broker in self.paper.items():
                     self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)
                 stored = self.store.get("pair_margin:gold")["pending"]
-                if stored is not None:
-                    stored.pop("trading_baseline_at", None)
-                self.assertEqual(stored,
-                    None if status == "acknowledged" else record)
+                self.assertEqual(stored, record if status == "accepted" else None)
+                if status == "unknown":
+                    self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["request_id"], record["request_id"])
                 self.advance(5)
 
     def test_unknown_transfer_does_not_starve_pending_close_order_recovery(self):
@@ -306,6 +308,8 @@ class PairMarginPollEfficiencyTests(TestCase):
              patch.object(long, "query", side_effect=ExchangeError("not found yet", code=-2013)):
             result = self.tick()
         self.assertIsNotNone(result["pending"], result)
+        self.assertEqual(result["margin"]["status"], "skipped")
+        self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
         order_id = result["pending"]["legs"][0]["order"]["newClientOrderId"]
         self.advance(5)
         with patch.object(long, "query", wraps=long.query) as query, \
@@ -316,10 +320,12 @@ class PairMarginPollEfficiencyTests(TestCase):
         query.assert_called_once_with("XAUUSD1", order_id)
         self.assertIsNone(result["pending"], result)
         self.assertEqual(result["progress"]["completed_cycles"], 1)
-        self.assertEqual(result["margin"]["status"], "unknown")
-        stored = self.store.get("pair_margin:gold")["pending"]
-        self.assertIsNotNone(stored.pop("trading_baseline_at", None))
-        self.assertEqual(stored, transfer)
+        self.assertEqual(result["margin"]["status"], "waiting")
+        self.assertFalse(result["margin"]["blocks_trading"])
+        journal = self.store.get("pair_margin:gold")
+        self.assertIsNone(journal["pending"])
+        self.assertEqual(journal["last_transfer"]["status"], "skipped")
+        self.assertEqual(journal["last_transfer"]["request_id"], transfer["request_id"])
         for side, broker in self.paper.items():
             self.assertEqual(len(broker.state["orders"]), 1)
             self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)

@@ -145,3 +145,19 @@ class PairMarginSkipTests(TestCase):
         self.assertEqual(self.state()["pending"]["transaction_id"], "late-receipt")
         self.assertIsNone(self.store.get(self.archive_key))
         self.assertEqual(len(self.transfers), 1)
+
+    def test_cooldown_starts_after_transaction_checks_finish(self):
+        self.unknown()
+        wall = [time.time()]
+        original = self.brokers["short"].require_snapshot_current
+
+        def checked(value):
+            original(value)
+            wall[0] += 2  # Simulate delay acquiring/checking the writer transaction.
+
+        with patch("time.time", side_effect=lambda: wall[0]), \
+                patch.object(self.brokers["short"], "require_snapshot_current", side_effect=checked):
+            result = self.balancer.tick(self.pair, {})
+        self.assertEqual(result["status"], "skipped", result)
+        self.assertEqual(result["last_transfer"]["skipped_at"], wall[0])
+        self.assertEqual(result["cooldown_until"], wall[0] + self.pair["margin"]["cooldown_seconds"])

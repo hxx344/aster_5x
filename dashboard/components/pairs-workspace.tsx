@@ -308,6 +308,11 @@ function PairDetail({
   const net = pairNetQuantity(snapshots);
   const pending = pairHasPending(pair);
   const margin = pair.state?.margin;
+  const reservedTransferOnly =
+    !pair.state?.pending &&
+    margin?.status === 'unknown' &&
+    margin.trading_resume_allowed === true &&
+    margin.blocks_trading === false;
   const configurationLock = pairConfigurationLock(pair);
   const deletionBlock = pairDeletionBlock(pair, now, offline);
   const locked = busy || offline || Boolean(configurationLock);
@@ -506,16 +511,22 @@ function PairDetail({
             <dt>订单与风险恢复</dt>
             <dd className={pending ? 'amber' : ''}>
               {pending
-                ? '继续查询 / 恢复'
+                ? reservedTransferOnly
+                  ? '划转待核对'
+                  : '继续查询 / 恢复'
                 : pair.state
                   ? '无待确认请求'
                   : '等待状态'}
             </dd>
             <small>
               {pending
-                ? !pair.enabled && !pairStartRecoveryBlock(pair)
-                  ? '可直接点击启动自动核对；原单全部结束后，保留已核验的实际平衡底仓'
-                  : '结果未明时停止新增，继续核对原订单与恢复状态'
+                ? reservedTransferOnly
+                  ? pair.enabled
+                    ? '交易按新余额及预留金额继续检查；原划转保留，不重复或新增划转'
+                    : '可重新启动并核验账户；交易继续预留未知转出金额'
+                  : !pair.enabled && !pairStartRecoveryBlock(pair)
+                    ? '可直接点击启动自动核对；原单全部结束后，保留已核验的实际平衡底仓'
+                    : '结果未明时停止新增，继续核对原订单与恢复状态'
                 : '单侧异常时由配对组统一处理'}
             </small>
           </div>

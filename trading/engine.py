@@ -261,6 +261,20 @@ class Engine:
             broker.invalidate_cycle_hot_data(reason, refresh_modes=True)
         self.wake_cycle_hot_data(account_id)
 
+    def _pair_hot_refresh_pending(self, pair, state=None):
+        """A reserved unknown transfer allows reads, never grants order authority."""
+        from .margin_balance import MarginBalancer
+        state = self.store.get("pair_runtime:" + pair["id"], {}) if state is None else state
+        margin = self.store.get("pair_margin:" + pair["id"], {})
+        if not isinstance(state, dict) or not isinstance(margin, dict) or state.get("pending") is not None:
+            return True
+        if margin.get("pending") is None:
+            return False
+        try:
+            return not MarginBalancer.resume_ready(margin)
+        except (TradingError, KeyError, TypeError, ValueError):
+            return True
+
     def poll_cycle_hot_data(self, account_id):
         """Refresh independently of the account execution slot and quote trigger."""
         account = self.store.account(account_id)
@@ -289,12 +303,12 @@ class Engine:
             listener = work.hot_listener
         broker.start_cycle_hot_data([hot_symbol], on_invalidate=listener)
         paired_state = (self.store.get("pair_runtime:" + paired["id"]) or {}) if paired else {}
-        if paired and not (paired["cycle"]["enabled"] or has_cycle_quantity(paired_state)):
+        if paired and (not pair_active(paired, paired_state)
+                       or not (paired["cycle"]["enabled"] or has_cycle_quantity(paired_state))):
             # Ordinary/monitor-only groups read complete snapshots themselves.
-            # Keep private events revoking those reads without a second REST poll.
+            # Paused transfers still need their stream, without repeated REST.
             return 30
-        paired_pending = paired and (paired_state.get("pending") or
-            (self.store.get("pair_margin:" + paired["id"]) or {}).get("pending"))
+        paired_pending = paired and self._pair_hot_refresh_pending(paired, paired_state)
         if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
             broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
             with self.lock:
@@ -321,8 +335,7 @@ class Engine:
                     (not paired and (not latest["enabled"] or latest.get("cycle") != account.get("cycle")))):
                 broker.invalidate_cycle_hot_data("账户配置在后台更新期间发生变化", refresh_modes=True)
                 return CYCLE_HOT_POLL_INTERVAL
-            paired_pending = paired and ((self.store.get("pair_runtime:" + paired["id"]) or {}).get("pending") or
-                (self.store.get("pair_margin:" + paired["id"]) or {}).get("pending"))
+            paired_pending = paired and self._pair_hot_refresh_pending(paired)
             if self.store.intent(account_id) or self.store.get("post_fill_check:" + account_id):
                 broker.discard_cycle_hot_snapshot("本账户未完成批次正在核对")
                 with self.lock:

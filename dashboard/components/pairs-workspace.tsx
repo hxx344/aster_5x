@@ -436,7 +436,7 @@ function PairDetail({
           </p>
           {!pair.enabled ? (
             <p className="muted">
-              启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未决划转或循环仓位仍须先完成恢复。
+              启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未知划转完成新余额读取后可在预留转出金额的条件下启动；其他未决请求或循环仓位仍须先恢复。
             </p>
           ) : null}
         </div>
@@ -605,9 +605,11 @@ function PairDetail({
             <p className="amber">
               {pairTransferStatus(margin.pending)}：
               <TransferSummary transfer={margin.pending} />
-              {margin.pending.status === 'acknowledged'
-                ? '。继续读取两侧余额，刷新完成前不重新划转或开始新开仓。'
-                : '。只读核对，缺少可靠结果时保留待确认状态，不重新划转或开始新开仓。'}
+              {margin.trading_resume_allowed && !margin.blocks_trading
+                ? '。交易按新余额检查，并额外预留转出金额；原请求保留，不重发或新增划转。'
+                : margin.pending.status === 'acknowledged'
+                  ? '。继续读取两侧余额，刷新完成前不重新划转或开始新开仓。'
+                  : '。只读核对，缺少可靠结果时保留待确认状态，不重新划转或开始新开仓。'}
             </p>
           ) : null}
         </div>

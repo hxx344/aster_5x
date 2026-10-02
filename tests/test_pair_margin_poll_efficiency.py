@@ -102,14 +102,19 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertEqual(self.budget.local_weight, 60)
         self.assert_read_only()
 
-    def test_unknown_without_transaction_id_never_polls_unusable_balances(self):
+    def test_paused_unknown_reads_new_baseline_once_and_never_guesses_confirmation(self):
         self.pending("unknown", transaction=False)
+        self.pair = self.store.save_pair({**self.pair, "enabled": False})
         for _ in range(12):
             state = self.tick()
             self.assertEqual(state["margin"]["status"], "unknown")
-            self.assertTrue(state["margin"]["blocks_trading"])
+            self.assertFalse(state["margin"]["blocks_trading"])
+            self.assertEqual(state["phase"], "paused")
             self.advance(5)
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(len(self.calls(ACCOUNT)), 2)
+        self.assertEqual(self.calls(INCOME), [])
+        self.assertIn("long", state["snapshots"])
+        self.assert_read_only()
         self.assertIsNotNone(self.store.get("pair_margin:gold")["pending"])
 
     def test_reconciliation_completion_ends_turn_and_next_turn_reads_both_accounts(self):
@@ -273,7 +278,10 @@ class PairMarginPollEfficiencyTests(TestCase):
                 self.assertEqual(result["margin"]["status"], status)
                 for side, broker in self.paper.items():
                     self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)
-                self.assertEqual(self.store.get("pair_margin:gold")["pending"],
+                stored = self.store.get("pair_margin:gold")["pending"]
+                if stored is not None:
+                    stored.pop("trading_baseline_at", None)
+                self.assertEqual(stored,
                     None if status == "acknowledged" else record)
                 self.advance(5)
 
@@ -309,7 +317,9 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertIsNone(result["pending"], result)
         self.assertEqual(result["progress"]["completed_cycles"], 1)
         self.assertEqual(result["margin"]["status"], "unknown")
-        self.assertEqual(self.store.get("pair_margin:gold")["pending"], transfer)
+        stored = self.store.get("pair_margin:gold")["pending"]
+        self.assertIsNotNone(stored.pop("trading_baseline_at", None))
+        self.assertEqual(stored, transfer)
         for side, broker in self.paper.items():
             self.assertEqual(len(broker.state["orders"]), 1)
             self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)

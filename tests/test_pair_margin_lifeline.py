@@ -120,13 +120,14 @@ class PairMarginLifelineTests(TestCase):
         self.budget.reserve(1500)
         before = self.budget.snapshot()["used"]
         state = self.tick()
-        self.assertEqual(state["margin"]["status"], "blocked", state)
+        self.assertEqual(state["margin"]["status"], "waiting", state)
+        self.assertFalse(state["margin"]["blocks_trading"])
         self.assertEqual(state["margin"]["api_notice"]["kind"], "budget")
         self.assertEqual(self.budget.snapshot()["used"], before)
         self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
         self.wall += 1
-        with patch.object(self.trader, "_read", side_effect=AssertionError("no reads during API backoff")):
-            state = self.tick()
+        state = self.tick()
+        self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
         self.assertGreater(state["retry_after"], 1)
         self.assertEqual(state["margin"]["api_notice"]["kind"], "budget")
 

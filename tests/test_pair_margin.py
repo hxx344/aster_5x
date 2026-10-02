@@ -350,7 +350,8 @@ class PairMarginTests(unittest.TestCase):
                 self.assertEqual(len(self.transfers), 1)
                 if status == "unknown":
                     self.assertIsNotNone(result["pending"])
-                    self.assertTrue(result["blocks_trading"])
+                    self.assertFalse(result["blocks_trading"])
+                    self.assertTrue(result["trading_resume_allowed"])
                 else:
                     self.assertIsNone(result["pending"])
                     self.assertEqual(self.refreshed[-2:], ["long", "short"])
@@ -567,7 +568,9 @@ class PairMarginTests(unittest.TestCase):
         self.pair["margin"]["enabled"] = False
         second = MarginBalancer(self.engine).tick(self.pair, snapshots)
         self.assertEqual(second["status"], "unknown")
-        self.assertTrue(second["blocks_trading"])
+        self.assertFalse(second["blocks_trading"])
+        self.assertTrue(second["trading_resume_allowed"])
+        self.assertEqual(self.state()["pending"]["request_id"], first["pending"]["request_id"])
         self.assertEqual(len(self.transfers), 1)
         self.assertNotIn("remote secret", str(second))
 

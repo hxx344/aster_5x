@@ -16,6 +16,30 @@ const pausedStaleText =
   '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。';
 const offlineText = '连接中断，保留最近记录。 等待有效快照后才能新增开仓。';
 
+test('paused unknown transfer explains reserved restart even when displayed snapshots are stale', () => {
+  const fixture = pair(
+    {
+      margin: {
+        status: 'unknown',
+        blocks_trading: false,
+        trading_resume_allowed: true,
+        pending: { request_id: 'original', status: 'unknown' },
+        reason: '已读取新的保证金基线',
+      },
+    },
+    { enabled: false },
+  );
+  const text = pairStatusNotices(fixture, 120)
+    .map((notice) => notice.text)
+    .join('\n');
+  assert.match(text, /可点击“启动配对组”/);
+  assert.match(text, /预留/);
+  assert.doesNotMatch(
+    text,
+    /完成后才能启动|结果未明时仍保持暂停|核验原单与补偿单/,
+  );
+});
+
 function pair(state = {}, options = {}) {
   return {
     id: 'fixture-pair',

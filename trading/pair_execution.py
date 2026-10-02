@@ -192,10 +192,17 @@ class PairTrader:
 
             return current, {side: lambda side=side: check(side) for side in checks}
 
-        result = MarginBalancer(self.engine).tick(pair, snapshots or {}, pending_orders=pending_orders,
+        balancer = MarginBalancer(self.engine)
+        result = balancer.tick(pair, snapshots or {}, pending_orders=pending_orders,
             snapshot_guards=guards, snapshot_loader=load)
+        if balancer.refreshed_snapshots is not None:
+            self._publish_snapshots(state, balancer.refreshed_snapshots)
         state["margin"] = result
         return result
+
+    def _risk_snapshots(self, pair, snapshots, *, recovery=False):
+        from .margin_balance import MarginBalancer
+        return MarginBalancer(self.engine).risk_snapshots(pair, snapshots, recovery=recovery)
 
     @contextmanager
     def _confirmed(self, pair, brokers, guards):
@@ -280,7 +287,7 @@ class PairTrader:
                 margin_checked = True
                 margin = self._balance(pair, state, brokers, identities, pending_orders=bool(pending))
                 state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
-                if not closing_due and not pending:
+                if margin.get("blocks_trading") and not closing_due and not pending:
                     margin_delay = max(0, margin.get("retry_after", 0))
                     return state
             if time.time() < retry.get("until", 0):
@@ -303,7 +310,7 @@ class PairTrader:
                     state.update(margin=margin, phase="margin_wait", reason=margin["reason"])
                     margin_delay = max(0, margin_state["next_check_at"] - time.time())
                     return state
-            if not pair["enabled"] and not holding and not margin_pending:
+            if not pair["enabled"] and not holding:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
             if not holding and self._margin_wait(pair, state, identities, brokers, margin_state):
@@ -347,7 +354,7 @@ class PairTrader:
                 # Publish the completed read before potentially slow transfer
                 # preparation; this never changes the original snapshot time.
                 self._save(pair, state)
-            if not closing_due:
+            if not closing_due and not margin_checked:
                 margin_checked = True
                 margin = self._balance(pair, state, brokers, identities, snapshots, guards)
                 if margin.get("blocks_trading"):
@@ -364,6 +371,7 @@ class PairTrader:
             if not holding and time.time() < state.get("retry_at", 0):
                 state.update(phase="waiting", reason="上批已核对结束，当前底仓保留；开仓冷却结束后系统重新检查开仓条件")
                 return state
+            risk_snapshots = self._risk_snapshots(pair, snapshots) if not holding else snapshots
             book = self.engine.cycle_book(SYMBOL) if pair["cycle"]["enabled"] or holding else self.market.book(SYMBOL)
             rule = self.market.rules[SYMBOL]
             if holding or pair["cycle"]["enabled"]:
@@ -372,16 +380,16 @@ class PairTrader:
                     capacity = self.engine.require_cycle_open_capacity(pair["cycle"], held["LONG"].leverage)
                 depth = self.engine.cycle_depth(SYMBOL)
                 remaining = self._daily_remaining(pair, state) if not holding else None
-                plan = plan_paired_cycle(pair, snapshots, book, depth, rule, state["progress"],
+                plan = plan_paired_cycle(pair, risk_snapshots, book, depth, rule, state["progress"],
                                          capacity=capacity, daily_remaining=remaining, paused=not pair["enabled"])
                 self._start(pair, state, brokers, snapshots, guards, plan, kind="cycle", quality_depth=depth)
             elif pair["ordinary"]["enabled"]:
                 capacities = self.engine.capacities(SYMBOL)
-                target = ordinary_upgrade(pair, snapshots, book, capacities)
+                target = ordinary_upgrade(pair, risk_snapshots, book, capacities)
                 if target is not None:
                     self._leverage(pair, state, brokers, snapshots, guards, target)
                 else:
-                    plan = plan_ordinary(pair, snapshots, book, rule, capacities)
+                    plan = plan_ordinary(pair, risk_snapshots, book, rule, capacities)
                     self._start(pair, state, brokers, snapshots, guards, plan, kind="ordinary")
             else:
                 state.update(phase="monitoring", reason="未启用开仓模式，仅管理保证金；"
@@ -474,17 +482,18 @@ class PairTrader:
                     for guard in guards.values():
                         guard()
                     require_quantities(snapshots, before)
+                    risk_snapshots = self._risk_snapshots(pair, snapshots) if opening else snapshots
                     book = self.engine.cycle_book(SYMBOL) if kind == "cycle" else self.market.book(SYMBOL)
                     if kind == "cycle":
                         capacity = self.engine.require_cycle_open_capacity(pair["cycle"], plan.leverage,
                             minimum_notional=plan.capacity_notional or 0) if opening else None
                         depth = self.engine.cycle_depth(SYMBOL)
-                        latest = plan_paired_cycle(pair, snapshots, book, depth, self.market.rules[SYMBOL],
+                        latest = plan_paired_cycle(pair, risk_snapshots, book, depth, self.market.rules[SYMBOL],
                                                    state["progress"], capacity=capacity, daily_remaining=self._daily_remaining(pair, state) if opening else None,
                                                    paused=not pair["enabled"])
                         pair_quality.prepare(pending, pair["id"], depth, final=True)
                     else:
-                        latest = plan_ordinary(pair, snapshots, book, self.market.rules[SYMBOL], self.engine.capacities(SYMBOL))
+                        latest = plan_ordinary(pair, risk_snapshots, book, self.market.rules[SYMBOL], self.engine.capacities(SYMBOL))
                     if latest.phase != plan.phase or latest.qty < plan.qty or latest.leverage != plan.leverage:
                         raise RequestNotSent("发单前两账户风险、盘口或额度已变化")
                     for guard in guards.values():
@@ -684,7 +693,9 @@ class PairTrader:
                     state["reason"] += "；账户仓位刷新暂未完成：" + exchange_reason(str(exc))
             return
         member_read = None
-        if pending["kind"] == "ordinary" and pending["phase"] == "open" and pending.get("position_review"):
+        margin_pending = (self.store.get("pair_margin:" + pair["id"], {}) or {}).get("pending") is not None
+        if (not margin_pending and pending["kind"] == "ordinary" and pending["phase"] == "open"
+                and pending.get("position_review")):
             member_read = self.engine.pairs._read_members(pair, adopt=True, reconciliation=True)
             snapshots, member_guards = member_read
             guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
@@ -702,7 +713,7 @@ class PairTrader:
         # Balanced terminal ordinary batches are a normal completion path.
         # Preserve manual additions; do not enter a repair path merely because
         # the old local baseline differs. Cycles retain their separate baseline.
-        if (pending["kind"] == "ordinary" and pending["phase"] == "open"
+        if (not margin_pending and pending["kind"] == "ordinary" and pending["phase"] == "open"
                 and (actual != expected or (actual["LONG"] == actual["SHORT"]
                      and actual != {side: dec(pending["before"][side]) for _, side in SIDES}
                      and (not original_full or pending["repairs"])))
@@ -717,8 +728,9 @@ class PairTrader:
             raise PairPositionError("成交回执与两子账户实际仓位或杠杆不一致，保留批次并停止新增；" + detail)
         if pending["phase"] == "open" and original_full and not pending["repairs"]:
             limit = cycle_margin_limit(pair["ordinary"]) if pending["kind"] == "cycle" else opening_margin_limit(pair["ordinary"], pending["leverage"])
-            if any(s.equity <= 0 or s.margin_exceeds(limit) for s in snapshots.values()):
-                if (pending["kind"] == "ordinary" and actual["LONG"] == actual["SHORT"]
+            risk_snapshots = self._risk_snapshots(pair, snapshots, recovery=True)
+            if any(s.equity <= 0 or s.margin_exceeds(limit) for s in risk_snapshots.values()):
+                if (risk_snapshots is snapshots and pending["kind"] == "ordinary" and actual["LONG"] == actual["SHORT"]
                         and self.engine.pairs.recovery.reconcile_positions(
                             self, pair, state, source=recovery_source or "automatic_positions", member_read=member_read)):
                     return

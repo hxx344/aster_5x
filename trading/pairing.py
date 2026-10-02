@@ -237,7 +237,7 @@ class PairManager:
             self._changed(pair)
         return pair
 
-    def _idle(self, pair, *, require_flat=False):
+    def _idle(self, pair, *, require_flat=False, resume_unknown=False):
         if pair["enabled"]:
             raise TradingError("请先暂停配对组")
         runtime = self.store.get("pair_runtime:" + pair["id"], {})
@@ -246,7 +246,9 @@ class PairManager:
             raise TradingError("配对组或保证金日志无效，请先核对，不能重新采纳持仓")
         if runtime.get("pending") is not None or has_cycle_quantity(runtime):
             raise TradingError("配对组仍在核对订单或减回本轮循环持仓，暂不能启动、修改设置、核对空仓或删除；请查看配对组当前执行状态")
-        if margin.get("pending") is not None or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown"):
+        from .margin_balance import MarginBalancer
+        can_resume = resume_unknown and MarginBalancer.resume_ready(margin)
+        if not can_resume and (margin.get("pending") is not None or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
             raise TradingError("保证金划转结果尚未核实，暂不能启动、修改设置、核对空仓或删除；请查看保证金平衡中的核对状态")
         if require_flat and any(dec(qty) for qty in (runtime.get("owned") or {}).values()):
             raise TradingError("配对组仍有普通策略底仓，完全平仓并核对后才能解除绑定")
@@ -293,7 +295,7 @@ class PairManager:
                         raise TradingError("启动前自动核对尚未完成，仓位保持不变；" + result["message"])
                     pair = self.store.pair(pair_id)
                 margin = self.store.get("pair_margin:" + pair_id, {})
-                original_runtime = self._idle(pair)
+                original_runtime = self._idle(pair, resume_unknown=True)
                 if not any(pair[key]["enabled"] for key in ("ordinary", "cycle", "margin")):
                     raise TradingError("请先选择普通策略、独立循环或保证金均衡")
                 accounts = self._members(pair)
@@ -311,7 +313,10 @@ class PairManager:
                         if snapshots[key].pair(SYMBOL)[index].qty != dec(original_runtime["owned"][side]):
                             raise TradingError("人工归档后实际仓位发生变化；请点击“核对并采纳当前底仓”，核对旧订单后确认当前持仓，再启动")
                 from .margin_balance import MarginBalancer
-                MarginBalancer(self.engine).verify_members(pair)
+                balancer = MarginBalancer(self.engine)
+                balancer.verify_members(pair)
+                if margin.get("pending") is not None:
+                    balancer.risk_snapshots(pair, snapshots)
                 if trader._members(pair)[2] != identities:
                     raise TradingError("启动核验期间账户身份已变化，请重新核对")
                 owned = {side: wire(snapshots[key].pair(SYMBOL)[index].qty)
@@ -338,6 +343,8 @@ class PairManager:
                         current()
                     if any(not self.engine.live_allowed(a) for a in accounts):
                         raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
+                    if margin.get("pending") is not None:
+                        balancer.risk_snapshots(pair, snapshots)
                 with self._current_members(guards):
                     saved = self.store.activate_pair(pair, runtime, expected_runtime=original_runtime,
                         expected_margin=margin, accounts=accounts, check_current=check_current, message=message)

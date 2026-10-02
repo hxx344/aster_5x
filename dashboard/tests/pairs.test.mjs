@@ -590,6 +590,35 @@ test('other pending work still blocks start even alongside an ordinary opening',
   );
 });
 
+test('unknown transfer with a verified new baseline allows start but retains edit and deletion locks', () => {
+  const margin = {
+    status: 'unknown',
+    pending: { request_id: 'original-transfer', status: 'unknown' },
+    blocks_trading: false,
+    trading_resume_allowed: true,
+  };
+  const fixture = pair({ margin });
+  assert.equal(pairStartRecoveryBlock(fixture), '');
+  assert.equal(pairHasPending(fixture), true);
+  assert.match(pairConfigurationLock(fixture), /待核对/);
+  assert.match(pairDeletionBlock(fixture, 100), /等待确认/);
+  assert.match(pairMarginStatus(margin), /交易/);
+  for (const changed of [
+    { trading_resume_allowed: false },
+    { trading_resume_allowed: undefined },
+    { blocks_trading: true },
+    { status: 'acknowledged' },
+  ])
+    assert.match(
+      pairStartRecoveryBlock(pair({ margin: { ...margin, ...changed } })),
+      /划转/,
+    );
+  assert.match(
+    pairStartRecoveryBlock(pair({ margin, pending: { kind: 'cycle' } })),
+    /批次/,
+  );
+});
+
 test('deletion blocks known positions and defers missing/stale snapshots to the server fresh-read guard', () => {
   assert.equal(pairDeletionBlock(pair(), 100), '');
   assert.match(pairDeletionBlock({ ...pair(), enabled: true }, 100), /暂停/);

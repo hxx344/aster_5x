@@ -39,6 +39,7 @@ export type PairMarginState = {
   reason?: string;
   api_notice?: PairApiNotice | null;
   blocks_trading?: boolean;
+  trading_resume_allowed?: boolean;
   checked_at?: number;
   pending?: PairTransfer | null;
   last_transfer?: PairTransfer | null;
@@ -371,9 +372,14 @@ export function pairHasPending(pair: Pair): boolean {
 export function pairStartRecoveryBlock(pair: Pair): string {
   const margin = pair.state?.margin;
   if (
-    margin?.pending ||
-    ['submitting', 'accepted', 'acknowledged', 'unknown'].includes(
-      margin?.status ?? '',
+    (margin?.pending ||
+      ['submitting', 'accepted', 'acknowledged', 'unknown'].includes(
+        margin?.status ?? '',
+      )) &&
+    !(
+      margin?.trading_resume_allowed === true &&
+      margin.blocks_trading === false &&
+      margin.status === 'unknown'
     )
   )
     return '划转结果仍待核对，完成后才能启动';
@@ -527,6 +533,12 @@ export function pairTransferStatus(transfer: PairTransfer): string {
 }
 
 export function pairMarginStatus(margin?: PairMarginState): string {
+  if (
+    margin?.status === 'unknown' &&
+    margin.trading_resume_allowed === true &&
+    margin.blocks_trading === false
+  )
+    return '划转待核对 · 交易已解除阻塞';
   if (margin?.status === 'submitting') return '划转请求提交中 · 等待回执';
   if (
     margin?.status === 'acknowledged' &&

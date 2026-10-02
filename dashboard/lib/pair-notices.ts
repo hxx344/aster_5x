@@ -128,6 +128,8 @@ export function pairStatusNotices(
   const snapshots = pair.state?.snapshots;
   const canCheckAtStart =
     !pair.enabled && pairHasPending(pair) && !pairStartRecoveryBlock(pair);
+  const canResumeTransfer =
+    canCheckAtStart && pair.state?.margin?.trading_resume_allowed === true;
   const fresh =
     pairDataFresh(pair.state?.updated_at, now, offline) &&
     pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
@@ -141,7 +143,9 @@ export function pairStatusNotices(
         (!pair.enabled && !offline
           ? pairHasPending(pair)
             ? canCheckAtStart
-              ? ' 可直接点击“启动配对组”自动核对，无需另点手动核对；结果未明时仍保持暂停。'
+              ? canResumeTransfer
+                ? ' 可点击“启动配对组”，服务会重新读取账户；未知划转继续保留，并预留转出金额。'
+                : ' 可直接点击“启动配对组”自动核对，无需另点手动核对；结果未明时仍保持暂停。'
               : ' 仍有订单或划转待核对，暂停不会结束核对；完成后才能启动。'
             : ' 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。'
           : ' 等待有效快照后才能新增开仓。'),
@@ -172,7 +176,9 @@ export function pairStatusNotices(
     const text =
       `${label}${reason && !apiReason ? ` · ${reason}` : ''}` +
       (canCheckAtStart
-        ? ' · 启动时会自动核验原单与补偿单；全部结束且账户检查通过后，保留实际平衡底仓，无需减回旧底仓。'
+        ? canResumeTransfer
+          ? ' · 可重新启动；启动时重新核验账户，交易额外预留未知转出金额，原划转不重发。'
+          : ' · 启动时会自动核验原单与补偿单；全部结束且账户检查通过后，保留实际平衡底仓，无需减回旧底仓。'
         : '');
     if (trackedTransfer) {
       // A retry countdown is still the same transfer and stage. Its current

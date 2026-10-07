@@ -1,4 +1,5 @@
 """Portal summaries stay small and never initiate exchange/history work."""
+from copy import deepcopy
 from datetime import datetime, timezone
 import time
 import threading
@@ -8,12 +9,15 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from tests.helpers import Fixture, account
+from tests import test_pair_order_recovery as recovery_tests
 from trading.engine import Engine
+from trading.exchange import ExchangeError
 from trading.hub_summary import hub_summary
 from trading.server import create_app
 from trading.models import TradingError
 from trading.pair_execution import runtime_default
 from trading.pairing import validate_pair
+from trading.pair_recovery import require_archived_orders_clear
 from trading.store import _StoreSnapshot
 
 
@@ -71,7 +75,7 @@ class HubSummaryTests(TestCase):
              patch.object(self.f.store, "read_snapshot", wraps=self.f.store.read_snapshot) as read_snapshot, \
              patch("trading.pair_quality.read", side_effect=AssertionError("quality history")), \
              patch("trading.pair_cost.read", side_effect=AssertionError("cost history")):
-            result = hub_summary(self.engine, now=self.now)
+            result = hub_summary(self.engine, now=self.now, diagnostics=True)
         read_snapshot.assert_called_once_with()
         self.assertEqual(self.metrics(result), {"accounts": 2, "live_accounts": 2,
                                               "occupied_margin": 30, "daily_volume": 550})
@@ -79,6 +83,124 @@ class HubSummaryTests(TestCase):
         self.assertEqual(result["data"]["updatedAt"], expected)
         self.assertEqual(result["data"]["health"]["state"], "online")
         self.assertIsNone(self.engine.dashboard_reports.worker)
+
+    def test_diagnostics_are_opt_in_and_keep_legacy_values_and_health(self):
+        self.pair()
+        with patch.object(_StoreSnapshot, "intent", side_effect=AssertionError("opt-in only")):
+            legacy = hub_summary(self.engine, now=self.now)
+        self.assertNotIn("diagnostics", legacy["data"])
+        self.assertEqual(hub_summary(self.engine, now=self.now, diagnostics=False), legacy)
+        extended = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual(extended["data"].pop("diagnostics"), [])
+        self.assertEqual(extended, legacy)
+
+    def test_report_notice_and_snapshot_fault_leave_null_and_stale_values_unchanged(self):
+        self.live()
+        self.engine.dashboard_reports.entries.clear()
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]],
+                         [("account:test:report", "notice")])
+        self.assertIsNone(self.metrics(result)["daily_volume"])
+        self.assertEqual(result["data"]["health"]["state"], "partial")
+        self.engine.views["test"]["snapshot"]["timestamp"] = self.now - 120
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]],
+                         [("account:test:snapshot", "fault"), ("account:test:report", "notice")])
+        self.assertEqual(result["data"]["health"]["state"], "stale")
+        legacy = hub_summary(self.engine, now=self.now)
+        result["data"].pop("diagnostics")
+        self.assertEqual(result, legacy)
+        self.live()
+        self.engine.dashboard_reports.entries["test"]["error"] = "读取失败，等待重试"
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]],
+                         [("account:test:report", "fault")])
+        self.assertIsNone(self.metrics(result)["daily_volume"])
+        self.assertEqual(result["data"]["health"]["state"], "partial")
+
+    def test_pair_diagnostics_merge_both_members_and_keep_highest_kind(self):
+        runtime = self.pair()
+        runtime.update(phase="attention", attention="两侧仓位不一致，请人工核对")
+        runtime["snapshots"]["short"] = {}
+        self.f.store.put("pair_runtime:gold", runtime)
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        rows = result["data"]["diagnostics"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["id"], rows[0]["kind"]), ("pair:gold", "action"))
+        for reason in ("两侧仓位不一致", "缺少账户快照", "今日成交量暂不可用"):
+            self.assertIn(reason, rows[0]["message"])
+        self.assertIsNone(result["data"]["updatedAt"])
+        self.assertIsNone(self.metrics(result)["occupied_margin"])
+        self.assertIsNone(self.metrics(result)["daily_volume"])
+
+    def test_pair_automatic_recovery_is_fault_but_stats_only_delay_is_notice(self):
+        runtime = self.pair()
+        for changes, kind in (({"phase": "reconciling"}, "fault"),
+                              ({"phase": "repairing"}, "fault"),
+                              ({"daily_volume": None}, "notice"),
+                              ({"updated_at": self.now - 120}, "notice"),
+                              ({"phase": "attention", "reason": "需要人工核对"}, "action")):
+            with self.subTest(changes=changes):
+                self.f.store.put("pair_runtime:gold", {**runtime, **changes})
+                result = hub_summary(self.engine, now=self.now, diagnostics=True)
+                self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]],
+                                 [("pair:gold", kind)])
+                self.assertIsNone(self.metrics(result)["daily_volume"])
+                self.assertEqual(result["data"]["health"]["state"], "partial")
+
+    def test_paused_attention_remains_visible_without_counting_paused_accounts(self):
+        runtime = self.pair(enabled=False)
+        runtime.update(phase="attention", attention="账户设置需要人工核对")
+        runtime["snapshots"] = {}
+        self.f.store.put("pair_runtime:gold", runtime)
+        legacy = hub_summary(self.engine, now=self.now)
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        rows = result["data"].pop("diagnostics")
+        self.assertEqual([(row["id"], row["kind"]) for row in rows], [("pair:gold", "action")])
+        self.assertNotIn("快照", rows[0]["message"])
+        self.assertEqual(result, legacy)
+        self.assertEqual(self.metrics(result)["accounts"], 0)
+        self.assertIsNone(self.metrics(result)["occupied_margin"])
+        runtime.update(phase="paused", attention=None, recovery_watch={"batches": []})
+        self.f.store.put("pair_runtime:gold", runtime)
+        self.assertEqual(hub_summary(self.engine, now=self.now, diagnostics=True)["data"]["diagnostics"], [])
+        pair = self.f.store.pair("gold")
+        self.f.store.save_pair({**pair, "pause_reason": "账户模式已变化，请确认"})
+        rows = hub_summary(self.engine, now=self.now, diagnostics=True)["data"]["diagnostics"]
+        self.assertEqual([(row["id"], row["kind"]) for row in rows], [("pair:gold", "action")])
+        self.assertIn("账户模式已变化", rows[0]["message"])
+
+    def test_disabled_single_pause_reason_and_attention_intent_are_action_without_metrics(self):
+        self.live(enabled=False)
+        legacy = hub_summary(self.engine, now=self.now)
+        self.assertEqual(hub_summary(self.engine, now=self.now, diagnostics=True)["data"]["diagnostics"], [])
+        saved = self.f.store.account("test")
+        self.f.store.pause_account(saved, "仓位不一致，需要人工核对")
+        self.f.store.save_intent({"id": "pending", "account_id": "test", "status": "attention",
+                                  "kind": "cycle", "last_error": "未完成批次需要人工核对"})
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        rows = result["data"].pop("diagnostics")
+        self.assertEqual([(row["id"], row["kind"]) for row in rows], [("account:test:state", "action")])
+        self.assertIn("仓位不一致", rows[0]["message"])
+        self.assertIn("未完成批次", rows[0]["message"])
+        self.assertEqual(result, legacy)
+        self.assertEqual(self.metrics(result)["accounts"], 0)
+        self.assertIsNone(self.metrics(result)["occupied_margin"])
+
+    def test_service_faults_merge_and_diagnostic_overflow_remains_visible(self):
+        self.engine.ready, self.engine.error = False, "行情暂不可用"
+        self.engine.shutdown.set()
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]],
+                         [("service:engine", "fault")])
+        self.assertIn("交易服务已停止", result["data"]["diagnostics"][0]["message"])
+        records = [self.f.store.account_defaults({**account(f"account-{index}", "live"), "name": "账户😀" * 35})
+                   for index in range(70)]
+        with patch.object(_StoreSnapshot, "accounts", return_value=records):
+            rows = hub_summary(self.engine, now=self.now, diagnostics=True)["data"]["diagnostics"]
+        self.assertEqual(len(rows), 64)
+        self.assertEqual((rows[-1]["id"], rows[-1]["kind"]), ("summary:more", "fault"))
+        self.assertTrue(all(len(row["message"].encode("utf-16-le")) // 2 <= 500 for row in rows))
 
     def test_pair_and_standalone_accounts_are_deduplicated_and_keep_separate_volume_sources(self):
         self.pair()
@@ -429,7 +551,115 @@ class HubSummaryTests(TestCase):
                 result = client.get("/api/hub/summary?schemaVersion=2")
             self.assertEqual(result.status_code, 200)
             self.assertEqual(result.json()["schemaVersion"], 2)
+            self.assertNotIn("diagnostics", result.json()["data"])
             self.assertEqual(result.headers["cache-control"], "no-store")
+            extended = client.get("/api/hub/summary?schemaVersion=2&diagnostics=1")
+            self.assertEqual(extended.status_code, 200)
+            self.assertEqual(extended.headers["cache-control"], "no-store")
+            self.assertEqual(extended.json()["data"]["diagnostics"], [])
+            self.assertNotIn("diagnostics", client.get("/api/hub/summary?schemaVersion=2&diagnostics=0").json()["data"])
             self.assertEqual(client.get("/api/hub/summary?schemaVersion=3").status_code, 422)
             client.post("/api/logout")
             self.assertEqual(client.get("/api/hub/summary?schemaVersion=2").status_code, 401)
+            self.assertEqual(client.get("/api/hub/summary?schemaVersion=2&diagnostics=1").status_code, 401)
+
+
+class HubWatchDiagnosticTests(TestCase):
+    """Observe actual existing guards through offline GET fixtures, never trade."""
+    tearDown = recovery_tests.PairOrderRecoveryLiveReadTests.tearDown
+    seed = recovery_tests.PairOrderRecoveryTests.seed
+    state = recovery_tests.PairOrderRecoveryTests.state
+    preview = recovery_tests.PairOrderRecoveryTests.preview
+    confirm = recovery_tests.PairOrderRecoveryTests.confirm
+    broker = recovery_tests.PairOrderRecoveryTests.broker
+    no_writes = recovery_tests.PairOrderRecoveryTests.no_writes
+
+    def setUp(self):
+        recovery_tests.PairOrderRecoveryLiveReadTests.setUp(self)
+        self.addCleanup(self.engine.dashboard_reports.close)
+        self.engine.ready, self.engine.error = True, None
+
+    def activate_watch(self):
+        self.seed()
+        with self.no_writes():
+            self.confirm(self.preview()["token"])
+            before = self.f.store.pair("gold")["revision"]
+            self.engine.pairs.enable("gold", True)
+        self.assertGreater(self.f.store.pair("gold")["revision"], before)
+
+    def summary(self):
+        before = deepcopy(self.state())
+        calls = {aid: deepcopy(broker.api.calls) for aid, broker in self.live.items()}
+        with self.no_writes(), patch.object(self.engine, "state", side_effect=AssertionError("full state")), \
+             patch.object(self.engine.pairs, "states", side_effect=AssertionError("pair history")), \
+             patch.object(self.engine, "broker", side_effect=AssertionError("new account read")), \
+             patch.object(self.engine.dashboard_reports, "read", side_effect=AssertionError("report work")), \
+             patch("trading.pair_recovery.require_archived_orders_clear", side_effect=AssertionError("new guard check")):
+            result = hub_summary(self.engine, diagnostics=True)
+        self.assertEqual(self.state(), before)
+        self.assertEqual({aid: broker.api.calls for aid, broker in self.live.items()}, calls)
+        return result
+
+    def assert_kind(self, kind):
+        result = self.summary()
+        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]], [("pair:gold", kind)])
+        self.assertIsNone(next(row["value"] for row in result["data"]["metrics"] if row["key"] == "daily_volume"))
+        return result
+
+    def test_successful_enable_preserves_healthy_watch_notice_across_revision_and_time(self):
+        self.activate_watch()
+        self.assert_kind("notice")
+        self.engine.pair_watch_diagnostics["gold"]["checked_at"] -= 3600
+        self.assert_kind("notice")
+
+    def test_failed_watch_check_is_fault_and_observed_new_activity_is_action(self):
+        self.activate_watch()
+        original = deepcopy(self.state())
+        pair = self.f.store.pair("gold")
+        with self.no_writes(), patch.object(self.broker(), "query", side_effect=ExchangeError("offline")):
+            with self.assertRaises(TradingError):
+                require_archived_orders_clear(self.engine, pair)
+        self.assert_kind("fault")
+        leg = original["recovery_watch"]["batches"][0]["legs"][0]
+        for status, quantity in (("NEW", "0"), ("FILLED", "0.2")):
+            with self.subTest(status=status), self.no_writes(), \
+                 patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status=status, qty=quantity)):
+                with self.assertRaisesRegex(TradingError, "出现成交或活动回执"):
+                    require_archived_orders_clear(self.engine, pair)
+            self.assert_kind("action")
+        with self.no_writes(), patch.object(self.broker(), "query", side_effect=ExchangeError("offline")):
+            with self.assertRaises(TradingError):
+                require_archived_orders_clear(self.engine, pair)
+        self.assert_kind("action")
+        self.assertEqual(self.state(), original)
+
+    def test_restarted_or_changed_watch_and_account_config_require_existing_guard_evidence(self):
+        self.activate_watch()
+        self.engine.pair_watch_diagnostics.clear()
+        self.assert_kind("fault")
+        with self.no_writes():
+            counts = {aid: len(broker.api.calls) for aid, broker in self.live.items()}
+            evidence = require_archived_orders_clear(self.engine, self.f.store.pair("gold"))
+        self.assertEqual(len(evidence), 2)
+        self.assertEqual({aid: len(broker.api.calls) - counts[aid] for aid, broker in self.live.items()},
+                         {"test": 1, "second": 1})
+        self.assert_kind("notice")
+        runtime = self.state()
+        original = deepcopy(runtime)
+        runtime["recovery_watch"]["changed"] = True
+        self.f.store.put("pair_runtime:gold", runtime)
+        self.assert_kind("fault")
+        self.f.store.put("pair_runtime:gold", original)
+        saved = self.f.store.account("test")
+        self.f.store.save_account({**saved, "env_prefix": "ASTER_REPLACEMENT"})
+        self.assert_kind("fault")
+
+    def test_diagnostic_publication_failure_does_not_change_guard_result(self):
+        self.activate_watch()
+        pair = self.f.store.pair("gold")
+        with patch.object(self.engine, "pair_watch_diagnostics", None), self.no_writes():
+            self.assertEqual(len(require_archived_orders_clear(self.engine, pair)), 2)
+            leg = self.state()["recovery_watch"]["batches"][0]["legs"][0]
+            with patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status="NEW")):
+                with self.assertRaisesRegex(TradingError, "出现成交或活动回执"):
+                    require_archived_orders_clear(self.engine, pair)

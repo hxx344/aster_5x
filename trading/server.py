@@ -435,8 +435,8 @@ def create_app(engine=None, *, demo=False, start_engine=True):
                             history_account=history_account, history_revision=history_revision)
 
     @app.get("/api/hub/summary", dependencies=[Depends(authenticated)])
-    def summary(schema_version: int = Query(2, alias="schemaVersion", ge=2, le=2)):
-        return hub_summary(engine)
+    def summary(schema_version: int = Query(2, alias="schemaVersion", ge=2, le=2), diagnostics: bool = False):
+        return hub_summary(engine, diagnostics=diagnostics)
 
     write_dependencies = [Depends(authenticated), Depends(origin_check)]
 

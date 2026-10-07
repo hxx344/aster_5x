@@ -39,6 +39,29 @@ def _query(broker, order):
     return row
 
 
+def _publish_archived_diagnostic(engine, pair, watch, accounts, status, message):
+    """Observe an existing guard only; this cache never authorizes execution."""
+    try:
+        record = {"watch": deepcopy(watch), "members": [pair["long_account_id"], pair["short_account_id"], pair["symbol"]],
+                  "accounts": {side: {key: account[key] for key in ("id", "env_prefix", "mode")}
+                               for side, account in accounts.items()} if accounts is not None else None,
+                  "status": status, "message": message, "checked_at": time.time()}
+        with engine.pair_watch_diagnostic_lock:
+            cache = engine.pair_watch_diagnostics
+            previous = cache.get(pair["id"], {})
+            if (status == "failed" and previous.get("status") == "action"
+                    and previous.get("watch") == watch and previous.get("members") == record["members"]):
+                record.update(status="action", message=previous["message"])
+            cache.pop(pair["id"], None)
+            cache[pair["id"]] = record
+            while len(cache) > 64:
+                cache.pop(next(iter(cache)))
+    except Exception:
+        # A display-only observation must not change the guard's result,
+        # exception type, request count or durable transaction.
+        pass
+
+
 def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
     """Only new writes use this guard; reductions and existing recovery remain possible."""
     from .pair_execution import PairTrader
@@ -46,29 +69,40 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
     watch = state.get("recovery_watch")
     if watch is None:
         return
-    batches = watch.get("batches") if isinstance(watch, dict) else None
-    if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
-        raise TradingError("人工归档订单跟踪记录无效，禁止新开仓与划转")
-    _, current_brokers, identities = PairTrader(engine)._members(pair)
-    brokers = current_brokers if brokers is None else brokers
-    evidence = []
-    for batch in batches:
-        if not isinstance(batch, dict) or batch.get("identities") != identities:
-            raise TradingError("人工归档订单的账户身份已变化，禁止新开仓与划转")
-        legs = batch.get("legs")
-        if (not isinstance(legs, list) or len(legs) != 2 or any(not isinstance(leg, dict) for leg in legs)
-                or {leg.get("key") for leg in legs} != {"long", "short"}
-                or any(not isinstance(leg.get("order"), dict) for leg in legs)):
-            raise TradingError("人工归档订单明细无效，禁止新开仓与划转")
-        for leg in legs:
-            row = _query(brokers[leg["key"]], leg["order"])
-            if row is not None and (row["status"] not in TERMINAL or dec(row["executedQty"]) != 0):
-                raise TradingError("已人工归档的原订单出现成交或活动回执，停止新开仓与划转；请核对原订单和实际仓位")
-            evidence.append({"batch_id": batch.get("id"), "side": leg["key"].upper(),
-                "client_order_id": leg["order"]["newClientOrderId"],
-                "status": row["status"] if row is not None else "UNKNOWN",
-                "executed_qty": wire(dec(row["executedQty"])) if row is not None else None})
-    return evidence
+    status, message, accounts = "failed", "历史订单观察检查未完成，等待原流程重试", None
+
+    def action(reason):
+        nonlocal status, message
+        status, message = "action", reason
+        return TradingError(reason)
+
+    try:
+        batches = watch.get("batches") if isinstance(watch, dict) else None
+        if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
+            raise action("人工归档订单跟踪记录无效，禁止新开仓与划转")
+        accounts, current_brokers, identities = PairTrader(engine)._members(pair)
+        brokers = current_brokers if brokers is None else brokers
+        evidence = []
+        for batch in batches:
+            if not isinstance(batch, dict) or batch.get("identities") != identities:
+                raise action("人工归档订单的账户身份已变化，禁止新开仓与划转")
+            legs = batch.get("legs")
+            if (not isinstance(legs, list) or len(legs) != 2 or any(not isinstance(leg, dict) for leg in legs)
+                    or {leg.get("key") for leg in legs} != {"long", "short"}
+                    or any(not isinstance(leg.get("order"), dict) for leg in legs)):
+                raise action("人工归档订单明细无效，禁止新开仓与划转")
+            for leg in legs:
+                row = _query(brokers[leg["key"]], leg["order"])
+                if row is not None and (row["status"] not in TERMINAL or dec(row["executedQty"]) != 0):
+                    raise action("已人工归档的原订单出现成交或活动回执，停止新开仓与划转；请核对原订单和实际仓位")
+                evidence.append({"batch_id": batch.get("id"), "side": leg["key"].upper(),
+                    "client_order_id": leg["order"]["newClientOrderId"],
+                    "status": row["status"] if row is not None else "UNKNOWN",
+                    "executed_qty": wire(dec(row["executedQty"])) if row is not None else None})
+        status, message = "clear", "历史订单继续观察，既有检查未发现新增成交或活动订单"
+        return evidence
+    finally:
+        _publish_archived_diagnostic(engine, pair, watch, accounts, status, message)
 
 
 class PairOrderRecovery:

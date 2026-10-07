@@ -164,6 +164,8 @@ class Engine:
         self.deleted_accounts = set()
         self.markets, self.views, self.rotation = {}, {}, {}
         self.display_snapshots = {}
+        self.pair_watch_diagnostics = {}
+        self.pair_watch_diagnostic_lock = threading.Lock()
         self.dashboard_reports = ReportCache(self._load_dashboard_report)
         self.account_work = {}
         self.cycle_market_updates, self.cycle_market_order = {}, {}

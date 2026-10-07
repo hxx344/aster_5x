@@ -1,5 +1,5 @@
 """Bounded, read-only portal summary from already published dashboard data."""
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import math
 import time
 
@@ -40,11 +40,100 @@ def _message(base, reasons):
     return message
 
 
+def _snapshot(now, *candidates):
+    candidates = [value for value in candidates if isinstance(value, dict) and value]
+    valid = [(stamp, value) for value in candidates
+             if (stamp := _number(value.get("timestamp"))) is not None and 0 < stamp <= now + 60]
+    if valid:
+        stamp, snapshot = max(valid, key=lambda item: item[0])
+        return snapshot, stamp
+    return (candidates[0] if candidates else {}), None
+
+
+def _pair_orders_unresolved(runtime):
+    if (runtime.get("recovery_watch") is not None or runtime.get("attention")
+            or runtime.get("phase") in ("attention", "reconciling", "repairing")):
+        return True
+    pending = runtime.get("pending")
+    if pending is None:
+        return False
+    if not isinstance(pending, dict):
+        return True
+    if pending.get("kind") == "leverage":
+        results = pending.get("results")
+        return (runtime.get("phase") != "leverage" or not isinstance(results, dict)
+                or any(not isinstance(row, dict) or row.get("unknown") for row in results.values()))
+    if (runtime.get("phase") != "submitting" or pending.get("kind") not in ("cycle", "ordinary")
+            or pending.get("phase") not in ("open", "close")):
+        return True
+    legs, repairs = pending.get("legs"), pending.get("repairs")
+    if not isinstance(legs, list) or len(legs) != 2 or not isinstance(repairs, list) or repairs:
+        return True
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return True
+        receipt = leg.get("receipt")
+        if receipt is None:
+            # Sending is normal; a returned error/evidence without a receipt
+            # proves uncertainty, even before phase becomes reconciling.
+            if leg.get("error") or leg.get("submit_error") or leg.get("submit_evidence"):
+                return True
+        elif not isinstance(receipt, dict) or receipt.get("status") not in (
+                "NEW", "PARTIALLY_FILLED", "PENDING_CANCEL", "FILLED", "CANCELED",
+                "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
+            return True
+    return False
+
+
+def _pair_volume(runtime, side, now, utc_date):
+    if not isinstance(runtime, dict) or not runtime:
+        return None, "配对运行记录缺失或无效"
+    stamp = _number(runtime.get("updated_at"))
+    if stamp is None or not 0 < stamp <= now:
+        return None, "配对成交统计缺少有效更新时间"
+    if now - stamp >= STALE_AFTER_SECONDS:
+        return None, f"配对成交统计已过期（超过 {STALE_AFTER_SECONDS} 秒）"
+    if _pair_orders_unresolved(runtime):
+        return None, "配对订单尚待核对，今日成交量暂不可用"
+    unknown = bool(runtime.get("volume_unknown"))
+    until = runtime.get("volume_unknown_until_utc")
+    if until is not None:
+        try:
+            if not isinstance(until, str) or date.fromisoformat(until).isoformat() != until:
+                raise ValueError
+            unknown = utc_date <= until
+        except ValueError:
+            return None, "配对成交统计未知日期无效"
+    if unknown:
+        return None, "配对今日成交量存在未知成交"
+    daily = runtime.get("daily_volume")
+    if not isinstance(daily, dict):
+        return None, "配对今日成交量缺失或无效"
+    # The ledger creates a day only after a batch is reconciled. In-flight
+    # normal batches do not invalidate the already confirmed daily total.
+    if utc_date not in daily:
+        return 0.0, None
+    row = daily[utc_date]
+    value = _number(row.get(side)) if isinstance(row, dict) else None
+    if value is None or value < 0:
+        return None, "配对今日成交量缺失或无效"
+    return value, None
+
+
 def hub_summary(engine, *, now=None):
     """Never start account reads, history calculations or report refresh workers."""
     now = time.time() if now is None else now
     with engine.store.read_snapshot() as reader:
-        accounts = [account for account in reader.accounts() if account.get("enabled")]
+        saved_accounts = reader.accounts()
+        pairs = [pair for pair in reader.pairs() if pair.get("enabled")]
+        paired = {}
+        for pair in pairs:
+            runtime = reader.get("pair_runtime:" + pair["id"])
+            for side in ("long", "short"):
+                paired[pair[side + "_account_id"]] = (runtime, side)
+        accounts = {account["id"]: account for account in saved_accounts
+                    if account.get("enabled") or account["id"] in paired}
+    accounts = list(accounts.values())
     live = [account for account in accounts if account.get("mode") == "live"]
     stamps, margins, volumes, reasons = [], [], [], []
     with engine.lock:
@@ -56,12 +145,12 @@ def hub_summary(engine, *, now=None):
         for account in live:
             aid = account["id"]
             label = f"{_text(account.get('name'), '实盘账户')}（{_text(aid, '未知账户')}）"
-            snapshot = engine.views.get(aid, {}).get("snapshot") or {}
-            displayed = engine.display_snapshots.get(aid) or {}
-            if (_number(displayed.get("timestamp")) or 0) > (_number(snapshot.get("timestamp")) or 0):
-                snapshot = displayed
-            stamp = _number(snapshot.get("timestamp"))
-            stamps.append(stamp if stamp is not None and 0 < stamp <= now + 60 else None)
+            runtime, side = paired.get(aid, (None, None))
+            snapshots = runtime.get("snapshots") if isinstance(runtime, dict) else None
+            snapshot, stamp = _snapshot(now,
+                snapshots.get(side) if isinstance(snapshots, dict) else None,
+                engine.views.get(aid, {}).get("snapshot"), engine.display_snapshots.get(aid))
+            stamps.append(stamp)
             margins.append(_number(snapshot.get("occupied_margin")))
             if not snapshot:
                 reasons.append(f"{label}：缺少账户快照")
@@ -76,6 +165,14 @@ def hub_summary(engine, *, now=None):
     reports = engine.dashboard_reports
     with reports.lock:
         for account in live:
+            if account["id"] in paired:
+                runtime, side = paired[account["id"]]
+                volume, reason = _pair_volume(runtime, side, now, utc_date)
+                volumes.append(volume)
+                if reason:
+                    label = f"{_text(account.get('name'), '实盘账户')}（{_text(account['id'], '未知账户')}）"
+                    reasons.append(f"{label}：{reason}")
+                continue
             entry = reports.entries.get(account["id"], {})
             stamp = _number(entry.get("as_of"))
             valid = (entry.get("key") == reports.key(account) and not entry.get("error")
@@ -117,7 +214,8 @@ def hub_summary(engine, *, now=None):
         {"key": "live_accounts", "label": "实盘账户", "value": len(live), "unit": "个"},
         {"key": "occupied_margin", "label": "实盘占用保证金", "value": _sum(margins), "unit": "USD1"},
         {"key": "daily_volume", "label": "实盘今日成交量", "value": _sum(volumes), "unit": "USD1",
-         "detail": "上游 UTC 日口径；不计入资产汇总"},
+         "detail": "上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总" if any(account["id"] in paired for account in live)
+                   else "上游 UTC 日口径；不计入资产汇总"},
     ]
     return {"schemaVersion": 2, "data": {"updatedAt": updated_at,
             "health": {"state": health, "message": message, "staleAfterSeconds": STALE_AFTER_SECONDS}, "metrics": metrics}}

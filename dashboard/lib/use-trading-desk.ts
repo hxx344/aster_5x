@@ -5,6 +5,7 @@ import type { CycleTrade } from './cycle';
 import { createStatePoller } from './state-poller';
 import { createStateHistory } from './state-history';
 import { connectHubBridge } from './hub-bridge';
+import { createStateRefresh } from './state-refresh';
 export function useTradingDesk() {
   const [state, setState] = useState<State | null>(null);
   const [selected, setSelected] = useState('');
@@ -59,28 +60,15 @@ export function useTradingDesk() {
   const refresh = useCallback(() => poller.refresh(), [poller]);
   useEffect(() => {
     poller.resume();
-    let hubActive = true;
-    let timer: ReturnType<typeof setInterval> | undefined;
-    const tick = () => {
-      setNow(Date.now() / 1000);
-      void refresh();
-    };
-    const updateActivity = () => {
-      clearInterval(timer);
-      timer = undefined;
-      const active =
-        document.visibilityState === 'visible' && navigator.onLine && hubActive;
-      poller.setActivity(active);
-      if (active) {
-        tick();
-        timer = setInterval(tick, 3000);
-      }
-    };
+    const updates = createStateRefresh({
+      target: window,
+      page: document,
+      poller,
+      onTick: () => setNow(Date.now() / 1000),
+    });
     const bridge = connectHubBridge(window, {
-      onActivity: (active) => {
-        hubActive = active;
-        updateActivity();
-      },
+      onActivity: (active, background) =>
+        updates.setHostActivity(active, background),
       onConnected: setHubConnected,
       onNavigate: (accountId) => {
         if (accountId) selectAccount(accountId);
@@ -88,18 +76,11 @@ export function useTradingDesk() {
       },
     });
     hubBridge.current = bridge;
-    document.addEventListener('visibilitychange', updateActivity);
-    window.addEventListener('online', updateActivity);
-    window.addEventListener('offline', updateActivity);
-    updateActivity();
+    updates.start();
     return () => {
-      clearInterval(timer);
-      document.removeEventListener('visibilitychange', updateActivity);
-      window.removeEventListener('online', updateActivity);
-      window.removeEventListener('offline', updateActivity);
+      updates.dispose();
       bridge.dispose();
       hubBridge.current = null;
-      poller.setActivity(false);
       poller.pause();
     };
   }, [refresh, poller, selectAccount]);

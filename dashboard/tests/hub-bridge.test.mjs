@@ -10,7 +10,8 @@ function fixture({
   const sent = [],
     activities = [],
     connections = [],
-    navigations = [];
+    navigations = [],
+    background = [];
   let receive;
   const parent = {
     postMessage: (message, origin) => sent.push({ message, origin }),
@@ -30,7 +31,10 @@ function fixture({
   };
   if (!embedded) target.parent = target;
   const bridge = connectHubBridge(target, {
-    onActivity: (value) => activities.push(value),
+    onActivity: (value, enabled = false) => {
+      activities.push(value);
+      background.push(enabled);
+    },
     onConnected: (value) => connections.push(value),
     onNavigate: (value) => navigations.push(value),
   });
@@ -41,8 +45,38 @@ function fixture({
       origin: `${protocol}//hub.localhost:18080`,
       ...override,
     });
-  return { bridge, sent, activities, connections, navigations, message };
+  return {
+    bridge,
+    sent,
+    activities,
+    background,
+    connections,
+    navigations,
+    message,
+  };
 }
+
+test('only a trusted, handshaken host can grant boolean background read permission', () => {
+  const f = fixture();
+  f.message({ type: 'activity', active: false, backgroundUpdates: true });
+  assert.deepEqual(f.background, [false]);
+  f.message({ type: 'ready', role: 'host' });
+  f.message(
+    { type: 'activity', active: false, backgroundUpdates: true },
+    { source: {} },
+  );
+  f.message(
+    { type: 'activity', active: false, backgroundUpdates: true },
+    { origin: 'http://evil.test' },
+  );
+  assert.deepEqual(f.background, [false]);
+  f.message({ type: 'activity', active: false, backgroundUpdates: true });
+  f.message({ type: 'activity', active: false, backgroundUpdates: 'true' });
+  f.message({ type: 'activity', active: false });
+  assert.deepEqual(f.activities, [false, false, false, false]);
+  assert.deepEqual(f.background, [false, true, false, false]);
+  f.bridge.dispose();
+});
 
 test('isolated hub module starts paused and completes a validated host handshake', () => {
   const f = fixture();

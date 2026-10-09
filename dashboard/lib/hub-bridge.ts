@@ -2,7 +2,7 @@ const CHANNEL = 'project-hub';
 const MODULE_HOST = /^p-[a-f0-9]{24}\.hub\.localhost$/;
 
 type BridgeCallbacks = {
-  onActivity: (active: boolean) => void;
+  onActivity: (active: boolean, backgroundUpdates?: boolean) => void;
   onConnected: (connected: boolean) => void;
   onNavigate: (accountId?: string) => void;
 };
@@ -47,7 +47,7 @@ export function connectHubBridge(target: Window, callbacks: BridgeCallbacks) {
       data.type === 'activity' &&
       typeof data.active === 'boolean'
     ) {
-      callbacks.onActivity(data.active);
+      callbacks.onActivity(data.active, data.backgroundUpdates === true);
     } else if (
       connected &&
       data.type === 'navigate' &&

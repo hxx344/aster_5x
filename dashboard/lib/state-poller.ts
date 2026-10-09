@@ -28,8 +28,8 @@ export function createStatePoller<T>({
   };
 
   return {
-    // Visibility is independent from session/mutation pauses: resume and an
-    // explicit refresh may never make a background module start requests.
+    // Read permission is independent from session/mutation pauses: neither
+    // resume nor explicit refresh may bypass a disconnected or inactive host.
     setActivity(value: boolean) {
       activeView = value;
       if (!activeView) cancel();

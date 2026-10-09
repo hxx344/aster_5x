@@ -43,5 +43,6 @@ async (page) => {
   await page.clock.runFor(60_000); await settle(); assert(reads === loggedOutReads, '401 remains paused');
   assert(writes.length === 0, 'automatic updates only GET');
   assert(errors.length === 0, errors.join('; '));
+  await page.clock.resume();
   return { passed: true, reads, hiddenRounds: 3, writes: writes.length, browserErrors: errors.length };
 }

@@ -13,24 +13,6 @@ def gh(*arguments, check=True):
     return subprocess.run(["gh", *arguments], check=check, capture_output=True, text=True)
 
 
-def should_promote_latest(repository, commit):
-    # The workflow serializes publication. A newer failing build must not hide
-    # this checked package; an older successful job must not move latest back.
-    latest = gh("api", f"repos/{repository}/releases/latest", check=False)
-    if latest.returncode:
-        if "404" in latest.stderr:
-            return True
-        raise RuntimeError(latest.stderr)
-    tag = json.loads(latest.stdout)["tag_name"]
-    if not re.fullmatch(r"deploy-[a-f0-9]{40}", tag):
-        raise ValueError("Latest release is outside the deployment channel")
-    previous = tag.removeprefix("deploy-")
-    status = json.loads(gh("api", f"repos/{repository}/compare/{previous}...{commit}").stdout)["status"]
-    if status not in {"ahead", "identical", "behind", "diverged"}:
-        raise ValueError("Unknown release ancestry")
-    return status in {"ahead", "identical"}
-
-
 def main():
     output = Path(sys.argv[1] if len(sys.argv) > 1 else "release-output")
     manifest = json.loads((output / "release-manifest.json").read_text(encoding="utf-8"))
@@ -58,7 +40,7 @@ def main():
             return
     else:
         gh("release", "create", tag, "--repo", repository, "--target", commit, "--draft",
-           "--title", f"Deployment {commit[:12]}", "--notes", f"Checked runtime package for commit {commit}.")
+           "--title", f"Candidate {commit[:12]}", "--notes", f"Checked runtime package for commit {commit}.")
         release = {"assets": []}
     existing_names = {item["name"] for item in release["assets"]}
     with tempfile.TemporaryDirectory(prefix="deploy-publish-") as temporary:
@@ -70,9 +52,8 @@ def main():
                     raise ValueError(f"Refusing to overwrite an existing draft asset: {name}")
             else:
                 gh("release", "upload", tag, str(path), "--repo", repository)
-    promote = should_promote_latest(repository, commit)
-    gh("release", "edit", tag, "--repo", repository, "--draft=false", "--latest=" + str(promote).lower())
-    print(f"Published all checked deployment assets for {commit}.")
+    gh("release", "edit", tag, "--repo", repository, "--draft=false", "--prerelease=true", "--latest=false")
+    print(f"Published CI candidate assets (stable channel unchanged) for {commit}.")
 
 
 if __name__ == "__main__":

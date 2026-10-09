@@ -1,0 +1,30 @@
+name: Publish stable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character commit of a successful CI candidate to publish as stable
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: deployment-release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify candidate and explicitly publish the stable version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
+        run: python3 deploy/promote-release.py

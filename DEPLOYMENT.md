@@ -1,6 +1,6 @@
 # Linux 账户交易管理
 
-安装器默认使用 `PROJECT_DEPLOY_MODE=ci`：下载最新通过检查的 GitHub Release 部署包，固定到完整提交标签并校验 SHA-256。CI 包含已构建的 dashboard，服务器跳过 Node/npm 安装和前端构建，继续复用锁定 Python 依赖；代码未变不重启，失败恢复上一版本。配置、凭据和数据库保留。一键命令直接使用 CI 包；需要源码构建时使用 `curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install-trading.sh | sudo env PROJECT_DEPLOY_MODE=source bash`。CI 尚未通过的新提交不会覆盖已有可用包。
+安装器默认使用 `PROJECT_DEPLOY_MODE=ci`：下载经过 CI 验证并明确发布的最新正式部署包，固定到完整提交标签并校验 SHA-256。`main` CI 只发布 `prerelease` 候选；发布者在 **Publish stable release** 工作流选择 `main`，输入已通过本仓库 CI 的完整 40 位提交 SHA，核验后才晋级为正式版。CI 包含已构建的 dashboard，服务器跳过 Node/npm 安装和前端构建，继续复用锁定 Python 依赖；代码未变不重启，失败恢复上一版本。配置、凭据和数据库保留。默认安装和工作台前端更新只使用正式版；需要源码构建时使用 `curl -fsSL https://raw.githubusercontent.com/hxx344/aster_5x/main/install-trading.sh | sudo env PROJECT_DEPLOY_MODE=source bash`。未晋级候选不会改变已有正式包。
 
 公开额度可由独立副服务器采集并通过 WS 推送；副服务器一键安装、证书生成、主服务器接入及撤销配置见 [公开额度中继部署](RELAY.md)。
 

@@ -8,10 +8,19 @@ ci_release_resolve() {
   local repository=$1 workspace=$2 manifest values
   [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
   CI_RELEASE_REPOSITORY=$repository
+  # shellcheck disable=SC2034 # Part of the shared installer interface.
   CI_RELEASE_WORK=$workspace
   mkdir -p -- "$workspace" || return 1
   manifest="$workspace/release-manifest.json"
-  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  if [[ -n ${PROJECT_DEPLOY_MANIFEST_FILE:-} ]]; then
+    [[ -f "$PROJECT_DEPLOY_MANIFEST_FILE" && ! -L "$PROJECT_DEPLOY_MANIFEST_FILE" &&
+       $(stat -c %u "$PROJECT_DEPLOY_MANIFEST_FILE") == "$EUID" ]] || {
+      printf '[CI] 预检清单不存在或不属于当前安装用户。\n' >&2; return 1;
+    }
+    if [[ "$PROJECT_DEPLOY_MANIFEST_FILE" != "$manifest" ]]; then
+      cp -- "$PROJECT_DEPLOY_MANIFEST_FILE" "$manifest" || return 1
+    fi
+  elif ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --retry 3 --connect-timeout 15 --max-time 90 --max-filesize 1048576 \
     "https://github.com/$repository/releases/latest/download/release-manifest.json" -o "$manifest"; then
     printf '[CI] %s 暂无可用部署清单或下载失败；现有服务保持原样。\n' "$repository" >&2
@@ -49,6 +58,7 @@ CI_MANIFEST_PY
   CI_RELEASE_FILE=${fields[2]}
   CI_RELEASE_SHA256=${fields[3]}
   CI_RELEASE_APPLICATION_KEY=${fields[4]}
+  # shellcheck disable=SC2034 # Python applications do not consume the Node version.
   CI_RELEASE_NODE_VERSION=${fields[5]:-}
   printf '[CI] %s 最新可用部署包：%s。\n' "$repository" "${CI_RELEASE_COMMIT:0:12}"
 }
@@ -129,7 +139,7 @@ CI_EXTRACT_PY
 }
 # END CI RELEASE HELPERS
 
-deploy_mode=${PROJECT_DEPLOY_MODE:-source}
+deploy_mode=${PROJECT_DEPLOY_MODE:-ci}
 case "$deploy_mode" in source|ci) ;; *) printf 'PROJECT_DEPLOY_MODE must be source or ci.\n' >&2; exit 1 ;; esac
 cleanup_only=0
 case ${1:-} in

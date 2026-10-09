@@ -46,7 +46,7 @@ class CiInstallerTests(unittest.TestCase):
         return package.build_release(source, commit, self.h.base / "ci-release")
 
     def ci(self, **arguments):
-        return self.h.run(mode="ci", **arguments)
+        return self.h.run(mode=None, **arguments)
 
     def test_source_to_ci_reuses_python_and_never_installs_or_builds_node(self):
         original = self.h.success()

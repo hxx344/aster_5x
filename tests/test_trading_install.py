@@ -215,7 +215,9 @@ esac''')
         try:
             command = ["bash", "-s", "--", *args] if remote else ["bash", str(self.source / "install-trading.sh"), *args]
             result = subprocess.run(command, cwd=self.base if remote else self.source,
-                                    env={**os.environ, "PATH": str(self.commands) + ":/usr/bin:/bin", "PROJECT_DEPLOY_MODE": mode,
+                                    env={**{key: value for key, value in os.environ.items() if key != "PROJECT_DEPLOY_MODE"},
+                                         "PATH": str(self.commands) + ":/usr/bin:/bin",
+                                         **({"PROJECT_DEPLOY_MODE": mode} if mode else {}),
                                          "HARNESS_BASE": str(self.base), "HARNESS_COMMANDS": str(self.commands),
                                          "HARNESS_COUNTERS": str(self.counters), "HARNESS_REAL_PYTHON": sys.executable,
                                          "HARNESS_NODE_VERSION": str(self.node_version), "HARNESS_NPM_VERSION": str(self.npm_version)},

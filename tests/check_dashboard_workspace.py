@@ -1,5 +1,6 @@
 """Opt-in real npm build check, run by deployment CI in an isolated workspace."""
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -35,6 +36,9 @@ def main():
             assert (workspace / '.complete').is_file(), 'Genuine build changed installed package files'
             assert (workspace / 'dashboard/tsconfig.tsbuildinfo').is_file()
             assert (source / 'dashboard/dist/client/index.html').is_file()
+            if label == 'cold' and os.environ.get('ASTER_RELEASE_OUTPUT'):
+                destination = Path(os.environ['ASTER_RELEASE_OUTPUT']).resolve()
+                shutil.copytree(source / 'dashboard/dist/client', destination)
             if initial_inode is not None:
                 assert package.stat().st_ino == initial_inode, 'Warm build reinstalled/copied dependencies'
             initial_inode = package.stat().st_ino

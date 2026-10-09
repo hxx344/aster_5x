@@ -32,9 +32,46 @@ jobs:
       - name: Check standalone installer syntax
         run: bash -n install-trading.sh
       - name: Exercise isolated storage and upgrade fixtures
-        run: sudo python3 -m unittest tests.test_install_storage tests.test_dashboard_build_workspace tests.test_trading_install_inputs tests.test_feishu_configuration tests.test_trading_install -v
+        run: sudo python3 -m unittest tests.test_install_storage tests.test_dashboard_build_workspace tests.test_trading_install_inputs tests.test_feishu_configuration tests.test_trading_install tests.test_release_package tests.test_ci_install -v
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Check real cold and incremental dashboard builds
         run: python3 tests/check_dashboard_workspace.py
+        env:
+          ASTER_RELEASE_OUTPUT: dashboard/dist/client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checked-dashboard
+          path: dashboard/dist/client
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  release:
+    needs: [relay, installer]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: deployment-release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-dashboard
+          path: dashboard/dist/client
+      - run: python deploy/package-release.py --commit "$GITHUB_SHA"
+      - run: python -m pip install --disable-pip-version-check -r requirements.lock
+      - run: python tests/smoke_release.py release-output
+      - name: Publish immutable deployment assets after every required check
+        run: python deploy/publish-release.py release-output
+        env:
+          GH_TOKEN: ${{ github.token }}

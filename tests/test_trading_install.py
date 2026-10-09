@@ -209,13 +209,13 @@ start|enable)
 list-unit-files) printf 'aster-5x.service enabled\\n' ;;
 esac''')
 
-    def run(self, fail=None, args=(), remote=False):
+    def run(self, fail=None, args=(), remote=False, mode="source"):
         if fail:
             (self.base / ("fail-" + fail)).touch()
         try:
             command = ["bash", "-s", "--", *args] if remote else ["bash", str(self.source / "install-trading.sh"), *args]
             result = subprocess.run(command, cwd=self.base if remote else self.source,
-                                    env={**os.environ, "PATH": str(self.commands) + ":/usr/bin:/bin",
+                                    env={**os.environ, "PATH": str(self.commands) + ":/usr/bin:/bin", "PROJECT_DEPLOY_MODE": mode,
                                          "HARNESS_BASE": str(self.base), "HARNESS_COMMANDS": str(self.commands),
                                          "HARNESS_COUNTERS": str(self.counters), "HARNESS_REAL_PYTHON": sys.executable,
                                          "HARNESS_NODE_VERSION": str(self.node_version), "HARNESS_NPM_VERSION": str(self.npm_version)},

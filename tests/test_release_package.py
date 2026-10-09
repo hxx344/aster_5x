@@ -73,6 +73,26 @@ class ReleasePackageTests(unittest.TestCase):
         runtime = self.save()
         self.assertNotEqual(self.build(runtime)["artifacts"]["linux-x64"]["application_key"], original)
 
+    def test_random_frontend_output_does_not_restart_unchanged_application(self):
+        public = self.source / "dashboard/dist/client/index.html"
+        self.write("dashboard/app/page.tsx", "export default function Page() { return 'fixture'; }")
+        self.write("dashboard/package-lock.json", "locked dependency one")
+        commit = self.save()
+        original = self.build(commit)
+        public.write_text("<html>new random vinext build ID</html>", encoding="utf-8")
+        repeated = self.build(commit)
+        self.assertEqual(original["artifacts"]["linux-x64"]["application_key"],
+                         repeated["artifacts"]["linux-x64"]["application_key"])
+        self.assertNotEqual(original["artifacts"]["linux-x64"]["sha256"],
+                            repeated["artifacts"]["linux-x64"]["sha256"])
+        key = repeated["artifacts"]["linux-x64"]["application_key"]
+        for name in ("dashboard/app/page.tsx", "dashboard/package-lock.json", "dashboard/public/icon.svg",
+                     "dashboard/vite.config.ts", "deploy/build-dashboard.py", ".github/workflows/deployment.yml"):
+            self.write(name, "changed build input")
+            changed = self.build(self.save())["artifacts"]["linux-x64"]["application_key"]
+            self.assertNotEqual(key, changed, name)
+            key = changed
+
     def test_variational_web_change_preserves_the_engine_tree(self):
         if not package.REPOSITORY.endswith("/variational-grid"):
             self.skipTest("Independent engine/web input trees belong to Variational")

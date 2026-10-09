@@ -35,6 +35,24 @@ def inputs(root: Path, commit: str) -> dict[str, str]:
                          if not line.split("\t", 1)[1].startswith("variational_grid/web/")
                          and line.split("\t", 1)[1] not in {"variational_grid/dashboard.py", "variational_grid/hub.py"})
         return {"engine_tree": engine, "web_tree": complete}
+    if REPOSITORY.endswith("/aster_5x"):
+        # vinext embeds a fresh build ID in otherwise equivalent static output.
+        # Fingerprint every tracked build input; artifact bytes have their own SHA.
+        digest = hashlib.sha256(b"aster-frontend-inputs-v1\0")
+        for record in git(root, "ls-tree", "-rz", commit, "--", "dashboard", "deploy/build-dashboard.py",
+                          ".github/workflows/deployment.yml").split(b"\0"):
+            if not record:
+                continue
+            _metadata, raw_name = record.split(b"\t", 1)
+            name = raw_name.decode("utf-8")
+            parts = Path(name).parts
+            if name.endswith(".md") or name.startswith("dashboard/tests/") or any(
+                part in {"node_modules", "dist", ".wrangler", ".vinext", ".next", ".git", "__pycache__"}
+                or part.startswith(".env") or part == "tsconfig.tsbuildinfo" for part in parts
+            ):
+                continue
+            digest.update(record + b"\0")
+        return {"frontend_input_key": digest.hexdigest()}
     return {}
 
 
@@ -64,14 +82,18 @@ def runtime_files(root: Path, commit: str) -> dict[str, tuple[bytes, int]]:
     return files
 
 
-def application_key(files: dict[str, tuple[bytes, int]]) -> str:
-    result = hashlib.sha256(b"ci-runtime-v1\0")
+def application_key(files: dict[str, tuple[bytes, int]], build_inputs: dict[str, str]) -> str:
+    result = hashlib.sha256(b"ci-runtime-v2\0")
     for name, (content, mode) in sorted(files.items()):
-        if name.endswith(".md") or name.startswith("tests/"):
+        if name.endswith(".md") or name.startswith(("tests/", "dashboard/dist/client/")):
             continue
         for value in (name.encode(), str(mode).encode(), content):
             result.update(len(value).to_bytes(8, "big"))
             result.update(value)
+    for name, value in sorted(build_inputs.items()):
+        for item in (name.encode(), value.encode()):
+            result.update(len(item).to_bytes(8, "big"))
+            result.update(item)
     return result.hexdigest()
 
 
@@ -79,10 +101,11 @@ def build_release(root: Path, commit: str, output: Path) -> dict:
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
         raise ValueError("A full immutable commit is required")
     files = runtime_files(root, commit)
-    key = application_key(files)
+    build_inputs = inputs(root, commit)
+    key = application_key(files, build_inputs)
     files[".release-commit"] = ((commit + "\n").encode(), 0o644)
     files[".release-application-key"] = ((key + "\n").encode(), 0o644)
-    files[".release-inputs.json"] = ((json.dumps(inputs(root, commit), sort_keys=True) + "\n").encode(), 0o644)
+    files[".release-inputs.json"] = ((json.dumps(build_inputs, sort_keys=True) + "\n").encode(), 0o644)
     output.mkdir(parents=True, exist_ok=True)
     filename = REPOSITORY.split("/")[1] + "-linux.tar.gz"
     destination = output / filename

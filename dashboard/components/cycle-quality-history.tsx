@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import { CycleExecutionQualityPanel } from '@/components/cycle-execution-quality';
 import {
   cycleExecutionQualityView,
@@ -8,7 +8,7 @@ import {
   type CycleQualityHistory,
 } from '@/lib/cycle-quality';
 
-export function CycleQualityHistoryPanel({
+export const CycleQualityHistoryPanel = memo(function CycleQualityHistoryPanel({
   history,
   quality,
   accountName,
@@ -124,4 +124,4 @@ export function CycleQualityHistoryPanel({
       </section>
     </div>
   );
-}
+});

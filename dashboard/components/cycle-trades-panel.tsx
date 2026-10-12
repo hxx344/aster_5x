@@ -2,7 +2,7 @@
 
 /* oxlint-disable jsx-a11y/no-noninteractive-tabindex -- The labeled overflow region needs keyboard focus so arrow keys can scroll the table. */
 
-import { useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import {
   Select,
   SelectContent,
@@ -39,8 +39,11 @@ export function CycleTradesPanel({
   now,
 }: Props) {
   const [selectedDate, setSelectedDate] = useState('');
-  const dates = cycleTradeDates(trades);
-  const rows = cycleTradesForDate(trades, selectedDate);
+  const dates = useMemo(() => cycleTradeDates(trades), [trades]);
+  const rows = useMemo(
+    () => cycleTradesForDate(trades, selectedDate),
+    [trades, selectedDate],
+  );
   const selectedMissing = selectedDate && !dates.includes(selectedDate);
   const report = cycleReportSummary(reportStatus, now);
 
@@ -90,85 +93,7 @@ export function CycleTradesPanel({
         </div>
       </div>
       {rows.length ? (
-        <section
-          className="cycle-trades-region"
-          aria-label="循环成交明细，可横向滚动"
-          tabIndex={0}
-        >
-          <table className="cycle-trade-table">
-            <thead>
-              <tr>
-                <th>成交时间 · UTC</th>
-                <th>动作 / 品种</th>
-                <th>本笔成交金额 · USD1</th>
-                <th>该品种当日累计 · USD1</th>
-                <th>本笔已计成本 · USD1</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((trade) => {
-                const cost = cycleTradeCostView(trade.cost);
-                return (
-                  <tr
-                    key={`${trade.symbol}:${trade.trade_id}:${trade.order_id}`}
-                  >
-                    <td>
-                      <span className="mobile-trade-label" aria-hidden="true">
-                        成交时间 · UTC
-                      </span>
-                      <time>{cycleUtcTime(trade.executed_at)}</time>
-                      <small
-                        className={
-                          trade.time_source === 'legacy_estimated'
-                            ? 'amber'
-                            : ''
-                        }
-                      >
-                        {cycleTradeTimeSource(trade)}
-                      </small>
-                      {!validCycleUtcDate(trade.utc_date) ? (
-                        <small className="amber">统计日期缺失</small>
-                      ) : null}
-                    </td>
-                    <td>
-                      <span className="mobile-trade-label" aria-hidden="true">
-                        动作 / 品种
-                      </span>
-                      <strong>{trade.symbol || '品种未知'}</strong>
-                      <small>{cycleTradeAction(trade)}</small>
-                    </td>
-                    <td className="cycle-trade-money">
-                      <span className="mobile-trade-label" aria-hidden="true">
-                        本笔成交金额 · USD1
-                      </span>
-                      {cycleAmount(trade.notional)}
-                    </td>
-                    <td className="cycle-trade-money">
-                      <span className="mobile-trade-label" aria-hidden="true">
-                        该品种当日累计 · USD1
-                      </span>
-                      {cycleAmount(trade.daily_volume)}
-                      {typeof trade.daily_volume !== 'string' ? (
-                        <small className="amber">此记录未提供累计值</small>
-                      ) : null}
-                    </td>
-                    <td className="cycle-trade-money cycle-trade-cost">
-                      <span className="mobile-trade-label" aria-hidden="true">
-                        本笔已计成本 · USD1
-                      </span>
-                      <strong>{cost.total}</strong>
-                      <small>估算手续费 {cost.fee}</small>
-                      <small>本笔计入差价 {cost.spread}</small>
-                      {cost.notice ? (
-                        <small className="amber">{cost.notice}</small>
-                      ) : null}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </section>
+        <CycleTradesTable rows={rows} />
       ) : (
         <div className="cycle-trades-empty">
           {trades === undefined
@@ -188,3 +113,89 @@ export function CycleTradesPanel({
     </section>
   );
 }
+
+// History references remain stable between ledger revisions; the live report
+// header still updates on each clock tick without reformatting every trade.
+const CycleTradesTable = memo(function CycleTradesTable({
+  rows,
+}: {
+  rows: CycleTrade[];
+}) {
+  return (
+    <section
+      className="cycle-trades-region"
+      aria-label="循环成交明细，可横向滚动"
+      tabIndex={0}
+    >
+      <table className="cycle-trade-table">
+        <thead>
+          <tr>
+            <th>成交时间 · UTC</th>
+            <th>动作 / 品种</th>
+            <th>本笔成交金额 · USD1</th>
+            <th>该品种当日累计 · USD1</th>
+            <th>本笔已计成本 · USD1</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((trade) => {
+            const cost = cycleTradeCostView(trade.cost);
+            return (
+              <tr key={`${trade.symbol}:${trade.trade_id}:${trade.order_id}`}>
+                <td>
+                  <span className="mobile-trade-label" aria-hidden="true">
+                    成交时间 · UTC
+                  </span>
+                  <time>{cycleUtcTime(trade.executed_at)}</time>
+                  <small
+                    className={
+                      trade.time_source === 'legacy_estimated' ? 'amber' : ''
+                    }
+                  >
+                    {cycleTradeTimeSource(trade)}
+                  </small>
+                  {!validCycleUtcDate(trade.utc_date) ? (
+                    <small className="amber">统计日期缺失</small>
+                  ) : null}
+                </td>
+                <td>
+                  <span className="mobile-trade-label" aria-hidden="true">
+                    动作 / 品种
+                  </span>
+                  <strong>{trade.symbol || '品种未知'}</strong>
+                  <small>{cycleTradeAction(trade)}</small>
+                </td>
+                <td className="cycle-trade-money">
+                  <span className="mobile-trade-label" aria-hidden="true">
+                    本笔成交金额 · USD1
+                  </span>
+                  {cycleAmount(trade.notional)}
+                </td>
+                <td className="cycle-trade-money">
+                  <span className="mobile-trade-label" aria-hidden="true">
+                    该品种当日累计 · USD1
+                  </span>
+                  {cycleAmount(trade.daily_volume)}
+                  {typeof trade.daily_volume !== 'string' ? (
+                    <small className="amber">此记录未提供累计值</small>
+                  ) : null}
+                </td>
+                <td className="cycle-trade-money cycle-trade-cost">
+                  <span className="mobile-trade-label" aria-hidden="true">
+                    本笔已计成本 · USD1
+                  </span>
+                  <strong>{cost.total}</strong>
+                  <small>估算手续费 {cost.fee}</small>
+                  <small>本笔计入差价 {cost.spread}</small>
+                  {cost.notice ? (
+                    <small className="amber">{cost.notice}</small>
+                  ) : null}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
+});
